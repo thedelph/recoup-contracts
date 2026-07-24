@@ -29,4 +29,12 @@ interface ICustodyAdapter {
     /// @notice Transfer bond units out of custody (withdrawal to owner, or auction
     ///         winner). Requires the adapter to be on DexFi's transfer whitelist.
     function transferBonds(address to, uint256 amount) external;
+
+    /// @notice The CollateralVault this adapter is bound to. The vault reads this
+    ///         to reject a custody swap to an adapter wired for a different vault.
+    function vault() external view returns (address);
+
+    /// @notice Bond units currently held in custody (staked in the farm). The vault
+    ///         reads this to reject a swap that would orphan a live position.
+    function stakedBalance() external view returns (uint256);
 }

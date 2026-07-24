@@ -141,7 +141,12 @@ contract CollateralVaultInvariants is Test {
 
         vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
         adapter = new DirectCallAdapter(
-            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault)
+            IDexFiBond(address(bond)),
+            IDexFiFarm(address(farm)),
+            usdc,
+            address(vault),
+            admin,
+            makeAddr("treasury")
         );
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));

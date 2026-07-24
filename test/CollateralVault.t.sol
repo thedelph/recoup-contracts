@@ -26,6 +26,7 @@ contract CollateralVaultTest is Test {
     address internal alice = makeAddr("alice");
     address internal auction = makeAddr("auction");
     address internal winner = makeAddr("winner");
+    address internal yieldSink = makeAddr("yieldSink");
 
     MockUSDC internal usdc;
     MockBond internal bond;
@@ -45,7 +46,7 @@ contract CollateralVaultTest is Test {
 
         vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
         adapter = new DirectCallAdapter(
-            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault)
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
 
         vm.startPrank(admin);
@@ -195,7 +196,7 @@ contract CollateralVaultTest is Test {
 
     // ── yield ────────────────────────────────────────────────────────────────
 
-    function test_harvestYield_sweepsToVault() public {
+    function test_harvestYield_sweepsToRecipient() public {
         vm.prank(alice);
         vault.depositBonds(100);
         farm.setPendingYield(address(adapter), 500e6);
@@ -204,11 +205,12 @@ contract CollateralVaultTest is Test {
         uint256 claimed = vault.harvestYield();
 
         assertEq(claimed, 500e6);
-        assertEq(usdc.balanceOf(address(vault)), 500e6);
+        assertEq(usdc.balanceOf(yieldSink), 500e6); // routed to the spendable recipient
+        assertEq(usdc.balanceOf(address(vault)), 0); // vault is no longer a USDC sink
         assertEq(usdc.balanceOf(address(adapter)), 0); // adapter holds nothing at rest
     }
 
-    function test_unstake_sweepsPendingYieldToo() public {
+    function test_unstake_sweepsPendingYieldToRecipient() public {
         vm.prank(alice);
         vault.depositBonds(100);
         farm.setPendingYield(address(adapter), 123e6);
@@ -216,8 +218,89 @@ contract CollateralVaultTest is Test {
         // Farm pays pending USDC alongside any withdrawal; it must not strand.
         vm.prank(alice);
         vault.withdrawBonds(100);
-        assertEq(usdc.balanceOf(address(vault)), 123e6);
+        assertEq(usdc.balanceOf(yieldSink), 123e6);
         assertEq(usdc.balanceOf(address(adapter)), 0);
+        assertEq(usdc.balanceOf(address(vault)), 0);
+    }
+
+    /// Finding 8: a donation to the adapter must not inflate the reported harvest.
+    function test_claimYield_reportsFarmDeltaNotBalance() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        farm.setPendingYield(address(adapter), 500e6);
+        usdc.mint(address(adapter), 1_000_000e6); // attacker donation
+
+        vm.prank(admin);
+        uint256 claimed = vault.harvestYield();
+
+        assertEq(claimed, 500e6, "report only the farm's payout, not the donation");
+        assertEq(usdc.balanceOf(address(adapter)), 0); // everything still swept out
+    }
+
+    /// Finding 2: bonds mis-sent to the adapter are not credited to the next depositor.
+    function test_depositETH_ignoresDonatedLooseBonds() public {
+        // A third party pushes bonds straight to the whitelisted adapter.
+        bond.mint(winner, 500);
+        vm.prank(winner);
+        bond.safeTransferFrom(winner, address(adapter), 0, 500, "");
+        assertEq(bond.bondBalance(address(adapter)), 500);
+
+        bytes memory mintData = _mintData(address(adapter), 1, 1 ether);
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        vault.depositETH{value: 1 ether}(mintData);
+
+        // Alice is credited exactly what she minted, not the donation.
+        assertEq(vault.bondCount(alice), 1);
+    }
+
+    // ── adapter migration guards (Finding 3) ─────────────────────────────────
+
+    function test_setCustodyAdapter_revertsWithLivePosition() public {
+        vm.prank(alice);
+        vault.depositBonds(100); // adapter now holds a live position
+
+        DirectCallAdapter fresh = new DirectCallAdapter(
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
+        );
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.AdapterHasLivePosition.selector, 100));
+        vault.setCustodyAdapter(ICustodyAdapter(address(fresh)));
+    }
+
+    function test_setCustodyAdapter_revertsOnVaultMismatch() public {
+        // Adapter bound to a different vault address.
+        DirectCallAdapter foreign = new DirectCallAdapter(
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(0xBEEF), admin, yieldSink
+        );
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.AdapterVaultMismatch.selector, address(0xBEEF))
+        );
+        vault.setCustodyAdapter(ICustodyAdapter(address(foreign)));
+    }
+
+    // ── stale-NAV withdrawal guard (Finding 6) ───────────────────────────────
+
+    function test_withdrawBonds_revertsOnStaleNav() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        credit.setDebt(alice, 1e6);
+        oracle.setStale(true);
+
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.NavStale.selector);
+        vault.withdrawBonds(10);
+    }
+
+    function test_withdrawBonds_debtFreeIgnoresStaleNav() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        oracle.setStale(true); // no debt ⇒ staleness is irrelevant
+
+        vm.prank(alice);
+        vault.withdrawBonds(100);
+        assertEq(vault.bondCount(alice), 0);
     }
 
     // ── seize ────────────────────────────────────────────────────────────────
@@ -245,9 +328,24 @@ contract CollateralVaultTest is Test {
         vm.expectRevert(DirectCallAdapter.NotVault.selector);
         adapter.stake(1);
         vm.expectRevert(DirectCallAdapter.NotVault.selector);
-        adapter.claimYield();
-        vm.expectRevert(DirectCallAdapter.NotVault.selector);
         adapter.transferBonds(alice, 1);
+        // claimYield is gated to vault OR the wired harvester.
+        vm.expectRevert(DirectCallAdapter.NotClaimer.selector);
+        adapter.claimYield();
+    }
+
+    function test_adapter_ownerOnlyRouting() public {
+        // Yield-routing config and the emergency hatch are owner-gated.
+        vm.expectRevert();
+        adapter.setYieldRecipient(alice);
+        vm.expectRevert();
+        adapter.setHarvester(alice);
+        vm.expectRevert();
+        adapter.emergencyUnstake(alice);
+
+        vm.prank(admin);
+        adapter.setHarvester(alice);
+        assertEq(adapter.harvester(), alice);
     }
 
     // ── fuzz ─────────────────────────────────────────────────────────────────

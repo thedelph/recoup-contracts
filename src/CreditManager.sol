@@ -19,6 +19,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error NotImplemented();
     error NotEpochHarvester();
     error ZeroAddress();
+    error RenounceDisabled();
 
     IERC20 public immutable usdc;
     ICollateralVault public immutable vault;
@@ -39,12 +40,29 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     constructor(IERC20 usdc_, ICollateralVault vault_, INAVOracle navOracle_, address initialOwner)
         Ownable(initialOwner)
     {
+        if (
+            address(usdc_) == address(0) || address(vault_) == address(0)
+                || address(navOracle_) == address(0)
+        ) revert ZeroAddress();
         usdc = usdc_;
         vault = vault_;
         navOracle = navOracle_;
     }
 
     // ── Wiring (owner, behind timelock in production) ────────────────────────
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @dev Renouncing would permanently freeze wiring and the pause switch.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
+    }
 
     function setLenderPool(address lenderPool_) external onlyOwner {
         if (lenderPool_ == address(0)) revert ZeroAddress();

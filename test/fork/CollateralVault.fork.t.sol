@@ -36,6 +36,7 @@ contract CollateralVaultForkTest is Test {
 
     CollateralVault internal vault;
     DirectCallAdapter internal adapter;
+    address internal treasury = makeAddr("treasury");
 
     bool internal run;
 
@@ -54,7 +55,7 @@ contract CollateralVaultForkTest is Test {
         vault = new CollateralVault(
             bond, INAVOracle(address(new MockNavOracle(25.15e8))), admin
         );
-        adapter = new DirectCallAdapter(bond, farm, usdc, address(vault));
+        adapter = new DirectCallAdapter(bond, farm, usdc, address(vault), admin, treasury);
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setLiquidationAuction(makeAddr("auction"));
@@ -106,7 +107,7 @@ contract CollateralVaultForkTest is Test {
         vm.warp(block.timestamp + 3 days);
         vm.prank(admin);
         uint256 claimed = vault.harvestYield();
-        assertEq(usdc.balanceOf(address(vault)), claimed);
+        assertEq(usdc.balanceOf(treasury), claimed); // yield routed to the recipient
         assertGt(claimed, 0, "3 days of streaming rewards on 10 bonds");
 
         // unstake + withdraw back to the user
