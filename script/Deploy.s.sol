@@ -36,8 +36,10 @@ contract DeployLocal is Script {
         NAVOracle oracle = new NAVOracle(admin);
         CollateralVault vault =
             new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        // yieldRecipient defaults to the admin (treasury stand-in); repoint to the
+        // EpochHarvester once Phase 3 lands. Owner = admin (timelock in production).
         DirectCallAdapter adapter = new DirectCallAdapter(
-            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault)
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, admin
         );
         bond.setWhitelisted(address(farm), true);
         bond.setWhitelisted(address(adapter), true);

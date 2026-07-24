@@ -24,6 +24,22 @@ contract ConfigTest is Test {
         assertLt(Config.LIQUIDATION_THRESHOLD_BPS, Config.AUCTION_FLOOR_BPS);
     }
 
+    /// @notice A floor-price fill must cover debt + liquidation penalty even at the
+    ///         worst LTV that can first trigger a liquidation. That worst case is one
+    ///         immediate NAV_MAX_DEVIATION_BPS drop applied to a position sitting at
+    ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev).
+    function test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger() public pure {
+        uint256 worstTriggerLtv =
+            (Config.LIQUIDATION_THRESHOLD_BPS * Config.BPS) / (Config.BPS - Config.NAV_MAX_DEVIATION_BPS);
+        uint256 requiredFloor =
+            (worstTriggerLtv * (Config.BPS + Config.LIQUIDATION_PENALTY_BPS)) / Config.BPS;
+        assertGe(
+            Config.AUCTION_FLOOR_BPS,
+            requiredFloor,
+            "auction floor must cover debt + penalty at the first-triggerable LTV"
+        );
+    }
+
     function test_auctionDecaysDownward() public pure {
         assertGt(Config.AUCTION_START_PREMIUM_BPS, Config.AUCTION_FLOOR_BPS);
     }

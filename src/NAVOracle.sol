@@ -18,6 +18,7 @@ contract NAVOracle is INAVOracle, Ownable {
     error NotImplemented();
     error NotKeeper();
     error ZeroAddress();
+    error RenounceDisabled();
 
     event NAVPosted(uint256 nav, uint256 timestamp);
     event NAVPending(uint256 nav, uint256 confirmableAt);
@@ -52,5 +53,10 @@ contract NAVOracle is INAVOracle, Ownable {
     // slither-disable-next-line timestamp
     function isStale() external view returns (bool) {
         return block.timestamp > lastUpdated + Config.NAV_STALENESS;
+    }
+
+    /// @dev Renouncing would permanently freeze keeper management and brick the feed.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 }

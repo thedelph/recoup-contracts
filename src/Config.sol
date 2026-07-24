@@ -20,7 +20,11 @@ library Config {
 
     // ── Liquidation auction (PRD §4.5) ───────────────────────────────────────
     uint256 internal constant AUCTION_START_PREMIUM_BPS = 10_000; // 100% of NAV
-    uint256 internal constant AUCTION_FLOOR_BPS = 6_500; // 65% of NAV
+    // Floor must cover debt + liquidation penalty at the worst LTV that can first
+    // trigger a liquidation - i.e. after one immediate NAV_MAX_DEVIATION_BPS drop:
+    //   THRESHOLD/(1-maxDev) x (1+penalty) = 5800/0.9 x 1.05 = 6767 bps.
+    // Set above that with margin; relation asserted in Config.t.sol.
+    uint256 internal constant AUCTION_FLOOR_BPS = 6_800; // 68% of NAV
     uint256 internal constant AUCTION_DURATION = 6 hours;
     uint256 internal constant LIQUIDATION_PENALTY_BPS = 500; // of debt; split 50/50 caller/insurance
 

@@ -7,6 +7,7 @@ import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
 contract MockNavOracle is INAVOracle {
     uint256 public navPerBond;
     uint256 public lastUpdated;
+    bool public stale;
 
     constructor(uint256 nav) {
         setNav(nav);
@@ -17,7 +18,11 @@ contract MockNavOracle is INAVOracle {
         lastUpdated = block.timestamp;
     }
 
-    function isStale() external pure returns (bool) {
-        return false;
+    function setStale(bool stale_) external {
+        stale = stale_;
+    }
+
+    function isStale() external view returns (bool) {
+        return stale;
     }
 }

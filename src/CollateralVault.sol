@@ -28,6 +28,10 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error WithdrawalExceedsMaxLtv(uint256 postLtvBps);
     error NothingMinted();
     error ZeroAddress();
+    error AdapterHasLivePosition(uint256 staked);
+    error AdapterVaultMismatch(address adapterVault);
+    error NavStale();
+    error RenounceDisabled();
 
     event YieldHarvested(uint256 usdcAmount);
 
@@ -42,14 +46,26 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     mapping(address => uint256) public override bondCount;
 
     constructor(IDexFiBond bond_, INAVOracle navOracle_, address initialOwner) Ownable(initialOwner) {
+        if (address(bond_) == address(0) || address(navOracle_) == address(0)) revert ZeroAddress();
         bond = bond_;
         navOracle = navOracle_;
     }
 
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
+    /// @dev A swap must not orphan a live position: reject unless the outgoing
+    ///      adapter holds nothing in custody, and require the incoming adapter to be
+    ///      bound to this vault. Migrating a live position requires unstaking first
+    ///      (or an explicit migration path), never a bare re-point.
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
         if (address(adapter) == address(0)) revert ZeroAddress();
+        ICustodyAdapter current = custodyAdapter;
+        if (address(current) != address(0)) {
+            uint256 staked = current.stakedBalance();
+            if (staked != 0) revert AdapterHasLivePosition(staked);
+        }
+        address boundVault = adapter.vault();
+        if (boundVault != address(this)) revert AdapterVaultMismatch(boundVault);
         custodyAdapter = adapter;
     }
 
@@ -69,6 +85,11 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /// @dev Renouncing would permanently disable all wiring and the pause switch.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     // ── ICollateralVault ─────────────────────────────────────────────────────
@@ -117,6 +138,9 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         if (creditManager != address(0)) {
             uint256 debt = ICreditManager(creditManager).debtOf(msg.sender);
             if (debt > 0) {
+                // Releasing collateral raises LTV exactly as borrowing does, so it
+                // must not price against a stale NAV (PRD §4.6).
+                if (navOracle.isStale()) revert NavStale();
                 uint256 remainingValue = (held - amount) * navOracle.navPerBond(); // USD, 8dp
                 uint256 debtNavScale = debt * Config.USDC_TO_NAV_SCALE; // USDC 6dp → 8dp
                 if (remainingValue == 0) revert WithdrawalExceedsMaxLtv(type(uint256).max);
