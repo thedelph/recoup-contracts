@@ -17,6 +17,7 @@ import {Config} from "./Config.sol";
 contract NAVOracle is INAVOracle, Ownable {
     error NotImplemented();
     error NotKeeper();
+    error ZeroAddress();
 
     event NAVPosted(uint256 nav, uint256 timestamp);
     event NAVPending(uint256 nav, uint256 confirmableAt);
@@ -25,11 +26,15 @@ contract NAVOracle is INAVOracle, Ownable {
     /// @inheritdoc INAVOracle
     uint256 public override navPerBond;
     /// @inheritdoc INAVOracle
+    /// @dev Zero until the first postNav by design: a fresh oracle must read as
+    ///      stale (tested in Skeletons.t.sol).
+    // slither-disable-next-line uninitialized-state
     uint256 public override lastUpdated;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
     function setKeeper(address keeper_) external onlyOwner {
+        if (keeper_ == address(0)) revert ZeroAddress();
         keeper = keeper_;
     }
 
@@ -42,6 +47,9 @@ contract NAVOracle is INAVOracle, Ownable {
     }
 
     /// @inheritdoc INAVOracle
+    /// @dev Staleness window is 8 days (Config); second-level timestamp drift is
+    ///      immaterial at that scale.
+    // slither-disable-next-line timestamp
     function isStale() external view returns (bool) {
         return block.timestamp > lastUpdated + Config.NAV_STALENESS;
     }

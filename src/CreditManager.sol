@@ -18,6 +18,7 @@ import {INAVOracle} from "./interfaces/INAVOracle.sol";
 contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error NotImplemented();
     error NotEpochHarvester();
+    error ZeroAddress();
 
     IERC20 public immutable usdc;
     ICollateralVault public immutable vault;
@@ -46,14 +47,17 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
     function setLenderPool(address lenderPool_) external onlyOwner {
+        if (lenderPool_ == address(0)) revert ZeroAddress();
         lenderPool = lenderPool_;
     }
 
     function setEpochHarvester(address epochHarvester_) external onlyOwner {
+        if (epochHarvester_ == address(0)) revert ZeroAddress();
         epochHarvester = epochHarvester_;
     }
 
     function setLiquidationAuction(address liquidationAuction_) external onlyOwner {
+        if (liquidationAuction_ == address(0)) revert ZeroAddress();
         liquidationAuction = liquidationAuction_;
     }
 

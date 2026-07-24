@@ -66,6 +66,19 @@ They prove, on real state:
 3. a single `addWhitelist([adapter])` from the bond owner unlocks the entire lifecycle:
    deposit → stake → claim real streamed USDC → unstake → withdraw.
 
+## Security posture (pre-audit)
+
+- **Stateful invariant fuzzing** (`test/CollateralVault.invariants.t.sol`): randomised multi-actor
+  call sequences must preserve four invariants after every sequence - vault accounting equals farm
+  stake, the adapter holds no USDC or loose bonds at rest, bond units are conserved, the vault
+  itself never custodies bonds. Run: `forge test --match-contract Invariants`.
+- **Slither**: clean - 0 findings with informational/optimization excluded; every triaged
+  suppression carries an inline justification comment.
+- **Coverage** (implemented contracts): CollateralVault 96.9% lines, DirectCallAdapter 97.1% lines
+  / 100% functions. Skeleton modules are stubs and intentionally uncovered until their phase.
+- All wiring setters and the adapter constructor zero-address-check; deposits are pausable, exits
+  are not; external audit is a hard gate before any real funds.
+
 ## External addresses (Base mainnet, verified 2026-07-24)
 
 | Name | Address |

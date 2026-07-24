@@ -19,6 +19,7 @@ import {INAVOracle} from "./interfaces/INAVOracle.sol";
 contract LiquidationAuction is ILiquidationAuction, Ownable, ReentrancyGuard {
     error NotImplemented();
     error NotCreditManager();
+    error ZeroAddress();
 
     struct Auction {
         address borrower;
@@ -46,6 +47,7 @@ contract LiquidationAuction is ILiquidationAuction, Ownable, ReentrancyGuard {
     }
 
     function setCreditManager(address creditManager_) external onlyOwner {
+        if (creditManager_ == address(0)) revert ZeroAddress();
         creditManager = creditManager_;
     }
 

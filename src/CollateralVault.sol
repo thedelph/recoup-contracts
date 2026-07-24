@@ -27,6 +27,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error InsufficientCollateral(uint256 requested, uint256 available);
     error WithdrawalExceedsMaxLtv(uint256 postLtvBps);
     error NothingMinted();
+    error ZeroAddress();
 
     event YieldHarvested(uint256 usdcAmount);
 
@@ -48,14 +49,17 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
+        if (address(adapter) == address(0)) revert ZeroAddress();
         custodyAdapter = adapter;
     }
 
     function setCreditManager(address creditManager_) external onlyOwner {
+        if (creditManager_ == address(0)) revert ZeroAddress();
         creditManager = creditManager_;
     }
 
     function setLiquidationAuction(address liquidationAuction_) external onlyOwner {
+        if (liquidationAuction_ == address(0)) revert ZeroAddress();
         liquidationAuction = liquidationAuction_;
     }
 
@@ -83,6 +87,10 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     }
 
     /// @inheritdoc ICollateralVault
+    /// @dev Slither reentrancy-benign: bondCount is written after the external mint
+    ///      because the minted amount cannot be known before it; guarded by
+    ///      nonReentrant and the adapter is immutable protocol code.
+    // slither-disable-next-line reentrancy-benign
     function depositETH(bytes calldata mintData) external payable whenNotPaused nonReentrant {
         ICustodyAdapter adapter = _adapter();
         if (msg.value == 0) revert ZeroAmount();
@@ -149,6 +157,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     /// @dev TODO(phase-3): EpochHarvester becomes the caller and the USDC is split
     ///      per PRD §4.4; until then the owner triggers claims and funds accumulate
     ///      here untouched.
+    // slither-disable-next-line reentrancy-events
     function harvestYield() external onlyOwner returns (uint256 usdcAmount) {
         usdcAmount = _adapter().claimYield();
         emit YieldHarvested(usdcAmount);

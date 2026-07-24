@@ -25,6 +25,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder {
     error NotVault();
     error ReceiverMustBeAdapter(address receiver);
     error PaymentMismatch(uint256 expected, uint256 actual);
+    error ZeroAddress();
 
     IDexFiBond public immutable bond;
     IDexFiFarm public immutable farm;
@@ -37,6 +38,10 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder {
     }
 
     constructor(IDexFiBond bond_, IDexFiFarm farm_, IERC20 usdc_, address vault_) {
+        if (
+            address(bond_) == address(0) || address(farm_) == address(0)
+                || address(usdc_) == address(0) || vault_ == address(0)
+        ) revert ZeroAddress();
         bond = bond_;
         farm = farm_;
         usdc = usdc_;
@@ -46,6 +51,9 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder {
     }
 
     /// @inheritdoc ICustodyAdapter
+    /// @dev Slither unused-return: only the staked amount from userInfo is needed;
+    ///      rewardDebt is MasterChef bookkeeping this contract does not consume.
+    // slither-disable-next-line unused-return
     function mintBonds(bytes calldata mintData) external payable onlyVault returns (uint256 amount) {
         IDexFiBond.MintDataInput memory data = abi.decode(mintData, (IDexFiBond.MintDataInput));
         // Bonds auto-stake for the receiver on mint; custody must land here.

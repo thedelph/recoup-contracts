@@ -20,6 +20,7 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
     error NotImplemented();
     error NotCreditManager();
     error NotEpochHarvester();
+    error ZeroAddress();
 
     event Lent(uint256 amount);
     event PrincipalRepaid(uint256 amount);
@@ -33,6 +34,8 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
 
     /// @notice USDC currently lent out, carried at face value less socialised loss
     ///         (debts are written down by yield, not defaulted — PRD §4.2).
+    /// @dev Zero until lend() lands (phase 4); the zero default is the correct value.
+    // slither-disable-next-line uninitialized-state
     uint256 public outstandingPrincipal;
 
     constructor(IERC20 usdc_, address initialOwner)
@@ -44,10 +47,12 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
     function setCreditManager(address creditManager_) external onlyOwner {
+        if (creditManager_ == address(0)) revert ZeroAddress();
         creditManager = creditManager_;
     }
 
     function setEpochHarvester(address epochHarvester_) external onlyOwner {
+        if (epochHarvester_ == address(0)) revert ZeroAddress();
         epochHarvester = epochHarvester_;
     }
 

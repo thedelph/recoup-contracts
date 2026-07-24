@@ -19,6 +19,7 @@ import {ICreditManager} from "./interfaces/ICreditManager.sol";
 contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     error NotImplemented();
     error EpochGapNotElapsed();
+    error ZeroAddress();
 
     IERC20 public immutable usdc;
     ICreditManager public immutable creditManager;
@@ -38,14 +39,17 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
+        if (address(adapter) == address(0)) revert ZeroAddress();
         custodyAdapter = adapter;
     }
 
     function setLenderPool(address lenderPool_) external onlyOwner {
+        if (lenderPool_ == address(0)) revert ZeroAddress();
         lenderPool = lenderPool_;
     }
 
     function setProtocolFeeWallet(address wallet) external onlyOwner {
+        if (wallet == address(0)) revert ZeroAddress();
         protocolFeeWallet = wallet;
     }
 
