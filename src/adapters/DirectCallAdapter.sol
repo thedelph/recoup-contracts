@@ -109,6 +109,11 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         IDexFiBond.MintDataInput memory data = abi.decode(mintData, (IDexFiBond.MintDataInput));
         // Bonds auto-stake for the receiver on mint; custody must land here.
         if (data.receiver != address(this)) revert ReceiverMustBeAdapter(data.receiver);
+        // Strict equality is deliberate and load-bearing: the bond takes
+        // `msg.value >= paymentAmount`, forwards only `paymentAmount` to its treasury,
+        // and exposes no native-withdrawal path, so any overpayment is burned with no
+        // recovery by anyone. Relaxing this to `>=` would turn a revert into a silent,
+        // permanent loss of the depositor's ETH.
         if (msg.value != data.paymentAmount) revert PaymentMismatch(data.paymentAmount, msg.value);
 
         (uint256 stakedBefore,) = farm.userInfo(address(this));
