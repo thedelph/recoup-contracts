@@ -46,7 +46,7 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 49 unit tests vs real-ABI mocks
+forge test      # 78 unit tests vs real-ABI mocks
 ```
 
 ### Mainnet fork tests

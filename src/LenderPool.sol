@@ -21,6 +21,7 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
     error NotCreditManager();
     error NotEpochHarvester();
     error ZeroAddress();
+    error RenounceDisabled();
 
     event Lent(uint256 amount);
     event PrincipalRepaid(uint256 amount);
@@ -42,7 +43,15 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
         ERC20("Recoup Lender Pool", "rcUSDC")
         ERC4626(usdc_)
         Ownable(initialOwner)
-    {}
+    {
+        if (address(usdc_) == address(0)) revert ZeroAddress();
+    }
+
+    /// @dev Matches the live-authority contracts: renouncing would permanently
+    ///      freeze wiring on a contract the deploy script already deploys.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
+    }
 
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 

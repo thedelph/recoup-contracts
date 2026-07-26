@@ -1,0 +1,298 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
+
+import {Config} from "../src/Config.sol";
+import {CollateralVault} from "../src/CollateralVault.sol";
+import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
+import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
+import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
+import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
+import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
+import {MockBond} from "./mocks/MockBond.sol";
+import {MockFarm} from "./mocks/MockFarm.sol";
+import {MockNavOracle} from "./mocks/MockNavOracle.sol";
+import {MockUSDC} from "./mocks/MockUSDC.sol";
+
+/// @notice Proves the eventual move to timelocked governance is a pure ownership
+///         transfer, without imposing one today.
+///
+///         Development deliberately runs with a plain EOA owner: pre-launch the
+///         contracts hold no third-party funds, and a 48h wait on every fix while the
+///         deployment shape is still moving would cost far more than it buys. The risk
+///         in deferring is not the delay itself, it is *discovering at go-live* that
+///         the handover does not work. These tests remove that risk now, and pin the
+///         one thing the handover breaks (see the pause pair at the end).
+contract GovernanceHandoverTest is Test {
+    uint256 internal constant NAV = 25.15e8;
+
+    address internal admin = makeAddr("admin");
+    address internal alice = makeAddr("alice");
+    address internal proposer = makeAddr("proposer");
+    address internal yieldSink = makeAddr("yieldSink");
+    address internal newSink = makeAddr("newSink");
+    address internal outsider = makeAddr("outsider");
+
+    MockUSDC internal usdc;
+    MockBond internal bond;
+    MockFarm internal farm;
+    MockNavOracle internal oracle;
+    CollateralVault internal vault;
+    DirectCallAdapter internal adapter;
+    TimelockController internal timelock;
+
+    function setUp() public {
+        usdc = new MockUSDC();
+        bond = new MockBond();
+        farm = new MockFarm(bond, usdc);
+        bond.setRewardPool(address(farm));
+        oracle = new MockNavOracle(NAV);
+
+        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        adapter = new DirectCallAdapter(
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
+        );
+
+        vm.prank(admin);
+        vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
+
+        bond.setWhitelisted(address(farm), true);
+        bond.setWhitelisted(address(adapter), true);
+
+        bond.mint(alice, 1_000);
+        vm.prank(alice);
+        bond.setApprovalForAll(address(vault), true);
+
+        // The shape we would actually deploy: one proposer (a Safe in production),
+        // open execution, and no standalone admin so there is no delay-bypassing
+        // backdoor to remember to renounce later.
+        address[] memory proposers = new address[](1);
+        proposers[0] = proposer;
+        address[] memory executors = new address[](1);
+        executors[0] = address(0);
+        timelock = new TimelockController(Config.ADMIN_TIMELOCK, proposers, executors, address(0));
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    function _handOver() internal {
+        vm.startPrank(admin);
+        vault.transferOwnership(address(timelock));
+        adapter.transferOwnership(address(timelock));
+        vm.stopPrank();
+    }
+
+    function _schedule(address target, bytes memory data) internal returns (bytes32 id) {
+        vm.prank(proposer);
+        timelock.schedule(target, 0, data, bytes32(0), bytes32(0), Config.ADMIN_TIMELOCK);
+        id = timelock.hashOperation(target, 0, data, bytes32(0), bytes32(0));
+    }
+
+    function _execute(address target, bytes memory data) internal {
+        timelock.execute(target, 0, data, bytes32(0), bytes32(0));
+    }
+
+    // ── the constant becomes load-bearing ────────────────────────────────────
+
+    /// @dev Config.ADMIN_TIMELOCK is referenced by no contract. This is what stops it
+    ///      reading as dead code and being deleted.
+    function test_timelockMinDelayMatchesConfig() public view {
+        assertEq(timelock.getMinDelay(), Config.ADMIN_TIMELOCK);
+        assertEq(Config.ADMIN_TIMELOCK, 48 hours);
+    }
+
+    // ── the handover itself ──────────────────────────────────────────────────
+
+    /// @dev The headline: no redeploy, no migration, no disturbance to live state.
+    function test_handoverIsPureOwnershipTransfer() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        _handOver();
+
+        assertEq(vault.owner(), address(timelock));
+        assertEq(adapter.owner(), address(timelock));
+        // Everything that matters is untouched.
+        assertEq(vault.bondCount(alice), 100);
+        assertEq(address(vault.custodyAdapter()), address(adapter));
+        assertEq(adapter.yieldRecipient(), yieldSink);
+        assertEq(adapter.stakedBalance(), 100);
+    }
+
+    function test_afterHandover_oldOwnerLosesAuthority() public {
+        _handOver();
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, admin));
+        vault.setLiquidationAuction(outsider);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, admin));
+        adapter.setYieldRecipient(newSink);
+    }
+
+    /// @dev The proposer is not the owner. Scheduling is its only power, so governance
+    ///      is genuinely delayed rather than nominally timelocked.
+    function test_proposerCannotCallOwnerFunctionsDirectly() public {
+        _handOver();
+
+        vm.prank(proposer);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, proposer));
+        adapter.setYieldRecipient(newSink);
+    }
+
+    /// @dev Users are unaffected by the flip: no governance action needed to transact.
+    function test_vaultLifecycleUnchangedAfterHandover() public {
+        _handOver();
+
+        vm.prank(alice);
+        vault.depositBonds(100);
+        assertEq(vault.bondCount(alice), 100);
+
+        vm.prank(alice);
+        vault.withdrawBonds(100);
+        assertEq(bond.balanceOf(alice, Config.DEXFI_BOND_TOKEN_ID), 1_000);
+    }
+
+    // ── a real governance operation, end to end ──────────────────────────────
+
+    function test_queuedSetYieldRecipient_revertsBeforeDelay() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(DirectCallAdapter.setYieldRecipient, (newSink));
+        _schedule(address(adapter), data);
+
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK - 1);
+        vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
+        _execute(address(adapter), data);
+
+        assertEq(adapter.yieldRecipient(), yieldSink);
+    }
+
+    function test_queuedSetYieldRecipient_executesAfterDelay() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(DirectCallAdapter.setYieldRecipient, (newSink));
+        _schedule(address(adapter), data);
+
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
+        _execute(address(adapter), data);
+
+        assertEq(adapter.yieldRecipient(), newSink);
+    }
+
+    /// @dev Execution is permissionless after the delay, by choice: it removes the
+    ///      "nobody available to press the button" failure mode, and the calldata has
+    ///      been public for 48h by then. If that policy ever changes, this test should
+    ///      fail rather than the change passing silently.
+    function test_executeIsOpenAfterDelay() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(DirectCallAdapter.setYieldRecipient, (newSink));
+        _schedule(address(adapter), data);
+
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
+        vm.prank(outsider);
+        _execute(address(adapter), data);
+
+        assertEq(adapter.yieldRecipient(), newSink);
+    }
+
+    /// @dev The counterweight to open execution: the proposer holds CANCELLER_ROLE by
+    ///      construction, so a mistaken operation can be pulled before it ripens.
+    function test_proposerCanCancelBeforeExecution() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(DirectCallAdapter.setYieldRecipient, (newSink));
+        bytes32 id = _schedule(address(adapter), data);
+
+        vm.prank(proposer);
+        timelock.cancel(id);
+
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
+        vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
+        _execute(address(adapter), data);
+    }
+
+    function test_scheduleRequiresProposerRole() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(DirectCallAdapter.setYieldRecipient, (newSink));
+
+        vm.prank(outsider);
+        vm.expectRevert();
+        timelock.schedule(address(adapter), 0, data, bytes32(0), bytes32(0), Config.ADMIN_TIMELOCK);
+    }
+
+    /// @dev No standalone admin was granted, so there is no backdoor to remember to
+    ///      renounce. The timelock administers itself, through its own delay.
+    function test_timelockHasNoStandaloneAdmin() public view {
+        bytes32 adminRole = timelock.DEFAULT_ADMIN_ROLE();
+        assertTrue(timelock.hasRole(adminRole, address(timelock)));
+        assertFalse(timelock.hasRole(adminRole, proposer));
+        assertFalse(timelock.hasRole(adminRole, address(this)));
+        assertFalse(timelock.hasRole(adminRole, admin));
+    }
+
+    /// @dev Governance cannot brick the protocol even deliberately.
+    function test_renounceOwnershipStaysDisabledUnderTimelock() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(Ownable.renounceOwnership, ());
+        _schedule(address(vault), data);
+
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
+        vm.expectRevert();
+        _execute(address(vault), data);
+
+        assertEq(vault.owner(), address(timelock));
+    }
+
+    /// @dev TimelockController is an ERC1155Holder, so it can always receive bonds.
+    ///      A Safe only can if its compatibility fallback handler is configured, which
+    ///      is not something to find out during a break-glass.
+    function test_timelockCanReceiveEmergencyUnstakedBonds() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        _handOver();
+
+        bytes memory data = abi.encodeCall(DirectCallAdapter.emergencyUnstake, (address(timelock)));
+        _schedule(address(adapter), data);
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
+        _execute(address(adapter), data);
+
+        assertEq(bond.balanceOf(address(timelock), Config.DEXFI_BOND_TOKEN_ID), 100);
+    }
+
+    // ── what the handover costs, in executable form ──────────────────────────
+
+    /// @dev Today: pause is one transaction. This is the upside of the current EOA
+    ///      owner and the reason deferring the timelock is defensible.
+    function test_pauseIsInstantUnderEoaOwner() public {
+        vm.prank(admin);
+        vault.pause();
+
+        vm.prank(alice);
+        vm.expectRevert();
+        vault.depositBonds(100);
+    }
+
+    /// @dev And the cost of the flip: pause becomes a 48-hour advance notice, which is
+    ///      worse than useless in an incident. Deposits keep working for the entire
+    ///      wait. This is why a guardian role (pause = owner or guardian, unpause =
+    ///      owner only) has to land in the *same* change as the timelock, not after.
+    function test_pauseBecomesDelayedUnderTimelock() public {
+        _handOver();
+        bytes memory data = abi.encodeCall(CollateralVault.pause, ());
+        _schedule(address(vault), data);
+
+        // Half a day into an incident, still nothing anyone can do.
+        vm.warp(block.timestamp + 12 hours);
+        assertFalse(vault.paused());
+        vm.prank(alice);
+        vault.depositBonds(100);
+        assertEq(vault.bondCount(alice), 100);
+
+        vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
+        _execute(address(vault), data);
+        assertTrue(vault.paused());
+    }
+}
