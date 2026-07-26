@@ -46,7 +46,7 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 33 unit tests vs real-ABI mocks
+forge test      # 45 unit tests vs real-ABI mocks
 ```
 
 ### Mainnet fork tests
@@ -67,6 +67,26 @@ They prove, on real state:
    deposit → stake → claim real streamed USDC → unstake → withdraw.
 
 ## Security posture (pre-audit)
+
+An **independent security review** was run over the two implemented contracts in July 2026, using a
+12-agent Solidity audit pass. Eight substantive findings were raised, and all eight are fixed here,
+each with regression tests - see the `Security hardening` commits for the per-finding diffs. What
+they covered:
+
+| Area | What changed |
+|---|---|
+| Yield routing | Harvested USDC could only ever land in the immutable, egress-less vault, where nothing could move it out again. It now routes to a settable `yieldRecipient`, and the reported figure is the farm delta rather than a raw balance, so a stray USDC transfer cannot inflate it. |
+| Mint accounting | Credit is pinned to the signed `amountNfts`, and the mint delta is measured, so over-credit, under-credit and donated bonds are all excluded. |
+| Custody swaps | `setCustodyAdapter` now refuses a swap while the outgoing adapter holds a live position, and requires the incoming adapter to be bound to this vault. |
+| Exits | The USDC sweep on `unstake` is best-effort, so a token pause or blacklist cannot brick a withdrawal. An owner-gated `emergencyUnstake` adds a farm escape hatch. |
+| Yield pipeline | `claimYield` is callable by the vault or a settable harvester, so the immutable adapter can be pointed at the batch harvester later with no redeploy. |
+| Oracle safety | `withdrawBonds` reverts on a stale NAV in the debt-bearing branch. |
+| Auction floor | Raised so the floor always clears debt plus penalty at the first triggerable liquidation; the full relation is now asserted in `Config.t.sol`. |
+
+Alongside those: constructor zero-address checks, `renounceOwnership` disabled on the
+live-authority contracts, and a `pause`/`unpause` pair on `CreditManager`. The suite grew from 33
+to 45 tests in the same pass. Remaining known items are tracked against the phase that resolves
+them, and an external audit is still a hard gate before any real funds.
 
 - **Stateful invariant fuzzing** (`test/CollateralVault.invariants.t.sol`): randomised multi-actor
   call sequences must preserve four invariants after every sequence - vault accounting equals farm
