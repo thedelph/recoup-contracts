@@ -46,7 +46,7 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 45 unit tests vs real-ABI mocks
+forge test      # 49 unit tests vs real-ABI mocks
 ```
 
 ### Mainnet fork tests
@@ -88,6 +88,12 @@ live-authority contracts, and a `pause`/`unpause` pair on `CreditManager`. The s
 to 45 tests in the same pass. Remaining known items are tracked against the phase that resolves
 them, and an external audit is still a hard gate before any real funds.
 
+- **Whitelist revocation is modelled, not assumed** (`test/WhitelistRevocation.t.sol`): the bond's
+  transfer whitelist is owner-managed and revocable, so the blast radius of losing it is a tested
+  quantity. Revocation does not only stop deposits, it strands live collateral: the farm can still
+  return bonds to the adapter, but the adapter cannot pass them to a non-whitelisted depositor, and
+  the emergency hatch hits the same gate unless its destination is whitelisted. Recorded here
+  because the mitigation is an integration agreement, not code.
 - **Stateful invariant fuzzing** (`test/CollateralVault.invariants.t.sol`): randomised multi-actor
   call sequences must preserve four invariants after every sequence - vault accounting equals farm
   stake, the adapter holds no USDC or loose bonds at rest, bond units are conserved, the vault
