@@ -20,6 +20,7 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     error NotImplemented();
     error EpochGapNotElapsed();
     error ZeroAddress();
+    error RenounceDisabled();
 
     IERC20 public immutable usdc;
     ICreditManager public immutable creditManager;
@@ -32,8 +33,15 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     uint256 public epochCount;
 
     constructor(IERC20 usdc_, ICreditManager creditManager_, address initialOwner) Ownable(initialOwner) {
+        if (address(usdc_) == address(0) || address(creditManager_) == address(0)) revert ZeroAddress();
         usdc = usdc_;
         creditManager = creditManager_;
+    }
+
+    /// @dev Matches the live-authority contracts: renouncing would permanently
+    ///      freeze wiring on a contract the deploy script already deploys.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     // ── Wiring (owner, behind timelock in production) ────────────────────────

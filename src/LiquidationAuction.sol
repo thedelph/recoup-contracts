@@ -20,6 +20,7 @@ contract LiquidationAuction is ILiquidationAuction, Ownable, ReentrancyGuard {
     error NotImplemented();
     error NotCreditManager();
     error ZeroAddress();
+    error RenounceDisabled();
 
     struct Auction {
         address borrower;
@@ -41,9 +42,19 @@ contract LiquidationAuction is ILiquidationAuction, Ownable, ReentrancyGuard {
     constructor(IERC20 usdc_, ICollateralVault vault_, INAVOracle navOracle_, address initialOwner)
         Ownable(initialOwner)
     {
+        if (
+            address(usdc_) == address(0) || address(vault_) == address(0)
+                || address(navOracle_) == address(0)
+        ) revert ZeroAddress();
         usdc = usdc_;
         vault = vault_;
         navOracle = navOracle_;
+    }
+
+    /// @dev Matches the live-authority contracts: renouncing would permanently
+    ///      freeze wiring on a contract the deploy script already deploys.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     function setCreditManager(address creditManager_) external onlyOwner {

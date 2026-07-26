@@ -45,7 +45,20 @@ library Config {
     uint256 internal constant USDC_TO_NAV_SCALE = 1e2; // 10^(NAV_DECIMALS − USDC's 6 dp)
 
     // ── Governance (PRD §9) ──────────────────────────────────────────────────
+    /// @dev Not read by any contract, by design. Ownership is a plain `address`, so
+    ///      the owner can be an EOA while building and a TimelockController at
+    ///      go-live with no contract change. This is the delay that timelock is
+    ///      constructed with; `test/Governance.t.sol` deploys one at exactly this
+    ///      value and proves the handover works. Do not delete as unused.
     uint256 internal constant ADMIN_TIMELOCK = 48 hours;
+
+    // Operator addresses (owner, treasury, keeper, protocol fee wallet) deliberately
+    // do NOT live here. The no-magic-numbers rule covers protocol parameters and
+    // verified external addresses, not per-deployment operator identities: those are
+    // rotatable, differ per environment, and would be published in this repo's git
+    // history before the contracts are even deployed. They are environment
+    // parameters to the deploy script (see script/.env.example). Please do not
+    // "fix" this by moving them in.
 
     // ── External addresses (PRD §7) ──────────────────────────────────────────
     // Resolved and verified 2026-07-24 via Blockscout source review of the live contracts.
@@ -65,7 +78,9 @@ library Config {
     /// @dev EIP-712 signer for bond mints (informational — mint flow needs DexFi's
     ///      backend to co-sign).
     address internal constant DEXFI_MINT_KEEPER = 0xBbBBBA31F7fD7E1ACAcAb33d905941f1F3A6ad91;
-    /// @dev Chainlink ETH/USD reference feed, Base mainnet, 8 decimals.
+    /// @dev Chainlink ETH/USD reference feed, Base mainnet, 8 decimals. Informational:
+    ///      consumed off-chain by the keeper and the webapp, deliberately not read by
+    ///      any contract. Collateral is priced from the NAV oracle, not from ETH.
     address internal constant CHAINLINK_ETH_USD = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
     /// @dev The bond token id — the bond is a fungible ERC-1155 balance, not
     ///      distinct NFTs. "Bond count" everywhere means balanceOf(id 0).
