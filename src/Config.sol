@@ -37,6 +37,19 @@ library Config {
     // ── Epoch harvesting (PRD §4.4) ──────────────────────────────────────────
     uint256 internal constant MIN_EPOCH_GAP = 5 days;
 
+    /// @notice How long a harvested epoch's borrower share is streamed into the
+    ///         yield accumulator rather than applied as a lump.
+    /// @dev Equal to MIN_EPOCH_GAP so consecutive epochs tile end to end: the stream
+    ///      from epoch N runs out exactly when epoch N+1 becomes harvestable, so
+    ///      yield accrues continuously with no dead gap and no overlap.
+    ///
+    ///      Streaming is what makes just-in-time capture pointless. A lump credited
+    ///      to whoever holds bonds at that instant can be taken by depositing a large
+    ///      position in the same block as the harvest and withdrawing immediately
+    ///      after; spread over the epoch, one block of holding earns one block of
+    ///      yield. Same mechanism as Synthetix StakingRewards.
+    uint256 internal constant YIELD_STREAM_DURATION = MIN_EPOCH_GAP;
+
     // ── NAV oracle guards (PRD §4.6) ─────────────────────────────────────────
     uint256 internal constant NAV_MAX_DEVIATION_BPS = 1_000;
     uint256 internal constant NAV_PENDING_DELAY = 12 hours; // large moves wait for 2nd key
@@ -45,6 +58,16 @@ library Config {
     ///      would reset `lastUpdated`, making a stale feed read as fresh at a price
     ///      that no longer holds.
     uint256 internal constant NAV_PENDING_EXPIRY = 24 hours;
+
+    /// @notice How far a repost may move the pending NAV before the confirmer's review
+    ///         window restarts.
+    /// @dev Exists because the review clock cannot key off the exact value. A live feed
+    ///      posts a different 8-decimal price every time, so restarting on any
+    ///      difference let a keeper slide the window indefinitely and no large move
+    ///      could ever be ratified - a unilateral veto over the second key, with an
+    ///      honest keeper. Jitter inside this band keeps the clock running; a move
+    ///      beyond it is a different number and earns a fresh review.
+    uint256 internal constant NAV_PENDING_REPRICE_TOLERANCE_BPS = 100; // 1%
     /// @dev The budget window for NAV movement. Allowed deviation from the last
     ///      accepted price is prorated by elapsed time over this window, so posting
     ///      more often buys no extra room and a compromised keeper cannot walk the

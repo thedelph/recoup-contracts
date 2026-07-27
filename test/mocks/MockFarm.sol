@@ -29,8 +29,16 @@ contract MockFarm is IDexFiFarm {
 
     /// @notice Auto-stake hook used by the bond's mint: tokens were minted straight
     ///         to this pool; only the staking credit is recorded here.
+    /// @dev Settles pending rewards like every other deposit path. A MasterChef pool
+    ///      pays out the whole position's accrued rewards whenever its stake changes,
+    ///      and this hook is a deposit. Until it modelled that, the auto-stake mint
+    ///      branch was the one farm-touching path no test could observe - the same
+    ///      blind spot that hid the deposit-side leak a round earlier.
     function depositForAccount(address account, uint256 amount) external {
         if (msg.sender != address(bond)) revert OnlyBond();
+        uint256 pending = pendingYield[account];
+        pendingYield[account] = 0;
+        if (pending > 0) usdc.mint(account, pending);
         staked[account] += amount;
     }
 
@@ -43,12 +51,32 @@ contract MockFarm is IDexFiFarm {
         pendingYield[staker] = amount;
     }
 
+    /// @notice Test helper: make `withdraw` revert, modelling DexFi pausing rewards or
+    ///         shipping a proxy upgrade that breaks the call. Their farm is behind a
+    ///         UUPS proxy owned by a single EOA, so this is a live possibility rather
+    ///         than a hypothetical, and several paths exist to survive it.
+    bool public revertOnWithdraw;
+
+    function setRevertOnWithdraw(bool value) external {
+        revertOnWithdraw = value;
+    }
+
+    /// @dev Settles pending rewards, exactly as `withdraw` does. MasterChef-style
+    ///      pools pay out on deposit as well, and the real one is one of those. Until
+    ///      this mirrored that, no test could see USDC arriving on a stake - which is
+    ///      the whole reason `stake()` and `mintBonds` measure their own balance.
     function deposit(uint256 amount) external {
+        uint256 pending = pendingYield[msg.sender];
+        pendingYield[msg.sender] = 0;
+        if (pending > 0) usdc.mint(msg.sender, pending);
         bond.safeTransferFrom(msg.sender, address(this), bond.TOKEN_ID(), amount, "");
         staked[msg.sender] += amount;
     }
 
+    error FarmDown();
+
     function withdraw(uint256 amount) external {
+        if (revertOnWithdraw) revert FarmDown();
         if (amount > staked[msg.sender]) revert InsufficientStake(amount, staked[msg.sender]);
         uint256 pending = pendingYield[msg.sender];
         pendingYield[msg.sender] = 0;

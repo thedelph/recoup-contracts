@@ -27,7 +27,8 @@ contract ConfigTest is Test {
     /// @notice A floor-price fill must cover debt + liquidation penalty even at the
     ///         worst LTV that can first trigger a liquidation. That worst case is one
     ///         immediate NAV_MAX_DEVIATION_BPS drop applied to a position sitting at
-    ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev).
+    ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev). (Was 6500 vs a
+    ///         6767 requirement — a lender shortfall; see security-notes.md.)
     function test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger() public pure {
         // Derive the worst drop from what NAVOracle actually accepts without a second
         // key, not from NAV_MAX_DEVIATION_BPS directly. Those were the same number

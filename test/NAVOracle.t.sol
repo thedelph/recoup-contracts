@@ -331,5 +331,76 @@ contract NAVOracleTest is Test {
         assertLt(Config.NAV_PENDING_DELAY, Config.NAV_DEVIATION_WINDOW);
         assertLt(Config.NAV_DEVIATION_WINDOW, Config.NAV_STALENESS);
         assertLe(Config.NAV_DEVIATION_MAX_ELAPSED, Config.NAV_STALENESS);
+        // The reprice tolerance has to sit well inside the budget, or a repost that
+        // keeps the review clock running could itself be a material move.
+        assertLt(Config.NAV_PENDING_REPRICE_TOLERANCE_BPS, Config.NAV_MAX_DEVIATION_BPS);
+    }
+
+    // ── the confirmation window ──────────────────────────────────────────────
+
+    /// @dev **The sliding-window regression.** A previous fix anchored the review clock
+    ///      to the pending *value*, so it only restarted when the value changed. That
+    ///      reads as safe and is not: a live price feed posts a different 8-decimal
+    ///      figure every time, so every repost restarted the twelve hours and no large
+    ///      move could ever be ratified - with an honest keeper on the documented
+    ///      cadence, not a compromised one.
+    ///
+    ///      Here the keeper reposts a crashed NAV on a 6h cadence with realistic
+    ///      jitter. The confirmation must become available on schedule.
+    function test_pending_jitteringRepostsDoNotSlideTheWindow() public {
+        uint256 crashed = (NAV * 70) / 100; // -30%, well outside the budget
+        _post(crashed);
+        uint256 confirmableAt = oracle.pendingConfirmableAt();
+
+        // Two reposts inside the delay, each a hair different, as a real feed would.
+        skip(6 hours);
+        _post(crashed + 1);
+        skip(6 hours);
+        _post(crashed + 2);
+
+        assertEq(oracle.pendingConfirmableAt(), confirmableAt, "the clock did not slide");
+        assertEq(oracle.pendingNav(), crashed + 2, "but the latest price is the pending one");
+
+        vm.prank(confirmer);
+        oracle.confirmNav(crashed + 2);
+        assertEq(oracle.navPerBond(), crashed + 2, "the crash was ratifiable on schedule");
+    }
+
+    /// @dev A materially different price is a different decision, so it earns a fresh
+    ///      review window rather than inheriting the old one.
+    function test_pending_aMaterialRepriceRestartsTheWindow() public {
+        _post((NAV * 70) / 100);
+        uint256 first = oracle.pendingConfirmableAt();
+
+        skip(6 hours);
+        _post((NAV * 50) / 100); // another 20% down - a different decision
+        assertGt(oracle.pendingConfirmableAt(), first, "the confirmer gets a fresh 12h");
+    }
+
+    // ── freshness ────────────────────────────────────────────────────────────
+
+    /// @dev **The frozen-price regression.** A zero-delta post satisfies the deviation
+    ///      budget for any elapsed time, so keying `lastUpdated` off every accepted
+    ///      post let a keeper hold a stale price indefinitely: `isStale()` never
+    ///      tripped, `borrow` stayed open, and the second key was never consulted.
+    ///      Freshness now tracks when the price last *changed*.
+    function test_repostingTheSameNavDoesNotRefreshStaleness() public {
+        // The keeper reposts the identical price for longer than the staleness window.
+        for (uint256 i; i < 10; ++i) {
+            skip(1 days);
+            _post(NAV);
+        }
+
+        assertTrue(oracle.isStale(), "an unchanging price is a stale price");
+    }
+
+    /// @dev And a price that genuinely moves keeps the feed fresh, so the check above
+    ///      cannot be satisfied by simply never updating `lastUpdated`.
+    function test_aMovingNavStaysFresh() public {
+        for (uint256 i; i < 10; ++i) {
+            skip(1 days);
+            _post(NAV + i + 1);
+        }
+        assertFalse(oracle.isStale(), "a live feed reads fresh");
     }
 }

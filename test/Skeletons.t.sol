@@ -87,8 +87,10 @@ contract SkeletonsTest is Test {
         vm.expectRevert(CreditManager.NotImplemented.selector);
         credit.liquidate(address(this));
 
+        // harvestRange stays unimplemented on purpose: distributeYield settles every
+        // position in one write, so there is no per-position iteration to paginate.
         vm.expectRevert(EpochHarvester.NotImplemented.selector);
-        harvester.harvest();
+        harvester.harvestRange(0, 1);
     }
 
     function test_borrowRefusesUntilLiquiditySourceIsWired() public {
@@ -106,9 +108,9 @@ contract SkeletonsTest is Test {
     }
 
     function test_onlyRoleGatesOnStubs() public {
-        // applyYield is EpochHarvester-only even while stubbed
+        // yield distribution is EpochHarvester-only
         vm.expectRevert(CreditManager.NotEpochHarvester.selector);
-        credit.applyYield(address(this), 1);
+        credit.distributeYield(1);
 
         // seize is LiquidationAuction-only
         vm.expectRevert(CollateralVault.NotLiquidationAuction.selector);

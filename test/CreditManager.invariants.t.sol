@@ -31,11 +31,8 @@ contract CreditHandler is Test {
     address public harvester;
     address[3] public actors;
 
-    /// @notice Mirrors what the handler believes each actor owes, so the invariant can
-    ///         check the contract's own total against an independent tally.
-    mapping(address => uint256) public ghostDebt;
-    /// @notice Set whenever a borrow succeeds, so the monotonicity invariant knows a
-    ///         legitimate increase happened.
+    /// @notice Incremented whenever a borrow succeeds, so the monotonicity invariant
+    ///         can tell a legitimate increase from debt appearing out of nowhere.
     uint256 public borrowCount;
 
     constructor(
@@ -65,7 +62,6 @@ contract CreditHandler is Test {
         amount = bound(amount, 1, 5_000e6);
         vm.prank(a);
         try credit.borrow(amount) {
-            ghostDebt[a] += amount;
             borrowCount++;
         } catch {}
     }
@@ -79,24 +75,39 @@ contract CreditHandler is Test {
         usdc.mint(a, paid);
         vm.startPrank(a);
         usdc.approve(address(credit), paid);
-        try credit.repay(amount) {
-            ghostDebt[a] -= paid;
-        } catch {}
+        try credit.repay(amount) {} catch {}
         vm.stopPrank();
     }
 
-    function applyYield(uint256 actorSeed, uint256 amount) external {
-        address a = _actor(actorSeed);
-        amount = bound(amount, 0, 2_000e6);
-        if (amount == 0) return;
+    /// @dev Settles every actor afterwards so later actions start from a clean
+    ///      position rather than a pile of unaccrued entitlement.
+    function distributeYield(uint256 amount) external {
+        amount = bound(amount, 1, 2_000e6);
         usdc.mint(harvester, amount);
         vm.startPrank(harvester);
         usdc.approve(address(credit), amount);
         credit.receiveYield(amount);
-        uint256 debt = credit.debtOf(a);
-        credit.applyYield(a, amount);
+        credit.distributeYield(amount);
         vm.stopPrank();
-        ghostDebt[a] -= amount > debt ? debt : amount;
+
+        for (uint256 i; i < actors.length; ++i) {
+            credit.settle(actors[i]);
+        }
+    }
+
+    /// @dev Without this the fuzzer never moves the clock, and an epoch's share is
+    ///      streamed over YIELD_STREAM_DURATION - so every distribution would accrue
+    ///      exactly nothing and the whole yield path would go unexercised. The range
+    ///      deliberately straddles the stream: shorter jumps land mid-stream, longer
+    ///      ones run it past the end and re-rate a leftover pot.
+    ///      Accrual alone moves no debt - it only advances the accumulator.
+    function passTime(uint256 seconds_) external {
+        skip(bound(seconds_, 1 hours, Config.YIELD_STREAM_DURATION * 2));
+        credit.accrueYield();
+    }
+
+    function settle(uint256 actorSeed) external {
+        credit.settle(_actor(actorSeed));
     }
 
     function claimSurplus(uint256 actorSeed) external {
@@ -122,11 +133,6 @@ contract CreditHandler is Test {
         oracle.setNav(bound(nav, 1e8, 100e8));
     }
 
-    function sumGhostDebt() external view returns (uint256 total) {
-        for (uint256 i; i < actors.length; ++i) {
-            total += ghostDebt[actors[i]];
-        }
-    }
 }
 
 /// @notice The Phase 2 invariants named in PRD §8, fuzzed.
@@ -148,6 +154,12 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
     CreditHandler internal handler;
 
     address[3] internal actors;
+
+    /// @notice Highest accumulator value seen so far, for the monotonicity check.
+    uint256 internal lastAcc;
+    /// @notice Previous observations, for the debt-monotonicity check.
+    uint256 internal lastTotalDebt;
+    uint256 internal lastBorrowCount;
 
     function setUp() public {
         actors = [makeAddr("alice"), makeAddr("bob"), makeAddr("carol")];
@@ -202,10 +214,23 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         assertEq(credit.totalDebt(), sum);
     }
 
-    /// @dev The handler's independent tally must agree too, which catches a
-    ///       bookkeeping slip that happens to be self-consistent inside the contract.
-    function invariant_ghostDebtAgrees() public view {
-        assertEq(credit.totalDebt(), handler.sumGhostDebt());
+    /// @dev PRD §8: "Debt is monotonically non-increasing absent a borrow." This is
+    ///      the property a self-repaying loan lives or dies on - nothing but an
+    ///      explicit borrow may ever increase what someone owes.
+    ///
+    ///      It replaces an earlier handler-side tally of each actor's debt. That tally
+    ///      could not survive lazy accrual: yield now streams continuously, so any
+    ///      action that touches a position settles it and writes debt down, and a
+    ///      mirror updated only on explicit settles drifts by design rather than by
+    ///      bug. This checks the real property instead of a bookkeeping duplicate.
+    function invariant_debtOnlyRisesOnABorrow() public {
+        uint256 debtNow = credit.totalDebt();
+        uint256 borrows = handler.borrowCount();
+        if (borrows == lastBorrowCount) {
+            assertLe(debtNow, lastTotalDebt, "debt rose with no borrow behind it");
+        }
+        lastTotalDebt = debtNow;
+        lastBorrowCount = borrows;
     }
 
     /// @dev Solvency. Every USDC this contract holds is spoken for exactly once:
@@ -229,5 +254,24 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         for (uint256 i; i < actors.length; ++i) {
             assertLe(credit.debtOf(actors[i]), Config.PER_ACCOUNT_BORROW_CAP);
         }
+    }
+
+    /// @dev The accumulator only ever moves up. Every position's entitlement is the
+    ///      difference between it and a recorded index, so a decrease would underflow
+    ///      `_pending` and revert every settlement - including the ones inside
+    ///      withdrawals, which would trap collateral.
+    function invariant_accumulatorNeverDecreases() public {
+        uint256 acc = credit.accYieldPerBond();
+        assertGe(acc, lastAcc);
+        lastAcc = acc;
+    }
+
+    /// @dev A stream can only ever pay out USDC that was actually delivered. If the
+    ///      accumulator could outrun the pot, `settle` would credit debt write-downs
+    ///      and claimable balances against money the contract does not hold - which is
+    ///      the solvency invariant failing one step later, from a cause that is much
+    ///      harder to read at that point.
+    function invariant_streamNeverPromisesMoreThanWasDelivered() public view {
+        assertLe(credit.undistributedYield(), usdc.balanceOf(address(credit)));
     }
 }

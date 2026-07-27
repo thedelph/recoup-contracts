@@ -4,10 +4,10 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **pre-deployment**. The collateral layer and the credit core are implemented, and the
-collateral layer is fork-tested against the live DexFi contracts. Lending, liquidation and batch
-harvesting are interfaced skeletons, built in deliberate phases. Nothing touches real funds before
-an external audit.
+Status: **pre-deployment**. The collateral layer, the credit core and the epoch harvester are
+implemented, and the whole loan lifecycle is fork-tested against the live DexFi contracts. Lending
+and liquidation are interfaced skeletons, built in deliberate phases. Nothing touches real funds
+before an external audit.
 
 ## Architecture
 
@@ -28,7 +28,12 @@ CreditManager + NAVOracle: implemented (borrow / repay / yield application; keep
 behind a deviation budget and a second key). Liquidity reaches CreditManager through the
 ILiquiditySource seam - a treasury float now, the LenderPool later, same interface.
 
-LenderPool / EpochHarvester / LiquidationAuction: skeletons, implemented per phase.
+EpochHarvester: implemented. Claims farm USDC, splits it four ways, and writes borrower debt down.
+It settles EVERY position in a single storage write, because CreditManager distributes through a
+yield-per-bond accumulator rather than iterating - so the cost of an epoch does not scale with the
+number of borrowers. The share is streamed over the window it accrued across, not applied as a lump.
+
+LenderPool / LiquidationAuction: skeletons, implemented per phase.
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
 
@@ -51,7 +56,7 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 149 unit tests vs real-ABI mocks
+forge test      # 197 unit + invariant tests vs real-ABI mocks
 ```
 
 ### Mainnet fork tests
@@ -75,7 +80,9 @@ The loan itself, also on real state:
 
 4. **the whole self-repaying loan end to end** - deposit real bonds, borrow at exactly max LTV,
    let a week of real USDC stream out of the live farm, apply that yield to write the debt down,
-   repay the remainder, withdraw the collateral, and return the principal to the lender float;
+   repay the remainder, withdraw the collateral, and return the principal to the lender float.
+   It also asserts, on real state, that **nothing is earned in the harvest block** - which is the
+   property that makes depositing just before a harvest pointless;
 5. borrowing refuses while the price feed is stale;
 6. a large NAV move parks for a second key instead of being waved through by the price poster.
 
@@ -84,9 +91,35 @@ that shows the product actually works.
 
 ## Security posture (pre-external-audit)
 
-**Two independent security reviews** have been run, each a 12-agent Solidity audit pass. The second
-(July 2026, after the credit core landed) covered all ten contracts and raised twelve findings, all
-fixed with regression tests. The ones worth knowing about:
+**Four independent security reviews** have been run, each a 12-agent Solidity audit pass.
+
+The third and fourth (July 2026) covered the epoch harvester and the yield-distribution mechanism
+behind it. The fourth deliberately audited *the third round's own fixes*, and that turned out to
+matter: **four of its twelve findings were regressions introduced by the third round**. Every one is
+fixed with a regression test. The lesson is now a standing habit here - a fix round is new code, and
+fixes that add a mechanism regress far more often than fixes that remove a constraint.
+
+The ones worth knowing about from those two rounds:
+
+- **Yield is streamed, not lumped.** Crediting an epoch's borrower share against an instantaneous
+  bond count made it free money for anyone watching the mempool: deposit a large position in the
+  harvest block, settle, claim, withdraw. It now pays out over the window it actually accrued
+  across, so one block of holding earns one block of yield.
+- **An epoch is sized from the harvester's own balance, not from what the claim call returns.** The
+  farm is MasterChef-style, so a withdrawal, a seizure or a direct claim each settle the whole
+  position and forward that USDC ahead of the epoch. Sized from the return value, those epochs
+  reported zero and the money sat unreachable.
+- **Guards that assumed their own escape hatch was reachable.** Three separate cases: a "flush
+  before repointing" guard whose flush target reverts by design, a "sweep to the outgoing recipient
+  before repointing away from it" path where that recipient is blocked (which is *why* you are
+  repointing), and a confirmation clock that restarted whenever the pending price changed, which a
+  live feed does on every post. The first locked a quarter of all yield permanently.
+- **A detached CreditManager stayed live and drainable.** The swap guard checked only that debt was
+  zero - the normal end state of a self-repaying loan - while the outgoing manager kept pricing
+  positions off the vault's still-moving bond counts.
+
+The second review (after the credit core landed) covered all ten contracts and raised twelve
+findings, all fixed with regression tests. The ones worth knowing about:
 
 - The NAV oracle's deviation rate limit was defeated by integer truncation. Both sides of the budget
   comparison floored to whole basis points, so sub-1-bps steps cost nothing and compounded; it now

@@ -48,6 +48,9 @@ contract CollateralVaultTest is Test {
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
+        // setCreditManager refuses a manager bound to a different vault, so the mock
+        // has to claim this one. It is built before the vault, hence the setter.
+        credit.setVault(address(vault));
 
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
@@ -346,6 +349,90 @@ contract CollateralVaultTest is Test {
         vm.prank(admin);
         adapter.setHarvester(alice);
         assertEq(adapter.harvester(), alice);
+    }
+
+    /// @dev Repointing the yield recipient sweeps everything the adapter holds to the
+    ///      outgoing address - including the USDC backing `unreportedYield`. The
+    ///      counter has to go with it. Left standing it is a claim on money the
+    ///      adapter no longer has: the next claim reports a figure it cannot pay, and
+    ///      an exit hands the vault a swept amount that never arrived.
+    function test_adapter_repointingYieldRecipientClearsTheCarriedCounter() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        // Strand a payout here by making the sweep fail, which is the only way
+        // unreportedYield ever becomes non-zero.
+        farm.setPendingYield(address(adapter), 500e6);
+        usdc.setBlocked(yieldSink, true);
+        vm.prank(alice);
+        vault.withdrawBonds(50);
+        usdc.setBlocked(yieldSink, false);
+
+        assertEq(adapter.unreportedYield(), 500e6, "carried, because the sweep failed");
+        assertEq(usdc.balanceOf(address(adapter)), 500e6, "and the USDC is still here");
+
+        address newSink = makeAddr("newSink");
+        vm.prank(admin);
+        adapter.setYieldRecipient(newSink);
+
+        assertEq(usdc.balanceOf(address(adapter)), 0, "swept to the outgoing recipient");
+        assertEq(usdc.balanceOf(yieldSink), 500e6);
+        assertEq(adapter.unreportedYield(), 0, "and the counter went with it");
+    }
+
+    /// @dev **The blacklist-trap regression.** The adapter's sweep is deliberately
+    ///      best-effort so a USDC pause or blacklist can never brick a collateral
+    ///      exit - but `setYieldRecipient`, the designated escape from a recipient
+    ///      that can no longer receive, used to hard-`safeTransfer` the whole balance
+    ///      to that very address first. It reverted on exactly the condition it
+    ///      existed to fix, so the recipient could never be repointed and every dollar
+    ///      of farm yield was trapped in an immutable contract, growing with each exit.
+    ///
+    ///      The test above steps around this by unblocking the sink one line before
+    ///      the repoint. This one leaves it blocked, which is the real situation.
+    function test_adapter_canRepointAwayFromABlockedYieldRecipient() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        farm.setPendingYield(address(adapter), 500e6);
+        usdc.setBlocked(yieldSink, true);
+
+        // The exit still works - that hardening is not what is being tested.
+        vm.prank(alice);
+        vault.withdrawBonds(50);
+        assertEq(adapter.unreportedYield(), 500e6, "carried, sweep failed");
+        assertEq(usdc.balanceOf(address(adapter)), 500e6, "and stuck here");
+
+        // The escape must go through with the old sink still blocked.
+        address rescue = makeAddr("rescue");
+        vm.prank(admin);
+        adapter.setYieldRecipient(rescue);
+        assertEq(adapter.yieldRecipient(), rescue, "repointed despite the block");
+
+        // And the trapped yield now has a route out.
+        vm.prank(admin);
+        uint256 swept = vault.harvestYield();
+        assertEq(usdc.balanceOf(rescue), 500e6, "recovered in full");
+        assertEq(swept, 500e6, "and reported");
+        assertEq(adapter.unreportedYield(), 0);
+    }
+
+    /// @dev A blocked recipient must not brick harvesting either - the yield carries
+    ///      to the next successful claim rather than reverting the epoch.
+    function test_adapter_claimYieldCarriesRatherThanRevertingOnABlockedSink() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        farm.setPendingYield(address(adapter), 300e6);
+        usdc.setBlocked(yieldSink, true);
+
+        vm.prank(admin);
+        uint256 swept = vault.harvestYield();
+        assertEq(swept, 0, "nothing left, and it said so");
+        assertEq(adapter.unreportedYield(), 300e6, "carried instead");
+
+        usdc.setBlocked(yieldSink, false);
+        vm.prank(admin);
+        assertEq(vault.harvestYield(), 300e6, "picked up by the next claim");
     }
 
     // ── fuzz ─────────────────────────────────────────────────────────────────
