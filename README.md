@@ -4,9 +4,10 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **pre-deployment**. The collateral layer is implemented and fork-tested against the live
-DexFi contracts; credit, lending, and liquidation modules are interfaced skeletons built in
-deliberate phases. Nothing touches real funds before an external audit.
+Status: **pre-deployment**. The collateral layer and the credit core are implemented, and the
+collateral layer is fork-tested against the live DexFi contracts. Lending, liquidation and batch
+harvesting are interfaced skeletons, built in deliberate phases. Nothing touches real funds before
+an external audit.
 
 ## Architecture
 
@@ -23,15 +24,19 @@ User ─────────────────────────
                               ▼          ▼
                         DexFi Farm ◄── DexFi Bond (ERC-1155, id 0, transfer whitelist)
 
-CreditManager / LenderPool / EpochHarvester / LiquidationAuction / NAVOracle: skeletons,
-implemented per phase. All parameters live in src/Config.sol - no magic numbers anywhere else.
+CreditManager + NAVOracle: implemented (borrow / repay / yield application; keeper-posted NAV
+behind a deviation budget and a second key). Liquidity reaches CreditManager through the
+ILiquiditySource seam - a treasury float now, the LenderPool later, same interface.
+
+LenderPool / EpochHarvester / LiquidationAuction: skeletons, implemented per phase.
+All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
 
 Design notes that matter for review:
 
 - **The custody adapter is the only address that needs DexFi whitelisting.** It is ~90 lines,
-  immutable, holds no USDC at rest (claims sweep to the vault in the same call), and only the
-  vault can call it. The `ICustodyAdapter` interface keeps custody swappable (direct-call vs a
+  immutable, holds no USDC at rest (claims sweep onward to the yield recipient in the same call),
+  and only the vault can call it. The `ICustodyAdapter` interface keeps custody swappable (direct-call vs a
   Safe-based backend) without touching vault accounting.
 - The DexFi-facing interfaces (`IDexFiBond`, `IDexFiFarm`) were built from the verified sources of
   the live contracts, and the mocks mirror their observable behaviour including the transfer
@@ -91,7 +96,7 @@ they covered:
 
 | Area | What changed |
 |---|---|
-| Yield routing | Harvested USDC could only ever land in the immutable, egress-less vault, where nothing could move it out again. It now routes to a settable `yieldRecipient`, and the reported figure is the farm delta rather than a raw balance, so a stray USDC transfer cannot inflate it. |
+| Yield routing | Harvested USDC could only ever land in the immutable, egress-less vault, where nothing could move it out again. It now routes to a settable `yieldRecipient`, and the reported figure counts real farm yield rather than the raw balance, so a stray USDC transfer cannot inflate it. |
 | Mint accounting | Credit is pinned to the signed `amountNfts`, and the mint delta is measured, so over-credit, under-credit and donated bonds are all excluded. |
 | Custody swaps | `setCustodyAdapter` now refuses a swap while the outgoing adapter holds a live position, and requires the incoming adapter to be bound to this vault. |
 | Exits | The USDC sweep on `unstake` is best-effort, so a token pause or blacklist cannot brick a withdrawal. An owner-gated `emergencyUnstake` adds a farm escape hatch. |
@@ -114,10 +119,12 @@ them, and an external audit is still a hard gate before any real funds.
   call sequences must preserve four invariants after every sequence - vault accounting equals farm
   stake, the adapter holds no USDC or loose bonds at rest, bond units are conserved, the vault
   itself never custodies bonds. Run: `forge test --match-contract Invariants`.
-- **Slither**: clean - 0 findings with informational/optimization excluded; every triaged
-  suppression carries an inline justification comment.
-- **Coverage** (implemented contracts): CollateralVault 96.9% lines, DirectCallAdapter 97.1% lines
-  / 100% functions. Skeleton modules are stubs and intentionally uncovered until their phase.
+- **Slither**: was clean over the collateral layer - 0 findings with informational/optimization
+  excluded, every triaged suppression carrying an inline justification. **Not yet re-run over the
+  credit core**, so treat that result as covering the earlier scope only.
+- **Coverage**: the collateral layer measured 96.9% lines (CollateralVault) and 97.1% lines / 100%
+  functions (DirectCallAdapter) at the previous pass. Skeleton modules are stubs and intentionally
+  uncovered until their phase.
 - All wiring setters and the adapter constructor zero-address-check; deposits are pausable, exits
   are not; external audit is a hard gate before any real funds.
 
