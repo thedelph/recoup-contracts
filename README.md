@@ -56,20 +56,31 @@ forge test      # 149 unit tests vs real-ABI mocks
 
 ### Mainnet fork tests
 
-Three integration tests run against the **live** DexFi contracts on Base (fork-at-latest, so any
-full node works - no archive access needed):
+Six integration tests run against the **live** DexFi contracts on Base (fork-at-latest, so any
+full node works - no archive access needed). This is the part worth running yourself:
 
 ```sh
 RUN_FORK_TESTS=true forge test --match-contract Fork -vv
 # optionally: BASE_RPC_URL=<your rpc> (defaults to https://mainnet.base.org)
 ```
 
-They prove, on real state:
+Custody, on real state:
 
 1. the configured addresses are the live contracts and behave as documented;
 2. deposits currently revert at the bond's transfer whitelist gate (today's mainnet reality);
 3. a single `addWhitelist([adapter])` from the bond owner unlocks the entire lifecycle:
    deposit → stake → claim real streamed USDC → unstake → withdraw.
+
+The loan itself, also on real state:
+
+4. **the whole self-repaying loan end to end** - deposit real bonds, borrow at exactly max LTV,
+   let a week of real USDC stream out of the live farm, apply that yield to write the debt down,
+   repay the remainder, withdraw the collateral, and return the principal to the lender float;
+5. borrowing refuses while the price feed is stale;
+6. a large NAV move parks for a second key instead of being waved through by the price poster.
+
+Test 3 is the one that shows exactly what a single `addWhitelist` call buys. Test 4 is the one
+that shows the product actually works.
 
 ## Security posture (pre-external-audit)
 
