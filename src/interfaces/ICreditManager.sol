@@ -33,9 +33,16 @@ interface ICreditManager {
 
     function totalDebt() external view returns (uint256);
 
-    /// @return ltvBps debt / collateralValue in bps; type(uint256).max if no collateral
+    /// @return ltvBps debt / collateralValue in bps. Zero when there is no debt,
+    ///         whatever the collateral; type(uint256).max when there is debt against
+    ///         no collateral. The debt-first ordering matters: otherwise every empty
+    ///         address reports maximum LTV and keeper scanners queue liquidations for
+    ///         accounts that do not exist.
     function currentLtvBps(address borrower) external view returns (uint256 ltvBps);
 
-    /// @return hf liquidationThreshold / currentLTV, 1e18 fixed point; < 1e18 ⇒ liquidatable
+    /// @return hf liquidationThreshold / currentLTV, 1e18 fixed point; < 1e18 ⇒ liquidatable.
+    ///         A view for keepers and the UI only. It divides twice, so a position a
+    ///         fraction of a bp past the threshold still reads as exactly 1e18: gate
+    ///         liquidation on a direct comparison, not on this.
     function healthFactor(address borrower) external view returns (uint256 hf);
 }

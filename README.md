@@ -46,7 +46,7 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 78 unit tests vs real-ABI mocks
+forge test      # 149 unit tests vs real-ABI mocks
 ```
 
 ### Mainnet fork tests
@@ -66,11 +66,27 @@ They prove, on real state:
 3. a single `addWhitelist([adapter])` from the bond owner unlocks the entire lifecycle:
    deposit → stake → claim real streamed USDC → unstake → withdraw.
 
-## Security posture (pre-audit)
+## Security posture (pre-external-audit)
 
-An **independent security review** was run over the two implemented contracts in July 2026, using a
-12-agent Solidity audit pass. Eight substantive findings were raised, and all eight are fixed here,
-each with regression tests - see the `Security hardening` commits for the per-finding diffs. What
+**Two independent security reviews** have been run, each a 12-agent Solidity audit pass. The second
+(July 2026, after the credit core landed) covered all ten contracts and raised twelve findings, all
+fixed with regression tests. The ones worth knowing about:
+
+- The NAV oracle's deviation rate limit was defeated by integer truncation. Both sides of the budget
+  comparison floored to whole basis points, so sub-1-bps steps cost nothing and compounded; it now
+  compares by cross-multiplication with no division anywhere.
+- The two-key confirmation path had two independent liveness defects - the delay restarted on every
+  repost, and an in-budget post cleared the pending value. Either let one key defeat the pair.
+- The Dutch auction floor was derived from a maximum NAV move the oracle did not actually enforce.
+  The parameter test now derives that bound from the oracle's own formula instead of restating the
+  assumption, so the two cannot silently diverge again.
+- A single-unit withdrawal settled the whole staked position's farm rewards and forwarded them
+  without reporting the amount, so the measured harvest could be driven to zero.
+- `LiquidationAuction` could not receive the ERC-1155 units it exists to escrow - invisible while
+  every seize test targeted an EOA, because an EOA destination skips the acceptance check.
+
+The first review covered the two contracts implemented at the time and raised eight findings, all
+fixed - see the `Security hardening` commits for the per-finding diffs. What
 they covered:
 
 | Area | What changed |

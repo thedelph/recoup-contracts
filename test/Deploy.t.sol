@@ -22,6 +22,7 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 contract DeployTest is Test, DeployBase {
     address internal treasury = makeAddr("treasury");
     address internal keeper = makeAddr("keeper");
+    address internal navConfirmer = makeAddr("navConfirmer");
     address internal owner = makeAddr("owner");
 
     MockUSDC internal usdc;
@@ -49,6 +50,7 @@ contract DeployTest is Test, DeployBase {
             owner: owner,
             yieldRecipient: treasury,
             keeper: keeper,
+            navConfirmer: navConfirmer,
             protocolFeeWallet: treasury
         });
     }
@@ -119,6 +121,34 @@ contract DeployTest is Test, DeployBase {
     function test_adapterHarvesterIsDeliberatelyUnset() public {
         Deployed memory d = _deployProtocol(_externals(), _params(), address(this));
         assertEq(d.adapter.harvester(), address(0));
+    }
+
+    /// @dev The end-to-end proof that the wiring produces a protocol that can actually
+    ///      lend. Before Phase 2 the deploy script wired `lenderPool` and nothing else,
+    ///      so a freshly deployed protocol would have reverted on every borrow.
+    function test_deployedProtocolCanBorrow() public {
+        Deployed memory d = _deployProtocol(_externals(), _params(), address(this));
+
+        // The two post-deploy steps the script prints as reminders.
+        usdc.mint(address(this), 10_000e6);
+        usdc.approve(address(d.liquidity), 10_000e6);
+        d.liquidity.fund(10_000e6);
+        vm.prank(owner);
+        d.oracle.bootstrapNav(25.15e8);
+
+        // Collateral, then a borrow well inside maxLTV.
+        bond.setWhitelisted(address(farm), true);
+        bond.setWhitelisted(address(d.adapter), true);
+        address borrower = makeAddr("borrower");
+        bond.mint(borrower, 100);
+        vm.startPrank(borrower);
+        bond.setApprovalForAll(address(d.vault), true);
+        d.vault.depositBonds(100);
+        d.credit.borrow(500e6);
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(borrower), 500e6);
+        assertEq(d.credit.debtOf(borrower), 500e6);
     }
 
     // ── the yieldRecipient footgun ───────────────────────────────────────────

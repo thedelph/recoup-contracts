@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
@@ -16,7 +17,11 @@ import {INAVOracle} from "./interfaces/INAVOracle.sol";
 /// @dev TODO(phase-3): implement full lifecycle incl. expiry → workout fork test
 ///      (PRD §6.3 AC). Blocked on Phase 0 bond-transferability verdict: if bonds
 ///      can't transfer, this design is dead and liquidation is redemption-only.
-contract LiquidationAuction is ILiquidationAuction, Ownable, ReentrancyGuard {
+/// @dev Inherits ERC1155Holder because `CollateralVault.seize` transfers the whole
+///      lot here to escrow it. Without it every seizure to this contract reverts
+///      `ERC1155InvalidReceiver`, which stays invisible while seize tests target EOAs
+///      (an EOA destination skips the acceptance check entirely).
+contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, ReentrancyGuard {
     error NotImplemented();
     error NotCreditManager();
     error ZeroAddress();

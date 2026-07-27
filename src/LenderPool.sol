@@ -65,6 +65,24 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
         epochHarvester = epochHarvester_;
     }
 
+    // ── Entry (closed until phase 4) ─────────────────────────────────────────
+
+    /// @dev The skeleton stubbed the functions it declared - `lend`, `repayPrincipal`,
+    ///      `distributeYield`, `socialiseLoss` - but `deposit`, `mint`, `withdraw` and
+    ///      `redeem` come from ERC4626 and were live from the moment this contract was
+    ///      deployed. That let anyone commit real USDC to a vault that cannot lend it,
+    ///      cannot distribute yield, and has no withdrawal queue. Returning zero here
+    ///      makes `deposit`/`mint` revert with ERC4626's own max-exceeded errors.
+    ///      Withdrawals stay open so anyone who deposited before this can still exit.
+    ///      Remove both overrides when the phase-4 queue and loss accounting land.
+    function maxDeposit(address) public pure override returns (uint256) {
+        return 0;
+    }
+
+    function maxMint(address) public pure override returns (uint256) {
+        return 0;
+    }
+
     // ── Accounting ───────────────────────────────────────────────────────────
 
     /// @notice idle USDC + outstanding principal (PRD §4.2)

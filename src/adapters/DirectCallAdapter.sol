@@ -47,6 +47,12 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///         so harvesting need not route through the owner-only vault path.
     address public harvester;
 
+    /// @notice Farm yield that has been received but not yet reported to the vault -
+    ///         a deposit-time settlement, or a payout left behind by a sweep that
+    ///         failed. Carried so the next successful claim reports it rather than the
+    ///         money leaving the protocol's accounting silently.
+    uint256 public unreportedYield;
+
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault();
         _;
@@ -82,8 +88,18 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
     // ── Yield routing config (owner = governance timelock) ───────────────────
 
+    /// @dev Settles to the outgoing recipient before repointing. Rewards accrue
+    ///      continuously inside the farm, so a bare repoint hands an epoch of
+    ///      already-earned borrower/lender/insurance yield to the new address - and
+    ///      that is the *planned* Phase 3 handover, not just a malicious one.
     function setYieldRecipient(address recipient) external onlyOwner {
         if (recipient == address(0)) revert ZeroAddress();
+        address outgoing = yieldRecipient;
+        if (outgoing != address(0) && recipient != outgoing) {
+            farm.withdraw(0); // claim, so nothing in-flight belongs to the new address
+            uint256 bal = usdc.balanceOf(address(this));
+            if (bal != 0) usdc.safeTransfer(outgoing, bal);
+        }
         yieldRecipient = recipient;
         emit YieldRecipientSet(recipient);
     }
@@ -137,26 +153,55 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     }
 
     /// @inheritdoc ICustodyAdapter
+    /// @dev Measures any USDC the farm settles on deposit. MasterChef-style pools pay
+    ///      pending rewards on `deposit` as well as `withdraw`; unmeasured, that money
+    ///      would later be swept out without ever being counted as yield.
     function stake(uint256 amount) external onlyVault {
+        uint256 balBefore = usdc.balanceOf(address(this));
         farm.deposit(amount);
+        unreportedYield += usdc.balanceOf(address(this)) - balBefore;
     }
 
     /// @inheritdoc ICustodyAdapter
-    function unstake(uint256 amount) external onlyVault {
-        // The farm pays any pending USDC alongside a withdrawal. Sweep it, but
-        // best-effort only: a USDC transfer failure (Circle pause/blacklist) must
-        // never brick a collateral exit. Un-swept USDC stays claimable via claimYield.
+    /// @dev Returns the USDC swept, which the vault must account for. The farm is
+    ///      MasterChef-style, so `withdraw(amount)` settles the pending rewards of the
+    ///      entire adapter position - which is every borrower's pooled yield, not just
+    ///      the caller's. Reporting nothing meant any depositor could withdraw a single
+    ///      bond unit and push a whole epoch's yield out through an unmeasured path,
+    ///      leaving the accounted harvest at zero and nobody's debt written down.
+    ///
+    ///      The sweep stays best-effort: a USDC pause or blacklist must never brick a
+    ///      collateral exit. Un-swept USDC stays claimable via claimYield.
+    function unstake(uint256 amount) external onlyVault returns (uint256 swept) {
+        uint256 balBefore = usdc.balanceOf(address(this));
         farm.withdraw(amount);
-        _trySweepUsdc();
+        uint256 farmPaid = usdc.balanceOf(address(this)) - balBefore;
+
+        if (_trySweepUsdc() == 0) {
+            // Sweep failed (USDC paused or the recipient blacklisted). The exit still
+            // succeeds; the yield stays here and is reported by the next successful
+            // claim rather than being forgotten.
+            unreportedYield += farmPaid;
+            return 0;
+        }
+        swept = farmPaid + unreportedYield;
+        unreportedYield = 0;
     }
 
     /// @inheritdoc ICustodyAdapter
+    /// @dev Reports real farm yield - this claim's payout plus anything a previous
+    ///      failed sweep or a deposit-time settlement left behind - while still
+    ///      excluding donations, so neither problem is traded for the other. A
+    ///      donation is transferred onward but never counted, because it is a gift to
+    ///      the recipient rather than yield owed to borrowers and lenders.
     function claimYield() external onlyClaimer returns (uint256 usdcAmount) {
         uint256 balBefore = usdc.balanceOf(address(this));
         farm.withdraw(0); // withdraw(0) = claim, verified on-chain behaviour
-        // Report only what the farm actually paid, so a USDC donation to this
-        // adapter cannot inflate the harvested-yield figure.
-        usdcAmount = usdc.balanceOf(address(this)) - balBefore;
+        uint256 farmPaid = usdc.balanceOf(address(this)) - balBefore;
+
+        usdcAmount = farmPaid + unreportedYield;
+        unreportedYield = 0;
+
         uint256 bal = usdc.balanceOf(address(this));
         if (bal > 0) usdc.safeTransfer(yieldRecipient, bal);
     }
@@ -188,12 +233,17 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     /// @dev Best-effort USDC sweep that never reverts the calling transaction.
-    function _trySweepUsdc() internal {
+    /// @return swept The amount that actually left, so the caller can account for it.
+    ///         Zero when the transfer failed, which is the case the whole low-level
+    ///         call exists to tolerate.
+    function _trySweepUsdc() internal returns (uint256 swept) {
         uint256 amount = usdc.balanceOf(address(this));
-        if (amount == 0) return;
+        if (amount == 0) return 0;
         // Low-level call so a reverting transfer (pause/blacklist) cannot brick exits.
         // slither-disable-next-line unchecked-lowlevel
         (bool ok,) = address(usdc).call(abi.encodeCall(IERC20.transfer, (yieldRecipient, amount)));
-        ok; // deliberately ignored: exit must succeed even if the sweep does not
+        // Not ignored any more: exits still succeed either way, but the amount has to
+        // be reported or it leaves the protocol's accounting silently.
+        swept = ok ? amount : 0;
     }
 }

@@ -40,9 +40,35 @@ library Config {
     // ── NAV oracle guards (PRD §4.6) ─────────────────────────────────────────
     uint256 internal constant NAV_MAX_DEVIATION_BPS = 1_000;
     uint256 internal constant NAV_PENDING_DELAY = 12 hours; // large moves wait for 2nd key
+    /// @dev A pending NAV is void this long after it becomes confirmable. Without an
+    ///      expiry, a price posted during a crash could be confirmed days later and
+    ///      would reset `lastUpdated`, making a stale feed read as fresh at a price
+    ///      that no longer holds.
+    uint256 internal constant NAV_PENDING_EXPIRY = 24 hours;
+    /// @dev The budget window for NAV movement. Allowed deviation from the last
+    ///      accepted price is prorated by elapsed time over this window, so posting
+    ///      more often buys no extra room and a compromised keeper cannot walk the
+    ///      price by repeating small steps (the per-post-only check cannot stop that).
+    uint256 internal constant NAV_DEVIATION_WINDOW = 24 hours;
+    /// @dev Cap on the prorated allowance, so a long keeper outage inside the 8-day
+    ///      staleness budget does not accrue an unbounded move for a single post.
+    ///
+    ///      **Must never exceed NAV_DEVIATION_WINDOW.** `AUCTION_FLOOR_BPS` below is
+    ///      derived from NAV_MAX_DEVIATION_BPS as the worst single *unconfirmed* NAV
+    ///      drop. Setting this to 3 days silently made that real bound 30% rather than
+    ///      10%, which left a floor-price liquidation ~19% of NAV short of covering
+    ///      debt plus penalty - with the guard test still passing, because it was
+    ///      pinned to the constant rather than to the oracle's actual behaviour.
+    ///      A larger move is still reachable; it just needs the second key.
+    ///      The relation is asserted in Config.t.sol.
+    uint256 internal constant NAV_DEVIATION_MAX_ELAPSED = NAV_DEVIATION_WINDOW;
     uint256 internal constant NAV_STALENESS = 8 days; // older ⇒ borrow paused
     uint8 internal constant NAV_DECIMALS = 8; // navPerBond posted in USD, 8 decimals
     uint256 internal constant USDC_TO_NAV_SCALE = 1e2; // 10^(NAV_DECIMALS − USDC's 6 dp)
+
+    /// @dev Fixed-point scale for healthFactor. 1e18 == exactly at the liquidation
+    ///      threshold; below it the position is liquidatable.
+    uint256 internal constant HEALTH_FACTOR_SCALE = 1e18;
 
     // ── Governance (PRD §9) ──────────────────────────────────────────────────
     /// @dev Not read by any contract, by design. Ownership is a plain `address`, so
