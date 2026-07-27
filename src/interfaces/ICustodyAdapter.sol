@@ -21,9 +21,15 @@ interface ICustodyAdapter {
     function stake(uint256 amount) external;
 
     /// @notice Unstake bond units from the farm (withdrawal / liquidation path).
-    function unstake(uint256 amount) external;
+    /// @return swept USDC the farm paid out alongside the unstake and that was
+    ///         forwarded onward. The farm settles the whole staked position's pending
+    ///         rewards on any withdrawal, so this is protocol-wide yield, not the
+    ///         caller's share, and it must be accounted for rather than discarded.
+    function unstake(uint256 amount) external returns (uint256 swept);
 
     /// @notice Claim accrued USDC yield from the farm (farm's `withdraw(0)`).
+    /// @return usdcAmount The amount forwarded to the yield recipient. Implementations
+    ///         must report exactly what they transfer.
     function claimYield() external returns (uint256 usdcAmount);
 
     /// @notice Transfer bond units out of custody (withdrawal to owner, or auction

@@ -31,4 +31,10 @@ interface ICollateralVault {
 
     /// @return value bondCount(owner) × navPerBond, in USD 8 decimals
     function collateralValue(address owner) external view returns (uint256 value);
+
+    /// @notice True when custody holds at least as many bonds as the ledger records.
+    /// @dev Gate new debt on this. The emergency custody exit empties the farm
+    ///      position without clearing per-owner balances, so the ledger can outlive
+    ///      the collateral behind it.
+    function custodyIsSolvent() external view returns (bool);
 }

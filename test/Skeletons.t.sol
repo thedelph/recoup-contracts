@@ -70,18 +70,32 @@ contract SkeletonsTest is Test {
         assertEq(pool.symbol(), "rcUSDC");
     }
 
-    function test_freshOracleIsStale() public {
-        // lastUpdated == 0 ⇒ stale until first post; borrow() must gate on this.
+    function test_freshOracleIsStale() public view {
+        // lastUpdated == 0 ⇒ stale until first post; borrow() gates on this, which is
+        // what stops a position being priced against a NAV of zero. No warp: the
+        // point is that it reads stale immediately, not only once time has passed.
+        assertTrue(oracle.isStale());
+    }
+
+    function test_freshOracleStaysStaleAfterTheWindow() public {
         vm.warp(Config.NAV_STALENESS + 1);
         assertTrue(oracle.isStale());
     }
 
     function test_stubsRevertNotImplemented() public {
+        // liquidate() is the remaining phase-3 stub on CreditManager.
         vm.expectRevert(CreditManager.NotImplemented.selector);
-        credit.borrow(1);
+        credit.liquidate(address(this));
 
         vm.expectRevert(EpochHarvester.NotImplemented.selector);
         harvester.harvest();
+    }
+
+    function test_borrowRefusesUntilLiquiditySourceIsWired() public {
+        // A CreditManager with no funding source must refuse rather than half-work:
+        // this fixture never wires one, unlike the deploy script.
+        vm.expectRevert(CreditManager.LiquiditySourceUnset.selector);
+        credit.borrow(1);
     }
 
     function test_vaultRequiresAdapterBeforeUse() public {

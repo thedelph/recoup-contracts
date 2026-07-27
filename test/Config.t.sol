@@ -29,8 +29,15 @@ contract ConfigTest is Test {
     ///         immediate NAV_MAX_DEVIATION_BPS drop applied to a position sitting at
     ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev).
     function test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger() public pure {
+        // Derive the worst drop from what NAVOracle actually accepts without a second
+        // key, not from NAV_MAX_DEVIATION_BPS directly. Those were the same number
+        // until NAV_DEVIATION_MAX_ELAPSED was introduced, at which point the real
+        // bound tripled and this test kept passing because it was pinned to the
+        // assumption rather than to the behaviour.
+        uint256 maxDropBps = (Config.NAV_MAX_DEVIATION_BPS * Config.NAV_DEVIATION_MAX_ELAPSED)
+            / Config.NAV_DEVIATION_WINDOW;
         uint256 worstTriggerLtv =
-            (Config.LIQUIDATION_THRESHOLD_BPS * Config.BPS) / (Config.BPS - Config.NAV_MAX_DEVIATION_BPS);
+            (Config.LIQUIDATION_THRESHOLD_BPS * Config.BPS) / (Config.BPS - maxDropBps);
         uint256 requiredFloor =
             (worstTriggerLtv * (Config.BPS + Config.LIQUIDATION_PENALTY_BPS)) / Config.BPS;
         assertGe(
@@ -57,5 +64,34 @@ contract ConfigTest is Test {
         assertTrue(Config.CHAINLINK_ETH_USD != address(0));
         // The bond contract is its own mint entrypoint (signature-gated payable mint).
         assertEq(Config.DEXFI_MINT_ENTRYPOINT, Config.DEXFI_BOND_NFT);
+    }
+
+    /// @dev The NAV guards only make sense in this order: a large move must be
+    ///      confirmable well inside the window it is measured against, and both must
+    ///      sit comfortably inside the staleness budget. Getting this wrong is silent -
+    ///      the feed keeps working and just stops protecting anything.
+    function test_navGuardRelations() public pure {
+        assertLt(Config.NAV_PENDING_DELAY, Config.NAV_DEVIATION_WINDOW);
+        assertLt(Config.NAV_DEVIATION_WINDOW, Config.NAV_STALENESS);
+        assertLt(Config.NAV_MAX_DEVIATION_BPS, Config.BPS);
+        // The one that bit: a clamp wider than the window raises the largest
+        // single-key NAV move above NAV_MAX_DEVIATION_BPS, which is the figure the
+        // auction floor is sized against.
+        assertLe(
+            Config.NAV_DEVIATION_MAX_ELAPSED,
+            Config.NAV_DEVIATION_WINDOW,
+            "a wider clamp silently breaks the auction floor's coverage guarantee"
+        );
+    }
+
+    /// @dev Nothing reads these yet - the reserve ratio and insurance fund target land
+    ///      with the LenderPool queue and the harvester. Asserting them here is what
+    ///      stops them being deleted as dead constants before their phase arrives.
+    function test_unusedParametersStaySane() public pure {
+        assertGt(Config.RESERVE_RATIO_BPS, 0);
+        assertLt(Config.RESERVE_RATIO_BPS, Config.BPS);
+        assertGt(Config.INSURANCE_FUND_TARGET_BPS, 0);
+        assertLt(Config.INSURANCE_FUND_TARGET_BPS, Config.BPS);
+        assertEq(Config.HEALTH_FACTOR_SCALE, 1e18);
     }
 }

@@ -6,57 +6,219 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {INAVOracle} from "./interfaces/INAVOracle.sol";
 import {Config} from "./Config.sol";
 
-/// @title NAVOracle (skeleton — PRD §4.6)
+/// @title NAVOracle (PRD §4.6)
 /// @notice Keeper posts navPerBond (USD, 8 decimals) daily (minimum weekly).
-///         Updates beyond maxDeviationPerUpdate enter a 12h pending state needing
-///         a second admin key. Staleness pauses borrows; liquidations continue on
+///         Moves beyond the time-prorated deviation budget enter a pending state
+///         needing a second key. Staleness pauses borrows; liquidations continue on
 ///         last-known NAV.
-/// @dev TODO(phase-2): implement postNav with deviation guard + two-key confirm
-///      flow; keeper role management. Worst realistic attack is NAV keeper key
-///      compromise (PRD §9) — guards here are the mitigation, treat as critical.
+/// @dev Keeper key compromise is the worst realistic attack on the protocol (PRD §9):
+///      a fake high NAV lets a position overborrow against collateral that isn't
+///      worth it. The guards here are the mitigation, so treat them as critical.
 contract NAVOracle is INAVOracle, Ownable {
-    error NotImplemented();
     error NotKeeper();
+    error NotConfirmer();
     error ZeroAddress();
+    error ZeroNav();
     error RenounceDisabled();
+    error AlreadyBootstrapped();
+    error NotBootstrapped();
+    error KeysMustDiffer();
+    error NoPendingNav();
+    error PendingNavMismatch(uint256 pending, uint256 supplied);
+    error PendingNotYetConfirmable(uint256 confirmableAt);
+    error PendingExpired(uint256 expiredAt);
 
     event NAVPosted(uint256 nav, uint256 timestamp);
     event NAVPending(uint256 nav, uint256 confirmableAt);
+    event NAVPendingCancelled(uint256 nav);
+    event KeeperSet(address indexed keeper);
+    event NavConfirmerSet(address indexed confirmer);
 
     address public keeper;
+    /// @notice The second key. Confirms moves that exceed the deviation budget, and
+    ///         must never be the keeper: that is what makes it two-key.
+    address public navConfirmer;
+
     /// @inheritdoc INAVOracle
     uint256 public override navPerBond;
     /// @inheritdoc INAVOracle
-    /// @dev Zero until the first postNav by design: a fresh oracle must read as
-    ///      stale (tested in Skeletons.t.sol).
+    /// @dev Zero until the first accepted post, which `isStale()` reports as stale.
     // slither-disable-next-line uninitialized-state
     uint256 public override lastUpdated;
 
+    /// @notice The price the deviation budget is measured from, and when it was set.
+    ///         Reset on every accepted NAV.
+    uint256 public anchorNav;
+    uint256 public anchorAt;
+
+    uint256 public pendingNav;
+    uint256 public pendingConfirmableAt;
+
     constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // ── Roles ────────────────────────────────────────────────────────────────
 
     function setKeeper(address keeper_) external onlyOwner {
         if (keeper_ == address(0)) revert ZeroAddress();
+        if (keeper_ == navConfirmer) revert KeysMustDiffer();
         keeper = keeper_;
+        emit KeeperSet(keeper_);
     }
 
-    /// @notice Post a new NAV. Within deviation bounds it takes effect immediately;
-    ///         beyond Config.NAV_MAX_DEVIATION_BPS it must wait NAV_PENDING_DELAY
-    ///         and be confirmed by a second key.
-    function postNav(uint256) external {
-        if (msg.sender != keeper) revert NotKeeper();
-        revert NotImplemented(); // TODO(phase-2)
-    }
-
-    /// @inheritdoc INAVOracle
-    /// @dev Staleness window is 8 days (Config); second-level timestamp drift is
-    ///      immaterial at that scale.
-    // slither-disable-next-line timestamp
-    function isStale() external view returns (bool) {
-        return block.timestamp > lastUpdated + Config.NAV_STALENESS;
+    /// @dev Rejecting `keeper == navConfirmer` matters more than it looks: without it
+    ///      the two-key requirement silently collapses to one key, and that pair is
+    ///      the entire mitigation for the attack PRD §9 calls the worst realistic one.
+    function setNavConfirmer(address confirmer_) external onlyOwner {
+        if (confirmer_ == address(0)) revert ZeroAddress();
+        if (confirmer_ == keeper) revert KeysMustDiffer();
+        navConfirmer = confirmer_;
+        emit NavConfirmerSet(confirmer_);
     }
 
     /// @dev Renouncing would permanently freeze keeper management and brick the feed.
     function renounceOwnership() public view override onlyOwner {
         revert RenounceDisabled();
+    }
+
+    // ── Posting ──────────────────────────────────────────────────────────────
+
+    /// @notice Seed the first NAV. Owner-only, once: there is nothing to measure a
+    ///         deviation against, so this sets the anchor everything else is judged
+    ///         from and should not be a keeper power.
+    function bootstrapNav(uint256 nav) external onlyOwner {
+        if (nav == 0) revert ZeroNav();
+        if (navPerBond != 0) revert AlreadyBootstrapped();
+        _accept(nav);
+    }
+
+    /// @notice Post a new NAV. Within the deviation budget it takes effect
+    ///         immediately; beyond it, the value is held pending a second key.
+    /// @dev The budget is prorated by time elapsed since the last accepted price:
+    ///      `NAV_MAX_DEVIATION_BPS * min(elapsed, NAV_DEVIATION_MAX_ELAPSED) /
+    ///      NAV_DEVIATION_WINDOW`. A flat per-post cap is not enough on its own,
+    ///      because a compromised keeper can post just under it repeatedly and walk
+    ///      the price anywhere within a block. Prorating makes posting frequency
+    ///      nearly irrelevant: twenty-four hourly posts move the price ~10.5% against
+    ///      ~10% for a single post a day later, since each accepted price becomes the
+    ///      new anchor and the steps compound. Bounded and predictable, rather than
+    ///      the unbounded walk a flat per-post cap permits.
+    ///
+    ///      Note what this does and does not do. It bounds the *rate*, not the total:
+    ///      sustained movement still compounds day over day, by design. The protection
+    ///      against a wrong price persisting is the staleness window and the second
+    ///      key, not this.
+    function postNav(uint256 nav) external {
+        if (msg.sender != keeper) revert NotKeeper();
+        if (nav == 0) revert ZeroNav();
+        if (navPerBond == 0) revert NotBootstrapped();
+
+        if (_withinBudget(nav)) {
+            // Deliberately does NOT clear a pending value. An earlier version did,
+            // reasoning that the keeper's latest word wins - but posting the current
+            // NAV always satisfies the budget, so that handed the keeper a free,
+            // unilateral veto over the second key. Only the owner or the confirmer
+            // may drop a pending value, via cancelPendingNav.
+            _accept(nav);
+        } else {
+            // Start the clock on the FIRST post of a given value only. Restarting it
+            // on every repost meant an honest keeper on a sub-delay cadence - the
+            // cadence this contract documents - slid the confirmation window away
+            // forever, so a real move could never be ratified.
+            if (pendingNav != nav) {
+                pendingNav = nav;
+                pendingConfirmableAt = block.timestamp + Config.NAV_PENDING_DELAY;
+                emit NAVPending(nav, pendingConfirmableAt);
+            }
+        }
+    }
+
+    /// @notice Second-key confirmation of a large move, after the delay.
+    /// @param nav Must equal the pending value. Passing it explicitly stops a keeper
+    ///        repost from racing a confirmation into ratifying a different price.
+    function confirmNav(uint256 nav) external {
+        if (msg.sender != navConfirmer) revert NotConfirmer();
+        uint256 pending = pendingNav;
+        if (pending == 0) revert NoPendingNav();
+        if (pending != nav) revert PendingNavMismatch(pending, nav);
+
+        uint256 confirmableAt = pendingConfirmableAt;
+        if (block.timestamp < confirmableAt) revert PendingNotYetConfirmable(confirmableAt);
+        // Expiry matters: without it, a price posted during a crash could be ratified
+        // days later, and accepting it would reset `lastUpdated` and make a stale feed
+        // read as fresh at a price that no longer holds.
+        uint256 expiresAt = confirmableAt + Config.NAV_PENDING_EXPIRY;
+        if (block.timestamp > expiresAt) revert PendingExpired(expiresAt);
+
+        _clearPending();
+        _accept(pending);
+    }
+
+    /// @notice Drop a pending NAV. Either governance key may do it.
+    function cancelPendingNav() external {
+        if (msg.sender != owner() && msg.sender != navConfirmer) revert NotConfirmer();
+        uint256 pending = pendingNav;
+        if (pending == 0) revert NoPendingNav();
+        emit NAVPendingCancelled(pending);
+        _clearPending();
+    }
+
+    // ── Views ────────────────────────────────────────────────────────────────
+
+    /// @inheritdoc INAVOracle
+    /// @dev A never-posted oracle reads as stale, so consumers gating on `isStale()`
+    ///      need no separate zero-NAV check. Staleness window is 8 days; second-level
+    ///      timestamp drift is immaterial at that scale.
+    // slither-disable-next-line timestamp
+    function isStale() external view returns (bool) {
+        return lastUpdated == 0 || block.timestamp > lastUpdated + Config.NAV_STALENESS;
+    }
+
+    /// @notice How far NAV may move right now, in bps, before needing a second key.
+    function allowedDeviationBps() external view returns (uint256) {
+        return _allowedDeviationBps();
+    }
+
+    // ── Internal ─────────────────────────────────────────────────────────────
+
+    function _accept(uint256 nav) private {
+        navPerBond = nav;
+        lastUpdated = block.timestamp;
+        anchorNav = nav;
+        anchorAt = block.timestamp;
+        emit NAVPosted(nav, block.timestamp);
+    }
+
+    function _clearPending() private {
+        pendingNav = 0;
+        pendingConfirmableAt = 0;
+    }
+
+    /// @dev The budget test, by cross-multiplication with no division anywhere.
+    ///
+    ///      Comparing two figures that were each floored to whole basis points was a
+    ///      real hole: at `elapsed == 0` the budget floors to 0, and any move smaller
+    ///      than `anchorNav / BPS` also floors to 0, so the guard read `0 <= 0` and
+    ///      accepted. Because every accepted post re-anchors, those free sub-bps steps
+    ///      compounded - enough of them in a single block moved NAV anywhere at all,
+    ///      without the second key ever being consulted.
+    ///
+    ///      `LtvMath.exceedsLtv` avoids division for exactly this reason and says so;
+    ///      this is the same discipline applied to the same class of comparison.
+    // slither-disable-next-line timestamp
+    function _withinBudget(uint256 nav) private view returns (bool) {
+        uint256 anchor = anchorNav;
+        uint256 delta = nav > anchor ? nav - anchor : anchor - nav;
+        uint256 elapsed = block.timestamp - anchorAt;
+        if (elapsed > Config.NAV_DEVIATION_MAX_ELAPSED) elapsed = Config.NAV_DEVIATION_MAX_ELAPSED;
+        // delta/anchor <= MAX_DEV/BPS * elapsed/WINDOW, cross-multiplied.
+        return delta * Config.BPS * Config.NAV_DEVIATION_WINDOW
+            <= Config.NAV_MAX_DEVIATION_BPS * elapsed * anchor;
+    }
+
+    // slither-disable-next-line timestamp
+    function _allowedDeviationBps() private view returns (uint256) {
+        uint256 elapsed = block.timestamp - anchorAt;
+        if (elapsed > Config.NAV_DEVIATION_MAX_ELAPSED) elapsed = Config.NAV_DEVIATION_MAX_ELAPSED;
+        return (Config.NAV_MAX_DEVIATION_BPS * elapsed) / Config.NAV_DEVIATION_WINDOW;
     }
 }

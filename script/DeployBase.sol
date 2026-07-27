@@ -11,6 +11,7 @@ import {EpochHarvester} from "../src/EpochHarvester.sol";
 import {LenderPool} from "../src/LenderPool.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
 import {NAVOracle} from "../src/NAVOracle.sol";
+import {TreasuryLiquiditySource} from "../src/TreasuryLiquiditySource.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {ICollateralVault} from "../src/interfaces/ICollateralVault.sol";
 import {ICreditManager} from "../src/interfaces/ICreditManager.sol";
@@ -38,6 +39,7 @@ abstract contract DeployBase is Script {
         address owner;
         address yieldRecipient;
         address keeper;
+        address navConfirmer;
         address protocolFeeWallet;
     }
 
@@ -54,6 +56,7 @@ abstract contract DeployBase is Script {
         DirectCallAdapter adapter;
         CreditManager credit;
         LenderPool pool;
+        TreasuryLiquiditySource liquidity;
         EpochHarvester harvester;
         LiquidationAuction auction;
     }
@@ -61,6 +64,8 @@ abstract contract DeployBase is Script {
     error OwnerRequired();
     error YieldRecipientRequired();
     error KeeperRequired();
+    error NavConfirmerRequired();
+    error NavKeysMustDiffer();
     error ProtocolFeeWalletRequired();
     error YieldRecipientCollision(address recipient, string collidesWith);
     error OwnershipNotTransferred(address contractAddr, address actualOwner);
@@ -74,6 +79,8 @@ abstract contract DeployBase is Script {
     ///      is worth more than one that merely runs.
     address internal constant LOCAL_TREASURY = address(uint160(uint256(keccak256("recoup.local.treasury"))));
     address internal constant LOCAL_KEEPER = address(uint160(uint256(keccak256("recoup.local.keeper"))));
+    address internal constant LOCAL_NAV_CONFIRMER =
+        address(uint160(uint256(keccak256("recoup.local.navConfirmer"))));
 
     function _isLocal() internal view returns (bool) {
         return block.chainid == ANVIL_CHAIN_ID;
@@ -89,11 +96,13 @@ abstract contract DeployBase is Script {
         p.owner = vm.envOr("RECOUP_OWNER", deployer);
         p.yieldRecipient = vm.envOr("RECOUP_YIELD_RECIPIENT", address(0));
         p.keeper = vm.envOr("RECOUP_KEEPER", address(0));
+        p.navConfirmer = vm.envOr("RECOUP_NAV_CONFIRMER", address(0));
         p.protocolFeeWallet = vm.envOr("RECOUP_PROTOCOL_FEE_WALLET", address(0));
 
         if (_isLocal()) {
             if (p.yieldRecipient == address(0)) p.yieldRecipient = LOCAL_TREASURY;
             if (p.keeper == address(0)) p.keeper = LOCAL_KEEPER;
+            if (p.navConfirmer == address(0)) p.navConfirmer = LOCAL_NAV_CONFIRMER;
             if (p.protocolFeeWallet == address(0)) p.protocolFeeWallet = LOCAL_TREASURY;
         }
 
@@ -109,6 +118,10 @@ abstract contract DeployBase is Script {
 
         if (p.yieldRecipient == address(0)) revert YieldRecipientRequired();
         if (p.keeper == address(0)) revert KeeperRequired();
+        if (p.navConfirmer == address(0)) revert NavConfirmerRequired();
+        // Two keys that are one key are not two keys. The oracle rejects this too;
+        // catching it here means a misconfigured deploy fails before it broadcasts.
+        if (p.navConfirmer == p.keeper) revert NavKeysMustDiffer();
         if (p.protocolFeeWallet == address(0)) revert ProtocolFeeWalletRequired();
         // A real treasury must be a distinct address. Routing harvested USDC to the
         // key that signed the deploy is the default that looks fine and is not
@@ -144,6 +157,10 @@ abstract contract DeployBase is Script {
         d.credit =
             new CreditManager(e.usdc, ICollateralVault(address(d.vault)), INAVOracle(address(d.oracle)), deployer);
         d.pool = new LenderPool(e.usdc, deployer);
+        // Funds borrows until the LenderPool takes over in Phase 4. Without it,
+        // `borrow` reverts `LiquiditySourceUnset` and the deployed protocol is a
+        // read-only museum piece.
+        d.liquidity = new TreasuryLiquiditySource(e.usdc, deployer);
         d.harvester = new EpochHarvester(e.usdc, ICreditManager(address(d.credit)), deployer);
         d.auction = new LiquidationAuction(
             e.usdc, ICollateralVault(address(d.vault)), INAVOracle(address(d.oracle)), deployer
@@ -160,9 +177,12 @@ abstract contract DeployBase is Script {
         d.vault.setCreditManager(address(d.credit));
         d.vault.setLiquidationAuction(address(d.auction));
 
+        d.credit.setLiquiditySource(address(d.liquidity));
         d.credit.setLenderPool(address(d.pool));
         d.credit.setEpochHarvester(address(d.harvester));
         d.credit.setLiquidationAuction(address(d.auction));
+
+        d.liquidity.setCreditManager(address(d.credit));
 
         d.pool.setCreditManager(address(d.credit));
         d.pool.setEpochHarvester(address(d.harvester));
@@ -177,6 +197,10 @@ abstract contract DeployBase is Script {
         // works even though postNav reverts, and an unset keeper blocks everyone.
         // Wiring it now means the address is already correct when Phase 2 lands.
         d.oracle.setKeeper(p.keeper);
+        // The second key on large NAV moves. Must differ from the keeper, or the
+        // two-key guard on the protocol's worst realistic attack (PRD §9) collapses
+        // to one key; the oracle enforces that itself.
+        d.oracle.setNavConfirmer(p.navConfirmer);
 
         // Deliberately NOT wired: adapter.setHarvester. Under an EOA owner it buys
         // nothing, because the owner can already call vault.harvestYield() directly.
@@ -217,6 +241,16 @@ abstract contract DeployBase is Script {
         if (d.harvester.lenderPool() == address(0)) revert WiringIncomplete("harvester.lenderPool");
         if (d.harvester.protocolFeeWallet() == address(0)) revert WiringIncomplete("harvester.protocolFeeWallet");
         if (d.oracle.keeper() == address(0)) revert WiringIncomplete("oracle.keeper");
+        if (d.oracle.navConfirmer() == address(0)) revert WiringIncomplete("oracle.navConfirmer");
+
+        // Without these two the protocol deploys but cannot lend a cent, which is the
+        // failure mode worth catching in the script rather than in production.
+        if (d.credit.liquiditySource() != address(d.liquidity)) {
+            revert WiringIncomplete("credit.liquiditySource");
+        }
+        if (d.liquidity.creditManager() != address(d.credit)) {
+            revert WiringIncomplete("liquidity.creditManager");
+        }
 
         // The audit's finding #1 in assertion form: the vault has no USDC egress, so
         // routing yield there strands it permanently.
@@ -241,8 +275,10 @@ abstract contract DeployBase is Script {
         console.log("CollateralVault   ", address(d.vault));
         console.log("DirectCallAdapter ", address(d.adapter));
         console.log("CreditManager     ", address(d.credit));
+        console.log("LiquiditySource   ", address(d.liquidity));
         console.log("LenderPool        ", address(d.pool));
         console.log("EpochHarvester    ", address(d.harvester));
         console.log("LiquidationAuction", address(d.auction));
+        console.log("Post-deploy: fund the liquidity source and bootstrap the NAV oracle.");
     }
 }
