@@ -29,6 +29,17 @@ interface ICollateralVault {
 
     function bondCount(address owner) external view returns (uint256);
 
+    /// @notice The CreditManager this vault currently settles into.
+    /// @dev Exposed so a CreditManager can tell whether it is still the live one. Its
+    ///      accumulator prices positions off `bondCount`/`totalBondCount`, and that is
+    ///      only sound while the vault settles into it before every bond-count change
+    ///      - which stops the instant this pointer moves elsewhere.
+    function creditManager() external view returns (address);
+
+    /// @notice Sum of every `bondCount`. The denominator for pro-rata yield, and the
+    ///         figure custody solvency is checked against.
+    function totalBondCount() external view returns (uint256);
+
     /// @return value bondCount(owner) × navPerBond, in USD 8 decimals
     function collateralValue(address owner) external view returns (uint256 value);
 

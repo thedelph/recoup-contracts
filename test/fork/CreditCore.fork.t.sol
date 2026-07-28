@@ -124,13 +124,26 @@ contract CreditCoreForkTest is Test {
         assertEq(usdc.balanceOf(harvester), harvested, "reported figure matches what moved");
 
         // 4. Apply that real yield against the debt, the way EpochHarvester will.
+        //    The share is streamed over an epoch rather than credited at once - that
+        //    is what makes depositing in the harvest block pointless - so the clock
+        //    has to run before any of it has actually been earned.
         uint256 debtBefore = credit.debtOf(alice);
         vm.startPrank(harvester);
         usdc.approve(address(credit), harvested);
         credit.receiveYield(harvested);
-        credit.applyYield(alice, harvested);
+        credit.distributeYield(harvested);
         vm.stopPrank();
-        assertEq(credit.debtOf(alice), debtBefore - harvested, "debt fell by the yield");
+
+        credit.settle(alice);
+        assertEq(credit.debtOf(alice), debtBefore, "nothing is earned in the harvest block");
+
+        // To the end of the stream, which is not a fixed five days: the pot is rated
+        // over the window it accrued across, and this epoch represents the seven days
+        // warped above. That is what stops a late depositor capturing a long window.
+        vm.warp(credit.streamEndsAt());
+        credit.settle(alice);
+        // At most 1 wei of USDC is left behind by the stream rate's truncation.
+        assertApproxEqAbs(credit.debtOf(alice), debtBefore - harvested, 1, "debt fell by the yield");
         assertLt(credit.currentLtvBps(alice), Config.MAX_LTV_BPS, "self-repaid, LTV improved");
 
         // 5. Repay the remainder and exit with the bonds.

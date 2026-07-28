@@ -96,12 +96,30 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         if (recipient == address(0)) revert ZeroAddress();
         address outgoing = yieldRecipient;
         if (outgoing != address(0) && recipient != outgoing) {
-            farm.withdraw(0); // claim, so nothing in-flight belongs to the new address
-            uint256 bal = usdc.balanceOf(address(this));
-            if (bal != 0) usdc.safeTransfer(outgoing, bal);
+            // Best-effort, not mandatory. This is the designated escape from a
+            // recipient that can no longer receive USDC - a Circle blacklist, a pause -
+            // and an earlier version made the escape itself a hard `safeTransfer` to
+            // that same address. It reverted on precisely the condition it existed to
+            // fix, so the recipient could never be repointed and every dollar of farm
+            // yield was trapped in an immutable contract, growing with each exit.
+            //
+            // `_trySweepUsdc` targets the *outgoing* recipient because the flip below
+            // has not happened yet, and `unreportedYield` is cleared only when the
+            // sweep actually moved the money it was tracking.
+            try this.claimFarmRewards() {} catch {}
+            if (_trySweepUsdc() != 0) unreportedYield = 0;
         }
         yieldRecipient = recipient;
         emit YieldRecipientSet(recipient);
+    }
+
+    /// @notice Pull pending farm rewards into this contract without forwarding them.
+    /// @dev External only so `setYieldRecipient` can wrap it in try/catch - Solidity
+    ///      has no try around an internal call. Self-call gated, so it is not a new
+    ///      entry point. Exists because a farm that reverts must not block a repoint.
+    function claimFarmRewards() external {
+        if (msg.sender != address(this)) revert NotVault();
+        farm.withdraw(0); // withdraw(0) = claim, verified on-chain behaviour
     }
 
     function setHarvester(address harvester_) external onlyOwner {
@@ -134,6 +152,14 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
         (uint256 stakedBefore,) = farm.userInfo(address(this));
         uint256 looseBefore = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
+        // Measured across the mint itself, not just the fallback stake below. On the
+        // auto-stake path `bond.mint` drives the farm's `depositForAccount` hook for
+        // this adapter, and a MasterChef-style pool settles the whole position's
+        // pending rewards on any deposit - so an ETH mint can flush an epoch of every
+        // borrower's yield in here with nothing measuring it. That is the same leak
+        // `_settleFarmPayout` was factored out to close, and this was the one
+        // farm-touching path still outside it.
+        uint256 usdcBefore = usdc.balanceOf(address(this));
 
         bond.mint{value: msg.value}(data);
 
@@ -148,18 +174,37 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         uint256 minted = (stakedAfter - stakedBefore) + newlyLoose;
         if (minted != data.amountNfts) revert MintAmountMismatch(data.amountNfts, minted);
 
+        // Same measurement `stake()` performs, for the same reason: this is a
+        // MasterChef-style farm, so `deposit` settles the whole adapter position's
+        // pending rewards. Unmeasured, an epoch of every borrower's yield would sit
+        // here uncounted until some later sweep pushed it out as an untracked
+        // donation. Only the fallback path reaches this - on the auto-stake path
+        // `newlyLoose` is zero and `bond.mint` has already staked - but the fallback
+        // is the one that fires if DexFi ever unsets the reward pool.
         if (newlyLoose > 0) farm.deposit(newlyLoose);
+
+        // One settle covering both branches, so the auto-stake path is measured too.
+        // The return is discarded rather than reported: this path already returns the
+        // minted bond count, and the yield still reaches borrowers because the
+        // harvester sizes an epoch from its own balance, not from a reported figure.
+        _settleFarmPayout(usdc.balanceOf(address(this)) - usdcBefore);
         amount = data.amountNfts;
     }
 
     /// @inheritdoc ICustodyAdapter
-    /// @dev Measures any USDC the farm settles on deposit. MasterChef-style pools pay
-    ///      pending rewards on `deposit` as well as `withdraw`; unmeasured, that money
-    ///      would later be swept out without ever being counted as yield.
-    function stake(uint256 amount) external onlyVault {
+    /// @dev Measures any USDC the farm settles on deposit, then forwards it, mirroring
+    ///      `unstake` exactly. MasterChef-style pools pay pending rewards on `deposit`
+    ///      as well as `withdraw`; unmeasured, that money would later be swept out
+    ///      without ever being counted as yield, and unswept it would sit here at rest
+    ///      against this contract's stated design.
+    ///
+    ///      The sweep stays best-effort for the same reason it does on the way out: a
+    ///      USDC pause or blacklist must never block a deposit. Un-swept USDC is
+    ///      carried in `unreportedYield` and reported by the next successful claim.
+    function stake(uint256 amount) external onlyVault returns (uint256 swept) {
         uint256 balBefore = usdc.balanceOf(address(this));
         farm.deposit(amount);
-        unreportedYield += usdc.balanceOf(address(this)) - balBefore;
+        swept = _settleFarmPayout(usdc.balanceOf(address(this)) - balBefore);
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -175,17 +220,9 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     function unstake(uint256 amount) external onlyVault returns (uint256 swept) {
         uint256 balBefore = usdc.balanceOf(address(this));
         farm.withdraw(amount);
-        uint256 farmPaid = usdc.balanceOf(address(this)) - balBefore;
-
-        if (_trySweepUsdc() == 0) {
-            // Sweep failed (USDC paused or the recipient blacklisted). The exit still
-            // succeeds; the yield stays here and is reported by the next successful
-            // claim rather than being forgotten.
-            unreportedYield += farmPaid;
-            return 0;
-        }
-        swept = farmPaid + unreportedYield;
-        unreportedYield = 0;
+        // On a failed sweep (USDC paused, recipient blacklisted) the exit still
+        // succeeds and the yield is carried to the next successful claim.
+        swept = _settleFarmPayout(usdc.balanceOf(address(this)) - balBefore);
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -194,16 +231,14 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///      excluding donations, so neither problem is traded for the other. A
     ///      donation is transferred onward but never counted, because it is a gift to
     ///      the recipient rather than yield owed to borrowers and lenders.
+    ///      Routes through the same best-effort settle as `stake` and `unstake`, so a
+    ///      recipient that cannot receive carries the yield forward instead of
+    ///      reverting. A hard transfer here meant a blacklisted recipient bricked
+    ///      every epoch as well as trapping the money.
     function claimYield() external onlyClaimer returns (uint256 usdcAmount) {
         uint256 balBefore = usdc.balanceOf(address(this));
         farm.withdraw(0); // withdraw(0) = claim, verified on-chain behaviour
-        uint256 farmPaid = usdc.balanceOf(address(this)) - balBefore;
-
-        usdcAmount = farmPaid + unreportedYield;
-        unreportedYield = 0;
-
-        uint256 bal = usdc.balanceOf(address(this));
-        if (bal > 0) usdc.safeTransfer(yieldRecipient, bal);
+        usdcAmount = _settleFarmPayout(usdc.balanceOf(address(this)) - balBefore);
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -231,6 +266,26 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
+
+    /// @dev What every farm interaction does with the USDC it shook loose: forward it
+    ///      and report it, or - if the transfer cannot go through - carry it in
+    ///      `unreportedYield` so the next successful claim picks it up.
+    ///
+    ///      Shared by `stake`, `unstake` and `mintBonds` because all three call into a
+    ///      MasterChef-style farm, and every one of those calls settles the pending
+    ///      rewards of the entire adapter position. Having it in one place is what
+    ///      stops a new farm-touching path quietly reintroducing the leak.
+    /// @param farmPaid USDC measured as arriving from the farm during the call.
+    /// @return swept Total forwarded onward, including any previously carried amount.
+    ///         Zero when the sweep could not go through.
+    function _settleFarmPayout(uint256 farmPaid) private returns (uint256 swept) {
+        if (_trySweepUsdc() == 0) {
+            unreportedYield += farmPaid;
+            return 0;
+        }
+        swept = farmPaid + unreportedYield;
+        unreportedYield = 0;
+    }
 
     /// @dev Best-effort USDC sweep that never reverts the calling transaction.
     /// @return swept The amount that actually left, so the caller can account for it.

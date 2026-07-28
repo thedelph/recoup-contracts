@@ -120,15 +120,28 @@ contract NAVOracle is INAVOracle, Ownable {
             // may drop a pending value, via cancelPendingNav.
             _accept(nav);
         } else {
-            // Start the clock on the FIRST post of a given value only. Restarting it
-            // on every repost meant an honest keeper on a sub-delay cadence - the
-            // cadence this contract documents - slid the confirmation window away
-            // forever, so a real move could never be ratified.
-            if (pendingNav != nav) {
-                pendingNav = nav;
+            // The clock belongs to the MOVE, not to the exact value.
+            //
+            // Anchoring it to the value looked like the fix for a keeper sliding the
+            // window, but it only stopped a keeper reposting the identical price -
+            // and a live feed never does. Every post differs in the last decimal, so
+            // every post restarted the twelve hours and no large move could ever be
+            // ratified, with an honest keeper on a normal cadence. That is the same
+            // unilateral veto the in-budget branch above was fixed to remove.
+            //
+            // So: refresh the pending value freely, but only restart the review window
+            // when the value has moved enough to be worth re-reviewing. Feed jitter
+            // keeps the clock running; a materially different price resets it, because
+            // the confirmer's twelve hours are to review the number they will ratify.
+            uint256 pending = pendingNav;
+            bool materiallyDifferent = pending == 0
+                || _deviatesBeyond(pending, nav, Config.NAV_PENDING_REPRICE_TOLERANCE_BPS);
+
+            pendingNav = nav;
+            if (materiallyDifferent || block.timestamp > pendingConfirmableAt + Config.NAV_PENDING_EXPIRY) {
                 pendingConfirmableAt = block.timestamp + Config.NAV_PENDING_DELAY;
-                emit NAVPending(nav, pendingConfirmableAt);
             }
+            emit NAVPending(nav, pendingConfirmableAt);
         }
     }
 
@@ -181,8 +194,35 @@ contract NAVOracle is INAVOracle, Ownable {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     function _accept(uint256 nav) private {
+        // A live pending deliberately SURVIVES an accepted post, and deliberately is
+        // not re-validated against the new anchor.
+        //
+        // An audit pass argued the opposite: a pending means "this move from THIS
+        // anchor is too large to take unilaterally", so once the anchor moves the
+        // pending is measured against a price that no longer exists, and confirming it
+        // is a larger jump than the budget would have allowed. That is true as stated.
+        //
+        // It is still the wrong trade. Clearing a pending here hands the keeper a
+        // unilateral veto over the second key - posting the current NAV always
+        // satisfies the budget, so a compromised keeper cancels every confirmation for
+        // free - and PRD §9 names keeper compromise as the worst realistic attack on
+        // this protocol. The budget is a rate limit on the keeper ACTING ALONE; the
+        // two-key path is meant to be able to exceed it, which is its entire purpose.
+        //
+        // What bounds the residual is that `confirmNav` takes the price as an explicit
+        // argument and reverts on mismatch, so the confirmer ratifies a number they
+        // typed rather than whatever is pending, and `NAV_PENDING_EXPIRY` caps how
+        // long a stale pending can live. Cancellation stays with the two governance
+        // keys via `cancelPendingNav`. Recorded as knowingly accepted, not missed.
+
+        // Freshness tracks when the price last *changed*, not when the keeper last
+        // spoke. A zero-delta repost satisfies any budget for any elapsed time, so
+        // keying `lastUpdated` off every accepted post let a keeper hold a wrong price
+        // indefinitely with `isStale()` never tripping and the second key never
+        // consulted - PRD §9 names keeper compromise as the worst realistic attack.
+        if (nav != navPerBond) lastUpdated = block.timestamp;
+
         navPerBond = nav;
-        lastUpdated = block.timestamp;
         anchorNav = nav;
         anchorAt = block.timestamp;
         emit NAVPosted(nav, block.timestamp);
@@ -191,6 +231,18 @@ contract NAVOracle is INAVOracle, Ownable {
     function _clearPending() private {
         pendingNav = 0;
         pendingConfirmableAt = 0;
+    }
+
+    /// @dev True when `to` differs from `from` by more than `toleranceBps`.
+    ///      Cross-multiplied, no division - the same discipline as `_withinBudget`,
+    ///      because flooring both sides to whole bps is what made that guard vacuous.
+    function _deviatesBeyond(uint256 from, uint256 to, uint256 toleranceBps)
+        private
+        pure
+        returns (bool)
+    {
+        uint256 delta = to > from ? to - from : from - to;
+        return delta * Config.BPS > toleranceBps * from;
     }
 
     /// @dev The budget test, by cross-multiplication with no division anywhere.

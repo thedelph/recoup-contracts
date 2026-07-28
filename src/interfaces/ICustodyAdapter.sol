@@ -18,7 +18,12 @@ interface ICustodyAdapter {
     function mintBonds(bytes calldata mintData) external payable returns (uint256 amount);
 
     /// @notice Stake bond units into the DexFi farm.
-    function stake(uint256 amount) external;
+    /// @return swept USDC the farm paid out alongside the stake and that was forwarded
+    ///         onward. The farm is MasterChef-style, so `deposit` settles the whole
+    ///         staked position's pending rewards exactly as `withdraw` does - meaning
+    ///         a deposit can flush a whole epoch of every borrower's yield. Same
+    ///         accounting obligation as `unstake`: report it or it leaves silently.
+    function stake(uint256 amount) external returns (uint256 swept);
 
     /// @notice Unstake bond units from the farm (withdrawal / liquidation path).
     /// @return swept USDC the farm paid out alongside the unstake and that was

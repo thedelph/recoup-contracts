@@ -34,6 +34,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error NavStale();
     error RenounceDisabled();
     error CreditManagerHasDebt(uint256 outstanding);
+    error CreditManagerVaultMismatch(address creditManagerVault);
 
     event YieldHarvested(uint256 usdcAmount);
 
@@ -82,6 +83,12 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      collateral against a loan the old manager still holds. Both structural
     ///      siblings - `setCustodyAdapter` here and `setLiquiditySource` on
     ///      CreditManager - already guard their own live state; this one did not.
+    ///
+    ///      It also checks the incoming manager is bound back to this vault, the same
+    ///      way `setCustodyAdapter` does. Since Phase 3 the vault settles a position
+    ///      before every bond-count change, and `settleForVault` is gated on the
+    ///      caller being its own vault - so pointing at a manager bound elsewhere
+    ///      reverts every deposit, withdrawal and seizure, with collateral inside.
     function setCreditManager(address creditManager_) external onlyOwner {
         if (creditManager_ == address(0)) revert ZeroAddress();
         address current = creditManager;
@@ -89,6 +96,8 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
             uint256 outstanding = ICreditManager(current).totalDebt();
             if (outstanding != 0) revert CreditManagerHasDebt(outstanding);
         }
+        address boundVault = address(ICreditManager(creditManager_).vault());
+        if (boundVault != address(this)) revert CreditManagerVaultMismatch(boundVault);
         creditManager = creditManager_;
     }
 
@@ -117,13 +126,23 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         ICustodyAdapter adapter = _adapter();
         if (amount == 0) revert ZeroAmount();
 
+        // Settle against the balance that earned, and set a new position's index to
+        // now. Without this a fresh depositor would inherit an index of zero and
+        // immediately claim every epoch distributed before they arrived.
+        _settlePosition(msg.sender);
+
         bondCount[msg.sender] += amount;
         totalBondCount += amount;
         emit BondsDeposited(msg.sender, amount);
 
         // Passes DexFi's whitelist iff the adapter is whitelisted (to-side).
         bond.safeTransferFrom(msg.sender, address(adapter), Config.DEXFI_BOND_TOKEN_ID, amount, "");
-        adapter.stake(amount);
+        // A deposit settles the farm's pending rewards for the whole adapter position,
+        // so it flushes protocol-wide yield exactly as a withdrawal does. Report it
+        // for the same reason: unreported, an epoch of everyone's yield could be
+        // pushed out through the deposit path with nothing accounting for it.
+        uint256 swept = adapter.stake(amount);
+        if (swept != 0) emit YieldHarvested(swept);
     }
 
     /// @inheritdoc ICollateralVault
@@ -139,6 +158,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         uint256 amount = adapter.mintBonds{value: msg.value}(mintData);
         if (amount == 0) revert NothingMinted();
 
+        _settlePosition(msg.sender);
         bondCount[msg.sender] += amount;
         totalBondCount += amount;
         emit ETHDeposited(msg.sender, msg.value, amount);
@@ -150,6 +170,11 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         uint256 held = bondCount[msg.sender];
         if (amount == 0) revert ZeroAmount();
         if (amount > held) revert InsufficientCollateral(amount, held);
+
+        // Credit earned yield first, so the check prices the debt actually owed. A
+        // borrower whose yield has already covered their loan must not be refused
+        // their own collateral on a stale figure.
+        _settlePosition(msg.sender);
 
         // Withdrawal rule (PRD §4.1): free when debt-clear, else the remaining
         // collateral must keep LTV within maxLTV. The formula lives in LtvMath so
@@ -186,6 +211,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
 
         amount = bondCount[owner_];
         if (amount == 0) return 0;
+        _settlePosition(owner_);
         bondCount[owner_] = 0;
         totalBondCount -= amount;
         emit BondsSeized(owner_, to, amount);
@@ -234,6 +260,14 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     function harvestYield() external onlyOwner returns (uint256 usdcAmount) {
         usdcAmount = _adapter().claimYield();
         emit YieldHarvested(usdcAmount);
+    }
+
+    /// @dev Credit any yield the position has earned before its bond count moves.
+    ///      Yield accrued to the OLD balance, so settling after the change would pay
+    ///      the wrong amount in both directions.
+    function _settlePosition(address owner_) private {
+        address cm = creditManager;
+        if (cm != address(0)) ICreditManager(cm).settleForVault(owner_, bondCount[owner_]);
     }
 
     function _adapter() internal view returns (ICustodyAdapter adapter) {

@@ -47,6 +47,45 @@ contract ShortLiquiditySource is ILiquiditySource {
     }
 }
 
+/// @notice A liquidity source that settles a borrower from inside `repayPrincipal`.
+///         Models the Phase-4 LenderPool, which will touch CreditManager during its
+///         own bookkeeping: `settle` is the one value-moving path without
+///         `nonReentrant`, and it increments `pendingPrincipal` via `_settle`.
+///
+///         Exists to pin the difference between assigning that counter from a pre-call
+///         snapshot and decrementing it. Assignment silently erases anything that
+///         landed during the call - or, in the other direction, leaves the counter
+///         above what is owed so the next settlement pays the excess out of USDC
+///         backing `totalClaimable` and the insurance fund.
+contract ReentrantLiquiditySource is ILiquiditySource {
+    IERC20 public immutable usdc;
+    CreditManager public creditManager;
+    address public settleTarget;
+
+    constructor(IERC20 usdc_) {
+        usdc = usdc_;
+    }
+
+    function wire(CreditManager credit_, address target) external {
+        creditManager = credit_;
+        settleTarget = target;
+    }
+
+    function lend(uint256 amount) external {
+        usdc.transfer(msg.sender, amount);
+    }
+
+    function repayPrincipal(uint256 amount) external {
+        // Re-enter before taking delivery, which is the window that matters.
+        if (settleTarget != address(0)) creditManager.settle(settleTarget);
+        usdc.transferFrom(msg.sender, address(this), amount);
+    }
+
+    function available() external view returns (uint256) {
+        return usdc.balanceOf(address(this));
+    }
+}
+
 /// @notice Phase-2 credit core: borrow, repay, yield application, surplus claims and
 ///         the LTV/cap/staleness gates (PRD §4.3, §6.1).
 ///
@@ -56,6 +95,14 @@ contract ShortLiquiditySource is ILiquiditySource {
 contract CreditManagerTest is Test {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
+
+    /// @notice Tolerance for figures that came through the yield stream.
+    /// @dev A stream's rate is `pot * 1e18 / duration`, so running one to completion
+    ///      delivers the pot short by at most 1 wei of USDC; two accrual steps in a
+    ///      test can compound that to 2. Anything larger is a real accounting bug, so
+    ///      this stays deliberately tight rather than being widened to make a test
+    ///      pass. Exact-value assertions are kept wherever the stream is not involved.
+    uint256 internal constant DUST = 2;
     uint256 internal constant MAX_BORROW = 880.25e6; // 100 × 25.15 × 35%, USDC 6dp
     uint256 internal constant FLOAT = 100_000e6;
 
@@ -339,73 +386,154 @@ contract CreditManagerTest is Test {
         assertEq(usdc.allowance(address(credit), address(liquidity)), 0, "no standing allowance");
     }
 
-    // ── applyYield ───────────────────────────────────────────────────────────
+    // ── yield distribution (accumulator) ─────────────────────────────────────
 
-    function test_applyYield_reducesDebt() public {
+    /// @dev Alice is the only holder in this fixture, so she receives the whole
+    ///      distribution and the arithmetic stays checkable by hand.
+    function test_distributeYield_reducesDebt() public {
         vm.prank(alice);
         credit.borrow(500e6);
-        _deliverYield(200e6);
+        _distribute(200e6);
+        credit.settle(alice);
 
-        vm.prank(harvester);
-        credit.applyYield(alice, 200e6);
-
-        assertEq(credit.debtOf(alice), 300e6);
-        assertEq(credit.totalDebt(), 300e6);
-        assertEq(credit.pendingPrincipal(), 200e6);
+        assertApproxEqAbs(credit.debtOf(alice), 300e6, DUST);
+        assertApproxEqAbs(credit.totalDebt(), 300e6, DUST);
+        assertApproxEqAbs(credit.pendingPrincipal(), 200e6, DUST);
     }
 
-    function test_applyYield_overflowGoesToClaimable() public {
+    /// @dev Debt is written down lazily, so the stored figure is stale until someone
+    ///      settles. `currentDebtOf` is the one to trust in between.
+    function test_currentDebtOfReflectsUnsettledYield() public {
+        vm.prank(alice);
+        credit.borrow(500e6);
+        _distribute(200e6);
+
+        assertEq(credit.debtOf(alice), 500e6, "stored figure is still pre-settlement");
+        assertApproxEqAbs(credit.pendingYieldOf(alice), 200e6, DUST);
+        assertApproxEqAbs(credit.currentDebtOf(alice), 300e6, DUST, "what she actually owes");
+    }
+
+    function test_distributeYield_overflowGoesToClaimable() public {
         vm.prank(alice);
         credit.borrow(100e6);
-        _deliverYield(250e6);
-
-        vm.prank(harvester);
-        credit.applyYield(alice, 250e6);
+        _distribute(250e6);
+        credit.settle(alice);
 
         assertEq(credit.debtOf(alice), 0);
-        assertEq(credit.claimableOf(alice), 150e6);
-        assertEq(credit.totalClaimable(), 150e6);
+        assertApproxEqAbs(credit.claimableOf(alice), 150e6, DUST);
+        assertApproxEqAbs(credit.totalClaimable(), 150e6, DUST);
     }
 
-    function test_applyYield_zeroDebtBorrowerGetsItAllAsClaimable() public {
-        _deliverYield(50e6);
-        vm.prank(harvester);
-        credit.applyYield(alice, 50e6);
-        assertEq(credit.claimableOf(alice), 50e6);
+    function test_distributeYield_zeroDebtHolderGetsItAllAsClaimable() public {
+        _distribute(50e6);
+        credit.settle(alice);
+        assertApproxEqAbs(credit.claimableOf(alice), 50e6, DUST);
     }
 
-    function test_applyYield_onlyEpochHarvester() public {
+    function test_distributeYield_onlyEpochHarvester() public {
         vm.expectRevert(CreditManager.NotEpochHarvester.selector);
-        credit.applyYield(alice, 1);
+        credit.distributeYield(1);
     }
 
-    /// @dev Dust is normal in a pro-rata split across 200 positions; 200 empty events
-    ///      are not.
-    function test_applyYield_zeroAmountIsANoOp() public {
-        vm.prank(harvester);
-        credit.applyYield(alice, 0);
-        assertEq(credit.claimableOf(alice), 0);
-    }
-
-    /// @dev The attack this closes: anything holding the harvester role crediting
-    ///      claimable balances it never funded, then draining the contract.
-    function test_applyYield_cannotDistributeUndeliveredYield() public {
+    function test_distributeYield_cannotDistributeUndeliveredYield() public {
         vm.prank(harvester);
         vm.expectRevert(abi.encodeWithSelector(CreditManager.YieldNotDelivered.selector, 1e6, 0));
-        credit.applyYield(alice, 1e6);
+        credit.distributeYield(1e6);
+    }
+
+    /// @dev Splits pro-rata by bond count, not per head.
+    function test_distributeYield_splitsProRataByBonds() public {
+        _giveCollateral(bob, 300); // alice 100, bob 300
+        _distribute(400e6);
+        credit.settle(alice);
+        credit.settle(bob);
+
+        assertApproxEqAbs(credit.claimableOf(alice), 100e6, DUST);
+        assertApproxEqAbs(credit.claimableOf(bob), 300e6, DUST);
+    }
+
+    /// @dev The property that makes lazy settlement safe: arriving after a
+    ///      distribution must earn nothing from it. A new position's index starts at
+    ///      the current accumulator rather than at zero.
+    function test_distributeYield_lateJoinerEarnsNothingFromEarlierEpochs() public {
+        _distribute(100e6);
+        _giveCollateral(bob, 100);
+
+        credit.settle(bob);
+        assertEq(credit.claimableOf(bob), 0, "bob missed that epoch entirely");
+
+        _distribute(200e6); // alice 100, bob 100 -> half each
+        credit.settle(alice);
+        credit.settle(bob);
+        assertApproxEqAbs(credit.claimableOf(alice), 200e6, DUST, "100 from the first, 100 from the second");
+        assertApproxEqAbs(credit.claimableOf(bob), 100e6, DUST);
+    }
+
+    /// @dev Leaving stops accrual. Yield distributed after a full withdrawal belongs
+    ///      to whoever is still holding.
+    function test_distributeYield_leaverEarnsNothingAfterwards() public {
+        _giveCollateral(bob, 100);
+        vm.prank(alice);
+        vault.withdrawBonds(BONDS);
+
+        _distribute(100e6);
+        credit.settle(alice);
+        credit.settle(bob);
+        assertEq(credit.claimableOf(alice), 0);
+        assertApproxEqAbs(credit.claimableOf(bob), 100e6, DUST, "the remaining holder takes all of it");
+    }
+
+    /// @dev A harvest that lands with nothing staked must not divide by zero, and must
+    ///      not credit anyone. The slice goes to the insurance fund as it elapses -
+    ///      see the capture test below for why it cannot simply be held.
+    function test_distributeYield_withNoBondsStakedGoesToInsurance() public {
+        vm.prank(alice);
+        vault.withdrawBonds(BONDS);
+        assertEq(vault.totalBondCount(), 0);
+
+        _distribute(100e6);
+        assertEq(credit.accYieldPerBond(), 0, "nothing to distribute across");
+        assertApproxEqAbs(credit.insuranceFund(), 100e6, DUST, "absorbed, not held");
+        assertLe(credit.undistributedYield(), DUST);
+    }
+
+    /// @dev Settling repeatedly must not pay twice.
+    function test_settle_isIdempotent() public {
+        _distribute(100e6);
+        credit.settle(alice);
+        uint256 after1 = credit.claimableOf(alice);
+        credit.settle(alice);
+        credit.settle(alice);
+        assertEq(credit.claimableOf(alice), after1);
+    }
+
+    /// @dev Truncation below one wei-per-bond stays in the backing balance rather than
+    ///      being counted as distributed, so the solvency identity holds.
+    function testFuzz_distributionNeverPromisesMoreThanItHolds(uint256 amount) public {
+        amount = bound(amount, 1, 10_000e6);
+        _giveCollateral(bob, 337); // deliberately awkward denominator
+        _distribute(amount);
+        credit.settle(alice);
+        credit.settle(bob);
+
+        assertGe(
+            usdc.balanceOf(address(credit)),
+            credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
+                + credit.insuranceFund(),
+            "distribution promised more than the contract holds"
+        );
     }
 
     // ── claimSurplus ─────────────────────────────────────────────────────────
 
     function test_claimSurplus_paysAndZeroes() public {
-        _deliverYield(50e6);
-        vm.prank(harvester);
-        credit.applyYield(alice, 50e6);
+        _distribute(50e6);
+        credit.settle(alice);
 
         vm.prank(alice);
         credit.claimSurplus();
 
-        assertEq(usdc.balanceOf(alice), 50e6);
+        assertApproxEqAbs(usdc.balanceOf(alice), 50e6, DUST);
         assertEq(credit.claimableOf(alice), 0);
         assertEq(credit.totalClaimable(), 0);
     }
@@ -556,6 +684,234 @@ contract CreditManagerTest is Test {
         vault.setCreditManager(makeAddr("freshManager"));
     }
 
+    /// @dev And the incoming manager must be bound back to this vault, the same way
+    ///      `setCustodyAdapter` checks its adapter. The vault settles a position
+    ///      before every bond-count change, and `settleForVault` only accepts calls
+    ///      from its own vault - so a manager bound elsewhere reverts every deposit,
+    ///      withdrawal and seizure, with everyone's collateral already inside.
+    function test_setCreditManager_refusedWhenBoundToAnotherVault() public {
+        CollateralVault otherVault =
+            new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        CreditManager foreign = new CreditManager(
+            usdc, ICollateralVault(address(otherVault)), INAVOracle(address(oracle)), admin
+        );
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CollateralVault.CreditManagerVaultMismatch.selector, address(otherVault)
+            )
+        );
+        vault.setCreditManager(address(foreign));
+    }
+
+    /// @dev Both risk views price against `currentDebtOf`, not the stored `debtOf`.
+    ///      Unsettled yield is already earned and already backed by USDC held here, so
+    ///      reporting against the stale figure is how a keeper queues a liquidation
+    ///      that a free, permissionless `settle` would have cleared.
+    function test_riskViewsPriceAgainstDebtNetOfEarnedYield() public {
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        uint256 ltvBefore = credit.currentLtvBps(alice);
+        uint256 hfBefore = credit.healthFactor(alice);
+
+        _distribute(400e6); // earned, but nobody has settled
+
+        assertEq(credit.debtOf(alice), MAX_BORROW, "still unsettled");
+        assertLt(credit.currentLtvBps(alice), ltvBefore, "LTV reflects the write-down");
+        assertGt(credit.healthFactor(alice), hfBefore, "and so does health");
+
+        // Settling changes nothing the views had not already reported.
+        uint256 ltvUnsettled = credit.currentLtvBps(alice);
+        credit.settle(alice);
+        assertEq(credit.currentLtvBps(alice), ltvUnsettled, "the views were not guessing");
+    }
+
+    /// @dev Claiming settles first. Without it a borrower whose debt is already
+    ///      cleared has to call `settle` themselves before the overflow is visible,
+    ///      and claiming looks like it lost them money when it merely ran early.
+    function test_claimSurplus_settlesBeforePaying() public {
+        vm.prank(alice);
+        credit.borrow(100e6);
+        _distribute(250e6);
+
+        // Deliberately no settle() call here.
+        assertEq(credit.claimableOf(alice), 0, "nothing booked yet");
+
+        vm.prank(alice);
+        credit.claimSurplus();
+        assertApproxEqAbs(usdc.balanceOf(alice), 100e6 + 150e6, DUST, "borrowed plus the surplus");
+        assertEq(credit.debtOf(alice), 0, "and the debt was cleared on the way");
+    }
+
+    // ── detachment ───────────────────────────────────────────────────────────
+
+    /// @dev **The orphaned-manager regression.** Repointing the vault at a new
+    ///      CreditManager left the old one fully live: `settle`, `accrueYield` and
+    ///      `claimSurplus` stayed permissionless and kept reading the vault's live
+    ///      bond counts, while the vault no longer settled into it. The invariant its
+    ///      accumulator rests on - the vault settles before every bond-count change -
+    ///      was severed, so anyone depositing after the swap held a zero index against
+    ///      a non-zero historical accumulator and could claim the orphan's whole
+    ///      balance, insurance fund included.
+    ///
+    ///      The swap guard passes at zero debt, which is the *normal* end state of a
+    ///      self-repaying loan, so this was reachable through ordinary operation.
+    function test_detachedManagerCannotPriceNewPositions() public {
+        // Build up an accumulator and an insurance balance on the live manager.
+        _distribute(400e6);
+        usdc.mint(address(this), 200e6);
+        usdc.approve(address(credit), 200e6);
+        credit.fundInsurance(200e6);
+        assertGt(credit.accYieldPerBond(), 0);
+        assertGt(usdc.balanceOf(address(credit)), 0);
+
+        // Alice clears out so the swap guard passes, then the owner migrates.
+        credit.settle(alice);
+        vm.prank(alice);
+        credit.claimSurplus();
+        assertEq(credit.totalDebt(), 0);
+
+        CreditManager fresh =
+            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        vm.prank(admin);
+        vault.setCreditManager(address(fresh));
+
+        // The attacker deposits into the vault, which now settles only into `fresh`,
+        // leaving their index on the old manager at zero.
+        address raider = makeAddr("raider");
+        _giveCollateral(raider, BONDS * 5);
+
+        // Every path that would price them against the stale accumulator now refuses.
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.Detached.selector, address(fresh)));
+        credit.settle(raider);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.Detached.selector, address(fresh)));
+        credit.accrueYield();
+        vm.prank(raider);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.Detached.selector, address(fresh)));
+        credit.borrow(1e6);
+
+        vm.prank(raider);
+        vm.expectRevert(CreditManager.NothingToClaim.selector);
+        credit.claimSurplus();
+
+        assertEq(credit.claimableOf(raider), 0, "no entitlement was minted");
+        assertEq(credit.insuranceFund(), 200e6, "the insurance fund is untouched");
+    }
+
+    /// @dev Exits must survive a migration, so a detached manager still lets a
+    ///      borrower repay and still pays out balances recorded while it was live.
+    function test_detachedManagerStillHonoursExits() public {
+        vm.prank(alice);
+        credit.borrow(500e6);
+        _distribute(700e6);
+        credit.settle(alice); // debt cleared, surplus recorded while attached
+
+        uint256 owed = credit.claimableOf(alice);
+        assertGt(owed, 0);
+        assertEq(credit.totalDebt(), 0);
+
+        CreditManager fresh =
+            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        vm.prank(admin);
+        vault.setCreditManager(address(fresh));
+
+        vm.prank(alice);
+        credit.claimSurplus();
+        assertEq(usdc.balanceOf(alice), 500e6 + owed, "recorded surplus still payable");
+    }
+
+    /// @dev **The counter-overwrite regression.** `settlePrincipal` snapshots
+    ///      `pendingPrincipal`, makes an external call, then wrote back
+    ///      `amount - delivered` - an assignment derived from a pre-call figure. Any
+    ///      increment landing during that call was silently erased, and `settle` is
+    ///      the one value-moving path without `nonReentrant`.
+    ///
+    ///      Here the source settles bob mid-call, writing his yield down against his
+    ///      debt and pushing that principal onto the counter. All of it must survive.
+    function test_settlePrincipal_survivesASourceThatSettlesMidCall() public {
+        ReentrantLiquiditySource source = new ReentrantLiquiditySource(usdc);
+        usdc.mint(address(source), FLOAT);
+
+        // Fresh manager so the liquidity source can be swapped in at zero debt.
+        CreditManager credit2 =
+            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        vm.startPrank(admin);
+        vault.setCreditManager(address(credit2));
+        credit2.setLiquiditySource(address(source));
+        credit2.setEpochHarvester(harvester);
+        vm.stopPrank();
+
+        _giveCollateral(bob, BONDS);
+        vm.prank(alice);
+        credit2.borrow(300e6);
+        vm.prank(bob);
+        credit2.borrow(300e6);
+
+        // Deliver an epoch and let it stream, so both have yield to settle.
+        usdc.mint(harvester, 400e6);
+        vm.startPrank(harvester);
+        usdc.approve(address(credit2), 400e6);
+        credit2.receiveYield(400e6);
+        credit2.distributeYield(400e6);
+        vm.stopPrank();
+        skip(Config.YIELD_STREAM_DURATION);
+
+        // Settle alice only; bob's write-down will land during the external call.
+        credit2.settle(alice);
+        uint256 queued = credit2.pendingPrincipal();
+        assertGt(queued, 0);
+
+        source.wire(credit2, bob);
+        credit2.settlePrincipal();
+
+        // Bob's principal was added mid-call and must still be owed, not erased.
+        uint256 bobShare = 400e6 / 2;
+        assertApproxEqAbs(
+            credit2.pendingPrincipal(), bobShare, DUST, "the re-entrant increment survived"
+        );
+        // And the contract still covers every claim on it.
+        assertGe(
+            usdc.balanceOf(address(credit2)),
+            credit2.totalClaimable() + credit2.undistributedYield() + credit2.pendingPrincipal()
+                + credit2.insuranceFund(),
+            "solvency held through the re-entrancy"
+        );
+    }
+
+    // ── the accrual window ───────────────────────────────────────────────────
+
+    /// @dev **The fixed-window regression.** Streaming closed same-block capture, but
+    ///      the rate was always `pot / 5 days` even when the pot represented months of
+    ///      accrual - so an attacker who deposited just before a long-delayed harvest
+    ///      captured a share wildly out of proportion to the time they were staked.
+    ///      The first epoch is the worst case: it skips the cooldown entirely, and
+    ///      `harvest` is permissionless, so the attacker picks the block.
+    ///
+    ///      Rating the stream over the window the pot actually accrued over makes the
+    ///      round trip cost what it earns, at any window length.
+    function test_stream_longAccrualWindowIsNotJustInTimeCapturable() public {
+        // Sixty days pass before the first epoch is ever harvested.
+        skip(60 days);
+
+        address jit = makeAddr("jit");
+        _giveCollateral(jit, BONDS * 9); // 9x alice's stake, arriving at the last moment
+
+        _deliver(1_000e6);
+
+        // Five days in - a full YIELD_STREAM_DURATION - the attacker exits.
+        skip(Config.YIELD_STREAM_DURATION);
+        credit.settle(jit);
+        uint256 captured = credit.claimableOf(jit);
+
+        // Their entitlement is bounded by time staked, not by the size of the pot:
+        // 5 days of a 60-day stream at 90% of the bonds is ~7.5% of the epoch.
+        assertLt(captured, 100e6, "a fixed 5-day window would have paid them ~900e6");
+
+        // And the rest is still there for the holders who stayed.
+        assertGt(credit.undistributedYield(), 800e6, "the epoch is still being paid out");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     function _giveCollateral(address who, uint256 bonds) private {
@@ -566,11 +922,135 @@ contract CreditManagerTest is Test {
         vm.stopPrank();
     }
 
-    function _deliverYield(uint256 amount) private {
+    /// @dev Deliver and distribute in one step, the way EpochHarvester does, then run
+    ///      the stream to completion.
+    ///
+    ///      The warp is the point rather than a convenience: an epoch's share is
+    ///      streamed over YIELD_STREAM_DURATION, so nothing is claimable the instant
+    ///      it is distributed. These tests are about how a fully-elapsed epoch is
+    ///      split between positions, so they let it elapse; the streaming behaviour
+    ///      itself is covered separately below.
+    function _distribute(uint256 amount) private {
+        _deliver(amount);
+        skip(Config.YIELD_STREAM_DURATION);
+        credit.accrueYield();
+    }
+
+    /// @dev Deliver and start the stream without waiting for it.
+    function _deliver(uint256 amount) private {
         usdc.mint(harvester, amount);
         vm.startPrank(harvester);
         usdc.approve(address(credit), amount);
         credit.receiveYield(amount);
+        credit.distributeYield(amount);
         vm.stopPrank();
+    }
+
+    // ── streaming ────────────────────────────────────────────────────────────
+
+    /// @dev The reason distribution streams at all. A lump credited to whoever holds
+    ///      bonds at the harvest instant is free money for anyone watching the
+    ///      mempool: deposit big, settle, claim, withdraw, all in one transaction.
+    ///      Here the attacker brings 9x alice's collateral and still leaves with
+    ///      nothing, because they held it for zero seconds.
+    function test_stream_justInTimeDepositEarnsNothing() public {
+        address jit = makeAddr("jit");
+        _giveCollateral(jit, BONDS * 9); // 900 bonds against alice's 100
+
+        _deliver(550e6);
+
+        // Same block as the distribution: settle, and try to take the epoch.
+        credit.settle(jit);
+        assertEq(credit.claimableOf(jit), 0, "nothing accrues in zero seconds");
+
+        vm.prank(jit);
+        vm.expectRevert(CreditManager.NothingToClaim.selector);
+        credit.claimSurplus();
+
+        // And the yield is still there for the holders who actually stay staked.
+        skip(Config.YIELD_STREAM_DURATION);
+        credit.settle(alice);
+        assertApproxEqAbs(credit.claimableOf(alice), 55e6, DUST, "alice keeps her tenth");
+    }
+
+    /// @dev A position that leaves halfway through the stream keeps the half it was
+    ///      staked for and no more. This is what the accumulator buys over a snapshot.
+    function test_stream_accruesInProportionToTimeStaked() public {
+        _deliver(100e6);
+
+        skip(Config.YIELD_STREAM_DURATION / 2);
+        credit.settle(alice);
+        assertApproxEqAbs(credit.claimableOf(alice), 50e6, DUST, "half the stream, half the yield");
+
+        skip(Config.YIELD_STREAM_DURATION / 2);
+        credit.settle(alice);
+        assertApproxEqAbs(credit.claimableOf(alice), 100e6, DUST, "the rest arrives by the end");
+    }
+
+    /// @dev Views must project the stream, not report the last written accumulator.
+    ///      A keeper reading a debt the stream has already paid down would queue a
+    ///      liquidation that a free, permissionless `settle` would have cleared.
+    function test_stream_viewsProjectWithoutSettling() public {
+        vm.prank(alice);
+        credit.borrow(500e6);
+        _deliver(100e6);
+
+        skip(Config.YIELD_STREAM_DURATION / 2);
+        assertApproxEqAbs(credit.pendingYieldOf(alice), 50e6, DUST, "visible before settling");
+        assertApproxEqAbs(credit.currentDebtOf(alice), 450e6, DUST, "debt already partly paid");
+        assertEq(credit.debtOf(alice), 500e6, "the stored figure has not moved");
+    }
+
+    /// @dev Nothing accrues past the end of the stream, so an epoch cannot pay out
+    ///      more than was delivered however long nobody touches it.
+    function test_stream_stopsAtTheEnd() public {
+        _deliver(100e6);
+        skip(Config.YIELD_STREAM_DURATION * 10);
+        credit.settle(alice);
+        assertApproxEqAbs(credit.claimableOf(alice), 100e6, DUST, "capped at what arrived");
+        assertLe(credit.undistributedYield(), DUST, "and the pot is drained but for dust");
+    }
+
+    /// @dev **The zero-stake capture regression.** An earlier version advanced the
+    ///      clock through an unstaked window but retained the money, on the reasoning
+    ///      that holding it was kinder than burning it. It was not: the retained pot
+    ///      was re-rated across whatever bond base existed at the *next* distribution,
+    ///      so after a mass exit a single bond deposited before the next epoch
+    ///      captured the entire previous cohort's yield.
+    ///
+    ///      The old test hid this by having the same holder return, which made a
+    ///      full-value payout look correct instead of looking like a windfall.
+    function test_stream_unstakedWindowCannotBeCapturedByALateArrival() public {
+        // The whole cohort exits one second into the stream.
+        _deliver(1_000e6);
+        skip(1);
+        vm.prank(alice);
+        vault.withdrawBonds(BONDS);
+        assertEq(vault.totalBondCount(), 0);
+
+        // Alice keeps exactly the one second she was staked for, paid on her way out.
+        uint256 aliceEarned = credit.claimableOf(alice);
+        uint256 perSecond = (1_000e6 / Config.YIELD_STREAM_DURATION);
+        assertApproxEqAbs(aliceEarned, perSecond, 2, "one second staked, one second paid");
+
+        // The rest of the stream elapses with nobody staked.
+        skip(Config.YIELD_STREAM_DURATION);
+        credit.accrueYield();
+        assertApproxEqAbs(
+            credit.insuranceFund(),
+            1_000e6 - aliceEarned,
+            DUST,
+            "everything she did not earn went to insurance, not into a capturable pot"
+        );
+
+        // An attacker arrives with a single bond and triggers a fresh epoch.
+        address jit = makeAddr("jit");
+        _giveCollateral(jit, 1);
+        _distribute(1e6);
+        credit.settle(jit);
+
+        // They get their share of the new epoch only, not the abandoned cohort's.
+        assertApproxEqAbs(credit.claimableOf(jit), 1e6, DUST, "only the epoch they were there for");
+        assertLt(credit.claimableOf(jit), 2e6, "the previous cohort's yield was not capturable");
     }
 }

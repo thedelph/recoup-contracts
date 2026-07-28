@@ -148,6 +148,7 @@ contract CollateralVaultInvariants is Test {
             admin,
             makeAddr("treasury")
         );
+        credit.setVault(address(vault)); // setCreditManager checks the binding back
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));

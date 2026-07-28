@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.24;
 
+import {ICollateralVault} from "./ICollateralVault.sol";
+
 /// @title ICreditManager
 /// @notice Debt accounting: borrow, optional manual repay, yield-driven write-down,
 ///         liquidation trigger (PRD §4.3). No borrow interest in v1.
@@ -18,9 +20,36 @@ interface ICreditManager {
     /// @notice Optional manual repayment, always allowed.
     function repay(uint256 amount) external;
 
-    /// @notice Reduce a borrower's debt from harvested yield; overflow beyond debt
-    ///         accrues to their claimable USDC balance. EpochHarvester only.
-    function applyYield(address borrower, uint256 amount) external;
+    /// @notice Deliver an epoch's borrower share before distributing it, so the
+    ///         accumulator can only ever promise USDC that has actually arrived.
+    ///         EpochHarvester only; pulls against an allowance.
+    function receiveYield(uint256 amount) external;
+
+    /// @notice Add USDC to the insurance fund, which absorbs auction shortfalls before
+    ///         any loss reaches lenders. Permissionless; pulls against an allowance.
+    function fundInsurance(uint256 amount) external;
+
+    /// @notice Spread an epoch's borrower share across every bond, in one write.
+    ///         EpochHarvester only, and the USDC must already have been delivered.
+    /// @dev Positions are not iterated. Each one works out its own share lazily from
+    ///      the difference between the running yield-per-bond and its own recorded
+    ///      index, which is what lets PRD §6.2's 200+ positions settle in one call.
+    function distributeYield(uint256 amount) external;
+
+    /// @notice Apply a position's accrued yield: debt first, remainder to claimable.
+    ///         Permissionless - it can only help the position it settles.
+    function settle(address borrower) external;
+
+    /// @notice Settle before the vault changes a bond count. Vault only.
+    /// @param currentBonds The balance BEFORE the change, since that is what earned.
+    function settleForVault(address borrower, uint256 currentBonds) external;
+
+    /// @return Yield this position has earned but not yet settled.
+    function pendingYieldOf(address borrower) external view returns (uint256);
+
+    /// @return Debt net of unsettled yield - what the borrower actually owes.
+    ///         `debtOf` is the stored figure and can be stale between settlements.
+    function currentDebtOf(address borrower) external view returns (uint256);
 
     /// @notice Claim yield accrued beyond debt (and post-liquidation surplus).
     function claimSurplus() external;
@@ -32,6 +61,12 @@ interface ICreditManager {
     function debtOf(address borrower) external view returns (uint256);
 
     function totalDebt() external view returns (uint256);
+
+    /// @notice The vault this manager is bound to. Exposed so the vault can refuse to
+    ///         point at a manager bound elsewhere: `settleForVault` is caller-gated on
+    ///         this, and the vault settles before every bond-count change, so a
+    ///         mismatched pointer reverts every deposit, withdrawal and seizure.
+    function vault() external view returns (ICollateralVault);
 
     /// @return ltvBps debt / collateralValue in bps. Zero when there is no debt,
     ///         whatever the collateral; type(uint256).max when there is debt against
