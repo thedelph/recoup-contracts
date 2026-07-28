@@ -4,11 +4,14 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {CollateralVault} from "../src/CollateralVault.sol";
+import {Config} from "../src/Config.sol";
+import {LtvMath} from "../src/LtvMath.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
+import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockCreditManager} from "./mocks/MockCreditManager.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
@@ -99,25 +102,66 @@ contract VaultHandler is Test {
         vault.harvestYield();
     }
 
+    /// @dev Asserts the gate and its complement together: a seize must succeed exactly
+    ///      when the position is liquidatable and fail exactly when it is not. Written
+    ///      as one action rather than two tests because a guard and the states it is
+    ///      supposed to admit are the classic pair that both pass in isolation while
+    ///      being mutually unsatisfiable.
     function seize(uint256 actorSeed) external {
         address a = _actor(actorSeed);
         uint256 held = vault.bondCount(a);
         address winner = makeAddr("winner");
+        bool liquidatable = _liquidatable(a, held);
+
         vm.prank(auction);
-        uint256 got = vault.seize(a, winner);
-        assertEq(got, held, "seize must move the whole position");
-        ghostTotalBondCount -= held;
-        ghostSeizedToWinners += held;
+        try vault.seize(a, winner) returns (uint256 got) {
+            assertTrue(liquidatable || held == 0, "seized a position that was not liquidatable");
+            assertEq(got, held, "seize must move the whole position");
+            ghostTotalBondCount -= held;
+            ghostSeizedToWinners += held;
+        } catch {
+            assertFalse(liquidatable && held != 0, "refused a genuinely liquidatable position");
+        }
+    }
+
+    /// @dev The workout path. Moves the claim to the auction and nothing else, so the
+    ///      bond-conservation invariants must be completely indifferent to it.
+    function reassign(uint256 actorSeed) external {
+        address a = _actor(actorSeed);
+        uint256 held = vault.bondCount(a);
+        if (a == auction) return;
+        bool liquidatable = _liquidatable(a, held);
+
+        vm.prank(auction);
+        try vault.reassign(a, auction) returns (uint256 moved) {
+            assertTrue(liquidatable || held == 0, "reassigned a position that was not liquidatable");
+            assertEq(moved, held, "reassign must move the whole claim");
+        } catch {
+            assertFalse(liquidatable && held != 0, "refused a genuinely liquidatable position");
+        }
+    }
+
+    function _liquidatable(address who, uint256 held) internal view returns (bool) {
+        return LtvMath.exceedsLtv(
+            credit.currentDebtOf(who),
+            LtvMath.collateralValue(held, vault.navOracle().navPerBond()),
+            Config.LIQUIDATION_THRESHOLD_BPS
+        );
     }
 
     function actorCount() external view returns (uint256) {
         return actors.length;
     }
 
+    /// @dev The auction is counted too. A workout reassigns a defaulted position's
+    ///      claim to it, and those bonds are still staked and still collateral - so
+    ///      leaving it out would not just under-count, it would make the vault look
+    ///      insolvent the moment anything expired.
     function sumBondCounts() external view returns (uint256 sum) {
         for (uint256 i = 0; i < actors.length; i++) {
             sum += vault.bondCount(actors[i]);
         }
+        sum += vault.bondCount(auction);
     }
 }
 
@@ -131,7 +175,8 @@ contract CollateralVaultInvariants is Test {
 
     function setUp() public {
         address admin = makeAddr("admin");
-        address auction = makeAddr("auction");
+        MockLiquidationAuction auctionMock = new MockLiquidationAuction();
+        address auction = address(auctionMock);
         usdc = new MockUSDC();
         bond = new MockBond();
         farm = new MockFarm(bond, usdc);
@@ -149,6 +194,7 @@ contract CollateralVaultInvariants is Test {
             makeAddr("treasury")
         );
         credit.setVault(address(vault)); // setCreditManager checks the binding back
+        auctionMock.setVault(address(vault));
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));

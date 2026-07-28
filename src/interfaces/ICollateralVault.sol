@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.24;
 
+
+
 /// @title ICollateralVault
 /// @notice Holds bond collateral (fungible ERC-1155 units, id 0), tracks per-owner
 ///         balances, delegates DexFi interaction to an ICustodyAdapter (PRD §4.1).
@@ -9,6 +11,8 @@ interface ICollateralVault {
     event ETHDeposited(address indexed owner, uint256 ethAmount, uint256 bondAmount);
     event BondsWithdrawn(address indexed owner, uint256 amount);
     event BondsSeized(address indexed owner, address indexed to, uint256 amount);
+    event BondsReassigned(address indexed from, address indexed to, uint256 amount);
+    event BondsDisposed(address indexed from, address indexed to, uint256 amount);
 
     /// @notice Deposit existing bond units as collateral; vault stakes them into
     ///         the farm. Requires the depositor↔vault transfer to pass DexFi's
@@ -23,11 +27,32 @@ interface ICollateralVault {
     ///         LTV ≤ maxLTV.
     function withdrawBonds(uint256 amount) external;
 
-    /// @notice Move a liquidated position's bonds to the auction winner / workout
-    ///         queue. LiquidationAuction only.
+    /// @notice Move a liquidated position's bonds out to the auction winner.
+    ///         LiquidationAuction only, and only while the position is liquidatable.
     function seize(address owner, address to) external returns (uint256 amount);
 
+    /// @notice Move a liquidated position's *ledger entry* to `to`, leaving the bonds
+    ///         staked exactly where they are. LiquidationAuction only, and only while
+    ///         the position is liquidatable.
+    /// @dev This is the workout path. It exists because DexFi gates bond transfers on
+    ///      a whitelist that only the custody adapter is on, so an expiry path that
+    ///      moved tokens would need a second whitelisted address the protocol does not
+    ///      have - and would therefore be a path that can revert while holding someone
+    ///      else's collateral. Moving the claim instead makes expiry unfailable, and
+    ///      leaves the lot earning through the manual-redemption wait.
+    function reassign(address from, address to) external returns (uint256 amount);
+
+    /// @notice Send a workout lot out of custody in one hop, through the adapter.
+    ///         LiquidationAuction only.
+    function disposeTo(address to, uint256 amount) external;
+
     function bondCount(address owner) external view returns (uint256);
+
+    /// @notice The auction this vault accepts `seize`/`reassign`/`disposeTo` from.
+    /// @dev Read by `CreditManager.liquidate`, which must not open an auction the vault
+    ///      will not honour - that auction's every exit would revert.
+    function liquidationAuction() external view returns (address);
+
 
     /// @notice The CreditManager this vault currently settles into.
     /// @dev Exposed so a CreditManager can tell whether it is still the live one. Its

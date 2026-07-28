@@ -118,9 +118,19 @@ contract DeployTest is Test, DeployBase {
     ///      already call vault.harvestYield() directly, so wiring it buys nothing and
     ///      would hand a claim right to an address that cannot use it. It becomes
     ///      load-bearing only once the owner is slow, or the EpochHarvester ships.
-    function test_adapterHarvesterIsDeliberatelyUnset() public {
+    /// @dev Was `test_adapterHarvesterIsDeliberatelyUnset`. The deferral it asserted was
+    ///      written before the EpochHarvester existed and outlived its own stated
+    ///      trigger; leaving it unset meant `harvest` could never claim, so every epoch
+    ///      silently reported zero yield.
+    function test_adapterYieldPathReachesTheHarvester() public {
         Deployed memory d = _deployProtocol(_externals(), _params(), address(this));
-        assertEq(d.adapter.harvester(), address(0));
+
+        // Permission to claim...
+        assertEq(d.adapter.harvester(), address(d.harvester), "harvester may claim");
+        // ...and the destination the claimed USDC actually sweeps to. The second is
+        // the one that carries the money; wiring only the first still routes 100% of
+        // yield past the split.
+        assertEq(d.adapter.yieldRecipient(), address(d.harvester), "and it lands there");
     }
 
     /// @dev The end-to-end proof that the wiring produces a protocol that can actually
@@ -160,7 +170,11 @@ contract DeployTest is Test, DeployBase {
     function test_yieldRecipientIsNotTheDeployerOrOwner() public {
         Deployed memory d = _deployProtocol(_externals(), _params(), address(this));
 
-        assertEq(d.adapter.yieldRecipient(), treasury);
+        // The sink is the harvester, which then splits to the treasury via its
+        // protocol-fee leg. What still matters here is that it is never an address
+        // that could quietly pocket the whole epoch.
+        assertEq(d.adapter.yieldRecipient(), address(d.harvester));
+        assertTrue(d.adapter.yieldRecipient() != treasury, "not straight to the treasury");
         assertTrue(d.adapter.yieldRecipient() != address(this));
         assertTrue(d.adapter.yieldRecipient() != owner);
     }

@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+import {MockLiquidationAuction} from "../mocks/MockLiquidationAuction.sol";
 import {Config} from "../../src/Config.sol";
 import {CollateralVault} from "../../src/CollateralVault.sol";
 import {DirectCallAdapter} from "../../src/adapters/DirectCallAdapter.sol";
@@ -58,7 +59,11 @@ contract CollateralVaultForkTest is Test {
         adapter = new DirectCallAdapter(bond, farm, usdc, address(vault), admin, treasury);
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
-        vault.setLiquidationAuction(makeAddr("auction"));
+        // The vault refuses an auction pointer that is not a contract bound back to it,
+        // so suites that never run a liquidation still need a stand-in.
+        MockLiquidationAuction auctionStub = new MockLiquidationAuction();
+        auctionStub.setVault(address(vault));
+        vault.setLiquidationAuction(address(auctionStub));
         vm.stopPrank();
 
         // Source real bond units for alice: the farm holds the staked supply and is

@@ -83,14 +83,20 @@ contract SkeletonsTest is Test {
     }
 
     function test_stubsRevertNotImplemented() public {
-        // liquidate() is the remaining phase-3 stub on CreditManager.
-        vm.expectRevert(CreditManager.NotImplemented.selector);
+        // liquidate() is implemented as of phase 3. It reaches its own gate rather
+        // than a stub - with no debt there is nothing to liquidate, and that is the
+        // first thing it checks.
+        vm.expectRevert(CreditManager.NoDebt.selector);
         credit.liquidate(address(this));
 
         // harvestRange stays unimplemented on purpose: distributeYield settles every
         // position in one write, so there is no per-position iteration to paginate.
         vm.expectRevert(EpochHarvester.NotImplemented.selector);
         harvester.harvestRange(0, 1);
+
+        // The LenderPool's protocol flows are the remaining phase-4 stubs.
+        vm.expectRevert(LenderPool.NotImplemented.selector);
+        pool.queuePosition(address(this));
     }
 
     function test_borrowRefusesUntilLiquiditySourceIsWired() public {

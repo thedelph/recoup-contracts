@@ -18,6 +18,8 @@ import {ILiquiditySource} from "../src/interfaces/ILiquiditySource.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
+import {MockLenderPool} from "./mocks/MockLenderPool.sol";
+import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
@@ -111,7 +113,8 @@ contract CreditManagerTest is Test {
     address internal bob = makeAddr("bob");
     address internal harvester = makeAddr("harvester");
     address internal yieldSink = makeAddr("yieldSink");
-    address internal auction = makeAddr("auction");
+    MockLiquidationAuction internal auctionMock;
+    address internal auction;
 
     MockUSDC internal usdc;
     MockBond internal bond;
@@ -128,6 +131,8 @@ contract CreditManagerTest is Test {
         farm = new MockFarm(bond, usdc);
         bond.setRewardPool(address(farm));
         oracle = new MockNavOracle(NAV);
+        auctionMock = new MockLiquidationAuction();
+        auction = address(auctionMock);
 
         vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
         adapter = new DirectCallAdapter(
@@ -139,7 +144,15 @@ contract CreditManagerTest is Test {
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));
-        vault.setLiquidationAuction(auction);
+        auctionMock.setVault(address(vault));
+        // `borrow` now refuses while the three wiring pointers disagree, so the mock
+        // has to report the aligned state the fixture is in.
+        auctionMock.setCreditManager(address(credit));
+        // Deliberately NOT wired here. An auction the vault names while this manager
+        // does not is a half-finished migration, and `borrow` now refuses in it - so a
+        // fixture that wired only the vault's side would put every borrow test in a
+        // state the protocol rejects. `_wireAuction` sets both; until it runs, this is
+        // the honest Phase-2 shape, with no auction anywhere.
         credit.setLiquiditySource(address(liquidity));
         credit.setEpochHarvester(harvester);
         liquidity.setCreditManager(address(credit));
@@ -1052,5 +1065,369 @@ contract CreditManagerTest is Test {
         // They get their share of the new epoch only, not the abandoned cohort's.
         assertApproxEqAbs(credit.claimableOf(jit), 1e6, DUST, "only the epoch they were there for");
         assertLt(credit.claimableOf(jit), 2e6, "the previous cohort's yield was not capturable");
+    }
+
+    // ── liquidate: the gate ──────────────────────────────────────────────────
+
+    /// @dev Wires a recording auction so `liquidate` can reach the line past its own
+    ///      gate. A typed call to an address with no code reverts, so an EOA will not
+    ///      do here.
+    /// @dev Wires the *same* auction the vault already honours. `liquidate` now refuses
+    ///      to open an auction the vault will not accept, because such an auction has no
+    ///      reachable exit - so a fixture pointing the two at different mocks no longer
+    ///      models anything real.
+    function _wireAuction() internal returns (MockLiquidationAuction a) {
+        a = auctionMock;
+        vm.startPrank(admin);
+        vault.setLiquidationAuction(address(a));
+        credit.setLiquidationAuction(address(a));
+        vm.stopPrank();
+    }
+
+    /// @notice New debt is refused while the wiring pointers disagree.
+    /// @dev `liquidate` already refused in exactly these states - it carries an
+    ///      `AuctionPointerMismatch` check - but `borrow` checked neither, so the
+    ///      protocol's only risk-reduction mechanism was offline while its risk-taking
+    ///      one stayed open. A manager migration cannot be atomic across two contracts,
+    ///      so every one passes through this window, and it is unbounded in wall-clock
+    ///      time because it ends only when the owner sends the second transaction.
+    ///
+    ///      The state is self-camouflaging: the auction's own `liveAuctionCount == 0`
+    ///      precondition reads as "nothing in flight" precisely *because* nothing can
+    ///      open an auction.
+    function test_borrow_refusedWhileTheAuctionPointersDisagree() public {
+        MockLiquidationAuction a = _wireAuction();
+
+        // The auction still names the manager it was wired to: borrowing is fine.
+        vm.prank(alice);
+        credit.borrow(100e6);
+
+        // Mid-migration: the auction now settles against a different manager.
+        address otherManager = makeAddr("otherManager");
+        a.setCreditManager(otherManager);
+
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CreditManager.AuctionPointerMismatch.selector, otherManager, address(credit)
+            )
+        );
+        credit.borrow(100e6);
+
+        // Repaying is never blocked - the guard must not trap anyone inside a position.
+        vm.startPrank(alice);
+        usdc.approve(address(credit), 100e6);
+        credit.repay(100e6);
+        vm.stopPrank();
+        assertEq(credit.debtOf(alice), 0, "the exit stays open");
+
+        // And it reopens the moment the migration completes.
+        a.setCreditManager(address(credit));
+        vm.prank(alice);
+        credit.borrow(100e6);
+        assertEq(credit.debtOf(alice), 100e6, "the hatch is reachable");
+    }
+
+    /// @notice The same guard, from the side the first version of it missed.
+    /// @dev Round 8 caught this. The guard originally read `liquidationAuction` off
+    ///      `this`, which is zero on a freshly deployed incoming manager - so on the
+    ///      migration order the code actually requires (vault first, then auction) it
+    ///      skipped itself in precisely the window it existed to close, and only bit if
+    ///      the auction happened to be pre-wired. From the manager, Phase 2 and a
+    ///      half-finished migration look identical; from the vault they do not, so the
+    ///      vault is what it asks now.
+    function test_borrow_refusedOnAFreshManagerWhileTheVaultAlreadyHasAnAuction() public {
+        _wireAuction();
+
+        CreditManager next =
+            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        vm.startPrank(admin);
+        next.setLiquiditySource(address(liquidity));
+        next.setEpochHarvester(harvester);
+        vault.setCreditManager(address(next));
+        liquidity.setCreditManager(address(next));
+        vm.stopPrank();
+
+        // `next.liquidationAuction` is still zero, so `next.liquidate` cannot open an
+        // auction at all. Debt drawn here would be unliquidatable until the owner sends
+        // the second transaction, and nothing bounds how long that takes.
+        assertEq(next.liquidationAuction(), address(0));
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CreditManager.AuctionPointerMismatch.selector, address(0), address(auctionMock)
+            )
+        );
+        next.borrow(100e6);
+
+        // Finishing the wiring opens it, so this never traps a migration.
+        auctionMock.setCreditManager(address(next));
+        vm.prank(admin);
+        next.setLiquidationAuction(address(auctionMock));
+        vm.prank(alice);
+        next.borrow(100e6);
+        assertEq(next.debtOf(alice), 100e6, "and the hatch is reachable");
+    }
+
+    function test_liquidate_revertsWithNoDebt() public {
+        _wireAuction();
+        vm.expectRevert(CreditManager.NoDebt.selector);
+        credit.liquidate(alice);
+    }
+
+    function test_liquidate_revertsWhileHealthy() public {
+        _wireAuction();
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.PositionHealthy.selector, Config.MAX_LTV_BPS));
+        credit.liquidate(alice);
+    }
+
+    /// @notice The whole reason `LtvMath.exceedsLtv` exists.
+    /// @dev 100 bonds at $10.00 is exactly $1,000 of collateral, so the threshold sits
+    ///      at exactly 580 USDC. One extra unit of debt puts the position genuinely
+    ///      past it - but `ltvBps` floors, so the view still reports 5800 bps and
+    ///      `healthFactor` still reports exactly 1e18 "healthy". A gate that read the
+    ///      view would refuse the first position that ever becomes liquidatable.
+    ///
+    ///      Both halves are asserted here rather than in two tests, because the point
+    ///      is precisely that they disagree.
+    function test_liquidate_oneUnitPastThresholdIsLiquidatableThoughHealthFactorReadsExactlyOne() public {
+        MockLiquidationAuction a = _wireAuction();
+
+        vm.prank(alice);
+        credit.borrow(580_000_001);
+        oracle.setNav(10e8);
+
+        assertEq(credit.currentLtvBps(alice), Config.LIQUIDATION_THRESHOLD_BPS, "the view floors to the threshold");
+        assertEq(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE, "and reports exactly healthy");
+
+        credit.liquidate(alice);
+        assertEq(a.startCalls(), 1, "but the position is genuinely past it");
+        assertEq(a.lastBorrower(), alice);
+        assertEq(a.lastCaller(), address(this), "the trigger, not the bidder, earns the reward");
+    }
+
+    /// @dev A position liquidatable on stored debt that a free `settle` would have
+    ///      cured must survive. Settling first is what makes the gate honest.
+    function test_liquidate_settlesBeforeGating() public {
+        _wireAuction();
+        vm.prank(alice);
+        credit.borrow(580_000_001);
+        oracle.setNav(10e8);
+
+        // An epoch's yield lands and streams; enough of it clears the position.
+        _distribute(700e6);
+        skip(Config.YIELD_STREAM_DURATION);
+
+        assertGt(credit.debtOf(alice), 0, "stored debt still says she is underwater");
+        assertEq(credit.currentDebtOf(alice), 0, "but the yield already earned has cleared it");
+
+        // Settling is what the gate does first, so it must reach `NoDebt` rather than
+        // liquidating against the stale figure.
+        vm.expectRevert(CreditManager.NoDebt.selector);
+        credit.liquidate(alice);
+    }
+
+    /// @notice PRD §4.6: staleness pauses borrowing, never liquidation.
+    function test_liquidate_worksOnStaleNavAndWhilePaused() public {
+        MockLiquidationAuction a = _wireAuction();
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        oracle.setNav(10e8);
+        oracle.setStale(true);
+        vm.prank(admin);
+        credit.pause();
+
+        // Composed deliberately: a protocol that pauses or goes stale its way out of
+        // liquidating underwater positions has only converted them into bad debt.
+        credit.liquidate(alice);
+        assertEq(a.startCalls(), 1);
+
+        vm.prank(alice);
+        vm.expectRevert();
+        credit.borrow(1);
+    }
+
+    function test_liquidate_revertsWhenAuctionUnset() public {
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        oracle.setNav(10e8);
+
+        vm.expectRevert(CreditManager.LiquidationAuctionUnset.selector);
+        credit.liquidate(alice);
+    }
+
+    // ── proceeds, write-downs and socialisation ──────────────────────────────
+
+    /// @dev A contract, not an EOA: `borrow` now asks the auction whether the borrower
+    ///      has an open workout, and a typed call to an address with no code reverts.
+    function _asAuction() internal returns (address a) {
+        a = address(auctionMock);
+        vm.prank(admin);
+        credit.setLiquidationAuction(a);
+        usdc.mint(a, 100_000e6);
+        vm.prank(a);
+        usdc.approve(address(credit), type(uint256).max);
+    }
+
+    function test_creditLiquidationProceeds_onlyAuction() public {
+        _asAuction();
+        vm.expectRevert(CreditManager.NotLiquidationAuction.selector);
+        credit.creditLiquidationProceeds(alice, 1e6, 1e6);
+    }
+
+    function test_creditLiquidationProceeds_creditsBothLegsFromOnePull() public {
+        address a = _asAuction();
+        uint256 before = usdc.balanceOf(address(credit));
+
+        vm.prank(a);
+        credit.creditLiquidationProceeds(alice, 12e6, 30e6);
+
+        assertEq(credit.insuranceFund(), 12e6);
+        assertEq(credit.claimableOf(alice), 30e6);
+        assertEq(credit.totalClaimable(), 30e6);
+        assertEq(usdc.balanceOf(address(credit)) - before, 42e6, "one pull, both legs");
+    }
+
+    /// @notice Surplus is credited, never pushed - so a blacklisted borrower cannot
+    ///         make every bid on their own position revert.
+    function test_creditLiquidationProceeds_survivesABlacklistedBorrower() public {
+        address a = _asAuction();
+        usdc.setBlocked(alice, true);
+
+        vm.prank(a);
+        credit.creditLiquidationProceeds(alice, 0, 30e6);
+        assertEq(credit.claimableOf(alice), 30e6, "the liquidation completed regardless");
+
+        // Their own claim still fails, which is their liveness problem and recoverable.
+        vm.prank(alice);
+        vm.expectRevert();
+        credit.claimSurplus();
+    }
+
+    function test_writeDownLoss_drawsInsuranceFirstAndKeepsPrincipalHonest() public {
+        address a = _asAuction();
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        usdc.mint(address(this), 500e6);
+        usdc.approve(address(credit), 500e6);
+        credit.fundInsurance(500e6);
+
+        uint256 principalBefore = credit.pendingPrincipal();
+        vm.prank(a);
+        credit.writeDownLoss(alice, 200e6);
+
+        assertEq(credit.debtOf(alice), MAX_BORROW - 200e6);
+        assertEq(credit.totalDebt(), MAX_BORROW - 200e6);
+        assertEq(credit.insuranceFund(), 300e6, "insurance absorbed it");
+        assertEq(credit.pendingPrincipal() - principalBefore, 200e6, "and the source is still owed it");
+        assertEq(credit.unsocialisedLoss(), 0, "nothing had to reach lenders");
+    }
+
+    function test_writeDownLoss_clampsToOutstandingDebt() public {
+        address a = _asAuction();
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW * 10);
+        assertEq(credit.debtOf(alice), 0);
+        assertEq(credit.totalDebt(), 0);
+    }
+
+    /// @notice The migration paths both refuse while `totalDebt != 0`, so a default
+    ///         written off in narrative but not in storage bricks Phase 4 permanently.
+    function test_writeDownLoss_leavesTheLiquiditySourceSwappable() public {
+        address a = _asAuction();
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        usdc.mint(address(this), MAX_BORROW);
+        usdc.approve(address(credit), MAX_BORROW);
+        credit.fundInsurance(MAX_BORROW);
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        // Insurance covered it, so the source is owed the principal back and both
+        // migration guards stay armed until it is actually returned.
+        assertEq(credit.pendingPrincipal(), MAX_BORROW);
+        credit.settlePrincipal();
+
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+        vm.startPrank(admin);
+        next.setCreditManager(address(credit));
+        credit.setLiquiditySource(address(next));
+        vm.stopPrank();
+        assertEq(credit.liquiditySource(), address(next), "bad debt must not block the Phase-4 swap");
+    }
+
+    /// @notice The three socialisation states, composed. A refusing pool is not an edge
+    ///         case: it is the only pool that exists before Phase 4, and asserting
+    ///         "the flush reverts while the pool refuses" on its own would pass forever
+    ///         while every liquidation was bricked.
+    function test_socialisedLoss_isRememberedWhileThePoolRefusesAndDeliveredOnceItCannot() public {
+        address a = _asAuction();
+        MockLenderPool pool = new MockLenderPool();
+        vm.prank(admin);
+        credit.setLenderPool(address(pool));
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+
+        // Insurance is empty, so the whole loss has to reach lenders - and cannot.
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "remembered, not swallowed");
+        assertEq(credit.debtOf(alice), 0, "and the liquidation still completed");
+
+        // An explicit flush still fails loudly, and leaves the counter intact.
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.SocialisationRejected.selector, MAX_BORROW));
+        credit.flushSocialisedLoss();
+        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "a failed flush must not lose the loss");
+
+        // Phase 4 arrives: the same counter drains with no redeploy.
+        pool.setAccepting(true);
+        credit.flushSocialisedLoss();
+        assertEq(credit.unsocialisedLoss(), 0);
+        assertEq(pool.socialisedTotal(), MAX_BORROW);
+    }
+
+    function test_flushSocialisedLoss_revertsWithNothingToDo() public {
+        vm.expectRevert(CreditManager.NothingToSettle.selector);
+        credit.flushSocialisedLoss();
+    }
+
+    /// @notice A second epoch must not compress the first epoch's unfinished tail.
+    /// @dev The regression that the existing long-window test misses **by stopping one
+    ///      epoch too early.** Rating a genesis pot over its true 60-day accrual window
+    ///      is correct, and that test proves it - but the pot is still 55/60 undrained
+    ///      five days later, and the next `distributeYield` used to re-rate the whole
+    ///      thing over the 5-day gap. That handed months of other people's accrual to
+    ///      whoever deposited at that moment, which is exactly what the streaming
+    ///      design exists to prevent. The stream's end is now a floor, never pulled in.
+    function test_stream_aSecondEpochDoesNotCompressTheFirstEpochsTail() public {
+        // A genesis epoch representing 60 days of accrual.
+        skip(60 days);
+        _deliver(6_000e6);
+        uint256 endAfterGenesis = credit.streamEndsAt();
+        assertEq(endAfterGenesis, block.timestamp + 60 days, "rated over its real window");
+
+        // Five days in, a just-in-time depositor arrives at nine times the honest base.
+        skip(5 days);
+        address jit = makeAddr("jit");
+        _giveCollateral(jit, BONDS * 9);
+
+        // ...and triggers a second, tiny epoch.
+        _deliver(10e6);
+        assertGe(credit.streamEndsAt(), endAfterGenesis, "the tail keeps its schedule");
+
+        skip(Config.YIELD_STREAM_DURATION);
+        credit.settle(jit);
+        credit.settle(alice);
+
+        // Five days of a sixty-day stream, at 90% of the bonds, is about 450 USDC.
+        // Before the fix this was ~5,400: the whole remaining pot rated over five days.
+        assertLt(credit.claimableOf(jit), 700e6, "five days of staking earns five days of yield");
     }
 }

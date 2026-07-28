@@ -11,6 +11,8 @@ import {Config} from "./Config.sol";
 import {LtvMath} from "./LtvMath.sol";
 import {ICreditManager} from "./interfaces/ICreditManager.sol";
 import {ICollateralVault} from "./interfaces/ICollateralVault.sol";
+import {ILenderPool} from "./interfaces/ILenderPool.sol";
+import {ILiquidationAuction} from "./interfaces/ILiquidationAuction.sol";
 import {ILiquiditySource} from "./interfaces/ILiquiditySource.sol";
 import {INAVOracle} from "./interfaces/INAVOracle.sol";
 
@@ -48,6 +50,16 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error YieldNotDelivered(uint256 requested, uint256 undistributed);
     error DebtOutstanding(uint256 totalDebtNow);
     error Detached(address liveManager);
+    error NotLiquidationAuction();
+    error LiquidationAuctionUnset();
+    error LenderPoolUnset();
+    error PositionHealthy(uint256 ltvBps);
+    error SocialisationRejected(uint256 amount);
+    error AuctionHasLiveWork(uint256 outstanding);
+    error AuctionPointerMismatch(address manager, address vault);
+    error WorkoutOpen(address borrower);
+    error StillAttached();
+    error LiquidationAuctionVaultMismatch(address auctionVault);
 
     event LiquiditySourceSet(address indexed source);
     event LenderPoolSet(address indexed lenderPool);
@@ -65,6 +77,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     event UnstakedSliceToInsurance(uint256 amount);
     event InsuranceFunded(address indexed from, uint256 amount);
     event PrincipalSettled(uint256 amount);
+    event LiquidationProceedsCredited(address indexed borrower, uint256 toInsurance, uint256 toBorrower);
+    /// @param fromInsurance The part the insurance fund made the liquidity source whole for.
+    /// @param socialised The part it could not, which lenders bear.
+    event LossWrittenDown(address indexed borrower, uint256 amount, uint256 fromInsurance, uint256 socialised);
+    event LossSocialised(address indexed pool, uint256 amount);
+    event LossDeferred(uint256 amount, uint256 totalDeferred);
+    event ReservesMigrated(address indexed to, uint256 amount);
 
     IERC20 public immutable usdc;
     ICollateralVault public immutable vault;
@@ -96,6 +115,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     uint256 public pendingPrincipal;
     /// @notice USDC held here to absorb auction shortfalls first (PRD §4.4).
     uint256 public insuranceFund;
+    /// @notice Losses recognised on the books that the lender pool has not accepted yet.
+    /// @dev Public because a loss that cannot be placed must be *visible*. Until Phase 4
+    ///      there is no pool to socialise into, and `LenderPool.socialiseLoss` reverts
+    ///      by design - so the alternative to this counter is either a liquidation that
+    ///      cannot complete or a loss that is silently dropped. Same shape as
+    ///      `EpochHarvester.pendingLenderYield`, adopted for the same reason.
+    uint256 public unsocialisedLoss;
 
     /// @notice Cumulative yield accrued per bond, scaled by ACC_PRECISION.
     ///         Monotonically increasing; the whole distribution mechanism is the
@@ -207,8 +233,27 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         emit EpochHarvesterSet(epochHarvester_);
     }
 
+    /// @dev Refuses while the outgoing auction still has work in flight, for the same
+    ///      reason the vault's twin does: `creditLiquidationProceeds` and
+    ///      `writeDownLoss` are gated on this pointer, so a repoint makes every
+    ///      in-flight `bid` revert mid-settlement and every `closeWorkout` revert -
+    ///      leaving a residual that can never be recognised, `totalDebt` that never
+    ///      returns to zero, and therefore both migration paths blocked permanently.
     function setLiquidationAuction(address liquidationAuction_) external onlyOwner {
         if (liquidationAuction_ == address(0)) revert ZeroAddress();
+        address current = liquidationAuction;
+        if (current != address(0)) {
+            uint256 liveAuctions = ILiquidationAuction(current).liveAuctionCount();
+            if (liveAuctions != 0) revert AuctionHasLiveWork(liveAuctions);
+            uint256 openWorkouts = ILiquidationAuction(current).openWorkoutCount();
+            if (openWorkouts != 0) revert AuctionHasLiveWork(openWorkouts);
+        }
+        // The incoming check its twin on the vault already had. Without it this manager
+        // alone could be pointed at an auction with no relationship to the collateral it
+        // is authorised to write losses against - and the two pointers can be set
+        // independently, in either order.
+        address boundVault = ILiquidationAuction(liquidationAuction_).vault();
+        if (boundVault != address(vault)) revert LiquidationAuctionVaultMismatch(boundVault);
         liquidationAuction = liquidationAuction_;
         emit LiquidationAuctionSet(liquidationAuction_);
     }
@@ -222,6 +267,56 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      self-repaying loan.
     function borrow(uint256 amount) external whenNotPaused nonReentrant whileAttached {
         if (amount == 0) revert ZeroAmount();
+        // No new debt while a workout is open against you. Two separate attacks need
+        // this, and bounding the write-off alone stopped neither:
+        //
+        //  - `repayFor` is permissionless and does not touch `Workout.recovered`, so a
+        //    third party can clear the defaulted debt without the workout noticing.
+        //    `min(live, debtAtExpiry - recovered)` then bounds a write-off against debt
+        //    that is entirely a fresh, fully-backed loan - and forgives it.
+        //  - `_distribute` repays live debt before taking any penalty, and v1 borrowing
+        //    is interest-free, so inflating live debt during the window makes the
+        //    surplus zero and the liquidation penalty collectable never.
+        //
+        // Refusing the borrow is the one change that closes both, and it costs a
+        // defaulter nothing they are entitled to: their collateral is already forfeit.
+        address auction = liquidationAuction;
+        if (auction != address(0) && ILiquidationAuction(auction).workoutsOpenFor(msg.sender) != 0) {
+            revert WorkoutOpen(msg.sender);
+        }
+        // **Do not issue debt that cannot be liquidated.** `liquidate` refuses unless
+        // all three wiring pointers agree, and a manager migration cannot be atomic
+        // across two contracts, so every one passes through a window where no auction
+        // can be opened at all. `borrow` checked none of it, which left the protocol's
+        // only risk-reduction mechanism offline while its risk-taking one stayed open -
+        // a borrower could draw the full per-account cap and then be unliquidatable
+        // until the owner finished wiring. The window is self-camouflaging, because the
+        // auction's own `liveAuctionCount == 0` precondition is trivially satisfied
+        // precisely *because* nothing can start an auction.
+        //
+        // This only ever blocks new debt, never an exit or a repayment, so it cannot
+        // deadlock a migration.
+        //
+        // **Ask the vault, not this contract.** Round 8 caught the first version of
+        // this guard reading `liquidationAuction` off `this`, which is zero on a
+        // freshly deployed incoming manager - so it skipped itself in exactly the
+        // migration window it was written to close, and only bit if the auction
+        // happened to be pre-wired, an ordering nothing requires.
+        //
+        // From the manager, Phase 2 and a half-finished migration are indistinguishable:
+        // both have `liquidationAuction == address(0)`. From the vault they are not.
+        // The vault knows whether an auction exists in the system at all, so that is
+        // the thing to condition on. Lending before the auction ships stays open;
+        // lending while an auction exists but does not agree with this manager does not.
+        address vaultAuction = vault.liquidationAuction();
+        if (vaultAuction != address(0)) {
+            if (vaultAuction != auction) revert AuctionPointerMismatch(auction, vaultAuction);
+            address auctionManager = ILiquidationAuction(auction).creditManager();
+            if (auctionManager != address(this)) {
+                revert AuctionPointerMismatch(auctionManager, address(this));
+            }
+        }
+
         address source = liquiditySource;
         if (source == address(0)) revert LiquiditySourceUnset();
         // A never-posted oracle reads as stale, so this covers the unbootstrapped case
@@ -308,7 +403,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      *whole* undistributed pot, which is what rolls a previous stream's
     ///      unfinished tail - and division dust, and anything that accrued while no
     ///      bonds were staked - into the new one instead of stranding it.
-    function distributeYield(uint256 amount) external {
+    /// @dev `whileAttached` for the reason the modifier's own NatSpec gives, which
+    ///      applied here all along: this calls `_accrue()` directly rather than going
+    ///      through `_settle`'s detached bail-out, so a detached manager would keep
+    ///      converting `undistributedYield` into accumulator units against a bond base
+    ///      it no longer governs - and nothing could ever settle against them. It was
+    ///      the one accumulator-writing entrypoint without the guard.
+    function distributeYield(uint256 amount) external whileAttached {
         if (msg.sender != epochHarvester) revert NotEpochHarvester();
         if (amount > undistributedYield) revert YieldNotDelivered(amount, undistributedYield);
 
@@ -332,6 +433,18 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         uint256 elapsed = block.timestamp - lastDistributeAt;
         uint256 duration =
             elapsed > Config.YIELD_STREAM_DURATION ? elapsed : Config.YIELD_STREAM_DURATION;
+
+        // **Never shorten a running stream.** `elapsed` describes the accrual window of
+        // the *new* money, but the pot it is applied to also holds the unfinished tail
+        // of the previous stream, whose window may have been months. Re-rating the tail
+        // over the new gap compresses it - which is precisely the just-in-time capture
+        // the stretch above exists to prevent, reintroduced one epoch later.
+        //
+        // Concretely: a genesis epoch rated over 60 days, followed by a normal epoch
+        // five days later, pays 55 days of other people's accrual to whoever is staked
+        // for those five. The tail keeps the window it was rated with.
+        uint256 remaining = streamEndsAt > block.timestamp ? streamEndsAt - block.timestamp : 0;
+        if (remaining > duration) duration = remaining;
 
         uint256 pot = undistributedYield;
         uint256 rate = (pot * ACC_PRECISION) / duration;
@@ -392,7 +505,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     /// @dev Separating delivery from allocation is what makes `claimableOf` a backed
     ///      balance rather than a promise: without it, anything holding the harvester
     ///      role could credit arbitrary claimable amounts and drain the contract.
-    function receiveYield(uint256 amount) external nonReentrant {
+    function receiveYield(uint256 amount) external nonReentrant whileAttached {
         if (msg.sender != epochHarvester) revert NotEpochHarvester();
         if (amount == 0) revert ZeroAmount();
         undistributedYield += amount;
@@ -458,9 +571,232 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         emit PrincipalSettled(delivered);
     }
 
+    // ── Liquidation (PRD §4.5) ───────────────────────────────────────────────
+
     /// @inheritdoc ICreditManager
-    function liquidate(address) external nonReentrant {
-        revert NotImplemented(); // TODO(phase-3): HF < 1 check, start auction, caller reward
+    /// @dev Three gates this deliberately does NOT apply, each a rule stated elsewhere:
+    ///
+    ///      - not `whenNotPaused`. Pause stops new risk, never resolution - the same
+    ///        rule that keeps `repay` open. A protocol that pauses its way out of
+    ///        liquidating underwater positions just converts them into bad debt.
+    ///      - no `navOracle.isStale()` check. PRD §4.6: staleness pauses *borrowing*
+    ///        and liquidation continues on the last known NAV. Gating here would let a
+    ///        keeper outage disable liquidation exactly when it matters.
+    ///      - no `custodyIsSolvent()` check. A break-glass `emergencyUnstake` must not
+    ///        also disable liquidation; `borrow` is the only caller that refuses.
+    ///
+    ///      `whileAttached`, though, is required: a detached manager's `_settle` is a
+    ///      silent no-op, so it would price positions off a frozen accumulator and
+    ///      start auctions against numbers it no longer governs.
+    function liquidate(address borrower) external nonReentrant whileAttached {
+        // Settle first. Yield streams continuously, so the stored `debtOf` lags what
+        // the borrower actually owes, and liquidating on the stale figure seizes a
+        // position that a free, permissionless `settle` would have cleared. It also
+        // makes this gate, the vault's, and the auction's all read one number.
+        _settle(borrower, vault.bondCount(borrower));
+
+        uint256 debt = debtOf[borrower];
+        if (debt == 0) revert NoDebt();
+
+        uint256 collateral = vault.collateralValue(borrower);
+        // `exceedsLtv` cross-multiplies. `healthFactor` divides twice and reports
+        // exactly 1e18 for a position a fraction of a bp past the threshold, so gating
+        // on the view would refuse the first position that becomes liquidatable.
+        if (!LtvMath.exceedsLtv(debt, collateral, Config.LIQUIDATION_THRESHOLD_BPS)) {
+            revert PositionHealthy(LtvMath.ltvBps(debt, collateral));
+        }
+
+        address auction = liquidationAuction;
+        if (auction == address(0)) revert LiquidationAuctionUnset();
+        // The vault must honour the same auction, or `start` succeeds and every exit the
+        // new auction has reverts `NotLiquidationAuction` on the vault - a permanently
+        // stranded position opened by an anonymous caller, during the two-transaction
+        // window every auction migration passes through. Worse, the live-work guard on
+        // `setLiquidationAuction` would then refuse to finish that migration.
+        address vaultAuction = vault.liquidationAuction();
+        if (vaultAuction != auction) revert AuctionPointerMismatch(auction, vaultAuction);
+
+        uint256 maxReward = (
+            ((debt * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS) * Config.LIQUIDATION_CALLER_SHARE_BPS
+        ) / Config.BPS;
+        emit LiquidationTriggered(borrower, msg.sender, maxReward);
+
+        ILiquidationAuction(auction).start(borrower, msg.sender);
+    }
+
+    /// @notice Book the non-debt part of a liquidation: the insurance fund's cut of the
+    ///         penalty, and whatever is left over for the borrower.
+    /// @dev One pull for both legs, so they cannot come apart and only one allowance is
+    ///      ever open. The borrower's share lands in `claimableOf` rather than being
+    ///      transferred, because a USDC-blacklisted borrower must not be able to make
+    ///      every bid on their position revert - which is what a push would do, turning
+    ///      a bad position into a permanently unliquidatable one.
+    function creditLiquidationProceeds(address borrower, uint256 toInsurance, uint256 toBorrower)
+        external
+        nonReentrant
+    {
+        if (msg.sender != liquidationAuction) revert NotLiquidationAuction();
+        uint256 total = toInsurance + toBorrower;
+        if (total == 0) revert ZeroAmount();
+
+        insuranceFund += toInsurance;
+        if (toBorrower != 0) {
+            claimableOf[borrower] += toBorrower;
+            totalClaimable += toBorrower;
+        }
+        emit LiquidationProceedsCredited(borrower, toInsurance, toBorrower);
+        usdc.safeTransferFrom(msg.sender, address(this), total);
+    }
+
+    /// @notice Recognise unrecoverable debt: clear it from the books, make the liquidity
+    ///         source whole out of insurance as far as that reaches, and socialise the
+    ///         rest to lenders.
+    /// @dev No token moves. USDC already held here is relabelled from one term of the
+    ///      solvency invariant (`insuranceFund`) to another (`pendingPrincipal`), which
+    ///      is precisely what "the insurance fund absorbs the shortfall" means: the
+    ///      source lent this principal and is still owed it, so erasing the borrower's
+    ///      debt without funding it would just move the hole somewhere less visible.
+    ///
+    ///      Clearing `debtOf`/`totalDebt` is load-bearing beyond the accounting.
+    ///      `CollateralVault.setCreditManager` and `setLiquiditySource` both refuse
+    ///      while `totalDebt != 0`, so a default written off in narrative but not in
+    ///      storage would permanently block both migration paths.
+    function writeDownLoss(address borrower, uint256 amount) external nonReentrant {
+        if (msg.sender != liquidationAuction) revert NotLiquidationAuction();
+        _settle(borrower, vault.bondCount(borrower));
+
+        uint256 outstanding = debtOf[borrower];
+        uint256 loss = amount > outstanding ? outstanding : amount;
+        if (loss == 0) revert ZeroAmount();
+
+        debtOf[borrower] = outstanding - loss;
+        totalDebt -= loss;
+
+        uint256 fromInsurance = loss > insuranceFund ? insuranceFund : loss;
+        insuranceFund -= fromInsurance;
+        pendingPrincipal += fromInsurance;
+
+        uint256 socialised = loss - fromInsurance;
+        emit LossWrittenDown(borrower, loss, fromInsurance, socialised);
+        // The uncovered part deliberately does not touch `pendingPrincipal`. That is
+        // what socialisation means: the source never gets it back.
+        if (socialised != 0) _socialise(socialised);
+    }
+
+    /// @notice Hand the insurance fund to the manager the vault now points at.
+    /// @dev **The migration path the vault's guard was standing in for.** Insurance is
+    ///      the largest of the four solvency pots, it grows monotonically, and its only
+    ///      spender is `writeDownLoss`, which needs a live borrower on *this* manager -
+    ///      something `setCreditManager`'s own `totalDebt == 0` precondition has just
+    ///      guaranteed does not exist. So a legitimate migration used to destroy it.
+    ///
+    ///      A guard on the vault could not fix that: insurance never returns to zero on
+    ///      its own, so the guard would simply block migration forever. The value has to
+    ///      be movable instead.
+    ///
+    ///      Only callable once detached, and only into the manager the vault actually
+    ///      points at, so this cannot be used to drain reserves to an arbitrary
+    ///      address. `fundInsurance` is permissionless and pull-based, so the incoming
+    ///      manager needs no wiring for this to land.
+    ///
+    ///      **Round 7: insurance was not the only trapped pot, and moving only it left
+    ///      the larger one behind.** `undistributedYield` is decremented in exactly one
+    ///      place, `_accrue()`, whose three callers are `_settle` (which returns early
+    ///      once detached), `accrueYield` and `distributeYield` (both `whileAttached`).
+    ///      A detached manager therefore has no writer, no reader and no sweep for it,
+    ///      and `harvest` is permissionless, so a stranger could time an epoch to
+    ///      maximise what a migration destroyed. The same is true of yield that
+    ///      `_accrue` has already moved into `accYieldPerBond` but no position has
+    ///      settled: it is backed by USDC that none of the four counters claims.
+    ///
+    ///      So this moves everything that is not still individually payable from here.
+    ///      `totalClaimable` and `pendingPrincipal` stay, because their claimants are
+    ///      named and `claimSurplus` keeps working while detached.
+    ///
+    ///      **`settlePrincipal` is the exception, and round 8 caught this docstring
+    ///      claiming otherwise.** It calls `liquiditySource.repayPrincipal`, which is
+    ///      `onlyCreditManager` against a single slot - and repointing that slot is
+    ///      part of the same migration, because otherwise the incoming manager cannot
+    ///      lend. So the order is load-bearing and is not enforced anywhere:
+    ///      **call `settlePrincipal()` here BEFORE repointing the liquidity source.**
+    ///      Miss it and the principal is unreachable by every contract, and the sweep
+    ///      will not take it either, since `balance == spokenFor` by construction. The
+    ///      vault's `totalDebt == 0` detach precondition makes this worst: it is only
+    ///      reachable through repayment, and every repayment grows `pendingPrincipal`.
+    ///
+    ///      Everything else goes, as insurance, because per-position entitlement
+    ///      cannot be reconstructed on the incoming manager - there is no holder list
+    ///      to replay. **That is a real cost, stated plainly: a holder who had accrued
+    ///      but not settled loses the individual claim.** The alternative was losing the
+    ///      value outright, and detachment is one-way (see `setCreditManager` on the
+    ///      vault), so there is no longer a re-attach that could pay them.
+    ///
+    ///      Delivery is measured rather than assumed, matching every other value-moving
+    ///      leg in this contract.
+    function migrateReserves() external onlyOwner nonReentrant {
+        address live = vault.creditManager();
+        if (live == address(this)) revert StillAttached();
+        if (live == address(0)) revert ZeroAddress();
+
+        uint256 spokenFor = totalClaimable + pendingPrincipal;
+        uint256 balance = usdc.balanceOf(address(this));
+        if (balance <= spokenFor) revert ZeroAmount();
+        uint256 amount = balance - spokenFor;
+
+        insuranceFund = 0;
+        undistributedYield = 0;
+        // The stream has no funds behind it any more; leaving it running would let a
+        // re-attached manager accrue against nothing. Detachment is one-way, so this is
+        // belt and braces - but a counter that outlives its balance is how round 6b's
+        // strand started.
+        yieldRate = 0;
+        streamEndsAt = 0;
+
+        usdc.forceApprove(live, amount);
+        ICreditManager(live).fundInsurance(amount);
+        usdc.forceApprove(live, 0);
+
+        uint256 delivered = balance - usdc.balanceOf(address(this));
+        if (delivered != amount) revert LiquidityNotDelivered(amount, delivered);
+        emit ReservesMigrated(live, amount);
+    }
+
+    /// @notice Retry placing deferred losses once the pool can accept them.
+    /// @dev Permissionless: it only ever moves an already-recognised loss to where it
+    ///      belongs. This is the Phase-4 seam - a live pool, no redeploy, no migration.
+    ///      Unlike the internal path this one *reverts* when the pool refuses, because
+    ///      a caller who explicitly asked for a flush wants to know it failed.
+    function flushSocialisedLoss() external nonReentrant {
+        uint256 amount = unsocialisedLoss;
+        if (amount == 0) revert NothingToSettle();
+        address pool = lenderPool;
+        if (pool == address(0)) revert LenderPoolUnset();
+
+        unsocialisedLoss = 0;
+        try ILenderPool(pool).socialiseLoss(amount) {
+            emit LossSocialised(pool, amount);
+        } catch {
+            unsocialisedLoss = amount;
+            revert SocialisationRejected(amount);
+        }
+    }
+
+    /// @dev Best-effort by necessity. `LenderPool.socialiseLoss` reverts `NotImplemented`
+    ///      until Phase 4 and the deploy script wires exactly that pool, so a hard call
+    ///      here would sit in the middle of a liquidation that must not be blockable.
+    ///      What it fails to place is *remembered*, not swallowed - the round-4 lesson
+    ///      about guards that assume their own escape hatch is reachable, applied
+    ///      before rather than after it bites.
+    function _socialise(uint256 amount) private {
+        address pool = lenderPool;
+        if (pool != address(0)) {
+            try ILenderPool(pool).socialiseLoss(amount) {
+                emit LossSocialised(pool, amount);
+                return;
+            } catch {}
+        }
+        unsocialisedLoss += amount;
+        emit LossDeferred(amount, unsocialisedLoss);
     }
 
     // ── Views ────────────────────────────────────────────────────────────────

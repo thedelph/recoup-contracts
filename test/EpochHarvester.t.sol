@@ -17,6 +17,7 @@ import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
+import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
@@ -112,7 +113,15 @@ contract EpochHarvesterTest is Test {
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));
-        vault.setLiquidationAuction(makeAddr("auction"));
+        // The vault refuses an auction pointer that is not a contract bound back to it,
+        // so suites that never run a liquidation still need a stand-in.
+        MockLiquidationAuction auctionStub = new MockLiquidationAuction();
+        auctionStub.setVault(address(vault));
+        auctionStub.setCreditManager(address(credit));
+        vault.setLiquidationAuction(address(auctionStub));
+        // `borrow` refuses while the vault names an auction this manager does not, so
+        // the stand-in has to be wired on both sides rather than just the vault's.
+        credit.setLiquidationAuction(address(auctionStub));
         credit.setLiquiditySource(address(liquidity));
         credit.setEpochHarvester(address(harvester));
         liquidity.setCreditManager(address(credit));
@@ -169,25 +178,29 @@ contract EpochHarvesterTest is Test {
         );
         assertEq(credit.insuranceFund(), toInsurance);
         assertEq(harvester.pendingLenderYield(), toLenders, "held until the pool opens");
+        harvester.flushProtocolFee();
         assertEq(usdc.balanceOf(feeWallet), toProtocol);
     }
 
     /// @dev Nothing may be left behind in the harvester beyond the lender share it is
     ///      deliberately holding - the protocol fee takes the rounding remainder.
     ///
-    ///      Bounded below by the smallest amount that yields a non-zero borrower share.
-    ///      Under that, `harvest` deliberately declines the epoch and carries the whole
-    ///      amount to the next one rather than burning the cooldown on nothing - which
-    ///      is a different property, covered by the two tests below.
+    ///      Bounded below by the smallest amount whose borrower share clears
+    ///      `MIN_EPOCH_YIELD`. Under that, `harvest` deliberately declines the epoch and
+    ///      carries the whole amount to the next one rather than burning the cooldown -
+    ///      and, more importantly, rather than letting a donation reset the window the
+    ///      yield stream's anti-just-in-time defence is derived from. That is a
+    ///      different property, covered by the tests below.
     function testFuzz_harvestLeavesNoStrandedDust(uint256 amount) public {
-        amount = bound(amount, Config.BPS / Config.SPLIT_BORROWER_BPS + 1, 1_000_000e6);
+        uint256 floorAmount = (Config.MIN_EPOCH_YIELD * Config.BPS) / Config.SPLIT_BORROWER_BPS + 1;
+        amount = bound(amount, floorAmount, 1_000_000e6);
         farm.setPendingYield(address(adapter), amount);
         harvester.harvest();
 
         assertEq(
-            usdc.balanceOf(address(harvester)),
+            usdc.balanceOf(address(harvester)) - harvester.pendingProtocolFee(),
             harvester.pendingLenderYield(),
-            "harvester holds exactly the lender share and nothing else"
+            "harvester holds exactly the lender share and the accrued fee, and nothing else"
         );
     }
 
@@ -234,9 +247,9 @@ contract EpochHarvesterTest is Test {
         uint256 toLenders = (expected * Config.SPLIT_LENDER_BPS) / Config.BPS;
         uint256 toInsurance = (expected * Config.SPLIT_INSURANCE_BPS) / Config.BPS;
         assertEq(
-            usdc.balanceOf(feeWallet),
+            usdc.balanceOf(address(harvester)) - harvester.pendingLenderYield(),
             expected - toBorrowers - toLenders - toInsurance,
-            "the donated wei was counted, not stranded"
+            "the donated wei was counted, not stranded (fee now accrues rather than pushing)"
         );
     }
 
@@ -421,7 +434,11 @@ contract EpochHarvesterTest is Test {
 
         uint256 perEpoch = (YIELD * Config.SPLIT_LENDER_BPS) / Config.BPS;
         assertEq(harvester.pendingLenderYield(), perEpoch * 2);
-        assertEq(usdc.balanceOf(address(harvester)), perEpoch * 2, "backed, not just counted");
+        assertEq(
+            usdc.balanceOf(address(harvester)) - harvester.pendingProtocolFee(),
+            perEpoch * 2,
+            "backed, not just counted"
+        );
     }
 
     /// @dev And the flush is separate, so a pool that reverts cannot block borrowers
@@ -518,7 +535,11 @@ contract EpochHarvesterTest is Test {
 
         assertEq(usdc.balanceOf(address(pool)), owed - shortfall, "the pool took what it took");
         assertEq(harvester.pendingLenderYield(), shortfall, "the rest is still owed");
-        assertEq(usdc.balanceOf(address(harvester)), shortfall, "and still backed");
+        assertEq(
+            usdc.balanceOf(address(harvester)) - harvester.pendingProtocolFee(),
+            shortfall,
+            "and still backed"
+        );
         assertEq(usdc.allowance(address(harvester), address(pool)), 0, "no standing allowance");
     }
 
@@ -548,5 +569,51 @@ contract EpochHarvesterTest is Test {
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
                 + credit.insuranceFund()
         );
+    }
+
+    /// @notice A fee wallet that cannot receive USDC must not stop the epoch.
+    /// @dev This was the one hard outbound transfer left in the yield path, and every
+    ///      sibling leg is best-effort with a stated reason. A Circle blacklist on the
+    ///      fee wallet reverted the whole permissionless `harvest()`, freezing the
+    ///      borrower, lender and insurance shares alongside the protocol's own - so the
+    ///      protocol's fee could stop borrowers' debt being written down.
+    ///
+    ///      Both halves in one test: the epoch completes while the wallet is frozen,
+    ///      and the fee is still collectable once it is not. Asserting only the first
+    ///      would pass just as well if the fee were silently dropped.
+    function test_harvest_completesWithABlacklistedFeeWalletAndPaysOutLater() public {
+        usdc.setBlocked(feeWallet, true);
+        farm.setPendingYield(address(adapter), 1_000e6);
+
+        harvester.harvest();
+
+        uint256 toProtocol = (1_000e6 * Config.SPLIT_PROTOCOL_BPS) / Config.BPS;
+        assertEq(harvester.pendingProtocolFee(), toProtocol, "accrued, not dropped");
+        assertEq(credit.undistributedYield(), (1_000e6 * Config.SPLIT_BORROWER_BPS) / Config.BPS,
+            "and borrowers were paid regardless");
+
+        vm.expectRevert();
+        harvester.flushProtocolFee();
+
+        usdc.setBlocked(feeWallet, false);
+        harvester.flushProtocolFee();
+        assertEq(usdc.balanceOf(feeWallet), toProtocol);
+        assertEq(harvester.pendingProtocolFee(), 0);
+    }
+
+    /// @dev The carried fee must not be counted as the next epoch's yield. Deducting
+    ///      only `pendingLenderYield` from the balance would have paid it out twice.
+    function test_harvest_carriedFeeIsNotCountedAsTheNextEpochsYield() public {
+        usdc.setBlocked(feeWallet, true);
+        farm.setPendingYield(address(adapter), 1_000e6);
+        harvester.harvest();
+        uint256 carried = harvester.pendingProtocolFee();
+        assertGt(carried, 0);
+
+        skip(Config.MIN_EPOCH_GAP);
+        farm.setPendingYield(address(adapter), 1_000e6);
+        harvester.harvest();
+
+        assertEq(harvester.pendingProtocolFee(), carried * 2, "one fee per epoch, not compounding");
     }
 }
