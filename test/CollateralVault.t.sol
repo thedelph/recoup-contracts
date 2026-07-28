@@ -10,6 +10,7 @@ import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
+import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockCreditManager} from "./mocks/MockCreditManager.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
@@ -24,7 +25,8 @@ contract CollateralVaultTest is Test {
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");
-    address internal auction = makeAddr("auction");
+    MockLiquidationAuction internal auctionMock;
+    address internal auction;
     address internal winner = makeAddr("winner");
     address internal yieldSink = makeAddr("yieldSink");
 
@@ -43,6 +45,8 @@ contract CollateralVaultTest is Test {
         bond.setRewardPool(address(farm));
         oracle = new MockNavOracle(NAV);
         credit = new MockCreditManager();
+        auctionMock = new MockLiquidationAuction();
+        auction = address(auctionMock);
 
         vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
         adapter = new DirectCallAdapter(
@@ -51,6 +55,7 @@ contract CollateralVaultTest is Test {
         // setCreditManager refuses a manager bound to a different vault, so the mock
         // has to claim this one. It is built before the vault, hence the setter.
         credit.setVault(address(vault));
+        auctionMock.setVault(address(vault));
 
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
@@ -306,11 +311,23 @@ contract CollateralVaultTest is Test {
         assertEq(vault.bondCount(alice), 0);
     }
 
-    // ── seize ────────────────────────────────────────────────────────────────
+    // ── seize / reassign ─────────────────────────────────────────────────────
+
+    /// @dev 100 bonds at NAV is $2,515 of collateral, so the 5800 bps threshold sits
+    ///      at $1,458.70. Derived rather than hard-coded so a NAV or threshold change
+    ///      moves it instead of silently making these tests assert nothing.
+    function _liquidatableDebt(uint256 bonds) internal pure returns (uint256) {
+        return (bonds * NAV * Config.LIQUIDATION_THRESHOLD_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE) + 1;
+    }
+
+    function _unhealthy(address who, uint256 bonds) internal {
+        vm.prank(who);
+        vault.depositBonds(bonds);
+        credit.setDebt(who, _liquidatableDebt(bonds));
+    }
 
     function test_seize_movesWholePositionToWinner() public {
-        vm.prank(alice);
-        vault.depositBonds(100);
+        _unhealthy(alice, 100);
 
         vm.prank(auction);
         uint256 seized = vault.seize(alice, winner);
@@ -323,6 +340,119 @@ contract CollateralVaultTest is Test {
     function test_seize_onlyAuction() public {
         vm.expectRevert(CollateralVault.NotLiquidationAuction.selector);
         vault.seize(alice, winner);
+    }
+
+    function test_seize_refusesAHealthyPosition() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        credit.setDebt(alice, _liquidatableDebt(100) - 2); // a whisker inside the threshold
+
+        vm.prank(auction);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CollateralVault.PositionNotLiquidatable.selector, Config.LIQUIDATION_THRESHOLD_BPS - 1
+            )
+        );
+        vault.seize(alice, winner);
+    }
+
+    /// @notice The executable form of go-live item G2. An owner who repoints the
+    ///         auction at themselves still cannot take a healthy position.
+    function test_ownerCannotSeizeAHealthyPositionByRepointingTheAuction() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        credit.setDebt(alice, 1e6); // comfortably healthy
+
+        // Since audit round 5 the repoint itself is refused: the incoming auction must
+        // be a contract bound back to this vault, the same rule the custody adapter and
+        // credit manager have always had. An EOA cannot answer `vault()`.
+        vm.prank(admin);
+        vm.expectRevert();
+        vault.setLiquidationAuction(admin);
+
+        // And even a legitimately-wired auction cannot take a healthy position, which
+        // is the property that survives regardless of how the pointer is set. Both
+        // halves together, because the first guard is the one an owner can work around
+        // by deploying a compliant contract, and the second is the one they cannot.
+        vm.prank(auction);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionNotLiquidatable.selector, uint256(3))
+        );
+        vault.seize(alice, admin);
+
+        assertEq(vault.bondCount(alice), 100, "collateral must survive a hostile repoint");
+    }
+
+    /// @notice PRD §4.6: staleness pauses borrowing, never liquidation.
+    function test_seize_stillWorksOnStaleNav() public {
+        _unhealthy(alice, 100);
+        oracle.setStale(true);
+
+        vm.prank(auction);
+        assertEq(vault.seize(alice, winner), 100);
+    }
+
+    /// @dev A position liquidatable on stored debt but cured by yield the accumulator
+    ///      has not paid out yet must not be seizable: a permissionless settle would
+    ///      have cleared it for free.
+    function test_seize_refusesAPositionCuredByUnsettledYield() public {
+        _unhealthy(alice, 100);
+        credit.setUnsettledCredit(alice, _liquidatableDebt(100));
+
+        vm.prank(auction);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionNotLiquidatable.selector, 0));
+        vault.seize(alice, winner);
+    }
+
+    function test_reassign_movesTheClaimAndLeavesTheBondsStaked() public {
+        _unhealthy(alice, 100);
+        uint256 stakedBefore = farm.staked(address(adapter));
+
+        vm.prank(auction);
+        uint256 moved = vault.reassign(alice, auction);
+
+        assertEq(moved, 100);
+        assertEq(vault.bondCount(alice), 0);
+        assertEq(vault.bondCount(auction), 100);
+        assertEq(farm.staked(address(adapter)), stakedBefore, "workout must not unstake");
+        assertEq(vault.totalBondCount(), 100, "the lot is still collateral in custody");
+        assertTrue(vault.custodyIsSolvent(), "custody solvency must stay honest");
+    }
+
+    /// @notice The whole point of the workout path: it cannot revert on a bond
+    ///         transfer, because it does not make one.
+    function test_reassign_survivesTheAdapterLosingItsWhitelistEntry() public {
+        _unhealthy(alice, 100);
+        bond.setWhitelisted(address(adapter), false);
+
+        vm.prank(auction);
+        assertEq(vault.reassign(alice, auction), 100);
+        assertEq(vault.bondCount(auction), 100);
+    }
+
+    function test_reassign_onlyAuctionAndOnlyWhenLiquidatable() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        vm.expectRevert(CollateralVault.NotLiquidationAuction.selector);
+        vault.reassign(alice, auction);
+
+        credit.setDebt(alice, 1e6);
+        vm.prank(auction);
+        vm.expectRevert();
+        vault.reassign(alice, auction);
+    }
+
+    function test_reassign_settlesBothSidesBeforeMovingTheCount() public {
+        _unhealthy(alice, 100);
+        uint256 callsBefore = credit.settleCalls();
+
+        vm.prank(auction);
+        vault.reassign(alice, auction);
+
+        assertEq(credit.settleCalls(), callsBefore + 2, "both positions settle first");
+        assertEq(credit.settledAtBonds(alice), 100, "alice settles against her OLD count");
+        assertEq(credit.settledAtBonds(auction), 0, "the destination settles against its old count");
     }
 
     // ── adapter hardening ────────────────────────────────────────────────────

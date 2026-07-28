@@ -27,6 +27,22 @@ library Config {
     uint256 internal constant AUCTION_FLOOR_BPS = 6_800; // 68% of NAV
     uint256 internal constant AUCTION_DURATION = 6 hours;
     uint256 internal constant LIQUIDATION_PENALTY_BPS = 500; // of debt; split 50/50 caller/insurance
+    /// @notice The liquidation caller's share of the penalty; the remainder, including
+    ///         any odd wei, goes to the insurance fund.
+    /// @dev PRD §4.5 says "split 50/50 caller reward / insurance fund". Named rather
+    ///      than written as `penalty / 2` at the call site, because a bare `/ 2` is a
+    ///      magic number that cannot be found when the split is retuned.
+    uint256 internal constant LIQUIDATION_CALLER_SHARE_BPS = 5_000;
+
+    // ── Workout queue (PRD §4.5, the expiry path) ────────────────────────────
+    /// @notice How long a workout may stay open before anyone can force the residual
+    ///         debt to be recognised as a loss.
+    /// @dev DexFi's manual redemption is quoted at "48h+" and is an off-chain process
+    ///      with no on-chain enforcement, so the honest bound is generous. It exists
+    ///      because the alternative is bad debt sitting on the books indefinitely at
+    ///      governance's discretion - loss recognition lagging the auction window is a
+    ///      known hazard, and an unbounded workout is the worst version of it.
+    uint256 internal constant WORKOUT_MAX_DURATION = 14 days;
 
     // ── Yield split (PRD §4.4) — must sum to BPS, enforced in tests ─────────
     uint256 internal constant SPLIT_BORROWER_BPS = 5_500;
@@ -36,6 +52,15 @@ library Config {
 
     // ── Epoch harvesting (PRD §4.4) ──────────────────────────────────────────
     uint256 internal constant MIN_EPOCH_GAP = 5 days;
+
+    /// @notice Smallest borrower share that counts as a real epoch, USDC 6dp.
+    /// @dev `EpochHarvester.harvest` sizes an epoch from its own USDC balance with no
+    ///      sender attribution, so without a floor anyone can advance an epoch by
+    ///      donating a couple of units - and advancing an epoch resets the window the
+    ///      yield stream's anti-just-in-time defence is derived from. $1 is far below
+    ///      any real epoch (the fund pays hundreds of USDC a week at current scale) and
+    ///      far above what is worth donating repeatedly.
+    uint256 internal constant MIN_EPOCH_YIELD = 1e6;
 
     /// @notice How long a harvested epoch's borrower share is streamed into the
     ///         yield accumulator rather than applied as a lump.

@@ -4,10 +4,11 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **pre-deployment**. The collateral layer, the credit core and the epoch harvester are
-implemented, and the whole loan lifecycle is fork-tested against the live DexFi contracts. Lending
-and liquidation are interfaced skeletons, built in deliberate phases. Nothing touches real funds
-before an external audit.
+Status: **pre-deployment**. The collateral layer, the credit core, the epoch harvester and the
+liquidation auction are implemented, and the whole loan lifecycle - including a liquidation
+filling at 82% of NAV and an unfilled one falling through to the workout path - is fork-tested
+against the live DexFi contracts. Lending is an interfaced skeleton, built in deliberate phases.
+Nothing touches real funds before an external audit.
 
 ## Architecture
 
@@ -33,7 +34,12 @@ It settles EVERY position in a single storage write, because CreditManager distr
 yield-per-bond accumulator rather than iterating - so the cost of an epoch does not scale with the
 number of borrowers. The share is streamed over the window it accrued across, not applied as a lump.
 
-LenderPool / LiquidationAuction: skeletons, implemented per phase.
+LiquidationAuction: implemented. A Dutch auction over the whole position, decaying from NAV to a
+6800 bps floor over six hours. Bonds are never escrowed - a fill sends them from custody straight
+to the winner, and an unfilled auction moves the *claim* to a workout queue while the units stay
+staked and earning. Three exits, and the guards exist to prove no state closes all of them.
+
+LenderPool: skeleton, implemented per phase.
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
 
@@ -131,8 +137,17 @@ findings, all fixed with regression tests. The ones worth knowing about:
   assumption, so the two cannot silently diverge again.
 - A single-unit withdrawal settled the whole staked position's farm rewards and forwarded them
   without reporting the amount, so the measured harvest could be driven to zero.
-- `LiquidationAuction` could not receive the ERC-1155 units it exists to escrow - invisible while
-  every seize test targeted an EOA, because an EOA destination skips the acceptance check.
+- `LiquidationAuction` could not receive ERC-1155 units at all - invisible while every seize test
+  targeted an EOA, because an EOA destination skips the acceptance check. The auction was later
+  redesigned to never escrow bonds, which makes the defect moot, but the blind spot it exposed
+  was not: a test fixture that only ever used EOAs could not have found it.
+- **Four later rounds went over the liquidation auction itself.** The sharpest was a pair of
+  wiring pointers that could be pulled apart and then pinned apart, so a position's health was
+  checked against one ledger and its debt settled against another - a lot seized against a
+  recorded debt of zero, or an entire fill returned to the borrower. Both setters are guarded now.
+  Two lessons generalised: when a fix adds a guard, look for the mirror case it did not cover
+  (every finding in that round was one side of a symmetric pair), and check what each guard's
+  escape hatch actually depends on.
 
 The first review covered the two contracts implemented at the time and raised eight findings, all
 fixed - see the `Security hardening` commits for the per-finding diffs. What

@@ -202,11 +202,22 @@ abstract contract DeployBase is Script {
         // to one key; the oracle enforces that itself.
         d.oracle.setNavConfirmer(p.navConfirmer);
 
-        // Deliberately NOT wired: adapter.setHarvester. Under an EOA owner it buys
-        // nothing, because the owner can already call vault.harvestYield() directly.
-        // It becomes load-bearing when the owner is slow (a timelock) or when the
-        // EpochHarvester ships, which is why it is on the go-live checklist rather
-        // than here.
+        // **The yield path, which round 7 found was never actually connected.**
+        // This deferral used to say the harvester link "becomes load-bearing when the
+        // EpochHarvester ships" - and it has shipped: it is constructed above and
+        // wired on both the manager and the pool. The trigger fired and the comment
+        // outlived it.
+        //
+        // Two calls are needed and the old note only ever named one. `setHarvester`
+        // makes the harvester a permitted claimer, without which `harvest`'s
+        // `try adapter.claimYield()` swallows a `NotClaimer` revert every epoch. But
+        // the money moves on the second: `_trySweepUsdc` sends the adapter's whole USDC
+        // balance to `yieldRecipient`, so while that stays the treasury the split never
+        // runs, every epoch reports `ZeroYieldEpoch`, and no borrower's debt is ever
+        // written down. The treasury still gets its share - through the harvester's
+        // protocol-fee leg, which is where the split says it belongs.
+        d.adapter.setHarvester(address(d.harvester));
+        d.adapter.setYieldRecipient(address(d.harvester));
     }
 
     /// @dev Ownership moves last, after everything is wired.
@@ -237,6 +248,15 @@ abstract contract DeployBase is Script {
         if (d.vault.creditManager() != address(d.credit)) revert WiringIncomplete("vault.creditManager");
         if (d.vault.liquidationAuction() != address(d.auction)) revert WiringIncomplete("vault.liquidationAuction");
 
+        // The other two legs of the same triangle. Both are wired in `_wire` and
+        // neither was asserted, so a deployment could reach production able to seize
+        // collateral but unable to open an auction, or with an auction nothing would
+        // accept settlement from. Now Phase 3 is real, that is not theoretical.
+        if (d.credit.liquidationAuction() != address(d.auction)) {
+            revert WiringIncomplete("credit.liquidationAuction");
+        }
+        if (d.auction.creditManager() != address(d.credit)) revert WiringIncomplete("auction.creditManager");
+
         if (address(d.harvester.custodyAdapter()) == address(0)) revert WiringIncomplete("harvester.custodyAdapter");
         if (d.harvester.lenderPool() == address(0)) revert WiringIncomplete("harvester.lenderPool");
         if (d.harvester.protocolFeeWallet() == address(0)) revert WiringIncomplete("harvester.protocolFeeWallet");
@@ -258,6 +278,12 @@ abstract contract DeployBase is Script {
         if (sink == address(d.vault)) revert YieldRecipientCollision(sink, "vault");
         if (sink == address(d.adapter)) revert YieldRecipientCollision(sink, "adapter");
         if (sink == address(0)) revert YieldRecipientRequired();
+        // The three checks above rule out the sinks that strand yield, and every one
+        // of them passed while 100% of it went to an EOA and the whole split sat idle.
+        // Ruling out wrong destinations is not the same as asserting the right one.
+        if (sink != address(d.harvester)) revert WiringIncomplete("adapter.yieldRecipient");
+        if (d.adapter.harvester() != address(d.harvester)) revert WiringIncomplete("adapter.harvester");
+        if (d.credit.epochHarvester() != address(d.harvester)) revert WiringIncomplete("credit.epochHarvester");
     }
 
     function _requireOwner(address contractAddr, address actual, address expected) private pure {

@@ -27,7 +27,8 @@ contract ConfigTest is Test {
     /// @notice A floor-price fill must cover debt + liquidation penalty even at the
     ///         worst LTV that can first trigger a liquidation. That worst case is one
     ///         immediate NAV_MAX_DEVIATION_BPS drop applied to a position sitting at
-    ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev).
+    ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev). (Was 6500 vs a
+    ///         6767 requirement - a lender shortfall, raised to 6800 after review.)
     function test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger() public pure {
         // Derive the worst drop from what NAVOracle actually accepts without a second
         // key, not from NAV_MAX_DEVIATION_BPS directly. Those were the same number
@@ -53,6 +54,25 @@ contract ConfigTest is Test {
 
     function test_capsOrdering() public pure {
         assertLe(Config.PER_ACCOUNT_BORROW_CAP, Config.GLOBAL_BORROW_CAP);
+    }
+
+    /// @dev The penalty split must be exhaustive and the caller must never be able to
+    ///      take all of it: the insurance fund's share is what makes liquidating a
+    ///      position net-positive for the protocol rather than merely for the keeper.
+    function test_penaltySplitLeavesTheInsuranceFundAShare() public pure {
+        assertLt(Config.LIQUIDATION_CALLER_SHARE_BPS, Config.BPS);
+        assertGt(Config.LIQUIDATION_CALLER_SHARE_BPS, 0);
+    }
+
+    /// @dev A workout must be allowed to run longer than DexFi's own quoted redemption
+    ///      turnaround, or the force-close would recognise a loss on debt that was
+    ///      about to be paid. `AUCTION_DURATION` bounds it from the other side: the
+    ///      workout only starts once the auction has run its course.
+    function test_workoutOutlastsTheAuctionAndTheRedemptionQuote() public pure {
+        assertGt(Config.WORKOUT_MAX_DURATION, Config.AUCTION_DURATION);
+        // DexFi quote their manual redemption at "48h+"; the bound has to clear it
+        // with room, because there is nothing on-chain that enforces their timeline.
+        assertGt(Config.WORKOUT_MAX_DURATION, 48 hours * 3);
     }
 
     function test_externalAddressesResolved() public pure {

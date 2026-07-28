@@ -10,6 +10,9 @@ interface ICreditManager {
     event Borrowed(address indexed borrower, uint256 amount);
     event Repaid(address indexed borrower, uint256 amount);
     event YieldApplied(address indexed borrower, uint256 debtReduced, uint256 overflowToClaimable);
+    /// @param callerReward What the caller earns *if* the lot sells for more than the
+    ///        debt. Not paid at trigger time: the penalty is taken from surplus, and
+    ///        an auction that fills below the debt has none. An entitlement ceiling.
     event LiquidationTriggered(address indexed borrower, address indexed caller, uint256 callerReward);
     event SurplusClaimed(address indexed borrower, uint256 amount);
 
@@ -19,6 +22,11 @@ interface ICreditManager {
 
     /// @notice Optional manual repayment, always allowed.
     function repay(uint256 amount) external;
+
+    /// @notice Repay on someone else's behalf; clamps at their outstanding debt.
+    /// @dev Needed for rescue (a borrower who has lost keys or been blacklisted) and
+    ///      by the auction, which pays a liquidated position's debt out of the sale.
+    function repayFor(address borrower, uint256 amount) external;
 
     /// @notice Deliver an epoch's borrower share before distributing it, so the
     ///         accumulator can only ever promise USDC that has actually arrived.
@@ -55,12 +63,42 @@ interface ICreditManager {
     function claimSurplus() external;
 
     /// @notice Start a Dutch auction for an unhealthy position. Callable by anyone
-    ///         when health factor < 1.0; caller earns a small reward.
+    ///         once the position is past the liquidation threshold; the caller earns a
+    ///         share of the penalty if the lot sells for more than the debt.
     function liquidate(address borrower) external;
+
+    /// @notice Book a liquidation's insurance cut and the borrower's surplus.
+    ///         LiquidationAuction only.
+    function creditLiquidationProceeds(address borrower, uint256 toInsurance, uint256 toBorrower) external;
+
+    /// @notice Recognise unrecoverable debt: insurance first, then socialised to
+    ///         lenders. LiquidationAuction only.
+    function writeDownLoss(address borrower, uint256 amount) external;
+
+    /// @notice Retry placing losses the lender pool could not accept. Permissionless.
+    function flushSocialisedLoss() external;
+
+    /// @return Losses recognised on the books but not yet accepted by the lender pool.
+    function unsocialisedLoss() external view returns (uint256);
+
+    /// @notice USDC held to absorb auction shortfalls before any loss reaches lenders.
+    function insuranceFund() external view returns (uint256);
 
     function debtOf(address borrower) external view returns (uint256);
 
     function totalDebt() external view returns (uint256);
+
+    /// @notice Delivered yield not yet moved into the accumulator. The vault checks it
+    ///         before a manager swap, because it is value in flight that debt does not
+    ///         account for.
+    function undistributedYield() external view returns (uint256);
+
+    /// @notice The running yield-per-bond accumulator. The vault reads it to refuse a
+    ///         manager that has already been live: `_settle` does not stamp an index
+    ///         while detached, so re-attaching one would let any position that moved in
+    ///         the meantime claim the whole accumulator against a zero index. A manager
+    ///         that has never been attached reports zero.
+    function accYieldPerBond() external view returns (uint256);
 
     /// @notice The vault this manager is bound to. Exposed so the vault can refuse to
     ///         point at a manager bound elsewhere: `settleForVault` is caller-gated on

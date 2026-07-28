@@ -14,6 +14,7 @@ import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
+import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
@@ -180,7 +181,11 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));
-        vault.setLiquidationAuction(makeAddr("auction"));
+        // The vault refuses an auction pointer that is not a contract bound back to it,
+        // so suites that never run a liquidation still need a stand-in.
+        MockLiquidationAuction auctionStub = new MockLiquidationAuction();
+        auctionStub.setVault(address(vault));
+        vault.setLiquidationAuction(address(auctionStub));
         credit.setLiquiditySource(address(liquidity));
         credit.setEpochHarvester(harvester);
         liquidity.setCreditManager(address(credit));

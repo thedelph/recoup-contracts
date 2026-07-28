@@ -28,6 +28,24 @@ contract MockCreditManager {
         debtOf[borrower] = debtUsdc;
     }
 
+    /// @notice What the vault's liquidatability check reads.
+    /// @dev The real manager projects unsettled streamed yield here, so it can be
+    ///      lower than `debtOf`. The mock has no accumulator, so the two agree - and
+    ///      `setUnsettledCredit` exists to force them apart, because the difference is
+    ///      exactly what makes a position look liquidatable on stored debt while a
+    ///      permissionless settle would have cleared it for free.
+    mapping(address => uint256) public unsettledCredit;
+
+    function setUnsettledCredit(address borrower, uint256 amount) external {
+        unsettledCredit[borrower] = amount;
+    }
+
+    function currentDebtOf(address borrower) external view returns (uint256) {
+        uint256 debt = debtOf[borrower];
+        uint256 credit = unsettledCredit[borrower];
+        return credit >= debt ? 0 : debt - credit;
+    }
+
     function settleForVault(address borrower, uint256 currentBonds) external {
         settledAtBonds[borrower] = currentBonds;
         settleCalls++;
