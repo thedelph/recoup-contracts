@@ -113,7 +113,7 @@ that shows the product actually works.
 The one thing Recoup needs from you is `addWhitelist` on the custody adapter. What that buys and
 what it does not is a tested quantity rather than an assurance:
 
-- **The adapter is the only address that touches your contracts.** Fork test 3 runs the entire
+- **The adapter is the only Recoup address that calls your contracts.** Fork test 3 runs the entire
   lifecycle with only that single address whitelisted, against live Base state, so you can see
   exactly which of your functions get called and which never do.
 - **Revoking the whitelist is modelled, not assumed** (`test/WhitelistRevocation.t.sol`). Revocation
@@ -126,7 +126,8 @@ what it does not is a tested quantity rather than an assurance:
   address needs whitelisting for liquidations to work.
 - **DexFi is treated as mutable.** Both your contracts are owned by a single EOA and the farm is
   upgradeable, so Recoup is built against that rather than around it: the custody backend sits
-  behind a swappable interface, and the borrow caps are sized for it.
+  behind a swappable interface, and there are hard borrow caps. How large those caps can
+  responsibly go depends on your admin-key plans, which is one of the open questions.
 
 ### How the contracts are reviewed
 
@@ -144,9 +145,14 @@ Three habits came out of that and now apply by default:
 - When a fix adds a guard, look for the mirror case it did not cover, and check what the guard's
   escape hatch actually depends on.
 
-Alongside the audits: stateful invariant fuzzing over three suites, each paired with a
-deterministic reachability test so a suite cannot pass vacuously; and the mainnet fork tests above,
-which are the real integration proof.
+Alongside the audits: stateful invariant fuzzing over four suites (21 invariants), and the mainnet
+fork tests above, which are the real integration proof.
+
+An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does
+not fail the fixture, which means a suite that never reaches the interesting state still reports
+everything passing. Two of the four suites carry a deterministic reachability test that pins the
+state was actually reached. **The vault and credit-manager suites do not yet**, and that is a gap
+rather than a decision.
 
 ### What is knowingly not mitigated
 
