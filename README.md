@@ -69,9 +69,9 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 346 unit + invariant tests vs real-ABI mocks (~6 min: the
-                # three invariant suites dominate, so a short timeout will kill
-                # the run mid-flight rather than fail it)
+forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: the
+                # three invariant suites dominate, and a short timeout will kill
+                # the run mid-flight rather than fail it
 ```
 
 ### Mainnet fork tests
@@ -106,117 +106,62 @@ that shows the product actually works.
 
 ## Security posture (pre-external-audit)
 
-**Nine independent security reviews** have been run, each a 12-agent Solidity audit pass.
+**Nothing is deployed to any chain, and an external audit is a hard gate before any real funds.**
 
-The third and fourth (July 2026) covered the epoch harvester and the yield-distribution mechanism
-behind it. The fourth deliberately audited *the third round's own fixes*, and that turned out to
-matter: **four of its twelve findings were regressions introduced by the third round**. Every one is
-fixed with a regression test. The lesson is now a standing habit here - a fix round is new code, and
-fixes that add a mechanism regress far more often than fixes that remove a constraint.
+### What this means if you are DexFi
 
-Rounds five through eight (July 2026) covered the liquidation auction and then, repeatedly, each
-other. Four rounds running found regressions in the previous round's own fixes, which is why the
-re-audit is now automatic rather than optional. Two results are worth stating plainly:
+The one thing Recoup needs from you is `addWhitelist` on the custody adapter. What that buys and
+what it does not is a tested quantity rather than an assurance:
 
-- **Round seven's critical was cleared by eight of twelve agents, and the majority was wrong.**
-  They analysed a function where the argument genuinely holds and never looked at the one where it
-  does not. A proof-of-concept settled it in ten minutes: 100 bonds confiscated against a recorded
-  debt of zero, and a variant that returns an entire liquidation fill to the borrower. Agreement
-  between agents is not evidence; a specific trace is.
-- **Round six-b's fix made its own bug permanent.** A guard added to one side of a symmetric pair
-  meant that once the two pointers diverged, the guard *refused to let them reconverge*.
+- **The adapter is the only address that touches your contracts.** Fork test 3 runs the entire
+  lifecycle with only that single address whitelisted, against live Base state, so you can see
+  exactly which of your functions get called and which never do.
+- **Revoking the whitelist is modelled, not assumed** (`test/WhitelistRevocation.t.sol`). Revocation
+  does not merely stop new deposits: it strands live collateral. The farm can still return bonds to
+  the adapter, but the adapter cannot pass them to a non-whitelisted depositor, and the emergency
+  hatch hits the same gate unless its destination is whitelisted. This is recorded here because the
+  mitigation is an integration agreement, not code. It is the reason Recoup asks for either a
+  permanently whitelisted unwind address or notice before revocation.
+- **The auction never escrows bonds.** A lot moves adapter-to-winner in one hop, so no second
+  address needs whitelisting for liquidations to work.
+- **DexFi is treated as mutable.** Both your contracts are owned by a single EOA and the farm is
+  upgradeable, so Recoup is built against that rather than around it: the custody backend sits
+  behind a swappable interface, and the borrow caps are sized for it.
 
-Round nine (August 2026) covered the referral registry. It is the first round where the contract
-logic came through untouched - every agent attacked the code-canonicalisation walk, the write-once
-mappings and the attribution lookup, and one differential-fuzzed the canonicalisation 40,000 times
-against an independent implementation with zero mismatches. **Every finding was in the deploy
-script or in the comments describing the contract**, which is its own lesson: confident prose next
-to correct code is still a defect when the prose is wrong. The worst was a claim that reserved
-brand codes were seeded atomically - a broadcast emits one transaction per call, so what actually
-existed was a live registry with an open, permissionless registration function followed by a race
-for each name. Seeding moved into the constructor.
+### How the contracts are reviewed
 
-The ones worth knowing about from rounds three and four:
+Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
+re-audited**, because four rounds running found regressions introduced by the previous round's own
+fixes. Findings are fixed with regression tests. The full round-by-round record is in
+[AUDITS.md](AUDITS.md).
 
-- **Yield is streamed, not lumped.** Crediting an epoch's borrower share against an instantaneous
-  bond count made it free money for anyone watching the mempool: deposit a large position in the
-  harvest block, settle, claim, withdraw. It now pays out over the window it actually accrued
-  across, so one block of holding earns one block of yield.
-- **An epoch is sized from the harvester's own balance, not from what the claim call returns.** The
-  farm is MasterChef-style, so a withdrawal, a seizure or a direct claim each settle the whole
-  position and forward that USDC ahead of the epoch. Sized from the return value, those epochs
-  reported zero and the money sat unreachable.
-- **Guards that assumed their own escape hatch was reachable.** Three separate cases: a "flush
-  before repointing" guard whose flush target reverts by design, a "sweep to the outgoing recipient
-  before repointing away from it" path where that recipient is blocked (which is *why* you are
-  repointing), and a confirmation clock that restarted whenever the pending price changed, which a
-  live feed does on every post. The first locked a quarter of all yield permanently.
-- **A detached CreditManager stayed live and drainable.** The swap guard checked only that debt was
-  zero - the normal end state of a self-repaying loan - while the outgoing manager kept pricing
-  positions off the vault's still-moving bond counts.
+Three habits came out of that and now apply by default:
 
-The second review (after the credit core landed) covered all ten contracts and raised twelve
-findings, all fixed with regression tests. The ones worth knowing about:
-
-- The NAV oracle's deviation rate limit was defeated by integer truncation. Both sides of the budget
-  comparison floored to whole basis points, so sub-1-bps steps cost nothing and compounded; it now
-  compares by cross-multiplication with no division anywhere.
-- The two-key confirmation path had two independent liveness defects - the delay restarted on every
-  repost, and an in-budget post cleared the pending value. Either let one key defeat the pair.
-- The Dutch auction floor was derived from a maximum NAV move the oracle did not actually enforce.
-  The parameter test now derives that bound from the oracle's own formula instead of restating the
-  assumption, so the two cannot silently diverge again.
-- A single-unit withdrawal settled the whole staked position's farm rewards and forwarded them
-  without reporting the amount, so the measured harvest could be driven to zero.
-- `LiquidationAuction` could not receive ERC-1155 units at all - invisible while every seize test
-  targeted an EOA, because an EOA destination skips the acceptance check. The auction was later
-  redesigned to never escrow bonds, which makes the defect moot, but the blind spot it exposed
-  was not: a test fixture that only ever used EOAs could not have found it.
-- **Four later rounds went over the liquidation auction itself.** The sharpest was a pair of
-  wiring pointers that could be pulled apart and then pinned apart, so a position's health was
-  checked against one ledger and its debt settled against another - a lot seized against a
-  recorded debt of zero, or an entire fill returned to the borrower. Both setters are guarded now.
-  Two lessons generalised: when a fix adds a guard, look for the mirror case it did not cover
-  (every finding in that round was one side of a symmetric pair), and check what each guard's
+- A fix round is new code. Fixes that add a mechanism regress far more often than fixes that remove
+  a constraint.
+- Agreement between reviewers is not evidence. One round's critical was cleared by eight of twelve
+  agents who had all analysed the wrong function; a proof-of-concept settled it in ten minutes.
+- When a fix adds a guard, look for the mirror case it did not cover, and check what the guard's
   escape hatch actually depends on.
 
-The first review covered the two contracts implemented at the time and raised eight findings, all
-fixed - see the `Security hardening` commits for the per-finding diffs. What
-they covered:
+Alongside the audits: stateful invariant fuzzing over three suites, each paired with a
+deterministic reachability test so a suite cannot pass vacuously; and the mainnet fork tests above,
+which are the real integration proof.
 
-| Area | What changed |
+### What is knowingly not mitigated
+
+Published because the alternative is worse. All of it is acceptable only while nothing is deployed
+and no third-party funds exist, and each item is tripwired to that condition.
+
+| Item | Status |
 |---|---|
-| Yield routing | Harvested USDC could only ever land in the immutable, egress-less vault, where nothing could move it out again. It now routes to a settable `yieldRecipient`, and the reported figure counts real farm yield rather than the raw balance, so a stray USDC transfer cannot inflate it. |
-| Mint accounting | Credit is pinned to the signed `amountNfts`, and the mint delta is measured, so over-credit, under-credit and donated bonds are all excluded. |
-| Custody swaps | `setCustodyAdapter` now refuses a swap while the outgoing adapter holds a live position, and requires the incoming adapter to be bound to this vault. |
-| Exits | The USDC sweep on `unstake` is best-effort, so a token pause or blacklist cannot brick a withdrawal. An owner-gated `emergencyUnstake` adds a farm escape hatch. |
-| Yield pipeline | `claimYield` is callable by the vault or a settable harvester, so the immutable adapter can be pointed at the batch harvester later with no redeploy. |
-| Oracle safety | `withdrawBonds` reverts on a stale NAV in the debt-bearing branch. |
-| Auction floor | Raised so the floor always clears debt plus penalty at the first triggerable liquidation; the full relation is now asserted in `Config.t.sol`. |
+| **Ownership is a plain EOA.** No timelock, no multisig. A 48-hour wait per fix while the deployment shape is still moving costs more than it buys pre-launch. | Resolved at go-live by a documented checklist: timelock, a 2-of-3 governance Safe, a guardian pause role landing in the same change, and ownership handover. `test/Governance.t.sol` proves the flip is a pure `transferOwnership` with no redeploy. |
+| **Manager migration is out of scope.** The contracts are immutable by choice, so fixing one means redeploying and repointing, and repointing does not move what the old contract holds. | Deliberate. Before launch the fix is to redeploy the set and move the bonds. The guards that protect any pointer change stay regardless. |
+| **`seize` depends on the farm being callable.** Accepted rather than engineered around. | Accepted, documented. |
+| **Slither has not been re-run over the credit core.** It was clean over the collateral layer, with every triaged suppression carrying an inline justification. | Treat the clean result as covering the earlier scope only. |
 
-Alongside those: constructor zero-address checks, `renounceOwnership` disabled on the
-live-authority contracts, and a `pause`/`unpause` pair on `CreditManager`. The suite grew from 33
-to 45 tests in the same pass. Remaining known items are tracked against the phase that resolves
-them, and an external audit is still a hard gate before any real funds.
-
-- **Whitelist revocation is modelled, not assumed** (`test/WhitelistRevocation.t.sol`): the bond's
-  transfer whitelist is owner-managed and revocable, so the blast radius of losing it is a tested
-  quantity. Revocation does not only stop deposits, it strands live collateral: the farm can still
-  return bonds to the adapter, but the adapter cannot pass them to a non-whitelisted depositor, and
-  the emergency hatch hits the same gate unless its destination is whitelisted. Recorded here
-  because the mitigation is an integration agreement, not code.
-- **Stateful invariant fuzzing** (`test/CollateralVault.invariants.t.sol`): randomised multi-actor
-  call sequences must preserve four invariants after every sequence - vault accounting equals farm
-  stake, the adapter holds no USDC or loose bonds at rest, bond units are conserved, the vault
-  itself never custodies bonds. Run: `forge test --match-contract Invariants`.
-- **Slither**: was clean over the collateral layer - 0 findings with informational/optimization
-  excluded, every triaged suppression carrying an inline justification. **Not yet re-run over the
-  credit core**, so treat that result as covering the earlier scope only.
-- **Coverage**: the collateral layer measured 96.9% lines (CollateralVault) and 97.1% lines / 100%
-  functions (DirectCallAdapter) at the previous pass. Skeleton modules are stubs and intentionally
-  uncovered until their phase.
-- All wiring setters and the adapter constructor zero-address-check; deposits are pausable, exits
-  are not; external audit is a hard gate before any real funds.
+Deposits are pausable; exits are not. All wiring setters and constructors zero-address-check, and
+`renounceOwnership` is disabled on the live-authority contracts.
 
 ## External addresses (Base mainnet, verified 2026-07-24)
 
