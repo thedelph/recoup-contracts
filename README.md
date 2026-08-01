@@ -10,6 +10,13 @@ filling at 82% of NAV and an unfilled one falling through to the workout path - 
 against the live DexFi contracts. Lending is an interfaced skeleton, built in deliberate phases.
 Nothing touches real funds before an external audit.
 
+`ReferralRegistry` is a standalone addition with zero coupling to the protocol above: two
+write-once mappings recording who owns a referral code and which code an account bound to, with no
+owner, no pause and no way to move either fact once written. It holds no value and no protocol
+contract reads it. It is deliberately absent from the main deploy script, because the supported
+fix for a core defect before launch is redeploying the set, and a registry inside that set would
+take a new address each time and orphan every existing binding.
+
 ## Architecture
 
 ```
@@ -62,12 +69,14 @@ Requires [Foundry](https://getfoundry.sh).
 ```sh
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
-forge test      # 197 unit + invariant tests vs real-ABI mocks
+forge test      # 346 unit + invariant tests vs real-ABI mocks (~6 min: the
+                # three invariant suites dominate, so a short timeout will kill
+                # the run mid-flight rather than fail it)
 ```
 
 ### Mainnet fork tests
 
-Six integration tests run against the **live** DexFi contracts on Base (fork-at-latest, so any
+Nine integration tests run against the **live** DexFi contracts on Base (fork-at-latest, so any
 full node works - no archive access needed). This is the part worth running yourself:
 
 ```sh
@@ -97,7 +106,7 @@ that shows the product actually works.
 
 ## Security posture (pre-external-audit)
 
-**Four independent security reviews** have been run, each a 12-agent Solidity audit pass.
+**Nine independent security reviews** have been run, each a 12-agent Solidity audit pass.
 
 The third and fourth (July 2026) covered the epoch harvester and the yield-distribution mechanism
 behind it. The fourth deliberately audited *the third round's own fixes*, and that turned out to
@@ -105,7 +114,29 @@ matter: **four of its twelve findings were regressions introduced by the third r
 fixed with a regression test. The lesson is now a standing habit here - a fix round is new code, and
 fixes that add a mechanism regress far more often than fixes that remove a constraint.
 
-The ones worth knowing about from those two rounds:
+Rounds five through eight (July 2026) covered the liquidation auction and then, repeatedly, each
+other. Four rounds running found regressions in the previous round's own fixes, which is why the
+re-audit is now automatic rather than optional. Two results are worth stating plainly:
+
+- **Round seven's critical was cleared by eight of twelve agents, and the majority was wrong.**
+  They analysed a function where the argument genuinely holds and never looked at the one where it
+  does not. A proof-of-concept settled it in ten minutes: 100 bonds confiscated against a recorded
+  debt of zero, and a variant that returns an entire liquidation fill to the borrower. Agreement
+  between agents is not evidence; a specific trace is.
+- **Round six-b's fix made its own bug permanent.** A guard added to one side of a symmetric pair
+  meant that once the two pointers diverged, the guard *refused to let them reconverge*.
+
+Round nine (August 2026) covered the referral registry. It is the first round where the contract
+logic came through untouched - every agent attacked the code-canonicalisation walk, the write-once
+mappings and the attribution lookup, and one differential-fuzzed the canonicalisation 40,000 times
+against an independent implementation with zero mismatches. **Every finding was in the deploy
+script or in the comments describing the contract**, which is its own lesson: confident prose next
+to correct code is still a defect when the prose is wrong. The worst was a claim that reserved
+brand codes were seeded atomically - a broadcast emits one transaction per call, so what actually
+existed was a live registry with an open, permissionless registration function followed by a race
+for each name. Seeding moved into the constructor.
+
+The ones worth knowing about from rounds three and four:
 
 - **Yield is streamed, not lumped.** Crediting an epoch's borrower share against an instantaneous
   bond count made it free money for anyone watching the mempool: deposit a large position in the
