@@ -31,6 +31,17 @@ import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 ///      addresses; operator identities are per-deployment, rotatable, and must not be
 ///      committed. Keeping them here is also what makes the eventual move of `owner`
 ///      from an EOA to a Safe or timelock a config change rather than a code change.
+///
+/// @dev **`ReferralRegistry` is deliberately NOT deployed here, and must not be added.**
+///      It has zero coupling in both directions, so `_assertWiring` would have nothing to
+///      assert about it, and a `Deployed` field with no possible assertion is the shape of
+///      audit-7 finding #6. The decisive reason is G9: the supported fix for a core defect
+///      before launch is to redeploy this whole set and move the bonds across, and a
+///      registry inside that set would take a new address every time. Bindings are
+///      immutable, address-scoped and non-portable, so each redeploy would orphan every
+///      referral binding permanently, with no owner able to repair it. The registry's
+///      lifecycle has to outlive the protocol's. It ships via
+///      `script/DeployReferral.s.sol`, once, on its own schedule.
 abstract contract DeployBase is Script {
     /// @notice Per-deployment operator addresses. `owner` is deliberately a plain
     ///         address: an EOA while building, a Safe or TimelockController at

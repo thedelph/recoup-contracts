@@ -50,6 +50,54 @@ library Config {
     uint256 internal constant SPLIT_INSURANCE_BPS = 1_000;
     uint256 internal constant SPLIT_PROTOCOL_BPS = 1_000;
 
+    // ── Referral programme v1 (approved 2026-07-30) ─────────────────────────
+    //
+    // NOT READ BY ANY CONTRACT, by design, and `ReferralRegistry` reads only the two code-length
+    // bounds. Everything here is consumed by the off-chain accrual calculator and, at Phase 4, by
+    // whatever computes the Merkle root. They live in Config anyway, per the no-magic-numbers rule
+    // and because the calculator and the UI must not each carry their own copy. Same policy as
+    // ADMIN_TIMELOCK below: do not delete as unused.
+    //
+    // All three share figures are percentages **of the Recoup protocol fee** (SPLIT_PROTOCOL_BPS),
+    // not of gross yield. On $100 of harvested yield the split stays 55/25/10/10, and it is
+    // Recoup's $10 that becomes $2 referrer + $1 referred borrower + $7 retained during the first
+    // 12 weeks, then $2 + $8 to week 52, then $10.
+    //
+    // The programme is **borrower-only**. A lender leg was rejected because the borrower's referrer
+    // and the lender's referrer would both be paid out of the protocol fee on the *same* harvest,
+    // so two independently-applied 30% caps could spend 60% of one dollar.
+    uint256 internal constant REFERRAL_REFERRER_SHARE_BPS = 2_000; // 20% of the protocol fee
+    uint256 internal constant REFERRAL_REFEREE_SHARE_BPS = 1_000; // 10%, paid as a USDC rebate
+
+    /// @dev The referee reward is a **rebate**, never an adjustment to the yield split. A per-user
+    ///      split is not implementable: `EpochHarvester` applies SPLIT_BORROWER_BPS to the whole
+    ///      claimed amount and `CreditManager` distributes through a single yield-per-bond
+    ///      accumulator with no per-position differentiation - which is exactly what settles 200+
+    ///      positions in one storage write (PRD §6.2). An earlier design specified "+2.5pp on the
+    ///      borrower's split"; it was both unbuildable and 45% of the fee against a claimed 30% cap.
+    uint256 internal constant REFERRAL_REFERRER_DURATION = 52 weeks;
+    uint256 internal constant REFERRAL_REFEREE_DURATION = 12 weeks;
+
+    /// @notice Hard ceiling on combined referral outflow, as a share of the protocol fee.
+    /// @dev Asserted against the two legs in `Config.t.sol` rather than trusted. The previous
+    ///      design claimed this cap while specifying figures that summed to 45%, which is the same
+    ///      failure as audit-2 finding #2: a constant sized against a bound nothing enforced.
+    uint256 internal constant REFERRAL_MAX_OUTFLOW_BPS = 3_000;
+
+    /// @notice Floors that stop dust spam in the calculator and the distributor, USDC 6dp.
+    /// @dev A position below the qualifying debt accrues nothing, and an accrual below the claim
+    ///      floor is carried rather than published into a Merkle root, where its claim would cost
+    ///      more gas than it pays. Both must be settled before the programme is activated.
+    uint256 internal constant REFERRAL_MIN_QUALIFYING_DEBT = 100e6;
+    uint256 internal constant REFERRAL_MIN_CLAIM = 10e6;
+
+    /// @notice Bounds on a referral code, in bytes. The only constants `ReferralRegistry` reads.
+    /// @dev A 1-character namespace is 38 entries and a 2-character one is 1,444; both are pure
+    ///      landgrab on day one. Three is still short enough to say out loud. The maximum keeps a
+    ///      code inside one `bytes32` with room to spare and keeps links readable.
+    uint256 internal constant REFERRAL_CODE_MIN_LENGTH = 3;
+    uint256 internal constant REFERRAL_CODE_MAX_LENGTH = 16;
+
     // ── Epoch harvesting (PRD §4.4) ──────────────────────────────────────────
     uint256 internal constant MIN_EPOCH_GAP = 5 days;
 

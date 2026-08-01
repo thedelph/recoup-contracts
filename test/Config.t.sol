@@ -113,5 +113,77 @@ contract ConfigTest is Test {
         assertGt(Config.INSURANCE_FUND_TARGET_BPS, 0);
         assertLt(Config.INSURANCE_FUND_TARGET_BPS, Config.BPS);
         assertEq(Config.HEALTH_FACTOR_SCALE, 1e18);
+
+        // The referral constants are consumed off-chain (the accrual calculator) and by the
+        // Phase 4 distributor. Same reason as above: assert them so they survive to their phase.
+        assertGt(Config.REFERRAL_MIN_QUALIFYING_DEBT, 0);
+        assertGt(Config.REFERRAL_MIN_CLAIM, 0);
+        assertLt(
+            Config.REFERRAL_MIN_CLAIM,
+            Config.REFERRAL_MIN_QUALIFYING_DEBT,
+            "a claim floor above the debt floor would make qualifying positions unpayable"
+        );
+    }
+
+    /// @dev **Derived, not asserted.** The previous referral design claimed a 30% cap while
+    ///      specifying legs that summed to 45% of the protocol fee, and nothing caught it because
+    ///      no test computed the sum. This is the same failure as audit-2 finding #2: a constant
+    ///      sized against a bound that nothing enforced. Compute the outflow from the legs and
+    ///      compare it to the declared cap, so the two cannot diverge again silently.
+    function test_referralOutflowFitsTheDeclaredCap() public pure {
+        uint256 outflow = Config.REFERRAL_REFERRER_SHARE_BPS + Config.REFERRAL_REFEREE_SHARE_BPS;
+        assertLe(
+            outflow,
+            Config.REFERRAL_MAX_OUTFLOW_BPS,
+            "referral legs exceed the cap the programme design promises"
+        );
+    }
+
+    /// @dev Both legs are shares *of the protocol fee*, so neither may exceed it, and the two
+    ///      together cannot take more than all of it. If either ever did, the referral programme
+    ///      would be paying out of the 55/25/10 promised to borrowers, lenders and insurance
+    ///      rather than out of Recoup's own slice, which is the promise the design rests on.
+    function test_referralIsFundedEntirelyFromTheProtocolFee() public pure {
+        uint256 outflow = Config.REFERRAL_REFERRER_SHARE_BPS + Config.REFERRAL_REFEREE_SHARE_BPS;
+        assertLe(outflow, Config.BPS, "referral cannot take more than the whole protocol fee");
+
+        // Expressed as a share of gross yield, what the programme costs at full tilt.
+        uint256 grossBps = (Config.SPLIT_PROTOCOL_BPS * outflow) / Config.BPS;
+        assertLt(
+            grossBps,
+            Config.SPLIT_PROTOCOL_BPS,
+            "the protocol must retain some of its own fee while a referral is live"
+        );
+    }
+
+    /// @dev The referee's rebate is a launch sweetener and the referrer's share is the standing
+    ///      income stream; the sweetener outlasting the income stream would invert the programme.
+    function test_referralDurationsOrdering() public pure {
+        assertLt(
+            Config.REFERRAL_REFEREE_DURATION,
+            Config.REFERRAL_REFERRER_DURATION,
+            "the referee boost must expire before the referrer's share"
+        );
+        assertGt(
+            Config.REFERRAL_REFEREE_DURATION,
+            Config.MIN_EPOCH_GAP,
+            "a reward window shorter than an epoch gap could pay nothing at all"
+        );
+    }
+
+    /// @dev The minimum being non-zero is **load-bearing for correctness**, not just for namespace
+    ///      economics. `ReferralRegistry.referrerFor` reads `referrerOf[boundCode[x]]`, and an
+    ///      unbound account reads `referrerOf[bytes32(0)]`. That resolves to nobody only because
+    ///      the zero code fails `isCanonical` on length. At a minimum of zero, one `register` would
+    ///      make the caller the recorded referrer of every unbound account in existence.
+    function test_referralCodeLengthBoundsAreSane() public pure {
+        assertGt(Config.REFERRAL_CODE_MIN_LENGTH, 0, "zero-length codes would break the unbound sentinel");
+        assertGt(Config.REFERRAL_CODE_MIN_LENGTH, 2, "a 2-character namespace is pure landgrab");
+        assertLt(Config.REFERRAL_CODE_MIN_LENGTH, Config.REFERRAL_CODE_MAX_LENGTH);
+        // Strictly under 32, not `<= 32`. `isCanonical` states "a code filling all 32 bytes is over
+        // the maximum anyway" as settled fact, and a `<= 32` bound admitted the one value that
+        // falsifies it. Client-side encoders are the other reason: ethers' `encodeBytes32String`
+        // caps at 31 bytes, so a 32-character code would be un-enterable from a standard client.
+        assertLt(Config.REFERRAL_CODE_MAX_LENGTH, 32, "a code must fit in one bytes32 with a terminator");
     }
 }
