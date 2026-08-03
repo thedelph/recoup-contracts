@@ -36,6 +36,21 @@ contract CreditHandler is Test {
     ///         can tell a legitimate increase from debt appearing out of nowhere.
     uint256 public borrowCount;
 
+    /// @notice Coverage ghosts, which `borrowCount` above is not - it exists to serve
+    ///         `invariant_debtOnlyRisesOnABorrow`, and happens to double as evidence a
+    ///         borrow is reachable. Nothing counted the rest. The interesting actions
+    ///         here are wrapped in `try`, which they have to be, so a fixture that could
+    ///         never reach a surplus claim would report seven green invariants having
+    ///         exercised nothing.
+    ///         `test_handlerCanReachEveryStateTheInvariantsCheck` asserts these.
+    uint256 public repaysDone;
+    uint256 public yieldDistributions;
+    uint256 public debtWriteDowns;
+    uint256 public surplusClaimsDone;
+    uint256 public principalSettlementsDone;
+    uint256 public withdrawsDone;
+    uint256 public withdrawsRefusedByLtv;
+
     constructor(
         MockUSDC usdc_,
         MockNavOracle oracle_,
@@ -76,7 +91,14 @@ contract CreditHandler is Test {
         usdc.mint(a, paid);
         vm.startPrank(a);
         usdc.approve(address(credit), paid);
-        try credit.repay(amount) {} catch {}
+        // `_repay` settles before reading the debt, so a position whose streamed yield
+        // has just cleared it reverts `NoDebt` between this handler's read and the call.
+        // That is a real state, not a fixture fault, and it is the only one expected.
+        try credit.repay(amount) {
+            ++repaysDone;
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), CreditManager.NoDebt.selector, "unexpected repay revert");
+        }
         vm.stopPrank();
     }
 
@@ -90,6 +112,7 @@ contract CreditHandler is Test {
         credit.receiveYield(amount);
         credit.distributeYield(amount);
         vm.stopPrank();
+        ++yieldDistributions;
 
         for (uint256 i; i < actors.length; ++i) {
             credit.settle(actors[i]);
@@ -107,18 +130,32 @@ contract CreditHandler is Test {
         credit.accrueYield();
     }
 
+    /// @dev Counts only settles that moved debt. A settle against an empty accumulator
+    ///      is a no-op, and a suite in which every settle was one would have proved
+    ///      nothing about the write-down path the whole protocol exists for.
     function settle(uint256 actorSeed) external {
-        credit.settle(_actor(actorSeed));
+        address a = _actor(actorSeed);
+        uint256 before = credit.debtOf(a);
+        credit.settle(a);
+        if (credit.debtOf(a) < before) ++debtWriteDowns;
     }
 
     function claimSurplus(uint256 actorSeed) external {
         address a = _actor(actorSeed);
         vm.prank(a);
-        try credit.claimSurplus() {} catch {}
+        try credit.claimSurplus() {
+            ++surplusClaimsDone;
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), CreditManager.NothingToClaim.selector, "unexpected claimSurplus revert");
+        }
     }
 
     function settlePrincipal() external {
-        try credit.settlePrincipal() {} catch {}
+        try credit.settlePrincipal() {
+            ++principalSettlementsDone;
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), CreditManager.NothingToSettle.selector, "unexpected settlePrincipal revert");
+        }
     }
 
     function withdraw(uint256 actorSeed, uint256 bonds) external {
@@ -127,7 +164,18 @@ contract CreditHandler is Test {
         if (held == 0) return;
         bonds = bound(bonds, 1, held);
         vm.prank(a);
-        try vault.withdrawBonds(bonds) {} catch {}
+        try vault.withdrawBonds(bonds) {
+            ++withdrawsDone;
+        } catch (bytes memory err) {
+            // The withdrawal rule is the only guard that should ever refuse here: the
+            // amount is bounded to the balance and this fixture's NAV is never stale.
+            assertEq(
+                bytes4(err),
+                CollateralVault.WithdrawalExceedsMaxLtv.selector,
+                "unexpected withdrawBonds revert"
+            );
+            ++withdrawsRefusedByLtv;
+        }
     }
 
     function moveNav(uint256 nav) external {
@@ -183,9 +231,20 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         vault.setCreditManager(address(credit));
         // The vault refuses an auction pointer that is not a contract bound back to it,
         // so suites that never run a liquidation still need a stand-in.
+        //
+        // **All three lines are load-bearing, and for six days only the first two were
+        // here.** Audit round 6 gave `borrow` a guard that reads the *vault's* auction
+        // pointer and, when it is set, requires this manager to agree with it and the
+        // auction to point back. Half-wired, that guard reverted every single borrow
+        // with `AuctionPointerMismatch(0x0, vault)` - and because the handler wraps
+        // `borrow` in `try`, the suite reported seven green invariants over a protocol
+        // in which no debt had ever existed. The tripwire below found it on its first
+        // run. Wire both directions, or wire neither.
         MockLiquidationAuction auctionStub = new MockLiquidationAuction();
         auctionStub.setVault(address(vault));
+        auctionStub.setCreditManager(address(credit));
         vault.setLiquidationAuction(address(auctionStub));
+        credit.setLiquidationAuction(address(auctionStub));
         credit.setLiquiditySource(address(liquidity));
         credit.setEpochHarvester(harvester);
         liquidity.setCreditManager(address(credit));
@@ -278,5 +337,75 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
     ///      harder to read at that point.
     function invariant_streamNeverPromisesMoreThanWasDelivered() public view {
         assertLe(credit.undistributedYield(), usdc.balanceOf(address(credit)));
+    }
+
+    /// @notice Proves the fixture above is not vacuous.
+    /// @dev The interesting handler actions are wrapped in `try`, which they have to be -
+    ///      most random call sequences are meaningless and must not fail a run. The cost
+    ///      is that a handler which never reached a surplus claim, or never let a settle
+    ///      write debt down, would still report seven green invariants having exercised
+    ///      nothing. Several of them are trivially satisfiable in that state:
+    ///      `invariant_balanceCoversEveryClaimOnIt` compares four counters that are all
+    ///      zero until yield flows, and `invariant_accumulatorNeverDecreases` holds
+    ///      vacuously against an accumulator that never moved.
+    ///
+    ///      It is a normal test rather than `afterInvariant` on purpose: `afterInvariant`
+    ///      fires once per run against counters that reset each run, so it would demand
+    ///      that every one of these behaviours occur in *every* random 500-call
+    ///      sequence, and fail on the first unlucky one.
+    ///
+    ///      No liquidation is asserted, and that is deliberate rather than an omission:
+    ///      `MockLiquidationAuction` here is a bare stub wired only to satisfy the
+    ///      vault's pointer check, so a liquidation is not reachable in this fixture at
+    ///      all. `LiquidationAuction.invariants.t.sol` is where that lives.
+    ///
+    ///      Each actor starts with 5,000 bonds staked at 25.15e8, so $125,750 of
+    ///      collateral, and `borrow` is bounded to $5,000 a call.
+    function test_handlerCanReachEveryStateTheInvariantsCheck() public {
+        handler.borrow(0, 5_000e6);
+        assertEq(handler.borrowCount(), 1, "borrowing must be possible");
+        assertEq(credit.totalDebt(), 5_000e6, "the borrow must have landed");
+
+        // An epoch arrives. Nothing is payable at the instant of distribution - the
+        // borrower's share streams over YIELD_STREAM_DURATION, which is the whole
+        // anti-just-in-time design - so the clock has to move before a settle can do
+        // anything.
+        handler.distributeYield(2_000e6);
+        assertEq(handler.yieldDistributions(), 1, "yield distribution must be reachable");
+        assertEq(handler.debtWriteDowns(), 0, "an epoch paid out at the instant it was distributed");
+
+        handler.passTime(Config.YIELD_STREAM_DURATION);
+        handler.settle(0);
+        assertEq(handler.debtWriteDowns(), 1, "the debt write-down path was never exercised");
+        assertLt(credit.debtOf(actors[0]), 5_000e6, "settling must reduce what is owed");
+
+        // Releasing 4,900 of 5,000 bonds would leave $2,515 of collateral against a
+        // debt still in the thousands, so the withdrawal rule must refuse it.
+        handler.withdraw(0, 4_900);
+        assertEq(handler.withdrawsRefusedByLtv(), 1, "the LTV withdrawal guard was never exercised");
+        assertEq(handler.withdrawsDone(), 0, "a withdrawal that breaches max LTV was allowed");
+
+        // Repaid in full. `repay` caps at the debt, so overshooting is safe.
+        handler.repay(0, 5_000e6);
+        assertEq(handler.repaysDone(), 1, "repayment must be possible");
+        assertEq(credit.debtOf(actors[0]), 0, "the position must clear");
+
+        // Principal owed back to the funding source, accumulated by the repayment and by
+        // the yield that wrote the debt down before it.
+        assertGt(credit.pendingPrincipal(), 0, "repaid principal must be recorded");
+        handler.settlePrincipal();
+        assertEq(handler.principalSettlementsDone(), 1, "principal settlement must be reachable");
+
+        // A debt-free position keeps earning, and its share becomes claimable surplus
+        // rather than a write-down. This is the other half of `_settle` and the only
+        // thing that makes `totalClaimable` non-zero.
+        handler.distributeYield(2_000e6);
+        handler.passTime(Config.YIELD_STREAM_DURATION);
+        handler.claimSurplus(0);
+        assertEq(handler.surplusClaimsDone(), 1, "surplus must be claimable");
+
+        // And with no debt left, collateral comes back out.
+        handler.withdraw(0, 1_000);
+        assertEq(handler.withdrawsDone(), 1, "a debt-free withdrawal must be possible");
     }
 }

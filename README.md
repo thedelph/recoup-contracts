@@ -168,9 +168,10 @@ fork tests above, which are the real integration proof.
 
 An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does
 not fail the fixture, which means a suite that never reaches the interesting state still reports
-everything passing. Two of the four suites carry a deterministic reachability test that pins the
-state was actually reached. **The vault and credit-manager suites do not yet**, and that is a gap
-rather than a decision.
+everything passing. **All four suites** now carry a deterministic reachability test that pins the
+state was actually reached. The last two were added on 2026-08-03, and one of them found that a
+suite really had been vacuous: seven invariants had been running against a protocol in which no
+borrow could succeed. [REVIEW.md](REVIEW.md) has the detail.
 
 ### What is knowingly not mitigated
 

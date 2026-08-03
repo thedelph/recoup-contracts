@@ -42,7 +42,9 @@ contract AuctionHandler is Test {
 
     /// @notice Coverage ghosts. Every action here is wrapped in `try`, so a fixture
     ///         that silently never reaches a liquidation would report six green
-    ///         invariants having proved nothing at all. `afterInvariant` reads these.
+    ///         invariants having proved nothing at all.
+    ///         `test_handlerCanReachEveryStateTheInvariantsCheck` reads these - not
+    ///         `afterInvariant`, for the reason given on that test.
     uint256 public bidsFilled;
     uint256 public cancelsDone;
     uint256 public workoutsOpened;
