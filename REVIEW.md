@@ -125,6 +125,30 @@ addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json). T
 your verified ABIs including the whitelist gate. The fork tests are the stronger evidence; the
 testnet deployment is there if you would rather click around than run Foundry.
 
+## The invariant suites, and why they might have been lying
+
+Four suites, 21 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
+one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no state
+in which all three of an auction's exits revert, because that state would be permanently stranded
+collateral and only a fuzzer looking for it would ever find it.
+
+The part worth knowing about how they are built: **an invariant suite can report green having
+tested nothing.** Handler actions have to be wrapped in `try`, because most random call sequences
+are meaningless and must not fail a run, so a fixture that can never reach the interesting state
+still reports every invariant passing. Every suite here is therefore paired with a deterministic
+`test_handlerCanReachEveryStateTheInvariantsCheck` that drives the sequence by hand and asserts the
+handler's coverage counters actually moved. Both new ones were checked by breaking a handler action
+on purpose and confirming the tripwire went red.
+
+That is not a hypothetical. When the tripwire was added to `CreditManager.invariants.t.sol` on
+2026-08-03 it failed immediately: the fixture wired the auction stub into the vault but not into
+the manager, so a guard added by an earlier audit round had been reverting **every borrow**, and
+seven invariants had been running against a protocol in which no debt ever existed. None of the
+seven were wrong - re-run with debt reachable, they all still pass - but nothing had tested them.
+It is written up here rather than quietly fixed because the distinction between "our invariants
+pass" and "our invariants were exercised" is the one an auditor should care about, and this repo
+would rather show you the machinery that caught it than the clean result.
+
 ## What has been reviewed
 
 [AUDITS.md](AUDITS.md) has the round-by-round record, and the README explains the habits that came

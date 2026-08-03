@@ -36,6 +36,19 @@ contract VaultHandler is Test {
     uint256 public ghostTotalBondCount; // mirror of Σ vault.bondCount
     uint256 public ghostSeizedToWinners;
 
+    /// @notice Coverage ghosts, distinct from the two mirrors above: those are
+    ///         *quantities* and stay at zero whether an action never ran or ran and
+    ///         moved nothing. These count occurrences. Every interesting action here is
+    ///         wrapped in `try`, which it has to be - most random sequences are
+    ///         meaningless and must not fail a run - so a fixture that could never reach
+    ///         a seize would report four green invariants having exercised nothing.
+    ///         `test_handlerCanReachEveryStateTheInvariantsCheck` asserts these.
+    uint256 public withdrawsDone;
+    uint256 public withdrawsRefusedByLtv;
+    uint256 public harvestsWithYield;
+    uint256 public seizesDone;
+    uint256 public reassignsDone;
+
     constructor(
         CollateralVault vault_,
         DirectCallAdapter adapter_,
@@ -86,7 +99,18 @@ contract VaultHandler is Test {
         vm.prank(a);
         try vault.withdrawBonds(amount) {
             ghostTotalBondCount -= amount;
-        } catch {}
+            ++withdrawsDone;
+        } catch (bytes memory err) {
+            // Typed rather than swallowed: the LTV refusal is the behaviour under test
+            // and needs counting, and anything else reaching here is a fixture fault
+            // that a bare `catch {}` would hide for as long as the suite exists.
+            assertEq(
+                bytes4(err),
+                CollateralVault.WithdrawalExceedsMaxLtv.selector,
+                "unexpected withdrawBonds revert"
+            );
+            ++withdrawsRefusedByLtv;
+        }
     }
 
     function setDebt(uint256 actorSeed, uint256 debt) external {
@@ -99,7 +123,10 @@ contract VaultHandler is Test {
 
     function harvest() external {
         vm.prank(admin);
-        vault.harvestYield();
+        uint256 got = vault.harvestYield();
+        // A harvest of nothing exercises none of the adapter's USDC path, so it is not
+        // evidence the path works. Only a non-zero one counts.
+        if (got != 0) ++harvestsWithYield;
     }
 
     /// @dev Asserts the gate and its complement together: a seize must succeed exactly
@@ -119,6 +146,7 @@ contract VaultHandler is Test {
             assertEq(got, held, "seize must move the whole position");
             ghostTotalBondCount -= held;
             ghostSeizedToWinners += held;
+            if (held != 0) ++seizesDone;
         } catch {
             assertFalse(liquidatable && held != 0, "refused a genuinely liquidatable position");
         }
@@ -136,6 +164,7 @@ contract VaultHandler is Test {
         try vault.reassign(a, auction) returns (uint256 moved) {
             assertTrue(liquidatable || held == 0, "reassigned a position that was not liquidatable");
             assertEq(moved, held, "reassign must move the whole claim");
+            if (held != 0) ++reassignsDone;
         } catch {
             assertFalse(liquidatable && held != 0, "refused a genuinely liquidatable position");
         }
@@ -239,5 +268,63 @@ contract CollateralVaultInvariants is Test {
     /// The vault never accumulates bonds itself (custody is farm-side only).
     function invariant_vaultHoldsNoBonds() public view {
         assertEq(bond.bondBalance(address(vault)), 0, "vault holds no bonds");
+    }
+
+    /// @notice Proves the fixture above is not vacuous.
+    /// @dev The interesting handler actions are wrapped in `try`, which they have to be -
+    ///      most random call sequences are meaningless and must not fail a run. The cost
+    ///      is that a handler which could never reach a seize would still report four
+    ///      green invariants, having exercised nothing. Two of the four are worse than
+    ///      merely unexercised without it: `invariant_bondConservation`'s `winners` term
+    ///      is only non-zero after a seize, and the auction term in `sumBondCounts()` is
+    ///      only non-zero after a reassign, so both reduce to a simpler identity that
+    ///      cannot fail.
+    ///
+    ///      This drives the handler deterministically through every state the invariants
+    ///      are supposed to be checking, and asserts each counter moved. It is a normal
+    ///      test rather than `afterInvariant` on purpose: `afterInvariant` fires once per
+    ///      run against counters that reset each run, so it would demand that all of
+    ///      these behaviours occur in *every* random 500-call sequence, and fail on the
+    ///      first unlucky one.
+    ///
+    ///      NAV is fixed at 25.15e8 in this fixture and there is no `moveNav` action, so
+    ///      liquidatability comes only from `setDebt`. That is why the debt figures below
+    ///      are hand-derived from the bond counts rather than picked round.
+    function test_handlerCanReachEveryStateTheInvariantsCheck() public {
+        // actor0 stakes 1,000 bonds - $25,150 of collateral at 25.15e8.
+        handler.deposit(0, 1_000);
+        assertEq(handler.ghostTotalBondCount(), 1_000, "deposits must reach the farm");
+
+        // A debt-free withdrawal, which the LTV rule lets through untouched.
+        handler.withdraw(0, 100);
+        assertEq(handler.withdrawsDone(), 1, "withdrawals must be possible");
+
+        // 900 bonds left, $22,635. At $7,000 the position sits at 30.9% LTV, inside the
+        // 35% ceiling - but releasing 300 more would leave 600 bonds ($15,090) and put it
+        // at 46.4%, so the withdrawal rule must refuse it.
+        handler.setDebt(0, 7_000e6);
+        handler.withdraw(0, 300);
+        assertEq(handler.withdrawsRefusedByLtv(), 1, "the LTV withdrawal guard was never exercised");
+        assertEq(handler.withdrawsDone(), 1, "a withdrawal that breaches max LTV was allowed");
+
+        // Yield has to actually flow, or the adapter's USDC path goes unchecked and
+        // `invariant_adapterHoldsNothingAtRest` proves nothing about it.
+        handler.accrueYield(500e6);
+        handler.harvest();
+        assertEq(handler.harvestsWithYield(), 1, "harvested yield must be reachable");
+
+        // Past the 58% liquidation threshold on 900 bonds ($22,635 x 0.58 = $13,128).
+        handler.setDebt(0, 15_000e6);
+        handler.seize(0);
+        assertEq(handler.seizesDone(), 1, "seizure must be reachable");
+        assertEq(handler.ghostSeizedToWinners(), 900, "the whole position must move to the winner");
+
+        // The workout path, on a second actor, so the seized one is not reused. 1,000
+        // bonds is $25,150 and $20,000 of debt is 79.5% - comfortably liquidatable.
+        handler.deposit(1, 1_000);
+        handler.setDebt(1, 20_000e6);
+        handler.reassign(1);
+        assertEq(handler.reassignsDone(), 1, "the workout reassignment must be reachable");
+        assertEq(vault.bondCount(handler.auction()), 1_000, "the claim must land on the auction");
     }
 }
