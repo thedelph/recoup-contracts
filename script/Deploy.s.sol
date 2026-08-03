@@ -51,6 +51,66 @@ contract DeployLocal is DeployBase {
     }
 }
 
+/// @notice Base Sepolia deployment against the mock DexFi stack (PRD §8).
+///         Usage: forge script script/Deploy.s.sol:DeployTestnet --rpc-url base_sepolia --broadcast --verify
+/// @dev Exists as a named target rather than pointing `DeployLocal` at a testnet RPC.
+///      `DeployLocal` has no chain guard, so it runs anywhere its RPC points; on a real
+///      chain it falls through `_isLocal()` into strict validation and mostly works,
+///      which is worse than failing outright. An implicit path nothing tests is exactly
+///      the footgun `DeployBase` was written to remove.
+/// @dev The mocks are deliberately permissionless - anyone can `mint` bonds and USDC and
+///      call `setWhitelisted`. On a testnet that is a feature: it lets someone try the
+///      dApp without being handed tokens. It is also why nothing here may ever be reused
+///      on mainnet, where the real bond contract gates all three.
+contract DeployTestnet is DeployBase {
+    error WrongChain(uint256 chainId);
+    error TestnetConfirmationMissing();
+
+    uint256 internal constant BASE_SEPOLIA_CHAIN_ID = 84532;
+    string internal constant CONFIRM_PHRASE = "RECOUP_DEPLOY_BASE_SEPOLIA";
+
+    function run() external {
+        if (block.chainid != BASE_SEPOLIA_CHAIN_ID) revert WrongChain(block.chainid);
+
+        if (
+            keccak256(bytes(vm.envOr("RECOUP_TESTNET_CONFIRM", string("")))) != keccak256(bytes(CONFIRM_PHRASE))
+        ) revert TestnetConfirmationMissing();
+
+        vm.startBroadcast();
+
+        MockUSDC usdc = new MockUSDC();
+        MockBond bond = new MockBond();
+        MockFarm farm = new MockFarm(bond, usdc);
+        bond.setRewardPool(address(farm));
+
+        // Not local, so `_resolveParams` enforces the full set: owner, yield recipient,
+        // keeper, nav confirmer and fee wallet all present, the two NAV keys distinct,
+        // and the yield recipient distinct from both the deployer and the owner.
+        GovParams memory p = _resolveParams(msg.sender);
+        Externals memory e = Externals({
+            bond: IDexFiBond(address(bond)),
+            farm: IDexFiFarm(address(farm)),
+            usdc: IERC20(address(usdc))
+        });
+
+        Deployed memory d = _deployProtocol(e, p, msg.sender);
+
+        // Mirrors the mainnet gate that DexFi controls. On mainnet this is the one
+        // integration ask and cannot be self-served (PRD §14 ask #5).
+        bond.setWhitelisted(address(farm), true);
+        bond.setWhitelisted(address(d.adapter), true);
+
+        vm.stopBroadcast();
+
+        _assertWiring(d, p);
+        console.log("MockUSDC          ", address(usdc));
+        console.log("MockBond          ", address(bond));
+        console.log("MockFarm          ", address(farm));
+        _log(d, p);
+        console.log("Next: fund the liquidity source, then bootstrapNav as the owner.");
+    }
+}
+
 /// @notice Base mainnet deployment. Still gated, but the gate is now a checklist of
 ///         named preconditions rather than a single blanket revert, so the script
 ///         states what is actually missing.
