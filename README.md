@@ -70,7 +70,7 @@ Requires [Foundry](https://getfoundry.sh).
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
 forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: the
-                # three invariant suites dominate, and a short timeout will kill
+                # four invariant suites dominate, and a short timeout will kill
                 # the run mid-flight rather than fail it
 ```
 
@@ -106,7 +106,14 @@ that shows the product actually works.
 
 ## Security posture (pre-external-audit)
 
-**Nothing is deployed to any chain, and an external audit is a hard gate before any real funds.**
+**Nothing is deployed to any chain.** A Base Sepolia deployment against a mock DexFi stack is the
+current work, and the target for it is in `script/Deploy.s.sol`.
+
+**An external audit is a hard gate before any third-party funds.** It is deliberately not a gate on
+the author's capital: the plan is to run a mainnet beta funded solely by the author, then
+commission an external audit before anyone else's money is accepted. That ordering is a judgement,
+not an oversight, and it is stated here rather than left to be discovered. Everything in "what is
+knowingly not mitigated" below is published on the same principle.
 
 ### What this means if you are DexFi
 
@@ -156,8 +163,9 @@ rather than a decision.
 
 ### What is knowingly not mitigated
 
-Published because the alternative is worse. All of it is acceptable only while nothing is deployed
-and no third-party funds exist, and each item is tripwired to that condition.
+Published because the alternative is worse. All of it is acceptable only while **no third-party
+funds exist**, and each item is tripwired to that condition. A testnet deployment does not loosen
+any of it, and a mainnet deployment holding only the author's capital does not either.
 
 | Item | Status |
 |---|---|

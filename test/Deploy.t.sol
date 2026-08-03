@@ -6,6 +6,7 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {DeployBase} from "../script/DeployBase.sol";
+import {DeployTestnet} from "../script/Deploy.s.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
@@ -181,11 +182,44 @@ contract DeployTest is Test, DeployBase {
 
     /// @dev Even the local default must model the right shape, or the footgun just
     ///      moves to whoever first runs the script against a real chain.
-    function test_localDefaultsDoNotPointAtTheDeployer() public view {
+    ///
+    ///      The operator variables have to be neutralised for the duration, because
+    ///      forge auto-loads `contracts/.env` and a real deployment fills in exactly
+    ///      these five. That means the local-default branch is unreachable on the one
+    ///      machine where a deploy actually gets run, and this test asserted a value it
+    ///      could not see - it failed the moment the Base Sepolia parameters landed in
+    ///      `.env`, while CI stayed green because CI has no `.env`. Same mechanism the
+    ///      confirmation-phrase note below describes, a different variable.
+    ///
+    ///      Restored immediately after, because `vm.setEnv` leaks into every other test
+    ///      in the run. `RECOUP_OWNER` is deliberately left alone: it defaults to the
+    ///      deployer rather than to zero, so zeroing it would trip `OwnerRequired`
+    ///      instead of reaching a default.
+    function test_localDefaultsDoNotPointAtTheDeployer() public {
+        string[4] memory keys;
+        keys[0] = "RECOUP_YIELD_RECIPIENT";
+        keys[1] = "RECOUP_KEEPER";
+        keys[2] = "RECOUP_NAV_CONFIRMER";
+        keys[3] = "RECOUP_PROTOCOL_FEE_WALLET";
+
+        address[4] memory prior;
+        for (uint256 i = 0; i < keys.length; i++) {
+            prior[i] = vm.envOr(keys[i], address(0));
+            vm.setEnv(keys[i], vm.toString(address(0)));
+        }
+
         GovParams memory p = _resolveParams(address(this));
+
+        for (uint256 i = 0; i < keys.length; i++) {
+            vm.setEnv(keys[i], vm.toString(prior[i]));
+        }
+
         assertTrue(p.yieldRecipient != address(this));
         assertTrue(p.keeper != address(this));
         assertEq(p.yieldRecipient, LOCAL_TREASURY);
+        assertEq(p.keeper, LOCAL_KEEPER);
+        assertEq(p.navConfirmer, LOCAL_NAV_CONFIRMER);
+        assertEq(p.protocolFeeWallet, LOCAL_TREASURY);
     }
 
     /// @dev Audit finding #1 as an assertion: the vault has no USDC egress, so yield
@@ -273,5 +307,42 @@ contract DeployTest is Test, DeployBase {
         vm.expectRevert();
         d.auction.renounceOwnership();
         vm.stopPrank();
+    }
+
+    // ── testnet target gates ─────────────────────────────────────────────────
+
+    /// @dev `DeployLocal` and `DeployMainnet` have `run()` bodies that no test has ever
+    ///      invoked, so their gates were only ever read rather than executed. The
+    ///      testnet target does not inherit that: both of its refusals run here.
+    ///
+    ///      What is deliberately not tested is the success path. It needs a real
+    ///      broadcast and an environment variable, and `vm.setEnv` leaks into every
+    ///      other test in the run. The body it would exercise - `_deployProtocol`,
+    ///      `_resolveParams`, `_assertWiring` - is already covered above, so the gates
+    ///      are the only part unique to this contract.
+    function test_testnet_refusesAnyChainButBaseSepolia() public {
+        DeployTestnet script = new DeployTestnet();
+
+        // setUp leaves us on anvil, which is the realistic slip: a testnet script run
+        // against a local node, or against mainnet by a stale --rpc-url.
+        vm.expectRevert(abi.encodeWithSelector(DeployTestnet.WrongChain.selector, ANVIL_CHAIN_ID));
+        script.run();
+
+        vm.chainId(8453);
+        vm.expectRevert(abi.encodeWithSelector(DeployTestnet.WrongChain.selector, uint256(8453)));
+        script.run();
+    }
+
+    /// @dev The phrase must be absent for this to mean anything, which is why
+    ///      `script/.env.example` documents passing it inline rather than storing it:
+    ///      forge auto-loads `.env`, so a stored phrase would be present on every
+    ///      invocation and this test would fail while the guard silently stopped
+    ///      guarding anything.
+    function test_testnet_requiresTheConfirmationPhrase() public {
+        DeployTestnet script = new DeployTestnet();
+
+        vm.chainId(84532);
+        vm.expectRevert(DeployTestnet.TestnetConfirmationMissing.selector);
+        script.run();
     }
 }

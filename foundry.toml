@@ -15,4 +15,16 @@ remappings = [
 [lint]
 exclude_lints = ["screaming-snake-case-immutable"]
 
-# TODO(phase-1): add [rpc_endpoints] with a Base archive RPC for fork tests
+# Resolved lazily: an alias is only expanded when something asks for it, so an unset
+# variable costs nothing on a plain `forge test`. The fork suite reads BASE_RPC_URL
+# directly through `vm.envOr` and does not go through these aliases.
+[rpc_endpoints]
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
+
+# One BaseScan key covers both networks. Without it `--verify` fails after a
+# successful broadcast, which leaves contracts deployed but unverified rather than
+# losing anything - re-run `forge verify-contract` in that case.
+[etherscan]
+base = { key = "${BASESCAN_API_KEY}", chain = 8453 }
+base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532 }
