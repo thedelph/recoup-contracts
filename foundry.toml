@@ -22,9 +22,16 @@ exclude_lints = ["screaming-snake-case-immutable"]
 base = "${BASE_RPC_URL}"
 base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 
-# One BaseScan key covers both networks. Without it `--verify` fails after a
-# successful broadcast, which leaves contracts deployed but unverified rather than
-# losing anything - re-run `forge verify-contract` in that case.
+# One key covers both networks, and it must be an **etherscan.io** key. Under the
+# Etherscan V2 multichain API a single key serves every explorer in the family and
+# legacy per-explorer keys (BaseScan, Polygonscan, BscScan) are rejected outright
+# with "Invalid API key" - so a BaseScan key is not merely redundant here, it fails.
+# `ETHERSCAN_API_KEY` is also the variable forge reads natively for
+# `--etherscan-api-key`, so naming it anything else silently gives up that default.
+#
+# Without it `--verify` fails after a successful broadcast, which leaves contracts
+# deployed but unverified rather than losing anything - re-run `forge verify-contract`
+# in that case.
 [etherscan]
-base = { key = "${BASESCAN_API_KEY}", chain = 8453 }
-base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532 }
+base = { key = "${ETHERSCAN_API_KEY}", chain = 8453 }
+base_sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 84532 }
