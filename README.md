@@ -4,11 +4,20 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **pre-deployment**. The collateral layer, the credit core, the epoch harvester and the
-liquidation auction are implemented, and the whole loan lifecycle - including a liquidation
-filling at 82% of NAV and an unfilled one falling through to the workout path - is fork-tested
-against the live DexFi contracts. Lending is an interfaced skeleton, built in deliberate phases.
-Nothing touches real funds before an external audit.
+Status: **deployed to Base Sepolia** (2026-08-03), nothing on mainnet. The collateral layer, the
+credit core, the epoch harvester and the liquidation auction are implemented, and the whole loan
+lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling through to
+the workout path - is fork-tested against the live DexFi contracts. Lending is an interfaced
+skeleton, built in deliberate phases. Nothing touches real funds before an external audit.
+
+Testnet addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json), all
+verified on Basescan. The testnet deployment runs against a **mock** DexFi stack, because the real
+bond and farm contracts exist only on Base mainnet; the mocks mirror their verified ABIs including
+the transfer whitelist. The live DexFi contracts are exercised by the mainnet fork tests below,
+which are the real integration proof.
+
+**Reviewing this repo?** [REVIEW.md](REVIEW.md) is a reading guide: where bonds can and cannot go,
+who controls what, what revoking the whitelist would do, and which tests to run first.
 
 `ReferralRegistry` is a standalone addition with zero coupling to the protocol above: two
 write-once mappings recording who owns a referral code and which code an account bound to, with no
@@ -106,8 +115,10 @@ that shows the product actually works.
 
 ## Security posture (pre-external-audit)
 
-**Nothing is deployed to any chain.** A Base Sepolia deployment against a mock DexFi stack is the
-current work, and the target for it is in `script/Deploy.s.sol`.
+**Nothing is deployed to mainnet.** The current deployment is Base Sepolia only, against a mock
+DexFi stack, from the `DeployTestnet` target in `script/Deploy.s.sol`. Addresses are in
+[`deployments/base-sepolia.json`](deployments/base-sepolia.json). It holds no third-party funds and
+no real value: the USDC, bonds and farm on that chain are all mocks deployed by the same script.
 
 **An external audit is a hard gate before any third-party funds.** It is deliberately not a gate on
 the author's capital: the plan is to run a mainnet beta funded solely by the author, then
