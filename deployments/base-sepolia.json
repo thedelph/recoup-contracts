@@ -1,0 +1,33 @@
+{
+  "network": "base-sepolia",
+  "chainId": 84532,
+  "deployedAt": "2026-08-03",
+  "verified": true,
+  "note": "Mock DexFi stack. Real DexFi bonds exist only on Base mainnet, so MockUSDC/MockBond/MockFarm stand in and mirror the verified ABIs including the whitelist gate. The adapter is self-whitelisted here; on mainnet that is DexFi's call and is the one integration ask (PRD 14 ask #5).",
+  "contracts": {
+    "NAVOracle": "0x3b70678BDb3de6E5D8E3B9031513F385Fc021214",
+    "CollateralVault": "0x1f4a33B40B135E424b3d57db649f258d4F2be35C",
+    "DirectCallAdapter": "0xe21d7Eb94e25fe3E3721917afdED6f9CD75E6224",
+    "CreditManager": "0xE4AE37d44548C66c180DF418f6DaDdAe3b74082C",
+    "TreasuryLiquiditySource": "0x38DD1afee26bfecA4033C102b4b0DCf3E38797c7",
+    "LenderPool": "0xc74f4EB1385cD0da3243689DE6B52Cd8B9e2C1ec",
+    "EpochHarvester": "0x2A93A7B4a8D35C9ccEfab4e3e05BAfC28f8f1ADD",
+    "LiquidationAuction": "0x5C2A9aA4425BC7c4bCCB6Ee88B5b3374f9D6A1Fa",
+    "ReferralRegistry": "0x30B9B1D7A40aa7D14613cb1742EFaaB155dC84a0"
+  },
+  "mocks": {
+    "MockUSDC": "0xFa5148Df05ebbAd57cEdB0AbC16fB01dadcDD525",
+    "MockBond": "0xb3a29C5c1f6FE1Bf7cF6BaDa743269689a6c20d5",
+    "MockFarm": "0xE7A54e090c1104bfCFC8e84e7F879C13C67C3A48"
+  },
+  "operatorsNote": "Owner, yield recipient, keeper and NAV confirmer are four distinct addresses, and every protocol contract was verified on-chain as owned by the configured owner rather than by the deployer. Read them from the contracts if you want them. The testnet operator keys are throwaways funded from a faucet; a mainnet deployment does not reuse that pattern.",
+  "state": {
+    "liquiditySourceFundedUsdc": "250000000000",
+    "liquiditySourceFundedNote": "250,000 mUSDC, equal to Config.GLOBAL_BORROW_CAP",
+    "navBootstrapped": true,
+    "navBootstrapValue": "2163780721",
+    "navBootstrapTx": "0x79997855e278b5558bc21d44bfd6a95bd3fadc5d79d69bde847aad4a8ea0c460",
+    "navBootstrapNote": "Seeded at the keeper's own independently reconstructed figure ($21.63780721), not DexFi's displayed $24.80. Bootstrapping at theirs would have put the keeper's first post outside the deviation budget on day one. bootstrapNav is one-shot (reverts AlreadyBootstrapped), so this cannot be corrected without redeploying the oracle and repointing everything at it.",
+    "navBudgetNote": "The deviation budget is prorated by time since the last accepted price, so it reads 0 bps immediately after a bootstrap and any post parks for the confirmer. It accrues at NAV_MAX_DEVIATION_BPS (1000) * elapsed / NAV_DEVIATION_WINDOW (24h), so ~9 minutes covers 6 bps and a daily run has the full budget. Not a fault."
+  }
+}
