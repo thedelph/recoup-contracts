@@ -103,7 +103,7 @@ permanently whitelisted unwind address or notice before revocation.
 
 ## Why believe any of it works?
 
-Run it. Nine integration tests execute against the **live** DexFi contracts on a Base mainnet fork,
+Run it. Ten integration tests execute against the **live** DexFi contracts on a Base mainnet fork,
 fork-at-latest, no archive node needed:
 
 ```sh
@@ -115,6 +115,12 @@ addresses really are your live contracts and behave as documented, shows that de
 today at your whitelist gate (the current mainnet reality), and then impersonates a single
 `addWhitelist([adapter])` and runs the entire lifecycle: deposit, stake, claim real streamed USDC,
 unstake, withdraw. That test is the ask in executable form.
+
+The same file also pins one property of your farm that Recoup's design leans on: a fresh stake can
+be withdrawn in the same block it was created, with no lock, cooldown or exit charge on the bond
+units. It is asserted separately because the lifecycle test above warps three days forward before
+withdrawing - and three days of slack would hide a cooldown rather than prove there is none. If
+that ever changes on your side, this is the test that goes red first.
 
 `test/fork/CreditCore.fork.t.sol` runs the whole self-repaying loan on the same fork, and
 `test/fork/Liquidation.fork.t.sol` covers a lot filling at 82% of NAV and an unfilled one falling

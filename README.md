@@ -85,7 +85,7 @@ forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: th
 
 ### Mainnet fork tests
 
-Nine integration tests run against the **live** DexFi contracts on Base (fork-at-latest, so any
+Ten integration tests run against the **live** DexFi contracts on Base (fork-at-latest, so any
 full node works - no archive access needed). This is the part worth running yourself:
 
 ```sh
@@ -98,19 +98,24 @@ Custody, on real state:
 1. the configured addresses are the live contracts and behave as documented;
 2. deposits currently revert at the bond's transfer whitelist gate (today's mainnet reality);
 3. a single `addWhitelist([adapter])` from the bond owner unlocks the entire lifecycle:
-   deposit → stake → claim real streamed USDC → unstake → withdraw.
+   deposit → stake → claim real streamed USDC → unstake → withdraw;
+4. **a fresh stake can be unwound in the same block it was created** - the farm imposes no lock,
+   cooldown, epoch boundary or withdrawal charge on the bond units themselves. Worth stating
+   separately because test 3 does *not* establish it: that one warps three days forward before
+   withdrawing, in order to accrue rewards worth asserting on, and three days of slack is exactly
+   what would hide a cooldown.
 
 The loan itself, also on real state:
 
-4. **the whole self-repaying loan end to end** - deposit real bonds, borrow at exactly max LTV,
+5. **the whole self-repaying loan end to end** - deposit real bonds, borrow at exactly max LTV,
    let a week of real USDC stream out of the live farm, apply that yield to write the debt down,
    repay the remainder, withdraw the collateral, and return the principal to the lender float.
    It also asserts, on real state, that **nothing is earned in the harvest block** - which is the
    property that makes depositing just before a harvest pointless;
-5. borrowing refuses while the price feed is stale;
-6. a large NAV move parks for a second key instead of being waved through by the price poster.
+6. borrowing refuses while the price feed is stale;
+7. a large NAV move parks for a second key instead of being waved through by the price poster.
 
-Test 3 is the one that shows exactly what a single `addWhitelist` call buys. Test 4 is the one
+Test 3 is the one that shows exactly what a single `addWhitelist` call buys. Test 5 is the one
 that shows the product actually works.
 
 ## Security posture (pre-external-audit)

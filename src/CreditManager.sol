@@ -27,11 +27,9 @@ import {INAVOracle} from "./interfaces/INAVOracle.sol";
 ///
 ///      Every USDC balance this contract holds is spoken for by one of those four.
 ///      Borrowed principal is never held here - it passes through in a single call.
-/// @dev TODO(phase-3): liquidate.
 contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    error NotImplemented();
     error NotEpochHarvester();
     error NotVault();
     error ZeroAddress();

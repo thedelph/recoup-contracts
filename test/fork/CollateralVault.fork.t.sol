@@ -123,4 +123,44 @@ contract CollateralVaultForkTest is Test {
         assertEq(staked, 0);
         assertEq(vault.bondCount(alice), 0);
     }
+
+    /// @notice A stake can be withdrawn in the same block it was created: DexFi's farm imposes no
+    ///         lock, cooldown, epoch boundary or withdrawal charge on the bond units themselves.
+    /// @dev    Written to settle the one open question gating the §14 ask #10 workaround. The
+    ///         proposal there is a fresh CREATE2 receiver per mint attempt, so each attempt gets its
+    ///         own nonce and users stop sharing one counter. The bonds auto-stake to whoever the
+    ///         mint names as receiver, so that receiver has to be able to unwind *immediately* and
+    ///         hand the position to the adapter, inside one user transaction. If the farm made a
+    ///         fresh stake wait, the whole design would need a child-custody model instead.
+    ///
+    ///         `test_oneWhitelistCallUnlocksFullLifecycle` above looks like it covers this and does
+    ///         not: it warps three days before withdrawing, to accrue rewards worth asserting on.
+    ///         Three days of slack is exactly what would hide a cooldown.
+    ///
+    ///         Only the bond units are asserted here. Forfeiting *rewards* on an instant withdrawal
+    ///         would be unsurprising and does not matter: a mint receiver holds the position for
+    ///         one transaction, so it has no meaningful yield to lose.
+    function test_freshStakeCanBeWithdrawnInTheSameBlock() public {
+        vm.skip(!run);
+
+        address bondOwner = Config.DEXFI_TREASURY_EOA;
+        address[] memory accounts = new address[](1);
+        accounts[0] = address(adapter);
+        vm.prank(bondOwner);
+        bond.addWhitelist(accounts);
+
+        uint256 before = bond.balanceOf(alice, Config.DEXFI_BOND_TOKEN_ID);
+
+        // No warp between these two calls, deliberately.
+        vm.startPrank(alice);
+        vault.depositBonds(10);
+        (uint256 staked,) = farm.userInfo(address(adapter));
+        assertEq(staked, 10, "staked into the live farm");
+        vault.withdrawBonds(10);
+        vm.stopPrank();
+
+        assertEq(bond.balanceOf(alice, Config.DEXFI_BOND_TOKEN_ID), before, "every unit came back");
+        (staked,) = farm.userInfo(address(adapter));
+        assertEq(staked, 0, "position fully unwound");
+    }
 }
