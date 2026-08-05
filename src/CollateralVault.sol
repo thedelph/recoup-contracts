@@ -452,10 +452,17 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
 
     // ── Yield ────────────────────────────────────────────────────────────────
 
-    /// @notice Pull accrued USDC from the farm into this vault.
-    /// @dev TODO(phase-3): EpochHarvester becomes the caller and the USDC is split
-    ///      per PRD §4.4; until then the owner triggers claims and funds accumulate
-    ///      here untouched.
+    /// @notice Owner-triggered claim of accrued USDC from the farm.
+    /// @dev No longer the main route. Since Phase 3 `EpochHarvester.harvest()` calls
+    ///      `claimYield` on the adapter itself and splits the proceeds per PRD §4.4;
+    ///      the adapter's `onlyClaimer` gate accepts this vault or the wired
+    ///      harvester, so both callers work. This stays as the manual path.
+    ///
+    ///      **The USDC does not land here, despite the name.** `claimYield` sweeps it
+    ///      to the adapter's `yieldRecipient`, which is the harvester in a wired
+    ///      deployment. That is deliberate: this contract is immutable and has no
+    ///      egress, so USDC arriving here would be lost - the first audit's worst
+    ///      finding, and the reason the recipient is settable rather than fixed.
     // slither-disable-next-line reentrancy-events
     function harvestYield() external onlyOwner returns (uint256 usdcAmount) {
         usdcAmount = _adapter().claimYield();
