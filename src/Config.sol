@@ -3,9 +3,25 @@ pragma solidity ^0.8.24;
 
 /// @title Config
 /// @notice Single source of truth for every protocol parameter and external address.
-///         PRD rule: no magic numbers anywhere else — all bps values use the 10_000
-///         denominator (`BPS`). Initial values from PRD §5 (risk) and §4.4 (yield split);
-///         at deployment these seed admin-tunable storage behind a 48h timelock.
+///         PRD rule: no magic numbers anywhere else - all bps values use the 10_000
+///         denominator (`BPS`). Values from PRD §5 (risk) and §4.4 (yield split).
+/// @dev    Every member here is an `internal constant`, inlined into each consumer at
+///         compile time. There is no parameter storage and no setter anywhere in the
+///         protocol, so changing any value below means redeploying the contracts that
+///         read it.
+///
+///         That is deliberate while nothing is live, and it is **not** the intended
+///         mainnet shape. PRD §4 and §9 call for the risk parameters to sit in
+///         admin-tunable storage behind a timelock of `ADMIN_TIMELOCK`; moving
+///         `MAX_LTV_BPS`, `LIQUIDATION_THRESHOLD_BPS` and the two borrow caps into
+///         bounded setters is a pre-mainnet task and has not been done.
+///
+///         Whoever does it: those four cannot be set independently. The auction floor
+///         has to keep covering debt plus the liquidation penalty after a worst-case
+///         NAV move, which ties `LIQUIDATION_THRESHOLD_BPS` to `AUCTION_FLOOR_BPS` by
+///         the relation derived below and asserted in `test/Config.t.sol`. A setter
+///         that moves one without checking the other can silently put the floor under
+///         the debt it is supposed to cover.
 library Config {
     uint256 internal constant BPS = 10_000;
 
