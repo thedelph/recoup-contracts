@@ -92,8 +92,13 @@ contract ReentrantLiquiditySource is ILiquiditySource {
 ///         the LTV/cap/staleness gates (PRD §4.3, §6.1).
 ///
 ///         Fixture uses the real 2026-07-24 NAV snapshot so the numbers are the ones
-///         the protocol will actually see: 100 bonds at $25.15 is $2,515 of collateral,
-///         and 35% of that is exactly 880.25 USDC of borrowing power.
+///         the protocol will actually see: 100 bonds at $25.15 is $2,515 of collateral.
+///
+///         `MAX_BORROW` is derived from `Config` rather than written down. It was the
+///         literal 880.25e6 (35% of $2,515) until the capped-beta parameters landed on
+///         2026-08-07 and broke fourteen tests at the fixture rather than in the code
+///         under test. The ratchet agreed with DexFi moves `MAX_LTV_BPS` at least twice
+///         more, so the fixture reads the parameter instead of restating it.
 contract CreditManagerTest is Test {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
@@ -105,8 +110,20 @@ contract CreditManagerTest is Test {
     ///      this stays deliberately tight rather than being widened to make a test
     ///      pass. Exact-value assertions are kept wherever the stream is not involved.
     uint256 internal constant DUST = 2;
-    uint256 internal constant MAX_BORROW = 880.25e6; // 100 × 25.15 × 35%, USDC 6dp
+    /// @dev Borrowing power at the ceiling: BONDS x NAV x maxLTV, in USDC 6dp.
+    uint256 internal constant MAX_BORROW =
+        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
     uint256 internal constant FLOAT = 100_000e6;
+
+    /// @dev The NAV the liquidation-boundary tests crash to, and the debt that sits
+    ///      exactly on the threshold once they do. Derived, because the property under
+    ///      test is "one unit past the threshold" and that is only true of a literal for
+    ///      as long as the threshold does not move. It was 580_000_001 against a 5,800
+    ///      bps threshold; at 5,000 the same literal is 16% past the line and the test
+    ///      would have been asserting something else entirely.
+    uint256 internal constant BOUNDARY_NAV = 10e8;
+    uint256 internal constant DEBT_AT_THRESHOLD =
+        ((BONDS * BOUNDARY_NAV / Config.USDC_TO_NAV_SCALE) * Config.LIQUIDATION_THRESHOLD_BPS) / Config.BPS;
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");
@@ -570,7 +587,7 @@ contract CreditManagerTest is Test {
     function test_healthFactor_aboveOneWhileWithinMaxLtv() public {
         vm.prank(alice);
         credit.borrow(MAX_BORROW);
-        // At maxLTV (3500) against a 5800 threshold, HF = 5800/3500 ≈ 1.657.
+        // At the LTV ceiling against the liquidation threshold, HF = threshold/maxLTV.
         assertGt(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE);
     }
 
@@ -1185,9 +1202,10 @@ contract CreditManagerTest is Test {
     }
 
     /// @notice The whole reason `LtvMath.exceedsLtv` exists.
-    /// @dev 100 bonds at $10.00 is exactly $1,000 of collateral, so the threshold sits
-    ///      at exactly 580 USDC. One extra unit of debt puts the position genuinely
-    ///      past it - but `ltvBps` floors, so the view still reports 5800 bps and
+    /// @dev 100 bonds at BOUNDARY_NAV is exactly $1,000 of collateral, so the threshold
+    ///      sits at exactly DEBT_AT_THRESHOLD. One extra unit of debt puts the position
+    ///      genuinely past it - but `ltvBps` floors, so the view still reports the
+    ///      threshold and
     ///      `healthFactor` still reports exactly 1e18 "healthy". A gate that read the
     ///      view would refuse the first position that ever becomes liquidatable.
     ///
@@ -1197,8 +1215,8 @@ contract CreditManagerTest is Test {
         MockLiquidationAuction a = _wireAuction();
 
         vm.prank(alice);
-        credit.borrow(580_000_001);
-        oracle.setNav(10e8);
+        credit.borrow(DEBT_AT_THRESHOLD + 1);
+        oracle.setNav(BOUNDARY_NAV);
 
         assertEq(credit.currentLtvBps(alice), Config.LIQUIDATION_THRESHOLD_BPS, "the view floors to the threshold");
         assertEq(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE, "and reports exactly healthy");
@@ -1214,8 +1232,8 @@ contract CreditManagerTest is Test {
     function test_liquidate_settlesBeforeGating() public {
         _wireAuction();
         vm.prank(alice);
-        credit.borrow(580_000_001);
-        oracle.setNav(10e8);
+        credit.borrow(DEBT_AT_THRESHOLD + 1);
+        oracle.setNav(BOUNDARY_NAV);
 
         // An epoch's yield lands and streams; enough of it clears the position.
         _distribute(700e6);
@@ -1235,7 +1253,7 @@ contract CreditManagerTest is Test {
         MockLiquidationAuction a = _wireAuction();
         vm.prank(alice);
         credit.borrow(MAX_BORROW);
-        oracle.setNav(10e8);
+        oracle.setNav(BOUNDARY_NAV);
         oracle.setStale(true);
         vm.prank(admin);
         credit.pause();
@@ -1253,7 +1271,7 @@ contract CreditManagerTest is Test {
     function test_liquidate_revertsWhenAuctionUnset() public {
         vm.prank(alice);
         credit.borrow(MAX_BORROW);
-        oracle.setNav(10e8);
+        oracle.setNav(BOUNDARY_NAV);
 
         vm.expectRevert(CreditManager.LiquidationAuctionUnset.selector);
         credit.liquidate(alice);

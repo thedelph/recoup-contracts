@@ -16,6 +16,15 @@ bond and farm contracts exist only on Base mainnet; the mocks mirror their verif
 the transfer whitelist. The live DexFi contracts are exercised by the mainnet fork tests below,
 which are the real integration proof.
 
+**One thing to know before you verify those addresses.** The four risk parameters in
+[`src/Config.sol`](src/Config.sol) changed on 2026-08-07 to the capped-beta values agreed with
+DexFi - max LTV 3500 -> 2500 bps, liquidation threshold 5800 -> 5000, and both borrow caps down.
+Those parameters are `internal constant`, inlined at compile time, and the Sepolia contracts were
+deployed on 2026-08-03, so **the deployed bytecode still enforces the old values**. Source and
+chain genuinely disagree here, and the source is the intended one. Closing it needs a redeploy,
+which is queued behind moving those four into bounded, timelocked storage so the next change is not
+a redeploy either.
+
 **Reviewing this repo?** [REVIEW.md](REVIEW.md) is a reading guide: where bonds can and cannot go,
 who controls what, what revoking the whitelist would do, and which tests to run first.
 
@@ -25,6 +34,17 @@ owner, no pause and no way to move either fact once written. It holds no value a
 contract reads it. It is deliberately absent from the main deploy script, because the supported
 fix for a core defect before launch is redeploying the set, and a registry inside that set would
 take a new address each time and orphan every existing binding.
+
+`ProtocolFeeSplitter` is the other standalone one, and it is also not in the deploy script yet
+because it needs a second address that does not exist. It forwards Recoup's protocol fee to two
+fixed destinations in a fixed ratio, and it exists so that a revenue split with a partner is a
+contract rather than a monthly promise: no owner, no setter, no pause, no rescue, both addresses and
+both shares fixed at construction. It needs no change to anything else, because
+`EpochHarvester.flushProtocolFee` pays out with a plain `safeTransfer` and does not care that the
+destination is a contract - a claim worth checking rather than believing, so
+`EpochHarvester.t.sol` runs a real epoch through it. Note the *lender* leg of the same split is
+delivered by approve-and-call, where a plain recipient would receive nothing; the two legs differ
+and the difference is invisible at the call site.
 
 ## Architecture
 

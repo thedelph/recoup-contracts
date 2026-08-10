@@ -26,10 +26,20 @@ library Config {
     uint256 internal constant BPS = 10_000;
 
     // ── Risk parameters (PRD §5) ─────────────────────────────────────────────
-    uint256 internal constant MAX_LTV_BPS = 3_500;
-    uint256 internal constant LIQUIDATION_THRESHOLD_BPS = 5_800;
-    uint256 internal constant GLOBAL_BORROW_CAP = 250_000e6; // USDC, 6 decimals
-    uint256 internal constant PER_ACCOUNT_BORROW_CAP = 25_000e6;
+    /// The four values below are the capped-beta settings agreed with DexFi on
+    /// 2026-08-07, not the PRD's original launch figures (3500 / 5800 / 250k / 25k).
+    /// They are deliberately tighter than the protocol requires: at a 25% ceiling and
+    /// a 50% threshold a bond has to lose half its value before a position is even
+    /// liquidatable, and the caps bound the whole book to a size where a total loss is
+    /// survivable. The expansion back towards the PRD figures is scheduled against
+    /// observable data rather than renegotiated - four clean epochs with the insurance
+    /// fund at INSURANCE_FUND_TARGET_BPS of debt raises the global cap, four more
+    /// raises MAX_LTV_BPS. Changing any of them is a redeploy until the bounded setters
+    /// described in the header exist.
+    uint256 internal constant MAX_LTV_BPS = 2_500;
+    uint256 internal constant LIQUIDATION_THRESHOLD_BPS = 5_000;
+    uint256 internal constant GLOBAL_BORROW_CAP = 25_000e6; // USDC, 6 decimals
+    uint256 internal constant PER_ACCOUNT_BORROW_CAP = 5_000e6;
     uint256 internal constant RESERVE_RATIO_BPS = 1_500; // LenderPool hot float target
     uint256 internal constant INSURANCE_FUND_TARGET_BPS = 500; // ≥5% of outstanding debt per cap raise
     uint256 internal constant UNDERWRITING_APR_BPS = 2_500; // UI/modelling only, never marketed
@@ -38,8 +48,15 @@ library Config {
     uint256 internal constant AUCTION_START_PREMIUM_BPS = 10_000; // 100% of NAV
     // Floor must cover debt + liquidation penalty at the worst LTV that can first
     // trigger a liquidation - i.e. after one immediate NAV_MAX_DEVIATION_BPS drop:
-    //   THRESHOLD/(1-maxDev) x (1+penalty) = 5800/0.9 x 1.05 = 6767 bps.
+    //   THRESHOLD/(1-maxDev) x (1+penalty) = 5000/0.9 x 1.05 = 5833 bps.
     // Set above that with margin; relation asserted in Config.t.sol.
+    // The margin used to be 33 bps against a 5800 threshold. Dropping the threshold to
+    // 5000 widened it to 967 bps without touching this value, so the floor is now far
+    // clear of its bound rather than sitting just above it. That headroom is offered to
+    // DexFi as a raise (80-85%) conditional on their liquidation backstop being
+    // pre-funded, because a high floor with nothing standing behind it pushes lots that
+    // cannot clear into the workout queue, which is the one path that truly redeems
+    // bonds out of their fund. Left at 6800 until they name a level.
     uint256 internal constant AUCTION_FLOOR_BPS = 6_800; // 68% of NAV
     uint256 internal constant AUCTION_DURATION = 6 hours;
     uint256 internal constant LIQUIDATION_PENALTY_BPS = 500; // of debt; split 50/50 caller/insurance
@@ -66,6 +83,21 @@ library Config {
     uint256 internal constant SPLIT_INSURANCE_BPS = 1_000;
     uint256 internal constant SPLIT_PROTOCOL_BPS = 1_000;
 
+    // ── Protocol fee split (agreed with DexFi 2026-08-06) - must sum to BPS ──
+    //
+    // Shares **of SPLIT_PROTOCOL_BPS**, not of gross yield. DexFi asked for a cut in return for
+    // backing the integration; the total fee stays at 10% rather than rising to the 12% they
+    // offered, because the four-way split above must sum to BPS, so those two points would have
+    // come off the borrower's 55% write-down - the one number the product is judged on.
+    //
+    // Not read by any contract yet, and deliberately so: `EpochHarvester.flushProtocolFee` pays
+    // the whole fee out with a plain `safeTransfer` to `protocolFeeWallet`, so the split is done
+    // by an immutable splitter installed at that address rather than by changing the core. Both
+    // destinations and both shares fixed at its construction, so neither party can redirect it
+    // afterwards. Blocked on DexFi naming their receiving address.
+    uint256 internal constant PROTOCOL_FEE_RECOUP_BPS = 8_000;
+    uint256 internal constant PROTOCOL_FEE_DEXFI_BPS = 2_000;
+
     // ── Referral programme v1 (approved 2026-07-30) ─────────────────────────
     //
     // NOT READ BY ANY CONTRACT, by design, and `ReferralRegistry` reads only the two code-length
@@ -74,16 +106,25 @@ library Config {
     // and because the calculator and the UI must not each carry their own copy. Same policy as
     // ADMIN_TIMELOCK below: do not delete as unused.
     //
-    // All three share figures are percentages **of the Recoup protocol fee** (SPLIT_PROTOCOL_BPS),
-    // not of gross yield. On $100 of harvested yield the split stays 55/25/10/10, and it is
-    // Recoup's $10 that becomes $2 referrer + $1 referred borrower + $7 retained during the first
-    // 12 weeks, then $2 + $8 to week 52, then $10.
+    // All three share figures are percentages **of Recoup's own share of the protocol fee**
+    // (SPLIT_PROTOCOL_BPS x PROTOCOL_FEE_RECOUP_BPS), not of gross yield and not of the whole fee.
+    // On $100 of harvested yield the split stays 55/25/10/10; the $10 fee splits $8 Recoup / $2
+    // DexFi; and it is Recoup's $8 that becomes $1.60 referrer + $0.80 referred borrower + $5.60
+    // retained during the first 12 weeks, then $1.60 + $6.40 to week 52, then $8.
+    //
+    // The base moved from the whole fee to Recoup's share of it on 2026-08-07, when DexFi confirmed
+    // "Recoup's referral rewards and borrower rebates come from Recoup's 80%". Rebasing rather than
+    // widening the bps is deliberate: the alternative holds the referrer's absolute payout constant
+    // by taking a larger slice of a smaller pot, which quietly makes the 30% cap a 37.5% one. The
+    // published copy on /refer and /r/[code] moved in the same change, and the timing is the whole
+    // point - payouts are Phase 4 and switched off, so nothing has accrued against the old wording.
+    // Once an accrual exists this stops being an edit and becomes a promise broken after the fact.
     //
     // The programme is **borrower-only**. A lender leg was rejected because the borrower's referrer
     // and the lender's referrer would both be paid out of the protocol fee on the *same* harvest,
     // so two independently-applied 30% caps could spend 60% of one dollar.
-    uint256 internal constant REFERRAL_REFERRER_SHARE_BPS = 2_000; // 20% of the protocol fee
-    uint256 internal constant REFERRAL_REFEREE_SHARE_BPS = 1_000; // 10%, paid as a USDC rebate
+    uint256 internal constant REFERRAL_REFERRER_SHARE_BPS = 2_000; // 20% of Recoup's share of the fee
+    uint256 internal constant REFERRAL_REFEREE_SHARE_BPS = 1_000; // 10% of it, paid as a USDC rebate
 
     /// @dev The referee reward is a **rebate**, never an adjustment to the yield split. A per-user
     ///      split is not implementable: `EpochHarvester` applies SPLIT_BORROWER_BPS to the whole
@@ -94,7 +135,7 @@ library Config {
     uint256 internal constant REFERRAL_REFERRER_DURATION = 52 weeks;
     uint256 internal constant REFERRAL_REFEREE_DURATION = 12 weeks;
 
-    /// @notice Hard ceiling on combined referral outflow, as a share of the protocol fee.
+    /// @notice Hard ceiling on combined referral outflow, as a share of Recoup's share of the fee.
     /// @dev Asserted against the two legs in `Config.t.sol` rather than trusted. The previous
     ///      design claimed this cap while specifying figures that summed to 45%, which is the same
     ///      failure as audit-2 finding #2: a constant sized against a bound nothing enforced.

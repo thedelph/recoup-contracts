@@ -150,9 +150,9 @@ contract CollateralVaultTest is Test {
     function test_withdrawBonds_allowsWithinMaxLtv() public {
         vm.prank(alice);
         vault.depositBonds(100);
-        // Debt sized so 80 remaining bonds sit exactly at maxLTV:
-        // 80 bonds × $25.15 × 35% = $704.20
-        credit.setDebt(alice, 704.2e6);
+        // Debt sized so the 80 remaining bonds sit exactly at maxLTV. Derived, so a
+        // change to MAX_LTV_BPS moves the fixture instead of breaking it.
+        credit.setDebt(alice, _maxDebtFor(80));
 
         vm.prank(alice);
         vault.withdrawBonds(20);
@@ -162,7 +162,7 @@ contract CollateralVaultTest is Test {
     function test_withdrawBonds_revertsBeyondMaxLtv() public {
         vm.prank(alice);
         vault.depositBonds(100);
-        credit.setDebt(alice, 704.2e6);
+        credit.setDebt(alice, _maxDebtFor(80));
 
         // One bond more than the maxLTV allows.
         vm.prank(alice);
@@ -318,6 +318,11 @@ contract CollateralVaultTest is Test {
     ///      moves it instead of silently making these tests assert nothing.
     function _liquidatableDebt(uint256 bonds) internal pure returns (uint256) {
         return (bonds * NAV * Config.LIQUIDATION_THRESHOLD_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE) + 1;
+    }
+
+    /// @dev The largest debt `bonds` may carry and still sit inside the LTV ceiling.
+    function _maxDebtFor(uint256 bonds) internal pure returns (uint256) {
+        return (bonds * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
     }
 
     function _unhealthy(address who, uint256 bonds) internal {

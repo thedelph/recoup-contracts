@@ -24,16 +24,54 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 /// @notice Dutch auction lifecycle against the real-ABI mocks (PRD §4.5, §6.3).
 ///
 ///         Fixture uses the real 2026-07-24 NAV snapshot, so 100 bonds is $2,515 of
-///         collateral and 35% of that is 880.25 USDC of borrowing power. Positions are
-///         put underwater by crashing NAV rather than by writing debt directly, which
-///         is the only way it can actually happen on chain.
+///         collateral. Positions are put underwater by crashing NAV rather than by
+///         writing debt directly, which is the only way it can actually happen on chain.
+///
+///         `MAX_BORROW` is derived from `Config` rather than written down. It used to be
+///         the literal 880.25e6, which was 35% of $2,515 - correct until the capped-beta
+///         parameters landed on 2026-08-07, at which point 53 of the 61 tests in this
+///         file failed at the fixture rather than in the code under test. The ratchet
+///         agreed with DexFi moves `MAX_LTV_BPS` at least twice more, so the same break
+///         is scheduled to happen again unless the fixture reads the parameter.
 contract LiquidationAuctionTest is Test {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
-    uint256 internal constant CRASHED_NAV = 10e8; // 100 bonds ⇒ exactly $1,000
-    uint256 internal constant SOFT_NAV = 15e8; // liquidatable at 5,868 bps, still solvent
     uint256 internal constant BONDS = 100;
-    uint256 internal constant MAX_BORROW = 880.25e6;
     uint256 internal constant FLOAT = 100_000e6;
+
+    /// @dev Borrowing power at the ceiling: BONDS x NAV x maxLTV, in USDC 6dp.
+    uint256 internal constant MAX_BORROW =
+        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+
+    /// @dev The NAV at which a position borrowed to the ceiling sits exactly on the
+    ///      liquidation threshold. Everything below is liquidatable, everything above is
+    ///      not, so the two scenario NAVs are chosen either side of it by construction.
+    uint256 internal constant NAV_AT_THRESHOLD =
+        (MAX_BORROW * Config.BPS * Config.USDC_TO_NAV_SCALE) / (Config.LIQUIDATION_THRESHOLD_BPS * BONDS);
+
+    /// @dev The NAV at which the whole lot is worth exactly the debt, so a fill at 100%
+    ///      of NAV covers the loan and not a cent more.
+    uint256 internal constant NAV_AT_DEBT_PARITY = (MAX_BORROW * Config.USDC_TO_NAV_SCALE) / BONDS;
+
+    /// @dev Liquidatable but still solvent: past the threshold, yet worth more than the
+    ///      debt, so a mid-auction fill leaves the borrower a surplus. Sits midway
+    ///      between the two bounds above so it can never drift to the wrong side of
+    ///      either when the parameters move.
+    uint256 internal constant SOFT_NAV = (NAV_AT_THRESHOLD + NAV_AT_DEBT_PARITY) / 2;
+
+    /// @dev The other side: even a fill at 100% of NAV cannot cover the loan, so the
+    ///      insurance fund and then the lenders take the difference. Half of debt parity
+    ///      is comfortably clear of the boundary rather than a cent under it.
+    uint256 internal constant CRASHED_NAV = NAV_AT_DEBT_PARITY / 2;
+
+    /// @dev The NAV at which the auction's *floor* price lands half a penalty above the
+    ///      debt, i.e. inside the band where a fill leaves some surplus but less than a
+    ///      full penalty. Solved from the floor rather than picked, because it depends on
+    ///      three parameters at once - the LTV ceiling, the auction floor and the penalty
+    ///      - and a hand-picked NAV silently leaves the band when any of them moves.
+    uint256 internal constant NAV_FOR_PARTIAL_PENALTY = (
+        (MAX_BORROW + (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / (2 * Config.BPS))
+            * Config.BPS * Config.USDC_TO_NAV_SCALE
+    ) / (BONDS * Config.AUCTION_FLOOR_BPS);
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");
@@ -95,16 +133,17 @@ contract LiquidationAuctionTest is Test {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// @dev Borrow at the ceiling, then crash NAV until the position is genuinely past
-    ///      the liquidation threshold. At $10.00 a bond, 880.25 of debt against $1,000
-    ///      of collateral is 8,802 bps - comfortably over 5,800.
+    ///      the liquidation threshold. `CRASHED_NAV` is half of debt parity, so the lot
+    ///      is worth half the loan and the LTV is well over 10,000 bps.
     function _openAuction() internal returns (uint256 id) {
         return _openAuctionAt(CRASHED_NAV);
     }
 
-    /// @dev `SOFT_NAV` ($15.00) is the interesting case: past the 5,800 bps threshold
-    ///      at 5,868 bps, but still worth more than the debt, so a mid-auction fill
-    ///      leaves a surplus. `CRASHED_NAV` ($10.00) is the other side - even a
-    ///      100%-of-NAV fill cannot cover the loan.
+    /// @dev `SOFT_NAV` is the interesting case: past the liquidation threshold, but the
+    ///      lot is still worth more than the debt, so a mid-auction fill leaves a
+    ///      surplus. `CRASHED_NAV` is the other side - even a 100%-of-NAV fill cannot
+    ///      cover the loan. Both are derived either side of `NAV_AT_DEBT_PARITY`, so
+    ///      neither can end up on the wrong side of its own premise.
     function _openAuctionAt(uint256 nav) internal returns (uint256 id) {
         vm.prank(alice);
         credit.borrow(MAX_BORROW);
@@ -159,7 +198,7 @@ contract LiquidationAuctionTest is Test {
         assertEq(startNav, CRASHED_NAV);
         assertEq(debt, MAX_BORROW);
         assertEq(startPrice, _lotPrice(BONDS, CRASHED_NAV, Config.AUCTION_START_PREMIUM_BPS));
-        assertEq(startPrice, 1_000e6, "100 bonds at $10.00 is $1,000 at 100% of NAV");
+        assertEq(startPrice, 314.375e6, "100 bonds at CRASHED_NAV, at 100% of NAV");
         assertTrue(auction.isLiquidating(alice));
     }
 
@@ -210,7 +249,7 @@ contract LiquidationAuctionTest is Test {
     function test_currentPrice_startsAtTheStartPremium() public {
         uint256 id = _openAuction();
         assertEq(auction.currentPremiumBps(id), Config.AUCTION_START_PREMIUM_BPS);
-        assertEq(auction.currentPrice(id), 1_000e6);
+        assertEq(auction.currentPrice(id), 314.375e6);
     }
 
     function test_currentPrice_decaysLinearlyAtHalfDuration() public {
@@ -227,7 +266,7 @@ contract LiquidationAuctionTest is Test {
         uint256 id = _openAuction();
         skip(Config.AUCTION_DURATION);
         assertEq(auction.currentPremiumBps(id), Config.AUCTION_FLOOR_BPS);
-        assertEq(auction.currentPrice(id), 680e6, "68% of $1,000");
+        assertEq(auction.currentPrice(id), 213.775e6, "68% of $314.375");
 
         // The floor holds at the boundary, which is the last instant a bid can land.
         // Past it, both quoting views refuse rather than keep returning a number no
@@ -278,14 +317,14 @@ contract LiquidationAuctionTest is Test {
     function test_currentPrice_worksWithAStaleFeed() public {
         uint256 id = _openAuction();
         oracle.setStale(true);
-        assertEq(auction.currentPrice(id), 1_000e6);
+        assertEq(auction.currentPrice(id), 314.375e6);
     }
 
     function test_currentPrice_pricesTheLiveLotSoATopUpIsNotSoldForNothing() public {
         uint256 id = _openAuction();
         vm.prank(alice);
         vault.depositBonds(50);
-        assertEq(auction.currentPrice(id), 1_500e6, "150 bonds at $10.00");
+        assertEq(auction.currentPrice(id), 471.5625e6, "150 bonds at CRASHED_NAV");
     }
 
     function test_currentPrice_revertsForUnknownAndClosedAuctions() public {
@@ -328,7 +367,7 @@ contract LiquidationAuctionTest is Test {
 
     function test_cancel_revertsWhileStillLiquidatable() public {
         uint256 id = _openAuction();
-        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.StillLiquidatable.selector, uint256(8_802)));
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.StillLiquidatable.selector, uint256(20_000)));
         auction.cancel(id);
     }
 
@@ -359,7 +398,7 @@ contract LiquidationAuctionTest is Test {
         assertEq(auction.currentPremiumBps(id), 8_200);
 
         uint256 price = auction.currentPrice(id);
-        assertEq(price, 1_230e6, "100 bonds at $15.00, 82% of NAV");
+        assertEq(price, 773.3625e6, "100 bonds at SOFT_NAV, 82% of NAV");
 
         _fundBidder(bidder, price);
         uint256 floatBefore = usdc.balanceOf(address(liquidity));
@@ -380,13 +419,13 @@ contract LiquidationAuctionTest is Test {
 
         // Penalty is 500 bps of the debt, split down the middle.
         uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
-        assertEq(penalty, 44.0125e6);
+        assertEq(penalty, 31.4375e6);
         assertEq(auction.rewardOf(keeper), penalty / 2, "the trigger, not the bidder");
         assertEq(credit.insuranceFund(), penalty - penalty / 2);
 
         // And the borrower keeps what is left, claimable rather than pushed.
         assertEq(credit.claimableOf(alice), price - MAX_BORROW - penalty);
-        assertEq(credit.claimableOf(alice), 305.7375e6);
+        assertEq(credit.claimableOf(alice), 113.175e6);
 
         // Every wei accounted for, and the auction keeps only the unclaimed reward.
         assertEq(usdc.balanceOf(address(auction)), auction.totalUnclaimedRewards());
@@ -398,7 +437,7 @@ contract LiquidationAuctionTest is Test {
 
         vm.prank(alice);
         credit.claimSurplus();
-        assertEq(usdc.balanceOf(alice), MAX_BORROW + 305.7375e6, "the loan plus the surplus");
+        assertEq(usdc.balanceOf(alice), MAX_BORROW + 113.175e6, "the loan plus the surplus");
 
         vm.prank(keeper);
         auction.claimReward();
@@ -416,7 +455,7 @@ contract LiquidationAuctionTest is Test {
 
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id);
-        assertEq(price, 680e6, "68% of $1,000");
+        assertEq(price, 213.775e6, "68% of $314.375");
         assertLt(price, MAX_BORROW, "the whole point: the lot is worth less than the loan");
 
         _fundBidder(bidder, price);
@@ -435,10 +474,10 @@ contract LiquidationAuctionTest is Test {
     /// @dev Near the floor `price < debt + penalty` is routine, not exotic. An unclamped
     ///      subtraction would panic in exactly the band where Dutch auctions fill.
     function test_bid_clampsThePenaltyToTheSurplusThatExists() public {
-        // $13.00 a bond puts the *floor* price only just above the debt: less than a
+        // NAV_FOR_PARTIAL_PENALTY puts the *floor* price only just above the debt: less
         // full penalty of surplus, but more than none. The decay curve cannot reach
         // that band at a higher NAV, because it stops at the floor by design.
-        uint256 id = _openAuctionAt(13e8);
+        uint256 id = _openAuctionAt(NAV_FOR_PARTIAL_PENALTY);
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id);
         assertGt(price, MAX_BORROW);
@@ -650,12 +689,12 @@ contract LiquidationAuctionTest is Test {
     function test_bid_revertsOnceATopUpHasCuredThePositionAndCancelClearsIt() public {
         uint256 id = _openAuctionAt(SOFT_NAV);
         vm.prank(alice);
-        vault.depositBonds(50); // 150 bonds at $15.00 is 3,912 bps: healthy again
+        vault.depositBonds(50); // 150 bonds at SOFT_NAV is 4,444 bps: healthy again
 
         _fundBidder(bidder, 5_000e6);
         uint256 price = auction.currentPrice(id);
         vm.prank(bidder);
-        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionNotLiquidatable.selector, uint256(3_912)));
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionNotLiquidatable.selector, uint256(4_444)));
         auction.bid(id, price);
 
         auction.cancel(id);
@@ -933,9 +972,9 @@ contract LiquidationAuctionTest is Test {
         vm.startPrank(bob);
         bond.setApprovalForAll(address(vault), true);
         vault.depositBonds(BONDS);
-        credit.borrow(350e6); // exactly max LTV against $1,000 of collateral
+        credit.borrow((BONDS * CRASHED_NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE));
         vm.stopPrank();
-        oracle.setNav(5e8); // and then it halves again
+        oracle.setNav(CRASHED_NAV / 4); // and then it quarters, to 10,000 bps
         vm.prank(keeper);
         credit.liquidate(bob);
         uint256 second = auction.auctionOf(bob);
