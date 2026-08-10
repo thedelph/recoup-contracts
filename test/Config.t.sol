@@ -139,20 +139,45 @@ contract ConfigTest is Test {
         );
     }
 
-    /// @dev Both legs are shares *of the protocol fee*, so neither may exceed it, and the two
-    ///      together cannot take more than all of it. If either ever did, the referral programme
-    ///      would be paying out of the 55/25/10 promised to borrowers, lenders and insurance
-    ///      rather than out of Recoup's own slice, which is the promise the design rests on.
-    function test_referralIsFundedEntirelyFromTheProtocolFee() public pure {
-        uint256 outflow = Config.REFERRAL_REFERRER_SHARE_BPS + Config.REFERRAL_REFEREE_SHARE_BPS;
-        assertLe(outflow, Config.BPS, "referral cannot take more than the whole protocol fee");
+    /// @dev The protocol fee is itself split with DexFi, so it must be exhaustive and must leave
+    ///      Recoup a majority - the referral programme, the borrower rebate and every running cost
+    ///      are funded from Recoup's leg alone.
+    function test_protocolFeeSplitSumsToBps() public pure {
+        assertEq(
+            Config.PROTOCOL_FEE_RECOUP_BPS + Config.PROTOCOL_FEE_DEXFI_BPS,
+            Config.BPS,
+            "protocol fee split must sum to 10000 bps"
+        );
+        assertGt(
+            Config.PROTOCOL_FEE_RECOUP_BPS,
+            Config.PROTOCOL_FEE_DEXFI_BPS,
+            "Recoup must retain the majority of its own fee"
+        );
+    }
 
-        // Expressed as a share of gross yield, what the programme costs at full tilt.
-        uint256 grossBps = (Config.SPLIT_PROTOCOL_BPS * outflow) / Config.BPS;
+    /// @dev Both legs are shares of *Recoup's share* of the protocol fee, so neither may exceed it,
+    ///      and the two together cannot take all of it. If either ever did, the referral programme
+    ///      would be paying out of the 55/25/10 promised to borrowers, lenders and insurance, or out
+    ///      of DexFi's 20%, rather than out of Recoup's own slice - which is the promise the design
+    ///      rests on and the one DexFi restated on 2026-08-07.
+    function test_referralIsFundedEntirelyFromRecoupsShareOfTheFee() public pure {
+        uint256 outflow = Config.REFERRAL_REFERRER_SHARE_BPS + Config.REFERRAL_REFEREE_SHARE_BPS;
+        assertLe(outflow, Config.BPS, "referral cannot take more than the whole of Recoup's share");
+
+        // What the programme costs at full tilt, as a share of gross yield: the protocol fee, times
+        // Recoup's share of it, times the outflow. Derived through both hops rather than assumed,
+        // because the base moved once already and the published copy moved with it.
+        uint256 recoupBps = (Config.SPLIT_PROTOCOL_BPS * Config.PROTOCOL_FEE_RECOUP_BPS) / Config.BPS;
+        uint256 grossBps = (recoupBps * outflow) / Config.BPS;
+        assertLt(
+            grossBps,
+            recoupBps,
+            "Recoup must retain some of its own share while a referral is live"
+        );
         assertLt(
             grossBps,
             Config.SPLIT_PROTOCOL_BPS,
-            "the protocol must retain some of its own fee while a referral is live"
+            "referral outflow must stay inside the protocol fee"
         );
     }
 

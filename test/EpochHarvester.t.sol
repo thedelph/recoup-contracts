@@ -6,6 +6,7 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Config} from "../src/Config.sol";
+import {ProtocolFeeSplitter} from "../src/ProtocolFeeSplitter.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
 import {EpochHarvester} from "../src/EpochHarvester.sol";
@@ -72,6 +73,15 @@ contract EpochHarvesterTest is Test {
     uint256 internal constant NAV = 25.15e8;
     uint256 internal constant FLOAT = 100_000e6;
     uint256 internal constant YIELD = 1_000e6;
+    uint256 internal constant BONDS = 100;
+
+    /// @dev Borrowing power at the ceiling for the seeded lot, derived from Config so the
+    ///      ratchet moves the fixture instead of breaking it. Tests asserting a partial
+    ///      write-down need a debt larger than one epoch of borrower share
+    ///      (YIELD x SPLIT_BORROWER_BPS = 550e6), which the ceiling comfortably is; the
+    ///      literal 800e6 this replaced stopped being inside the ceiling at 25% LTV.
+    uint256 internal constant MAX_BORROW =
+        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
 
     /// @dev At most 1 wei of USDC is left behind by a stream's rate truncation, and a
     ///      test that accrues twice can compound that to 2. Anything larger is a real
@@ -137,7 +147,7 @@ contract EpochHarvesterTest is Test {
         usdc.approve(address(liquidity), FLOAT);
         liquidity.fund(FLOAT);
 
-        _deposit(alice, 100);
+        _deposit(alice, BONDS);
     }
 
     function _deposit(address who, uint256 bonds) private {
@@ -180,6 +190,42 @@ contract EpochHarvesterTest is Test {
         assertEq(harvester.pendingLenderYield(), toLenders, "held until the pool opens");
         harvester.flushProtocolFee();
         assertEq(usdc.balanceOf(feeWallet), toProtocol);
+    }
+
+    /// @notice The 80/20 with DexFi, proved through a real epoch rather than in isolation.
+    /// @dev `ProtocolFeeSplitter` rests on one claim about this contract: that installing
+    ///      it as `protocolFeeWallet` needs no change to the core, because
+    ///      `flushProtocolFee` pays out with a plain `safeTransfer` and so does not care
+    ///      that the destination is a contract. That claim is worth an executable test
+    ///      and not a comment, because the *lender* leg of this same split is delivered
+    ///      by approve-and-call, where a plain recipient receives nothing - the two legs
+    ///      genuinely differ, and the difference is invisible at the call site.
+    function test_harvest_protocolFeeSplitsWithDexFiWhenTheSplitterIsTheFeeWallet() public {
+        ProtocolFeeSplitter splitter =
+            new ProtocolFeeSplitter(IERC20(address(usdc)), makeAddr("recoupTreasury"), makeAddr("dexfiTreasury"));
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(address(splitter));
+
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+        harvester.flushProtocolFee();
+
+        uint256 toBorrowers = (YIELD * Config.SPLIT_BORROWER_BPS) / Config.BPS;
+        uint256 toLenders = (YIELD * Config.SPLIT_LENDER_BPS) / Config.BPS;
+        uint256 toInsurance = (YIELD * Config.SPLIT_INSURANCE_BPS) / Config.BPS;
+        uint256 toProtocol = YIELD - toBorrowers - toLenders - toInsurance;
+
+        assertEq(usdc.balanceOf(address(splitter)), toProtocol, "the whole fee reached the splitter");
+
+        (uint256 toRecoup, uint256 toDexFi) = splitter.split();
+        assertEq(toRecoup + toDexFi, toProtocol, "and left it in full");
+        assertEq(usdc.balanceOf(splitter.dexfiWallet()), toDexFi);
+        assertEq(usdc.balanceOf(splitter.recoupWallet()), toRecoup);
+        assertEq(
+            toDexFi,
+            (toProtocol * Config.PROTOCOL_FEE_DEXFI_BPS) / Config.BPS,
+            "DexFi's leg is the agreed share of the fee, not of gross yield"
+        );
     }
 
     /// @dev Nothing may be left behind in the harvester beyond the lender share it is
@@ -276,14 +322,15 @@ contract EpochHarvesterTest is Test {
 
     function test_harvest_writesDownBorrowerDebt() public {
         vm.prank(alice);
-        credit.borrow(800e6);
+        credit.borrow(MAX_BORROW);
 
         farm.setPendingYield(address(adapter), YIELD);
         _harvestAndStream();
         credit.settle(alice);
 
         uint256 toBorrowers = (YIELD * Config.SPLIT_BORROWER_BPS) / Config.BPS;
-        assertApproxEqAbs(credit.debtOf(alice), 800e6 - toBorrowers, DUST, "the loan repaid itself");
+        assertLt(toBorrowers, MAX_BORROW, "a partial write-down, not a full repayment");
+        assertApproxEqAbs(credit.debtOf(alice), MAX_BORROW - toBorrowers, DUST, "the loan repaid itself");
     }
 
     /// @dev And when the yield exceeds the debt, the remainder becomes claimable
