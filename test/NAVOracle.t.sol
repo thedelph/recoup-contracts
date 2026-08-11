@@ -433,15 +433,43 @@ contract NAVOracleTest is Test {
         assertEq(oracle.pendingConfirmableAt(), confirmableAt, "and it must not have touched the clock");
     }
 
-    /// @dev A materially different price is a different decision, so it earns a fresh
-    ///      review window rather than inheriting the old one.
-    function test_pending_aMaterialRepriceRestartsTheWindow() public {
+    /// @notice The keeper can open a review window and cannot extend one.
+    /// @dev **This asserted the opposite, and the thing it asserted was the attack.** "A materially
+    ///      different price is a different decision, so it earns a fresh review window" reads as
+    ///      care and is a permanent veto: a keeper alternating two out-of-budget prices more than
+    ///      the reprice tolerance apart, once every eleven hours, restarted this clock every time,
+    ///      so `confirmNav` could never satisfy `block.timestamp >= pendingConfirmableAt`. The
+    ///      earlier tolerance fix had closed only the sub-tolerance half of the same hole.
+    function test_pending_aMaterialRepriceCannotExtendTheWindow() public {
         _post((NAV * 70) / 100);
         uint256 first = oracle.pendingConfirmableAt();
+        uint256 parked = oracle.pendingNav();
 
         skip(6 hours);
-        _post((NAV * 50) / 100); // another 20% down - a different decision
-        assertGt(oracle.pendingConfirmableAt(), first, "the confirmer gets a fresh 12h");
+        _post((NAV * 50) / 100); // another 20% down, well past the reprice tolerance
+
+        assertEq(oracle.pendingConfirmableAt(), first, "the keeper must not buy a fresh 12h");
+        assertEq(oracle.pendingNav(), parked, "nor swap the number under review");
+
+        vm.warp(first);
+        vm.prank(confirmer);
+        oracle.confirmNav(parked);
+        assertEq(oracle.navPerBond(), parked, "and the window still arrives on the original schedule");
+    }
+
+    /// @dev The escape hatch that makes write-once liveable: the second key can drop a pending
+    ///      value it does not want, and the next post parks a fresh one with a fresh clock.
+    function test_pending_cancellingLetsTheKeeperParkAFreshNumber() public {
+        _post((NAV * 70) / 100);
+
+        vm.prank(confirmer);
+        oracle.cancelPendingNav();
+
+        skip(1 hours);
+        uint256 replacement = (NAV * 50) / 100;
+        _post(replacement);
+        assertEq(oracle.pendingNav(), replacement, "a cleared slot accepts the next post");
+        assertEq(oracle.pendingConfirmableAt(), block.timestamp + Config.NAV_PENDING_DELAY);
     }
 
     // ── freshness ────────────────────────────────────────────────────────────
