@@ -359,11 +359,78 @@ contract NAVOracleTest is Test {
         _post(crashed + 2);
 
         assertEq(oracle.pendingConfirmableAt(), confirmableAt, "the clock did not slide");
-        assertEq(oracle.pendingNav(), crashed + 2, "but the latest price is the pending one");
+        assertEq(oracle.pendingNav(), crashed, "and the value under review held still");
 
         vm.prank(confirmer);
-        oracle.confirmNav(crashed + 2);
-        assertEq(oracle.navPerBond(), crashed + 2, "the crash was ratifiable on schedule");
+        oracle.confirmNav(crashed);
+        assertEq(oracle.navPerBond(), crashed, "the crash was ratifiable on schedule");
+    }
+
+    /// @dev **The permanent second-key veto.** `confirmNav` takes the price explicitly -
+    ///      deliberately, so the confirmer ratifies a number they typed rather than
+    ///      whatever happens to be pending. That guard is only worth anything if the
+    ///      pending value holds still long enough to be typed.
+    ///
+    ///      It did not. `postNav` assigned `pendingNav` on every out-of-budget post
+    ///      while restarting the review clock only on a *material* move, so a keeper
+    ///      posting last-decimal jitter swapped the value out from under every
+    ///      confirmation and `confirmNav` reverted `PendingNavMismatch` forever. PRD §9
+    ///      names keeper compromise as the worst realistic attack on this protocol, and
+    ///      this is that attack with its stated mitigation switched off - by a keeper
+    ///      that only has to behave like a live price feed.
+    ///
+    ///      The confirmer here reads the pending value once, as a human would, and then
+    ///      tries to ratify it while the keeper keeps posting.
+    function test_pending_jitterCannotVetoTheSecondKey() public {
+        uint256 crashed = (NAV * 70) / 100; // -30%, well outside the budget
+        _post(crashed);
+
+        // What the confirmer sees, and the number they will type.
+        uint256 seen = oracle.pendingNav();
+        uint256 confirmableAt = oracle.pendingConfirmableAt();
+
+        // The keeper keeps speaking, every value a hair off the last, none of them
+        // material. A real feed does exactly this.
+        for (uint256 i = 1; i <= 12; ++i) {
+            skip(1 hours);
+            _post(crashed + i);
+        }
+
+        assertEq(oracle.pendingNav(), seen, "jitter must not move the value under review");
+
+        vm.warp(confirmableAt);
+        vm.prank(confirmer);
+        oracle.confirmNav(seen);
+        assertEq(oracle.navPerBond(), seen, "the second key must be able to ratify what it was shown");
+    }
+
+    /// @dev The same line let the pending price *walk*. Each sub-tolerance repost
+    ///      overwrote `pendingNav` without restarting the clock, so twelve hours after
+    ///      the first post the confirmer could be handed a price arbitrarily far from
+    ///      the one whose review window they had been waiting out - ratifying, in one
+    ///      signature, a move no single post was ever allowed to make.
+    ///
+    ///      Each step here is under `NAV_PENDING_REPRICE_TOLERANCE_BPS` against the
+    ///      value before it, so every one of them is individually "not worth
+    ///      re-reviewing", which is the whole point.
+    function test_pending_subToleranceStepsCannotWalkThePendingPrice() public {
+        uint256 crashed = (NAV * 70) / 100;
+        _post(crashed);
+
+        uint256 seen = oracle.pendingNav();
+        uint256 confirmableAt = oracle.pendingConfirmableAt();
+
+        // Half the tolerance per step, compounding, for fifty steps: enough to move the
+        // pending price by roughly a fifth if the walk lands.
+        for (uint256 i; i < 50; ++i) {
+            uint256 next = oracle.pendingNav();
+            next += (next * (Config.NAV_PENDING_REPRICE_TOLERANCE_BPS / 2)) / Config.BPS;
+            skip(1 minutes);
+            _post(next);
+        }
+
+        assertEq(oracle.pendingNav(), seen, "a walk of immaterial steps is still a material move");
+        assertEq(oracle.pendingConfirmableAt(), confirmableAt, "and it must not have touched the clock");
     }
 
     /// @dev A materially different price is a different decision, so it earns a fresh
