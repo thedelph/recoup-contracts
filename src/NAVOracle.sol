@@ -120,50 +120,52 @@ contract NAVOracle is INAVOracle, Ownable {
             // may drop a pending value, via cancelPendingNav.
             _accept(nav);
         } else {
-            // The clock belongs to the MOVE, not to the exact value.
+            // A large move parks here for the second key. The history of this branch is worth
+            // keeping, because it has been wrong twice in the same direction and both times the
+            // wrong version read as the careful one.
             //
-            // Anchoring it to the value looked like the fix for a keeper sliding the
-            // window, but it only stopped a keeper reposting the identical price -
-            // and a live feed never does. Every post differs in the last decimal, so
-            // every post restarted the twelve hours and no large move could ever be
-            // ratified, with an honest keeper on a normal cadence. That is the same
-            // unilateral veto the in-budget branch above was fixed to remove.
+            // First it anchored the review clock to the exact pending *value*, so any change
+            // restarted the twelve hours - and a live feed changes in its last decimals on every
+            // post, so no large move could ever be ratified. Then it restarted the clock only on a
+            // *materially* different price, which fixed the honest-keeper case and left a
+            // deliberate one: two prices a tolerance apart, alternated, restart it just as
+            // reliably.
             //
-            // So: refresh the pending value freely, but only restart the review window
-            // when the value has moved enough to be worth re-reviewing. Feed jitter
-            // keeps the clock running; a materially different price resets it, because
-            // the confirmer's twelve hours are to review the number they will ratify.
+            // Both versions handed the keeper a unilateral veto over the second key, which is the
+            // same fault the in-budget branch above was fixed to remove, arriving twice more
+            // through the pending slot.
             uint256 pending = pendingNav;
-            bool materiallyDifferent = pending == 0
-                || _deviatesBeyond(pending, nav, Config.NAV_PENDING_REPRICE_TOLERANCE_BPS);
 
-            // **The value and its review clock move together, or neither moves.**
+            // **Write-once per review window: the keeper may open one and may not extend it.**
+            //
+            // The previous version of this branch skipped the write when the new price was inside
+            // `NAV_PENDING_REPRICE_TOLERANCE_BPS` of the pending one, and rewrote both the value
+            // and the clock when it was outside. That closed the *accidental* denial - a live feed
+            // jitters in its last decimals, and jitter was swapping the number out from under
+            // `confirmNav`, which takes the price explicitly - and left the deliberate one wide
+            // open. A keeper alternating two out-of-budget prices more than a tolerance apart, once
+            // every eleven hours, restarted the twelve-hour clock every time, so
+            // `block.timestamp >= pendingConfirmableAt` was never true and the second key could
+            // never ratify anything. Six of twelve agents in a later review found it, and the
+            // commit that shipped the tolerance fix claimed to have closed the veto outright. It
+            // had closed half of it.
+            //
+            // PRD §9 names keeper compromise as the worst realistic attack on this protocol and
+            // the second key as its mitigation, so a veto the keeper holds alone is the one thing
+            // this path must not permit. An honest keeper following a crashing feed produced the
+            // same denial, at exactly the moment a large correction needs ratifying.
+            //
+            // Replacing a live pending value early is now a decision for the keys that own the
+            // second-key path: `cancelPendingNav` is held by the owner and the confirmer, and a
+            // cleared slot accepts the next post with a fresh clock. The cost is that a pending
+            // figure can be up to one tolerance stale, which is the exposure the tolerance already
+            // accepts by definition.
             //
             // Refreshing the value freely while restarting the clock only on a material
             // move was two thirds of a good idea, and the missing third was fatal in
             // both directions.
             //
-            // `confirmNav` takes the price as an explicit argument, so the confirmer
-            // ratifies a number they typed rather than whatever is pending - which is
-            // the stated bound on the pending slot in `_accept` above. Assigning here
-            // on every post meant a keeper posting last-decimal jitter swapped that
-            // number out from under every confirmation, and `confirmNav` reverted
-            // `PendingNavMismatch` for as long as the keeper kept speaking. A live feed
-            // jitters by default, so this was reachable without any intent at all, and
-            // with intent it is a free permanent veto over the second key - PRD §9's
-            // worst realistic attack with the mitigation named against it disabled.
-            //
-            // The same line let the pending price walk: fifty sub-tolerance steps, each
-            // individually "not worth re-reviewing", moved it ~28% against a clock that
-            // never restarted, so the confirmer's twelve hours were spent reviewing a
-            // price they would not be the one to ratify.
-            //
-            // Skipping the write on jitter costs the freshness of the pending figure,
-            // and that is the intended trade rather than an oversight: the tolerance is
-            // by definition the band inside which a reprice is not a new decision, and
-            // the confirmer ratifying a price one tolerance stale is the same exposure
-            // the tolerance already accepts.
-            if (materiallyDifferent || block.timestamp > pendingConfirmableAt + Config.NAV_PENDING_EXPIRY) {
+            if (pending == 0 || block.timestamp > pendingConfirmableAt + Config.NAV_PENDING_EXPIRY) {
                 pendingNav = nav;
                 pendingConfirmableAt = block.timestamp + Config.NAV_PENDING_DELAY;
             }
