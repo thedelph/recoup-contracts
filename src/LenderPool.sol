@@ -6,14 +6,20 @@ import {ERC4626, IERC20} from "@openzeppelin/contracts/token/ERC20/extensions/ER
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title LenderPool (skeleton — PRD §4.2)
+/// @title LenderPool (skeleton - PRD §4.2)
 /// @notice ERC-4626 vault over native USDC. Lends to CreditManager only. Share
 ///         price rises with the lender share of harvested yield; shortfalls after
-///         auction + insurance fund are socialised via share price — this must be
+///         auction + insurance fund are socialised via share price - this must be
 ///         prominent in lender docs.
-/// @dev Deliberately not `is ILenderPool` yet to avoid interface/event inheritance
-///      friction while stubbed; the queue + lending functions land in phase 4 and
-///      the interface conformance test comes with them.
+/// @dev Not `is ILenderPool` while stubbed; the queue + lending functions land in
+///      phase 4 and the interface conformance test comes with them.
+///
+///      This line used to call that "avoiding interface/event inheritance friction",
+///      and the friction it avoided was the compiler doing its job: with the two only
+///      related by intention, `YieldDistributed` drifted to a different signature in
+///      the implementation and nobody found out until an internal audit round. The
+///      Phase-4 contract declares `is ILenderPool` for exactly that reason. Until it
+///      lands, the event signatures below are held to the interface by hand.
 ///      TODO(phase-4): FIFO withdrawal queue (withdraw/redeem overrides honouring
 ///      hot float), reserveRatio management, loss socialisation.
 contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
@@ -25,7 +31,9 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
 
     event Lent(uint256 amount);
     event PrincipalRepaid(uint256 amount);
-    event YieldDistributed(uint256 amount);
+    /// @dev Three parameters, matching `ILenderPool` and the Phase-4 implementation. See the
+    ///      interface for what the extra two carry and why this line was wrong.
+    event YieldDistributed(uint256 amount, uint256 ratePerSecond, uint256 streamEndsAt);
     event LossSocialised(uint256 amount);
     event WithdrawalQueued(address indexed lender, uint256 indexed queueIndex, uint256 assets);
     event QueuedWithdrawalServiced(address indexed lender, uint256 indexed queueIndex, uint256 assets);
@@ -34,7 +42,7 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
     address public epochHarvester;
 
     /// @notice USDC currently lent out, carried at face value less socialised loss
-    ///         (debts are written down by yield, not defaulted — PRD §4.2).
+    ///         (debts are written down by yield, not defaulted - PRD §4.2).
     /// @dev Zero until lend() lands (phase 4); the zero default is the correct value.
     // slither-disable-next-line uninitialized-state
     uint256 public outstandingPrincipal;
