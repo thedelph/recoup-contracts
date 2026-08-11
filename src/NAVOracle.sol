@@ -137,11 +137,39 @@ contract NAVOracle is INAVOracle, Ownable {
             bool materiallyDifferent = pending == 0
                 || _deviatesBeyond(pending, nav, Config.NAV_PENDING_REPRICE_TOLERANCE_BPS);
 
-            pendingNav = nav;
+            // **The value and its review clock move together, or neither moves.**
+            //
+            // Refreshing the value freely while restarting the clock only on a material
+            // move was two thirds of a good idea, and the missing third was fatal in
+            // both directions.
+            //
+            // `confirmNav` takes the price as an explicit argument, so the confirmer
+            // ratifies a number they typed rather than whatever is pending - which is
+            // the stated bound on the pending slot in `_accept` above. Assigning here
+            // on every post meant a keeper posting last-decimal jitter swapped that
+            // number out from under every confirmation, and `confirmNav` reverted
+            // `PendingNavMismatch` for as long as the keeper kept speaking. A live feed
+            // jitters by default, so this was reachable without any intent at all, and
+            // with intent it is a free permanent veto over the second key - PRD §9's
+            // worst realistic attack with the mitigation named against it disabled.
+            //
+            // The same line let the pending price walk: fifty sub-tolerance steps, each
+            // individually "not worth re-reviewing", moved it ~28% against a clock that
+            // never restarted, so the confirmer's twelve hours were spent reviewing a
+            // price they would not be the one to ratify.
+            //
+            // Skipping the write on jitter costs the freshness of the pending figure,
+            // and that is the intended trade rather than an oversight: the tolerance is
+            // by definition the band inside which a reprice is not a new decision, and
+            // the confirmer ratifying a price one tolerance stale is the same exposure
+            // the tolerance already accepts.
             if (materiallyDifferent || block.timestamp > pendingConfirmableAt + Config.NAV_PENDING_EXPIRY) {
+                pendingNav = nav;
                 pendingConfirmableAt = block.timestamp + Config.NAV_PENDING_DELAY;
             }
-            emit NAVPending(nav, pendingConfirmableAt);
+            // The stored pair, not the posted value - an observer that saw `nav` here
+            // would be reading a price this contract did not keep.
+            emit NAVPending(pendingNav, pendingConfirmableAt);
         }
     }
 
