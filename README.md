@@ -175,11 +175,13 @@ what it does not is a tested quantity rather than an assurance:
 ### How the contracts are reviewed
 
 Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
-re-audited**, because four rounds running found regressions introduced by the previous round's own
-fixes. Findings are fixed with regression tests. The full round-by-round record is in
-[AUDITS.md](AUDITS.md).
+re-audited**, because the rate at which fix rounds produce their own defects has stayed stubbornly
+high: **fourteen rounds so far, and five of the last six found defects in the round before them.**
+Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) covers
+the rounds over the code published here; the later ones also cover the lender pool, which is not in
+this repository yet.
 
-Three habits came out of that and now apply by default:
+Four habits came out of that and now apply by default:
 
 - A fix round is new code. Fixes that add a mechanism regress far more often than fixes that remove
   a constraint.
@@ -187,6 +189,9 @@ Three habits came out of that and now apply by default:
   agents who had all analysed the wrong function; a proof-of-concept settled it in ten minutes.
 - When a fix adds a guard, look for the mirror case it did not cover, and check what the guard's
   escape hatch actually depends on.
+- Before auditing a fix for bugs, re-run the original attack against it. One recent mechanism was
+  audited twice for correctness and deleted on the third pass, when someone finally asked the prior
+  question and found it never closed the hole it was written for.
 
 Alongside the audits: stateful invariant fuzzing over four suites (21 invariants), and the mainnet
 fork tests above, which are the real integration proof.
