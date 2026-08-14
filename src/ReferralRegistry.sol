@@ -144,6 +144,14 @@ contract ReferralRegistry {
     ///      giving it away, so there is no profit in it, and the write-once rule still applies.
     function registerFor(bytes32 code, address owner) external {
         if (owner == address(0)) revert ZeroAddress();
+        // **Audit round 12.** `NON_BINDABLE` is the constructor's tombstone: it means "reserved by
+        // Recoup, permanently unbindable", and `bind` treats it as a refusal that can never be
+        // lifted. `register` cannot mint it, because it can only ever write `msg.sender`. This
+        // function could, and one call was enough to brick any advertised-but-unclaimed code
+        // forever - write-once mappings, no owner, no transfer, so no recovery at any price - while
+        // emitting an event byte-identical to genuine brand protection, which the payout calculator
+        // is told to skip. Two writers of the same mapping, only one of them constrained.
+        if (owner == NON_BINDABLE) revert CodeNotBindable(code);
         _register(code, owner);
     }
 

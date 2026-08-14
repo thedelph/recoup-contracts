@@ -24,7 +24,7 @@ import {MockNavOracle} from "../mocks/MockNavOracle.sol";
 ///         1. the Config addresses are the live contracts and behave as documented;
 ///         2. without DexFi whitelisting, deposits revert at the bond's gate
 ///            (today's mainnet reality);
-///         3. ONE `addWhitelist([adapter])` from DexFi's owner (impersonated here —
+///         3. ONE `addWhitelist([adapter])` from DexFi's owner (impersonated here -
 ///            this is exactly §14 ask #5) unlocks the full lifecycle:
 ///            deposit → stake → claim (withdraw(0)) → unstake → withdraw.
 contract CollateralVaultForkTest is Test {

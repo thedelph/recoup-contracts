@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Config} from "../src/Config.sol";
 
-/// @notice Guards the internal consistency of Config — these relations are load-bearing
+/// @notice Guards the internal consistency of Config - these relations are load-bearing
 ///         assumptions elsewhere in the protocol (PRD §5, §4.4, §4.5).
 contract ConfigTest is Test {
     function test_yieldSplitSumsToBps() public pure {
@@ -28,7 +28,7 @@ contract ConfigTest is Test {
     ///         worst LTV that can first trigger a liquidation. That worst case is one
     ///         immediate NAV_MAX_DEVIATION_BPS drop applied to a position sitting at
     ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev). (Was 6500 vs a
-    ///         6767 requirement - a lender shortfall, raised to 6800 after review.)
+    ///         6767 requirement - a lender shortfall; see the private security notes.)
     function test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger() public pure {
         // Derive the worst drop from what NAVOracle actually accepts without a second
         // key, not from NAV_MAX_DEVIATION_BPS directly. Those were the same number
@@ -76,7 +76,7 @@ contract ConfigTest is Test {
     }
 
     function test_externalAddressesResolved() public pure {
-        // Resolved 2026-07-24 from on-chain archaeology (verified source review).
+        // Resolved 2026-07-24 from on-chain archaeology against the verified source.
         assertTrue(Config.USDC_BASE != address(0));
         assertTrue(Config.DEXFI_TREASURY_EOA != address(0));
         assertTrue(Config.DEXFI_BOND_NFT != address(0));
@@ -135,7 +135,7 @@ contract ConfigTest is Test {
         assertLe(
             outflow,
             Config.REFERRAL_MAX_OUTFLOW_BPS,
-            "referral legs exceed the cap the programme design promises"
+            "referral legs exceed the cap the approved design promises"
         );
     }
 

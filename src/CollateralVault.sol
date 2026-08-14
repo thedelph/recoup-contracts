@@ -46,7 +46,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
 
     IDexFiBond public immutable bond;
     INAVOracle public immutable navOracle;
-    /// @notice Pluggable custody backend (direct-call vs Safe) — §4.1 config decision.
+    /// @notice Pluggable custody backend (direct-call vs Safe) - §4.1 config decision.
     ICustodyAdapter public custodyAdapter;
     address public creditManager;
     address public liquidationAuction;
@@ -121,8 +121,10 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
             // It also guarded the wrong pot. `insuranceFund` is an order of magnitude
             // larger, grows monotonically, and its only spender needs a live borrower on
             // the outgoing manager - which `totalDebt == 0` has just guaranteed does not
-            // exist. **That strand is real**; it needs a migration path on
-            // CreditManager, not a guard here, and `migrateReserves` is that path.
+            // exist. **That strand is real, and `CreditManager.migrateReserves` is the
+            // fix for it** - a migration path on the manager, not a guard here. The
+            // one-way-detachment note below is what makes that sweep safe: nobody is
+            // coming back for the outgoing manager. Recorded in the private security notes.
         }
         // **The twin of `setLiquidationAuction`'s guard, and the one round 6b missed.**
         // `expireToWorkout` takes its authorisation from *this* pointer, via

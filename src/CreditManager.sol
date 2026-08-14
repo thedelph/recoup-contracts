@@ -47,6 +47,16 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error LiquidityNotDelivered(uint256 expected, uint256 received);
     error YieldNotDelivered(uint256 requested, uint256 undistributed);
     error DebtOutstanding(uint256 totalDebtNow);
+    /// @dev Distinct from `DebtOutstanding` so an operator knows which clause of the swap guard
+    ///      bit, and what to do about it: one waits for repayment, the other calls the flush.
+    error LossOutstanding(uint256 unsocialisedLossNow);
+    error LossNotThisPools(address liquiditySource, address lenderPool);
+    /// @dev Distinct from `LossOutstanding` for the same reason that one is distinct from
+    ///      `DebtOutstanding`: the two clauses of the `setLenderPool` guard need different actions
+    ///      from an operator. One waits for the flush, the other waits for borrowers to repay.
+    error PoolPrincipalOutstanding(address pool, uint256 outstanding);
+    /// @notice The outgoing pool still carries per-borrower marks that only it can be told to clear.
+    error PoolImpairmentOutstanding(address pool, uint256 marked);
     error Detached(address liveManager);
     error NotLiquidationAuction();
     error LiquidationAuctionUnset();
@@ -56,8 +66,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error AuctionHasLiveWork(uint256 outstanding);
     error AuctionPointerMismatch(address manager, address vault);
     error WorkoutOpen(address borrower);
+    error LiquidationOpen(address borrower);
     error StillAttached();
     error LiquidationAuctionVaultMismatch(address auctionVault);
+    /// @notice The incoming auction does not answer the whole interface the repayment path needs.
+    error LiquidationAuctionIncomplete();
+    /// @notice The incoming pool does not answer the enumeration the bounded impairment sweep needs.
+    error LenderPoolIncomplete();
 
     event LiquiditySourceSet(address indexed source);
     event LenderPoolSet(address indexed lenderPool);
@@ -81,6 +96,12 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     event LossWrittenDown(address indexed borrower, uint256 amount, uint256 fromInsurance, uint256 socialised);
     event LossSocialised(address indexed pool, uint256 amount);
     event LossDeferred(uint256 amount, uint256 totalDeferred);
+    /// @notice A default whose principal the current lender pool did not fund. Nothing is deferred:
+    ///         the source that lent the money bears it by not being repaid.
+    /// @dev Emitted rather than silently returning, because "no counter moved" and "a loss
+    ///      happened and landed where it should" are different facts and only one of them is
+    ///      visible from storage.
+    event LossBorneByTheSource(address indexed source, uint256 amount);
     event ReservesMigrated(address indexed to, uint256 amount);
 
     IERC20 public immutable usdc;
@@ -114,12 +135,30 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     /// @notice USDC held here to absorb auction shortfalls first (PRD §4.4).
     uint256 public insuranceFund;
     /// @notice Losses recognised on the books that the lender pool has not accepted yet.
-    /// @dev Public because a loss that cannot be placed must be *visible*. Until Phase 4
-    ///      there is no pool to socialise into, and `LenderPool.socialiseLoss` reverts
-    ///      by design - so the alternative to this counter is either a liquidation that
-    ///      cannot complete or a loss that is silently dropped. Same shape as
-    ///      `EpochHarvester.pendingLenderYield`, adopted for the same reason.
+    /// @dev Public because a loss that cannot be placed must be *visible*. The alternative to this
+    ///      counter is either a liquidation that cannot complete or a loss that is silently
+    ///      dropped. Same shape as `EpochHarvester.pendingLenderYield`, adopted for the same
+    ///      reason.
+    ///
+    ///      Audit round 10: for a while it was the silently-dropped option, and this comment was
+    ///      still describing the protection. The counter only ever filled from a `catch`, and when
+    ///      the pool gained a body it stopped reverting - it clamps a write-down to what it has
+    ///      lent and accepts the call regardless. `_socialise` now reads the absorbed amount back
+    ///      and keeps the difference here, so the counter fills on a partial acceptance and not
+    ///      just on a refusal.
     uint256 public unsocialisedLoss;
+
+    /// @notice Where the next bounded impairment sweep resumes: the index in the pool's impaired
+    ///         set that `refreshImpairments` will step down from.
+    /// @dev A hint, not a bookmark. The set swap-pops on release, so between calls this index can
+    ///      come to name a different borrower or none at all - which is fine, because the property
+    ///      the sweep owes is coverage of the whole set over successive calls, not exact
+    ///      enumeration within one. Without it, a bounded call restarted at the tail every time and
+    ///      the oldest mark was unreachable; see `refreshImpairments`.
+    ///
+    ///      Public so an operator can see where a sweep got to without replaying logs, which is the
+    ///      same off-chain archaeology the sweep itself was built to remove.
+    uint256 public impairmentCursor;
 
     /// @notice Cumulative yield accrued per bond, scaled by ACC_PRECISION.
     ///         Monotonically increasing; the whole distribution mechanism is the
@@ -212,17 +251,140 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      first repayment would underflow and brick repayment for every existing
     ///      borrower. Phase 4 therefore swaps at zero debt, or via an explicit
     ///      migration that seeds the pool's books first.
+    ///
+    ///      Also refuses while a recognised loss is still unplaced. Since round 11 that counter can
+    ///      only hold loss the current pool itself funded, so this is always satisfiable - flush it
+    ///      first - and it stops the one remaining way the old bearer instrument could re-form: a
+    ///      backlog banked against one source and settled against the next.
     function setLiquiditySource(address liquiditySource_) external onlyOwner {
         if (liquiditySource_ == address(0)) revert ZeroAddress();
         if (totalDebt != 0 || pendingPrincipal != 0) revert DebtOutstanding(totalDebt);
+        if (unsocialisedLoss != 0) revert LossOutstanding(unsocialisedLoss);
         liquiditySource = liquiditySource_;
         emit LiquiditySourceSet(liquiditySource_);
+        _pushLossReserves();
     }
 
+    /// @notice Repoint the balance sheet that bears socialised losses.
+    /// @dev **Audit round 11: this had `onlyOwner` and nothing else, while both of its structural
+    ///      siblings carried a live-state guard.** `setLiquiditySource` refuses while debt,
+    ///      pending principal or an unplaced loss is outstanding, and `LenderPool.setCreditManager`
+    ///      refuses while the pool has principal out. This setter decides where every future
+    ///      default lands and was the one that would move under anything.
+    ///
+    ///      Two clauses, mirroring those two siblings.
+    ///
+    ///      **A backlog banked against the outgoing pool must not be settled against the incoming
+    ///      one.** `unsocialisedLoss` records an amount and not whose principal funded it, and
+    ///      `flushSocialisedLoss` is permissionless - which is the exact bearer instrument round
+    ///      11's PoC monetised across a liquidity-source swap. `_socialise` closed the treasury
+    ///      route by refusing to offer a loss to a pool that is not the source; this closes the
+    ///      remaining route, which is to move the sink rather than the source.
+    ///
+    ///      **The deadlock question, asked out loud, because this repository has shipped two
+    ///      mutually-unsatisfiable guards and `EpochHarvester.setLenderPool` spends twenty lines
+    ///      on one of them.** The only drain for `unsocialisedLoss` is `flushSocialisedLoss`,
+    ///      which itself refuses unless `lenderPool == liquiditySource` - so yes, the drain
+    ///      requires the pointer this clause is refusing to move. That makes the clause necessary
+    ///      rather than dangerous, and the reason is that the move it forbids never unlocked
+    ///      anything: `setLiquiditySource` carries the identical clause, so a `lenderPool` repoint
+    ///      made in that state leaves the protocol equally stuck, with the loss now *permanently*
+    ///      unplaceable because `flushSocialisedLoss` would revert `LossNotThisPools` forever.
+    ///      Nothing reachable becomes unreachable. The state where the counter cannot be drained
+    ///      at all - a pool that refuses, or one whose `outstandingPrincipal` has already been
+    ///      clamped to zero, so `socialiseLoss` absorbs nothing - is terminal for migration
+    ///      whether or not this clause exists, because it already blocks the source leg.
+    ///
+    ///      **The second clause: the outgoing pool must not still be carrying principal.** Its
+    ///      `outstandingPrincipal` is written down by exactly two things, `repayPrincipal` and
+    ///      `socialiseLoss`, and once this pointer moves away only the first of them can still
+    ///      reach it. A default on a loan the outgoing pool funded would then be reported as
+    ///      `LossBorneByTheSource` and its `outstandingPrincipal` would never come down - so its
+    ///      `totalAssets` would overstate the book forever and its lenders would exit at a price
+    ///      that had stopped being true. Satisfiable by the ordinary wind-down: repayments reduce
+    ///      it and `setLiquiditySource` already requires an empty book, so the intended migration
+    ///      clears both counters before either pointer moves.
+    ///
+    ///      Read through `try`/`catch`, and failing open on purpose. An outgoing address that
+    ///      cannot answer `outstandingPrincipal()` is not a pool with depositors to short-change,
+    ///      and letting it brick the pointer permanently would be the deadlock shape again - this
+    ///      time reached through a call to a contract that is not what it was assumed to be. The
+    ///      guard protects against operator error, not against an owner who is already choosing
+    ///      the addresses on both sides.
     function setLenderPool(address lenderPool_) external onlyOwner {
         if (lenderPool_ == address(0)) revert ZeroAddress();
+        if (unsocialisedLoss != 0) revert LossOutstanding(unsocialisedLoss);
+
+        address outgoing = lenderPool;
+        if (outgoing != address(0) && outgoing != lenderPool_) {
+            try ILenderPool(outgoing).outstandingPrincipal() returns (uint256 stillLent) {
+                if (stillLent != 0) revert PoolPrincipalOutstanding(outgoing, stillLent);
+            } catch {}
+
+            // **The mirror of the outgoing pool's own refusal, and audit round 16 found it missing.**
+            // `LenderPool.setCreditManager` will not change its manager while `totalImpairment` is
+            // non-zero, with eighteen lines on why a stale per-borrower reserve is invisible at the
+            // swap. This side checked the principal and the backlog and said nothing about the
+            // mark, so the rule stood on one side of one pointer pair. Once this pointer moves,
+            // `_setImpairment` targets the incoming pool, so nothing can clear the outgoing one's
+            // map and the outgoing pool can never be repointed either.
+            //
+            // **`exitReserve()` cannot answer this**, which is why it needs a view of its own: it
+            // clamps to `outstandingPrincipal`, and the clause immediately above has just required
+            // that to be zero. The one impairment-shaped number already on the interface reads zero
+            // in exactly the state that matters.
+            //
+            // **Not a mutually-unsatisfiable pair, unlike the backlog clause above it**, but audit
+            // round 17 found the reason given here inverted and it is corrected rather than
+            // quietly deleted. This used to say a mark's drains "depend on neither pointer". They
+            // depend on this one: `refreshImpairment` and `refreshImpairments` both read
+            // `lenderPool`, `_setImpairment` writes through it, and `LenderPool
+            // .releaseImpairment` is gated on the pointer back - which the paragraph eleven lines
+            // above says outright. What is actually true is narrower and is all the guard needs:
+            // the drains work on the *outgoing* pool right up until this assignment, so the
+            // refusal forbids nothing that was reachable before it, and clearing the mark first is
+            // a step the owner can always take. That distinction is the one
+            // `EpochHarvester.setLenderPool` spends twenty lines on, and it is worth checking
+            // every time a guard like this is added.
+            //
+            // A separate `try` from the one above, because a `revert` inside a success body is not
+            // caught by its own `catch`. Fails open on an address that cannot answer, for the
+            // reason given at the head of this function.
+            try ILenderPool(outgoing).totalImpairment() returns (uint256 marked) {
+                if (marked != 0) revert PoolImpairmentOutstanding(outgoing, marked);
+            } catch {}
+        }
+
+        // **The same rule as `setLiquidationAuction`, one pointer over.** Audit round 17, and the
+        // reason it is a separate finding rather than the same one is that it was missed in the
+        // same commit range that applied the rule next door: `refreshImpairments` calls
+        // `impairedBorrowerCount` and `impairedBorrowerAt` bare, and both members arrived in the
+        // round that built the walk.
+        //
+        // Lower stakes than the auction probe and deliberately so: the two drains reach this pool
+        // through `_setImpairment`, which `try`s both legs, so a pool that cannot answer strands
+        // the bulk sweep rather than bricking repayment. Worth refusing at wiring time anyway,
+        // because the sweep is the only bounded way to clear a stale mark and a frozen queue is
+        // what a stale mark costs.
+        //
+        // Only `impairedBorrowerCount` is probed. `impairedBorrowerAt` cannot be: an incoming pool
+        // has an empty set, so index 0 is out of bounds and reverts with a `Panic`, which is
+        // indistinguishable at this call site from the missing selector the probe is looking for.
+        // A probe that cannot fail for the right reason is worse than none, because it reads as
+        // cover - which is the shape of the finding this commit is answering.
+        try ILenderPool(lenderPool_).impairedBorrowerCount() returns (uint256) {}
+        catch {
+            revert LenderPoolIncomplete();
+        }
+
         lenderPool = lenderPool_;
         emit LenderPoolSet(lenderPool_);
+        // Same trailing push `setLiquiditySource` makes, for the same reason: the incoming pool
+        // prices its exits off these two figures and starts out knowing neither. The loss term is
+        // zero by the guard above, so this only ever tells it the insurance cover standing in
+        // front of the impairments - which is the difference between a correct exit price and one
+        // that stands back from a fund the pool cannot see.
+        _pushLossReserves();
     }
 
     function setEpochHarvester(address epochHarvester_) external onlyOwner {
@@ -252,6 +414,50 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // independently, in either order.
         address boundVault = ILiquidationAuction(liquidationAuction_).vault();
         if (boundVault != address(vault)) revert LiquidationAuctionVaultMismatch(boundVault);
+
+        // **Every selector `_impairmentFor` calls, because it makes all of them bare and
+        // un-`try`ed.** Reached unguarded from `_repay`, and so from `repay` and `repayFor` - the
+        // path this file promises repeatedly is never blockable and deliberately not
+        // `whenNotPaused`. An address that answers `vault()` but not one of these bricks every
+        // repayment for every borrower it is asked about, repairable only by an `onlyOwner` call
+        // that by go-live is a timelock.
+        //
+        // `EpochHarvester.setCustodyAdapter` already does this and says why: an address that
+        // cannot answer should fail "at wiring time and under the owner's hand, rather than inside
+        // the permissionless `harvest`".
+        //
+        // **Audit round 17: the first version of this guard probed one of the three, and not the
+        // one called first.** It covered `recognisedRecoveryOf`, the member that had just arrived,
+        // and left the two the path had always called. `_impairmentFor` reaches `workoutsOpenFor`
+        // first and unconditionally for every borrower; `recognisedRecoveryOf` is reached only
+        // when `auctionOf` is non-zero, which on a freshly wired auction is nobody. So the guard
+        // read as done while the state it existed to prevent was still one call away - and that
+        // state is unrecoverable, because this function's own first statement reads
+        // `liveAuctionCount()` on the pointer it has just broken, and `CollateralVault
+        // .setCreditManager` needs a zero total debt that repayment can no longer reach.
+        //
+        // Prevention is therefore the whole of the fix: there is no way back, so the only safe
+        // thing is never to arrive. The three probes below are what make that true.
+        //
+        // **This list is `_impairmentFor`'s call set and has to stay that way.** It is the third
+        // round in a row that a selector reached a never-blockable path without its probe. If that
+        // function gains a fourth external call, it gains a fourth probe here in the same commit,
+        // and a fourth rejection test beside the three that already pin these.
+        //
+        // Probed at `address(0)`, which can hold no auction, no workout and no recovery, so each
+        // reads a value it discards and is testing only that the call answers at all.
+        try ILiquidationAuction(liquidationAuction_).workoutsOpenFor(address(0)) returns (uint256) {}
+        catch {
+            revert LiquidationAuctionIncomplete();
+        }
+        try ILiquidationAuction(liquidationAuction_).auctionOf(address(0)) returns (uint256) {}
+        catch {
+            revert LiquidationAuctionIncomplete();
+        }
+        try ILiquidationAuction(liquidationAuction_).recognisedRecoveryOf(address(0)) returns (uint256) {}
+        catch {
+            revert LiquidationAuctionIncomplete();
+        }
         liquidationAuction = liquidationAuction_;
         emit LiquidationAuctionSet(liquidationAuction_);
     }
@@ -281,6 +487,22 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         address auction = liquidationAuction;
         if (auction != address(0) && ILiquidationAuction(auction).workoutsOpenFor(msg.sender) != 0) {
             revert WorkoutOpen(msg.sender);
+        }
+        // **And none while an auction is live against you either.** Audit round 13.
+        //
+        // The guard above enumerated workouts because the two attacks it was written for were
+        // workout-shaped. A live auction is the same situation one stage earlier, and since the
+        // impairment reserves `currentDebtOf` it is now also the borrower's own lever on every
+        // lender's exit price: get liquidated, heal the position with `depositBonds` so `_bid` and
+        // `expireToWorkout` both refuse it, then borrow up to the per-account cap and watch the
+        // pool mark the whole of it down. `cancel` is the remedy and it is permissionless, but it
+        // is unrewarded and optional, so nothing makes it happen.
+        //
+        // Refusing costs a borrower under auction nothing they are entitled to - they can still
+        // repay their way out, which clears the auction on the next `cancel` - and it removes the
+        // only input to the mark that the marked party controls.
+        if (auction != address(0) && ILiquidationAuction(auction).auctionOf(msg.sender) != 0) {
+            revert LiquidationOpen(msg.sender);
         }
         // **Do not issue debt that cannot be liquidated.** `liquidate` refuses unless
         // all three wiring pointers agree, and a manager migration cannot be atomic
@@ -516,10 +738,29 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     /// @dev Permissionless: anyone may top it up, and nothing can pay it out except a
     ///      Phase 3 shortfall. Until this existed the counter was declared but never
     ///      written, which made one term of the solvency invariant vacuous.
+    ///
+    ///      **Being permissionless gives the withdrawal queue's refusal a price, and the price is
+    ///      one wei.** `LenderPool.serviceQueue` stops while `exitReserve()` is non-zero, and a
+    ///      donation here is netted off that figure synchronously, so a stranger can switch the
+    ///      refusal off by covering the mark. Audit round 16 raised it and it is **not** an
+    ///      extraction, for a reason worth writing down as the invariant it actually is:
+    ///
+    ///          exitReserve() == 0  implies  insuranceCover >= totalImpairment, or nothing is lent
+    ///
+    ///      so at the moment the queue reopens, either the shortfall is provably absorbed by this
+    ///      fund or the pool has no exposure to absorb it with - and the un-impaired price the
+    ///      queue then pays is the correct one. The donor pays the whole mark to gain a fraction of
+    ///      it. **The safety rests on that inequality and not on the gate**, which is worth being
+    ///      explicit about because the commit that introduced the gate is titled for the truncation
+    ///      it replaced and the comments around it credit the gate.
     function fundInsurance(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         insuranceFund += amount;
         emit InsuranceFunded(msg.sender, amount);
+        // The pool nets insurance against the gross impairment, so a top-up it has not been told
+        // about leaves `insuranceCover` stale-low and every exit under-priced until somebody
+        // happens to call `refreshImpairment`. See `_pushLossReserves` for the rule.
+        _pushLossReserves();
         usdc.safeTransferFrom(msg.sender, address(this), amount);
     }
 
@@ -620,6 +861,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         emit LiquidationTriggered(borrower, msg.sender, maxReward);
 
         ILiquidationAuction(auction).start(borrower, msg.sender);
+
+        // Marked the moment the auction exists rather than when it resolves, and it has to be
+        // after `start` because the mark is derived from the auction that call creates. Until this
+        // line runs the pool is still pricing exits as though nothing had happened, which is the
+        // recognition gap the whole impairment mechanism exists to close.
+        _setImpairment(borrower, _impairmentFor(borrower));
+        _pushLossReserves();
     }
 
     /// @notice Book the non-debt part of a liquidation: the insurance fund's cut of the
@@ -643,6 +891,11 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             totalClaimable += toBorrower;
         }
         emit LiquidationProceedsCredited(borrower, toInsurance, toBorrower);
+        // Raises the cover standing in front of the pool's reserve, and it arrives on the
+        // liquidation path where a reserve is most likely to be live. Not pushing here was the
+        // clearest of the five: the same transaction that resolves a liquidation left the pool
+        // pricing exits against the insurance figure from before it.
+        _pushLossReserves();
         usdc.safeTransferFrom(msg.sender, address(this), total);
     }
 
@@ -679,6 +932,311 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // The uncovered part deliberately does not touch `pendingPrincipal`. That is
         // what socialisation means: the source never gets it back.
         if (socialised != 0) _socialise(socialised);
+
+        // **The mark stands across `_socialise` and is dropped only afterwards, and that order is
+        // load-bearing.** Released first, the exit price would sit back at its un-impaired level
+        // for the instant between the release and the loss actually landing, and a lender leaving
+        // in that instant would take real USDC at a price the protocol already knew was wrong.
+        // Held first, the price is momentarily *low* instead - the leaver is short-changed rather
+        // than everybody who stayed, which is the safe direction to be wrong in. The only code
+        // that runs in that window is this protocol's own pool.
+        //
+        // **Audit round 16 found this paragraph describing the opposite of what the code did, and
+        // the direction it names as unsafe is the one the code took.** On the fill path the mark
+        // reaching here had already been netted against the fill twice, so it was understated or
+        // zero and the price was momentarily *high*. The order was never the problem; what stood
+        // in the window was. The auction now clears its in-flight recovery before the debt moves,
+        // so what stands here is the exact loss about to be socialised, and the sentence above is
+        // a true statement again rather than an intention.
+        //
+        // Set to zero rather than re-derived. **The reason is that the debt has just been cleared,
+        // not that the auction pointer has.** This used to say the pointer was already deleted on
+        // the fill path, which is inverted: `writeDownLoss` is reached from `_settleFill`, and
+        // `delete auctionOf[borrower]` happens after that returns. A wrong reason licenses a wrong
+        // edit - re-deriving here instead of writing zero is exactly what a reader who believed
+        // that sentence would think was equivalent.
+        //
+        // The forced `closeWorkout` path closes its workout on the next line. Both leave nothing
+        // to mark, and the auction re-derives it anyway on the way out.
+        _setImpairment(borrower, 0);
+        _pushLossReserves();
+    }
+
+    /// @notice Re-state the reserve the lender pool holds against `borrower`, derived from auction
+    ///         and vault state. Permissionless.
+    /// @dev **One function doing two jobs**: the notification `LiquidationAuction` sends on every
+    ///      terminal transition, and the way back when that notification is dropped.
+    ///
+    ///      Permissionless deliberately, and the auction's `try`/`catch` is why. That `catch` has to
+    ///      exist - `expireToWorkout` is the exit of last resort and an exit a lender pool can brick
+    ///      is not an exit - so a notification genuinely can be swallowed. A dropped *release* would
+    ///      then strand a reserve and depress the exit price for every lender permanently, and the
+    ///      party who most wants that fixed is the lender about to leave. Letting them call it turns
+    ///      "no impairment outlives its auction" from a claim about call-site completeness into a
+    ///      claim about reachability, which is the weaker thing to have to prove and the one that
+    ///      survives somebody adding a seventh call site badly.
+    ///
+    ///      Safe to open up because the caller supplies no figure. `_impairmentFor` derives the only
+    ///      value this can ever store from state the caller does not control, so the worst a
+    ///      stranger can do is bring the pool up to date.
+    ///
+    ///      Deliberately not `nonReentrant` and not `whenNotPaused`. It is reachable from inside
+    ///      `liquidate`'s own guarded frame - `start` notifies from its supersede branch - and
+    ///      pausing stops new risk, never resolution, the same rule that keeps `repay` open.
+    function refreshImpairment(address borrower) external {
+        _setImpairment(borrower, _impairmentFor(borrower));
+        _pushLossReserves();
+    }
+
+    /// @notice Re-state up to `maxBorrowers` of the pool's standing marks, newest first.
+    ///         Permissionless.
+    /// @return refreshed how many borrowers were visited.
+    /// @dev **The version of the function above that needs no borrower address.** Audit round 16
+    ///      found a stale mark with no attacker and no transaction behind it: a mark is a
+    ///      photograph of `currentDebtOf`, the yield stream lowers that figure continuously with
+    ///      nothing to hang a refresh on, and `impairmentOf` had no key list - so the only way to
+    ///      learn which borrower to name was to replay `Impaired` logs off chain. The pool now
+    ///      publishes the set and this walks it.
+    ///
+    ///      What made it worth building rather than documenting is what a stale mark now costs.
+    ///      Audit round 15 keyed the withdrawal queue's refusal on `exitReserve() != 0`, which is
+    ///      sound and which turned every pre-existing stale mark from a wrong exit price into a
+    ///      total freeze of the queue. Executed: a debt of zero, 24,371 USDC of idle cash, and the
+    ///      queue shut. **Widening what a condition governs re-prices every latent defect that can
+    ///      reach it.**
+    ///
+    ///      **Downward, and that is load-bearing rather than stylistic.** Releasing a mark
+    ///      swap-pops the tail of the pool's set into the vacated slot. Walking upward would step
+    ///      over whatever was moved into a slot the cursor had already passed; walking downward has
+    ///      visited the tail already, so nothing is skipped.
+    ///
+    ///      Bounded by the caller, because the set has no a-priori limit and an unbounded loop over
+    ///      it would be a call that stops fitting in a block exactly when there are most marks to
+    ///      clear.
+    ///
+    ///      **The bound needs a cursor, and audit round 17 found it missing.** This used to restart
+    ///      at `count - 1` on every call, so any `maxBorrowers` below `count` re-visited the same
+    ///      tail forever. Marks append, so the *oldest* mark - the one the clock has had longest to
+    ///      make stale, and therefore the one freezing the queue - sits nearest index 0 and was
+    ///      reached last or never. Executed: twenty-five consecutive `refreshImpairments(1)` calls
+    ///      each reported one refresh, changed nothing, and left `serviceQueue` reverting
+    ///      `QueueHeldByReserve` over 23,292 USDC of idle cash and one queued lender. Only a call
+    ///      spanning the whole set cleared it - which is the unbounded call the bound exists to
+    ///      avoid.
+    ///
+    ///      The old NatSpec claimed "repeated bounded calls always make progress", reasoning that
+    ///      each iteration either clears a mark or leaves a live one for later. A live tail entry
+    ///      re-examined is a fixed point, so that was false. It is true now, and in the specific
+    ///      sense worth stating: **every entry is visited within `ceil(count / maxBorrowers)`
+    ///      calls**, because the cursor descends and wraps rather than restarting.
+    ///
+    ///      **Still downward, and that is load-bearing rather than stylistic.** Releasing a mark
+    ///      swap-pops the tail of the pool's set into the vacated slot. Walking upward would step
+    ///      over whatever was moved into a slot the cursor had already passed; walking downward has
+    ///      visited the tail already, so nothing is skipped within a call. Audit round 17 attacked
+    ///      the direction from six angles and it held - the direction was never the defect, and a
+    ///      fix that reversed it would have broken the thing that was working.
+    ///
+    ///      The cursor is an index into a set that mutates between calls, so it is a hint rather
+    ///      than a bookmark: after a release the index may name a different borrower. That is
+    ///      correct for a sweep. What the cursor has to buy is *coverage*, not exact enumeration,
+    ///      and descend-and-wrap gives coverage against any mutation - a swap-popped entry lands
+    ///      below the cursor and is picked up on the next lap.
+    ///
+    ///      It cannot run out of bounds. The cursor only ever decreases within a call while the set
+    ///      only ever shrinks by at most one per iteration, so `cursor < count` is preserved; the
+    ///      wrap re-reads the live count rather than trusting the one loaded at entry.
+    ///
+    ///      One `_pushLossReserves` at the end rather than one per borrower - it restates two
+    ///      book-level figures that no iteration here changes. **It also has to happen on the empty
+    ///      path**, which audit round 17 found it skipping: `count == 0` returned before reaching
+    ///      it, so the two terms of the reserve that are not per-borrower went unrefreshed in
+    ///      exactly the state where nothing else was going to refresh them.
+    ///
+    ///      Not `whenNotPaused` and not `nonReentrant`, for the same reasons as the single-borrower
+    ///      form above: pausing stops new risk, never resolution.
+    function refreshImpairments(uint256 maxBorrowers) external returns (uint256 refreshed) {
+        address pool = lenderPool;
+        if (pool == address(0)) return 0;
+
+        uint256 count = ILenderPool(pool).impairedBorrowerCount();
+        if (count == 0) {
+            // Nothing to walk, but the book-level terms are still this function's job.
+            impairmentCursor = 0;
+            _pushLossReserves();
+            return 0;
+        }
+        if (maxBorrowers > count) maxBorrowers = count;
+
+        uint256 cursor = impairmentCursor;
+        if (cursor > count) cursor = count; // the set shrank since the last call
+
+        for (uint256 i; i < maxBorrowers; ++i) {
+            if (cursor == 0) {
+                // Wrap to the top, re-reading the count rather than trusting the entry snapshot:
+                // releases inside this very loop may have shortened the set underneath us.
+                cursor = ILenderPool(pool).impairedBorrowerCount();
+                if (cursor == 0) break; // everything got released on the way round
+            }
+            --cursor;
+            address borrower = ILenderPool(pool).impairedBorrowerAt(cursor);
+            // Counted on the write landing, not on the visit. Audit round 17: `refreshed` used to
+            // increment once per iteration while every write here is `try`-swallowed, so a pool
+            // refusing all of them reported a full sweep. The return value is what an operator
+            // reads to decide whether to call again.
+            if (_setImpairment(borrower, _impairmentFor(borrower))) refreshed++;
+        }
+        impairmentCursor = cursor;
+        _pushLossReserves();
+    }
+
+    /// @dev The only figure `refreshImpairment` will ever store, derived rather than supplied.
+    ///
+    ///      **One stage, not two: a liquidation in progress reserves the whole debt, and recovery
+    ///      is recognised when it is realised rather than when it is predicted.**
+    ///
+    ///      This used to credit `floorProceeds` as assumed recovery against a live auction, on the
+    ///      reasoning that the worst a Dutch auction can do to lenders is fill at its floor. That
+    ///      reasoning is sound about auctions and wrong about *this* number, because the figure it
+    ///      produced was a stored snapshot of a quantity that moves on the clock. Audit round 12
+    ///      found one defect wearing five costumes, and they are worth listing, because each was
+    ///      invisible from inside the formula:
+    ///
+    ///      - `AUCTION_FLOOR_BPS` (6800) sits above `LIQUIDATION_THRESHOLD_BPS` (5000), so
+    ///        `debt - floorProceeds` was negative and stored as **zero for the whole 50-68% LTV
+    ///        band** - the band every position enters first, and the only one reachable at all with
+    ///        the keeper posting on schedule. The mechanism was dormant in the ordinary case.
+    ///      - `floorProceeds` returns zero once the bid window lapses, and **a lapse writes no
+    ///        storage**, so the correct figure escalated with no transaction to carry it while the
+    ///        stored one stayed low.
+    ///      - The permissionless supersede re-derived it at a live NAV the caller chose the block
+    ///        for, so it could be reset downward at will.
+    ///      - It read as the full debt inside the winner's callback, where `a.settled`
+    ///        short-circuited the credit.
+    ///
+    ///      Marking the whole debt removes the recovery estimate, the supersede reset and the
+    ///      callback window together. What is left is a question about facts: is there a
+    ///      liquidation open against this borrower, and how much do they owe.
+    ///
+    ///      **Not "nothing here reads a clock", which is what this comment said until audit round
+    ///      13 refuted it.** `currentDebtOf` is `debtOf` less the borrower's projected share of the
+    ///      running yield stream, and that projection reads `block.timestamp` - so the derived mark
+    ///      decays continuously between blocks, and the permissionless `refreshImpairment` stores
+    ///      whichever value its caller's block produces. The claim was written at the moment the
+    ///      *price* dependence was removed and overstated it into a clock dependence that is still
+    ///      here.
+    ///
+    ///      What is true, and is the property worth relying on: absent a new `borrow` the debt is
+    ///      monotonically non-increasing, so a caller choosing a later block can only lower the
+    ///      mark and *raise* the exit price. The residual is the other direction - a caller may
+    ///      decline to refresh and settle against a stale-high mark. **This used to say the queue's
+    ///      `minAssets` floor answered that, and audit round 14 deleted the floor**, so for two
+    ///      rounds this file cited a mechanism that does not exist and `LenderPool` documented the
+    ///      deletion a few screens away. The staleness is real, one-directional and currently
+    ///      unanswered; it is recorded as an open item rather than papered over here. State it as a
+    ///      direction, not as an absence: this is exactly the sort of claim
+    ///      `LenderPool.requestWithdrawal` was reading off this file.
+    ///
+    ///      Recovery needs no branch of its own, and the reason is a disjointness claim rather than
+    ///      an ordering one. A fill reduces `currentDebtOf` by the proceeds, and the auction's
+    ///      in-flight recovery records only what has been paid in and *not yet* applied to the
+    ///      debt, so no dollar of the winner's payment is ever in both terms of the subtraction
+    ///      below. `auctionOf` is cleared on every terminal transition, so the mark falls because
+    ///      the debt fell - which is the difference between recognising a recovery and forecasting
+    ///      one. **Audit round 16 is what turned that from an ordering argument into this one**:
+    ///      the recovery outlived the debt reduction by one statement and the same dollars were
+    ///      subtracted twice.
+    ///
+    ///      **The cost, stated as a cost.** This is deliberately over-conservative: in the ordinary
+    ///      band the floor comfortably clears the loan, so a lender leaving during a routine
+    ///      six-hour auction is marked down for a loss that probably will not happen, and stayers
+    ///      gain what leavers give up. That is the intended direction rather than an oversight -
+    ///      an over-mark costs a leaver some of their upside, an under-mark hands them somebody
+    ///      else's principal - but it is a real cost and it is not being described as free.
+    ///      `exitReserve()` bounds it twice, netting `insuranceCover` and clamping to
+    ///      `outstandingPrincipal`, so the pool is never marked below its own exposure.
+    ///
+    ///      The workout is still checked first, because it outlives the auction that opened it: a
+    ///      borrower can hold a settled auction and an open workout at the same instant. Both
+    ///      branches now answer the same thing, so the ordering is about which fact is still true
+    ///      rather than about which figure is larger.
+    ///
+    ///      Zero once detached, which is the truth rather than a shortcut - the vault only releases
+    ///      a manager at `totalDebt == 0`, so a detached manager has no position left to mark.
+    function _impairmentFor(address borrower) private view returns (uint256) {
+        if (vault.creditManager() != address(this)) return 0;
+
+        address auction = liquidationAuction;
+        if (auction == address(0)) return 0;
+
+        if (ILiquidationAuction(auction).workoutsOpenFor(borrower) != 0) return currentDebtOf(borrower);
+
+        // `auctionOf` tracks the *existence* of a liquidation against this borrower: written by
+        // `start`, reassigned on a supersede, and deleted by `_bid`, `cancel` and `expireToWorkout`
+        // alike. **It does not track liveness, and this comment claimed it did until audit round
+        // 15.** Nothing deletes it when the bid window lapses, so a lapsed auction still answers
+        // here - which is correct and deliberate, because a lapse means nobody bid, the collateral
+        // is still forfeit and the successor states all mark the whole debt. The claim that reading
+        // it "keeps this answer free of the clock" was wrong twice over: `currentDebtOf` projects
+        // on `block.timestamp` anyway, and existence was never the same question as liveness.
+        if (ILiquidationAuction(auction).auctionOf(borrower) == 0) return 0;
+
+        // **Recovery already inside the auction, netted off before anyone can spend the un-netted
+        // figure.** Audit round 15: `_bid` holds the pointer above set across the winner's ERC-1155
+        // callback so the mark cannot be released early, and a winning bidder used that standing
+        // mark to settle a queued lender through the permissionless `serviceQueue`, on auctions
+        // whose realised loss ended at zero.
+        //
+        // This is not a forecast and does not reintroduce one. It is USDC the auction has already
+        // taken from the winner, measured as a balance delta, non-zero only between that payment
+        // and the first statement that applies it to the debt. The rule above is unchanged -
+        // recovery is recognised when it is realised, never when it is predicted - and it is now
+        // recognised at the statement where the realisation actually happens.
+        //
+        // **The two terms below must be disjoint, and audit round 16 is what proved that is the
+        // real requirement.** The claim used to be that this slot was non-zero only until "the
+        // write-down", which was a wider window than the one that matters: `_repay` re-derives the
+        // mark on its way out, with the debt already reduced by the fill, and for one statement
+        // both terms described the same dollars. The auction now clears the slot before the
+        // repayment leg begins rather than after it ends.
+        //
+        // Saturating, so a fill above the debt marks nothing rather than underflowing.
+        uint256 debt = currentDebtOf(borrower);
+        uint256 recovered = ILiquidationAuction(auction).recognisedRecoveryOf(borrower);
+        return debt > recovered ? debt - recovered : 0;
+    }
+
+    /// @dev Best-effort, exactly like `_socialise` and for the same reason: every caller sits on a
+    ///      liquidation path the pool must not be able to block, and all three of the auction's
+    ///      exits reach it. A pool that reverts here leaves a stale mark, which is a wrong price; a
+    ///      pool that could revert *through* here would leave stranded collateral, which is worse.
+    ///
+    ///      Routed to `releaseImpairment` at zero rather than to `impair(borrower, 0)`. The two
+    ///      leave identical storage, but only one of them emits `ImpairmentReleased` - and an
+    ///      indexer that never sees a release cannot tell a resolved position from a permanently
+    ///      marked one.
+    /// @return landed Whether the pool actually took the figure. Every caller but
+    ///         `refreshImpairments` ignores it and must keep ignoring it - they sit on liquidation
+    ///         paths that a refusal here is not allowed to change the course of. The bulk sweep is
+    ///         the one caller that *reports* to somebody, so it is the one that needs to know the
+    ///         difference between a mark it refreshed and a mark it merely looked at.
+    function _setImpairment(address borrower, uint256 amount) private returns (bool landed) {
+        address pool = lenderPool;
+        if (pool == address(0)) return false;
+
+        if (amount == 0) {
+            try ILenderPool(pool).releaseImpairment(borrower) {
+                return true;
+            } catch {
+                return false;
+            }
+        } else {
+            try ILenderPool(pool).impair(borrower, amount) {
+                return true;
+            } catch {
+                return false;
+            }
+        }
     }
 
     /// @notice Hand the insurance fund to the manager the vault now points at.
@@ -749,6 +1307,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // strand started.
         yieldRate = 0;
         streamEndsAt = 0;
+        // **The one insurance write whose direction inverts, so it is the one that matters most.**
+        // Every other writer that skipped this left the pool's `insuranceCover` stale-*low*, which
+        // over-reserves and under-pays a leaver - conservative, and wrong in the safe direction.
+        // This one takes the fund to zero, so a stale mirror leaves cover the manager no longer
+        // has standing in front of the pool's reserve, and exits price too high against an
+        // impairment that is now uncovered.
+        _pushLossReserves();
 
         usdc.forceApprove(live, amount);
         ICreditManager(live).fundInsurance(amount);
@@ -770,31 +1335,107 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         address pool = lenderPool;
         if (pool == address(0)) revert LenderPoolUnset();
 
+        // The counter can only fill against a pool that was the liquidity source, and this refuses
+        // if that is no longer true. Belt to `_socialise`'s braces: it stops a backlog banked
+        // against one funder being settled against whoever replaced it.
+        if (pool != liquiditySource) revert LossNotThisPools(liquiditySource, pool);
+
         unsocialisedLoss = 0;
-        try ILenderPool(pool).socialiseLoss(amount) {
-            emit LossSocialised(pool, amount);
+        try ILenderPool(pool).socialiseLoss(amount) returns (uint256 absorbed) {
+            // A pool that takes only part of it has not settled the rest. Zeroing the counter
+            // before the call and restoring it only in the `catch` meant a partial success wiped
+            // the difference - the caller asked to place a loss and was told it was placed.
+            if (absorbed < amount) {
+                unsocialisedLoss = amount - absorbed;
+                emit LossDeferred(amount - absorbed, unsocialisedLoss);
+            }
+            if (absorbed == 0) revert SocialisationRejected(amount);
+            emit LossSocialised(pool, absorbed);
         } catch {
             unsocialisedLoss = amount;
             revert SocialisationRejected(amount);
         }
+
+        // Drop the pool's mirror of the counter in the same call that drained it. Without this the
+        // pool would keep reserving against a loss it has now actually taken, double-counting it
+        // in the exit price - and the flush would move the price after all, in the direction that
+        // punishes whoever is still there.
+        _pushLossReserves();
     }
 
-    /// @dev Best-effort by necessity. `LenderPool.socialiseLoss` reverts `NotImplemented`
-    ///      until Phase 4 and the deploy script wires exactly that pool, so a hard call
-    ///      here would sit in the middle of a liquidation that must not be blockable.
-    ///      What it fails to place is *remembered*, not swallowed - the round-4 lesson
-    ///      about guards that assume their own escape hatch is reachable, applied
-    ///      before rather than after it bites.
+    /// @dev Best-effort by necessity. This call sits in the middle of a liquidation, which
+    ///      must not be blockable by anything the pool does - and the pool can refuse for
+    ///      reasons that have nothing to do with this position: it may be unset, it may not
+    ///      recognise this manager as its `creditManager`, or a future pool may add a
+    ///      condition of its own. What it fails to place is *remembered*, not swallowed -
+    ///      the round-4 lesson about guards that assume their own escape hatch is
+    ///      reachable, applied before rather than after it bites.
+    ///
+    ///      It also has to *measure* what the pool took rather than infer it from the absence of a
+    ///      revert. The pool clamps a write-down to what it has actually lent, so it can accept a
+    ///      call and absorb none of it - which is precisely the state the deploy script ships,
+    ///      since the pool is wired as the loss sink while the treasury is still the liquidity
+    ///      source. Treating that as a full placement erased real bad debt from every counter in
+    ///      the protocol, including this one, whose entire purpose is that an unplaceable loss
+    ///      stays visible. Every other value-moving call in this contract already measures
+    ///      delivery; this was the one that assumed it.
+    ///      **Audit round 11: only the balance sheet that funded the principal may be charged.**
+    ///      `unsocialisedLoss` recorded an amount and not whose money it was, `flushSocialisedLoss`
+    ///      is permissionless, and `socialiseLoss` moves no USDC - so a loss banked in one era
+    ///      could be pointed at whoever held shares in the next. An executed PoC turned 5,000e6
+    ///      into 6,250e6 with an exactly matching loss to a lender who had been there throughout.
+    ///
+    ///      The fix is narrower than it first looks, because the counter should never have filled
+    ///      in that era at all. `TreasuryLiquiditySource` implements no `socialiseLoss`: while the
+    ///      treasury funds the book it bears a default by simply never being repaid. Recording the
+    ///      same loss here as well was a **double count** - once against the treasury's capital,
+    ///      once as a placeable claim on a pool that had lent nothing.
+    ///
+    ///      So the loss is offered only to a pool that is also the liquidity source, and otherwise
+    ///      it is not deferred, it is reported as already borne. No write-off function is needed to
+    ///      unwind it, because nothing untrue is written down; and there is no migration deadlock,
+    ///      because the counter can now only ever hold loss the pool itself funded.
+    ///
+    ///      `setLiquiditySource` refuses while any principal is out, so the source cannot change
+    ///      under a live loan and "who funded this" is never ambiguous. That guard is what makes
+    ///      the current pointer a sound proxy for provenance here; without it this check would be
+    ///      reading today's configuration to answer a question about yesterday's money.
     function _socialise(uint256 amount) private {
         address pool = lenderPool;
-        if (pool != address(0)) {
-            try ILenderPool(pool).socialiseLoss(amount) {
-                emit LossSocialised(pool, amount);
-                return;
-            } catch {}
+        if (pool != liquiditySource || pool == address(0)) {
+            emit LossBorneByTheSource(liquiditySource, amount);
+            return;
         }
+
+        try ILenderPool(pool).socialiseLoss(amount) returns (uint256 absorbed) {
+            if (absorbed != 0) emit LossSocialised(pool, absorbed);
+            if (absorbed >= amount) return;
+            amount -= absorbed;
+        } catch {}
+
         unsocialisedLoss += amount;
         emit LossDeferred(amount, unsocialisedLoss);
+        _pushLossReserves();
+    }
+
+    /// @dev Mirror the two book-level figures the pool prices exits against: a loss recognised here
+    ///      but not yet absorbed there, and the insurance fund standing in front of the live
+    ///      impairments.
+    ///
+    ///      **This is what makes `flushSocialisedLoss` economically boring.** A deferred loss that
+    ///      the exit price does not yet carry is a discontinuity, and the flush is permissionless,
+    ///      so its caller would choose the block that discontinuity lands in. Pushed here, the
+    ///      backlog is already in the exit price the moment it is recognised, and the later flush
+    ///      only moves it from one term to another - the leaver is paid the same either side of it.
+    ///      What the caller can no longer choose is a moment when the price is about to move.
+    ///
+    ///      Best-effort, like `_socialise` itself. Every caller sits inside a liquidation or a
+    ///      repayment path that the pool must not be able to block, and the pool's own setter is
+    ///      total, so a `catch` here means a misconfigured pointer rather than a reachable state.
+    function _pushLossReserves() private {
+        address pool = lenderPool;
+        if (pool == address(0)) return;
+        try ILenderPool(pool).setLossReserves(unsocialisedLoss, insuranceFund) {} catch {}
     }
 
     // ── Views ────────────────────────────────────────────────────────────────
@@ -868,6 +1509,34 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             totalClaimable += overflow;
         }
         emit YieldApplied(borrower, reduced, overflow);
+
+        // **The mark is made of the debt, so it has to move when the debt does - and this was the
+        // one debt-writing path that never said so.** Audit round 13 added the identical refresh to
+        // `_repay`, reasoning that its enumeration had asked "how does an auction end" when the
+        // question is "what changes the number the mark is made of". Yield application changes it,
+        // and the same enumeration missed the sibling. Audit round 16 executed the consequence: the
+        // stream can pay a liquidated borrower's debt to zero while the pool goes on reserving the
+        // whole of it.
+        //
+        // **Gated on `reduced != 0`, which is the only branch that moves the number.** A yield
+        // overflow lands in `claimableOf` and leaves the debt alone; a settle at zero pending does
+        // nothing at all. So this costs nothing on the ordinary deposit, withdraw and transfer
+        // paths, which is where `_settle` is otherwise hot - the vault calls it on every bond-count
+        // change, twice on a transfer.
+        //
+        // **This does not make the mark self-maintaining and is not meant to.** Nothing has to
+        // settle a liquidated borrower, so a mark can still go stale on the clock with no
+        // transaction naming them; `refreshImpairments` is the answer to that and this is the
+        // answer to "somebody touched the position and the mark did not follow". Two different
+        // problems, and only one of them has a transaction to hang a fix on.
+        //
+        // Safe here despite `settle` and `settleForVault` deliberately carrying no `nonReentrant`:
+        // `_setImpairment` is `try`/`catch`ed, and both pool entry points it can reach write two
+        // slots and emit, with no outbound call to hand control anywhere.
+        if (reduced != 0) {
+            _setImpairment(borrower, _impairmentFor(borrower));
+            _pushLossReserves();
+        }
     }
 
     function _pending(address borrower, uint256 bonds) private view returns (uint256) {
@@ -908,6 +1577,10 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
                 undistributedYield = held - skipped;
                 insuranceFund += skipped;
                 emit UnstakedSliceToInsurance(skipped);
+                // The fifth insurance writer, and the one easiest to miss because it is not on a
+                // liquidation path at all. Reached only when nothing is staked and only when a
+                // slice is actually skipped, so this is not a per-accrual external call.
+                _pushLossReserves();
             }
             lastAccrualAt = endAt;
             return;
@@ -960,6 +1633,26 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         totalDebt -= paid;
         pendingPrincipal += paid;
         emit Repaid(borrower, paid);
+
+        // **The mark is the debt, so it has to move when the debt does.** Audit round 13.
+        //
+        // The six notification sites were all auction transitions, derived from "how does a
+        // liquidation end". Repaying is not a transition and notifies nobody - and `repayFor` is
+        // permissionless, so a stranger can cure a liquidated borrower's debt entirely while the
+        // pool goes on reserving the whole of it. The permissionless `serviceQueue` then settles a
+        // queued lender against a shortfall that no longer exists, and a later `refreshImpairment`
+        // releases the mark into the share price of whoever stayed.
+        //
+        // `LiquidationAuction.workoutSettle` already refreshes on exactly this reasoning, for a
+        // tranche that pays real debt down. This is the same event one contract over, and the set
+        // was enumerated from the wrong question: not "how does an auction end" but "what changes
+        // the number the mark is made of".
+        //
+        // Cheap when it does not apply - `_impairmentFor` returns early with no external calls
+        // when no auction is wired, and `_setImpairment` is a no-op at zero against a pool that
+        // holds no mark.
+        _setImpairment(borrower, _impairmentFor(borrower));
+        _pushLossReserves();
 
         usdc.safeTransferFrom(payer, address(this), paid);
     }

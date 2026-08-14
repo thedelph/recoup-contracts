@@ -2,15 +2,14 @@
 pragma solidity ^0.8.24;
 
 /// @title IDexFiFarm
-/// @notice DexFi bond staking pool — "RewardPoolBondsMigration" behind the ERC1967
-///         proxy at Config.DEXFI_FARM. Verified source reviewed 2026-07-24
-///         (2026-07-24). MasterChef-style accounting; rewards paid
-///         in USDC.
+/// @notice DexFi bond staking pool - "RewardPoolBondsMigration" behind the ERC1967
+///         proxy at Config.DEXFI_FARM. Verified source reviewed on-chain 2026-07-24.
+///         MasterChef-style accounting; rewards paid in USDC.
 ///
 ///         Integration-critical behaviours found in source:
-///         - `deposit`/`withdraw` are **permissionless and not EOA-gated** — our
+///         - `deposit`/`withdraw` are **permissionless and not EOA-gated** - our
 ///           vault can stake, unstake, and claim directly.
-///         - `withdraw(0)` pays out pending USDC rewards without unstaking — this
+///         - `withdraw(0)` pays out pending USDC rewards without unstaking - this
 ///           is the claim primitive for EpochHarvester.
 ///         - Staking custodies the ERC-1155 balance in the pool (transfer passes
 ///           the bond whitelist because the pool is whitelisted).

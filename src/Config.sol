@@ -41,6 +41,15 @@ library Config {
     uint256 internal constant GLOBAL_BORROW_CAP = 25_000e6; // USDC, 6 decimals
     uint256 internal constant PER_ACCOUNT_BORROW_CAP = 5_000e6;
     uint256 internal constant RESERVE_RATIO_BPS = 1_500; // LenderPool hot float target
+
+    /// @notice Ceiling on total deposits into the LenderPool.
+    /// @dev Set equal to `GLOBAL_BORROW_CAP` deliberately, and it is a yield figure rather than a
+    ///      risk one. A lender's return is 25% of the yield on collateral worth four times the
+    ///      debt, so at the LTV ceiling a fully deployed pool earns the bond fund's own yield rate.
+    ///      Idle USDC earns nothing and dilutes that rate for everyone in the pool, so a pool
+    ///      materially larger than the debt it can fund pays everyone less for no extra safety.
+    ///      Moves with the global cap on each ratchet step.
+    uint256 internal constant LENDER_POOL_DEPOSIT_CAP = GLOBAL_BORROW_CAP;
     uint256 internal constant INSURANCE_FUND_TARGET_BPS = 500; // ≥5% of outstanding debt per cap raise
     uint256 internal constant UNDERWRITING_APR_BPS = 2_500; // UI/modelling only, never marketed
 
@@ -73,11 +82,11 @@ library Config {
     /// @dev DexFi's manual redemption is quoted at "48h+" and is an off-chain process
     ///      with no on-chain enforcement, so the honest bound is generous. It exists
     ///      because the alternative is bad debt sitting on the books indefinitely at
-    ///      governance's discretion - loss recognition lagging the auction window is a
-    ///      known hazard, and an unbounded workout is the worst version of it.
+    ///      governance's discretion, which is the "loss recognition lags the auction
+    ///      window" deferral recorded in the private security notes.
     uint256 internal constant WORKOUT_MAX_DURATION = 14 days;
 
-    // ── Yield split (PRD §4.4) — must sum to BPS, enforced in tests ─────────
+    // ── Yield split (PRD §4.4) - must sum to BPS, enforced in tests ─────────
     uint256 internal constant SPLIT_BORROWER_BPS = 5_500;
     uint256 internal constant SPLIT_LENDER_BPS = 2_500;
     uint256 internal constant SPLIT_INSURANCE_BPS = 1_000;
@@ -98,7 +107,7 @@ library Config {
     uint256 internal constant PROTOCOL_FEE_RECOUP_BPS = 8_000;
     uint256 internal constant PROTOCOL_FEE_DEXFI_BPS = 2_000;
 
-    // ── Referral programme v1 (approved 2026-07-30) ─────────────────────────
+    // ── Referral programme v1 (design approved 2026-07-30) ───────────────────
     //
     // NOT READ BY ANY CONTRACT, by design, and `ReferralRegistry` reads only the two code-length
     // bounds. Everything here is consumed by the off-chain accrual calculator and, at Phase 4, by
@@ -166,6 +175,32 @@ library Config {
     ///      any real epoch (the fund pays hundreds of USDC a week at current scale) and
     ///      far above what is worth donating repeatedly.
     uint256 internal constant MIN_EPOCH_YIELD = 1e6;
+
+    /// @notice Smallest amount of farm-attributed USDC that must have reached the protocol
+    ///         since the last accepted epoch for `harvest` to treat this one as real, USDC 6dp.
+    /// @dev **A different question from `MIN_EPOCH_YIELD`, asked of a different quantity, even
+    ///      though the two happen to be the same number today.** `MIN_EPOCH_YIELD` asks "is this
+    ///      epoch worth running": it is measured against the *borrower share* of `claimed`, and
+    ///      `claimed` is a raw USDC balance with no sender attribution, so anyone can move it.
+    ///      This one asks "did the farm actually fund it": it is measured against the increase in
+    ///      `ICustodyAdapter.farmYieldDelivered`, a monotonic count of USDC the adapter measured
+    ///      arriving *from the farm*, which a donation cannot move by a single unit.
+    ///
+    ///      Because the quantity is unforgeable, this is not a price an attacker pays - it is a
+    ///      dust threshold on real yield. It exists because the DexFi farm is MasterChef-style, so
+    ///      any bond movement settles the whole adapter position: without a floor, a one-unit
+    ///      deposit made a block after the last epoch would deliver a few units of genuine yield
+    ///      and with it a write to `CreditManager.lastDistributeAt`, which is the anti-just-in-time
+    ///      window's only input. Audit round 11 measured what pinning that is worth: eleven pins
+    ///      one `YIELD_STREAM_DURATION` apart turned a $495 just-in-time take into $5,940 out of a
+    ///      $6,600 epoch, and left a holder staked for the whole sixty days with $671 of it.
+    ///
+    ///      $1 gross, for the same reason $1 net is right next door: the fund pays hundreds of
+    ///      USDC a week at current scale, so a real epoch clears this by three orders of magnitude,
+    ///      and no honest epoch is ever delayed by it. The two must not be aliased to each other,
+    ///      though - retuning `SPLIT_BORROWER_BPS` moves what `MIN_EPOCH_YIELD` means in gross
+    ///      terms and leaves this one exactly where it is.
+    uint256 internal constant MIN_EPOCH_FARM_YIELD = 1e6;
 
     /// @notice How long a harvested epoch's borrower share is streamed into the
     ///         yield accumulator rather than applied as a lump.
@@ -240,28 +275,29 @@ library Config {
     // "fix" this by moving them in.
 
     // ── External addresses (PRD §7) ──────────────────────────────────────────
-    // Resolved and verified 2026-07-24 via Blockscout source review of the live contracts.
+    // Resolved 2026-07-24 on-chain, from a real mint transaction traced through
+    // Blockscout and confirmed against each contract's verified source.
     address internal constant USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address internal constant DEXFI_TREASURY_EOA = 0xd4ec4E5b7625Fed3c40Bfeec206E49396F02Dd54;
 
     /// @dev "NFTBondsMigration": ERC-1155, single TOKEN_ID = 0, verified, immutable
     ///      (no proxy). Wallet↔wallet transfers whitelist-gated; owner = treasury EOA.
     ///      This contract is ALSO the mint entrypoint (payable `mint` gated by an
-    ///      EIP-712 signature from DexFi's keeper/owner — no on-chain referral param).
+    ///      EIP-712 signature from DexFi's keeper/owner - no on-chain referral param).
     address internal constant DEXFI_BOND_NFT = 0x969C6eCF97c256846029cBCBB865824E505E006f;
     address internal constant DEXFI_MINT_ENTRYPOINT = DEXFI_BOND_NFT;
     /// @dev "RewardPoolBondsMigration" behind an ERC1967/UUPS proxy (impl
     ///      0xdfb45A77…9A10, upgradeable by the treasury EOA). deposit/withdraw are
     ///      permissionless and NOT EOA-gated; withdraw(0) claims USDC rewards.
     address internal constant DEXFI_FARM = 0x0251cbB9a752331D29031eEc88c5a8BCbcDafFfa;
-    /// @dev EIP-712 signer for bond mints (informational — mint flow needs DexFi's
+    /// @dev EIP-712 signer for bond mints (informational - mint flow needs DexFi's
     ///      backend to co-sign).
     address internal constant DEXFI_MINT_KEEPER = 0xBbBBBA31F7fD7E1ACAcAb33d905941f1F3A6ad91;
     /// @dev Chainlink ETH/USD reference feed, Base mainnet, 8 decimals. Informational:
     ///      consumed off-chain by the keeper and the webapp, deliberately not read by
     ///      any contract. Collateral is priced from the NAV oracle, not from ETH.
     address internal constant CHAINLINK_ETH_USD = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
-    /// @dev The bond token id — the bond is a fungible ERC-1155 balance, not
+    /// @dev The bond token id - the bond is a fungible ERC-1155 balance, not
     ///      distinct NFTs. "Bond count" everywhere means balanceOf(id 0).
     uint256 internal constant DEXFI_BOND_TOKEN_ID = 0;
 }

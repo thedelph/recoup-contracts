@@ -14,7 +14,7 @@ import {IDexFiFarm} from "../interfaces/IDexFiFarm.sol";
 /// @title DirectCallAdapter (PRD §4.1)
 /// @notice Custody backend where the protocol itself holds and works the DexFi
 ///         position: this contract is the farm staker and the address DexFi must
-///         add to the bond transfer whitelist (§14 ask #5). Holds no USDC at rest —
+///         add to the bond transfer whitelist (§14 ask #5). Holds no USDC at rest -
 ///         every claim is forwarded to `yieldRecipient` in the same call.
 /// @dev Vault-only for the custody hot path; owner-only (the governance timelock) for
 ///      the yield-routing config and the emergency hatch. `yieldRecipient` and
@@ -52,6 +52,28 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///         failed. Carried so the next successful claim reports it rather than the
     ///         money leaving the protocol's accounting silently.
     uint256 public unreportedYield;
+
+    /// @inheritdoc ICustodyAdapter
+    /// @dev Monotonic, and the reason it can be trusted is that `_settleFarmPayout` is handed a
+    ///      *measured farm delta* rather than this contract's balance. `_trySweepUsdc` moves
+    ///      everything sitting here, donations included, but only what the farm paid is ever added
+    ///      to this counter. So a stranger can raise this contract's balance, and the harvester's,
+    ///      and move this number by nothing.
+    ///
+    ///      Audit round 11 is why it exists, and the shape of that finding is why it lives here
+    ///      rather than in the harvester. `EpochHarvester.harvest` treats the farm claim as
+    ///      best-effort but treated the epoch as real regardless, so ~$1.82 of donated USDC bought
+    ///      a write to `CreditManager.lastDistributeAt` - the sole record of how long an epoch's
+    ///      money took to earn. The sharper signal that closes it was already being computed on
+    ///      every farm-touching path and thrown away: `stake`, `unstake`, `mintBonds` and
+    ///      `claimYield` all return it and `CollateralVault` emits it and drops it. Accumulating
+    ///      it costs one SSTORE on paths that are already writing storage.
+    ///
+    ///      Never decreases, so the harvester can hold a high-water mark against it. A fresh
+    ///      adapter starts at zero, which is exactly why `EpochHarvester.setCustodyAdapter`
+    ///      re-seeds that mark instead of carrying it across a custody swap: a stale mark against
+    ///      a zeroed counter would decline every epoch forever.
+    uint256 public farmYieldDelivered;
 
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault();
@@ -285,6 +307,17 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         }
         swept = farmPaid + unreportedYield;
         unreportedYield = 0;
+        // Counted here rather than at the four call sites, for the same reason the sweep itself
+        // lives here: this is the one funnel every farm-touching path goes through, so a fifth
+        // path cannot deliver farm yield without also corroborating the epoch that pays it out.
+        // That is what stops a new path quietly reintroducing round 11's finding, the same way
+        // this helper stops one reintroducing the leak it was factored out to close.
+        //
+        // Counted on the swept branch only, and never on the failed one. A sweep that did not go
+        // through has delivered nothing to the harvester yet, so counting it there would let the
+        // harvester rate an epoch against money it has not received; `unreportedYield` carries the
+        // amount instead and the next successful sweep counts it exactly once.
+        farmYieldDelivered += swept;
     }
 
     /// @dev Best-effort USDC sweep that never reverts the calling transaction.

@@ -30,6 +30,20 @@ import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
 contract CreditCoreForkTest is Test {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
+
+    /// @dev Borrowing power at the ceiling, derived rather than written down.
+    ///
+    ///      **This was the literal `880.25e6` - 35% of $2,515 - and it went on being 35% after the
+    ///      ceiling moved to 25% on 2026-08-07.** That change derived the same figure in 53 unit
+    ///      tests and 14 CreditManager tests, and missed the fork suite entirely, so these four
+    ///      tests had been reverting `ExceedsMaxLtv(3500)` ever since while the README went on
+    ///      claiming ten green fork tests. Fork tests are skipped unless `RUN_FORK_TESTS=true` and
+    ///      CI does not set it, so nothing said otherwise.
+    ///
+    ///      The ratchet is expected to move `MAX_LTV_BPS` at least twice more, which is exactly why
+    ///      this must not be a number.
+    uint256 internal constant MAX_BORROW =
+        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
     uint256 internal constant FLOAT = 50_000e6;
 
     IDexFiBond internal bond = IDexFiBond(Config.DEXFI_BOND_NFT);
@@ -116,8 +130,8 @@ contract CreditCoreForkTest is Test {
         assertEq(adapter.stakedBalance(), BONDS, "staked in the live farm");
         assertTrue(vault.custodyIsSolvent());
 
-        // 2. Borrow against them. 100 bonds x $25.15 x 35% = 880.25 USDC.
-        uint256 maxBorrow = 880.25e6;
+        // 2. Borrow against them, at the ceiling `Config` sets today.
+        uint256 maxBorrow = MAX_BORROW;
         vm.prank(alice);
         credit.borrow(maxBorrow);
         assertEq(usdc.balanceOf(alice), maxBorrow, "USDC received same block");

@@ -18,6 +18,7 @@ import {ILiquiditySource} from "../src/interfaces/ILiquiditySource.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
+import {ILenderPool} from "../src/interfaces/ILenderPool.sol";
 import {MockLenderPool} from "./mocks/MockLenderPool.sol";
 import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
@@ -1380,15 +1381,230 @@ contract CreditManagerTest is Test {
         assertEq(credit.liquiditySource(), address(next), "bad debt must not block the Phase-4 swap");
     }
 
+    /// @dev Put the pool on both sides of the ledger: the source that funds the loan and the
+    ///      sink that takes the loss when it defaults.
+    ///
+    ///      Audit round 11 made that the only wiring in which a loss can be deferred at all.
+    ///      `_socialise` offers a loss to `lenderPool` only while it is also `liquiditySource`,
+    ///      because the treasury bears a default by simply never being repaid - so recording the
+    ///      same loss against a pool that had lent nothing was a double count, and the counter
+    ///      it filled was a bearer claim that `flushSocialisedLoss` would let anyone point at
+    ///      whoever held shares later. Every test below is about what happens to a loss the
+    ///      lenders really did fund, so every one of them has to say so in the wiring.
+    ///
+    ///      This has to run before any borrow, and not merely because it reads better there:
+    ///      `setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is non-zero.
+    ///      That guard is precisely what makes the current pointer a sound answer to "whose
+    ///      money funded this", which is what the round-11 fix leans on, so a fixture that
+    ///      swapped the source out from under a live loan would be proving something about a
+    ///      state the protocol does not permit.
+    function _poolFundsTheBook() internal returns (MockLenderPool pool) {
+        pool = new MockLenderPool(usdc);
+        usdc.mint(address(pool), FLOAT);
+        vm.startPrank(admin);
+        credit.setLiquiditySource(address(pool));
+        credit.setLenderPool(address(pool));
+        vm.stopPrank();
+    }
+
+    /// @notice **Audit round 11's executed PoC, as a regression test.** A loss banked while the
+    ///         treasury funded the book must never become chargeable to pool depositors.
+    /// @dev The original turned 5,000e6 into 6,250e6 with an exactly matching loss to an honest
+    ///      lender. The mechanism was that `unsocialisedLoss` recorded an amount and not whose
+    ///      principal funded it: the treasury era filled the counter, the switchover pointed a new
+    ///      balance sheet at it, and `flushSocialisedLoss` is permissionless, so an attacker chose
+    ///      the block in which depositors were charged for a loan none of their money funded.
+    ///
+    ///      The fix is narrower than blocking the switchover. `TreasuryLiquiditySource` has no
+    ///      `socialiseLoss` at all, so the treasury already bore this default by never being
+    ///      repaid - filling the counter as well was a double count. So there is nothing to
+    ///      migrate, nothing to write off, and no deadlock: the counter simply never fills.
+    ///
+    ///      Asserted at the counter rather than at an attacker's balance because the counter is
+    ///      the bearer instrument itself. With nothing in it there is nothing to point anywhere,
+    ///      and every downstream step of the PoC becomes unreachable rather than merely unprofitable.
+    function test_socialisedLoss_bankedAgainstTheTreasuryIsNeverChargeableToAPool() public {
+        address a = _asAuction();
+
+        // Treasury era: the float funds the book, and no pool is wired as the sink yet.
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+
+        assertEq(credit.unsocialisedLoss(), 0, "a treasury-funded default must leave nothing to place");
+
+        // The switchover. It is only legal at an empty book, which is what makes "who funded this"
+        // unambiguous - the source cannot move under a live loan.
+        assertEq(credit.totalDebt(), 0, "the write-down must have cleared the book");
+        MockLenderPool pool = _poolFundsTheBook();
+
+        // And there is nothing for the permissionless flush to point at the new depositors.
+        vm.expectRevert(CreditManager.NothingToSettle.selector);
+        credit.flushSocialisedLoss();
+        assertEq(pool.socialisedTotal(), 0, "the pool was charged for a loan it never funded");
+    }
+
+    /// @dev The other half of the same guard: a backlog that IS the pool's cannot be left behind by
+    ///      pointing the source somewhere else. Always satisfiable, because the counter only ever
+    ///      holds loss the pool funded - flush it first - so this blocks the bearer instrument
+    ///      re-forming without creating the deadlock that an unconditional guard would.
+    function test_setLiquiditySource_refusedWhileTheDeferredLossIsStillThePools() public {
+        address a = _asAuction();
+        MockLenderPool pool = _poolFundsTheBook();
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        pool.setAccepting(false); // the default, stated so the test does not rest on it
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        assertGt(credit.unsocialisedLoss(), 0, "the fixture must leave a genuine pool-funded backlog");
+
+        // `expectRevert` before `prank`: the cheatcode call consumes a pending prank, so the other
+        // order sends the call from this contract and fails on ownership instead of on the guard.
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.LossOutstanding.selector, credit.unsocialisedLoss())
+        );
+        vm.prank(admin);
+        credit.setLiquiditySource(address(liquidity));
+    }
+
+    /// @notice **Audit round 11: `setLenderPool` had `onlyOwner` and nothing else.** A backlog
+    ///         banked against the outgoing pool must not become settleable against the incoming
+    ///         one.
+    /// @dev The same bearer instrument the round's PoC monetised, reached through the other
+    ///      pointer. `_socialise` closed the route that moved the *source* out from under a
+    ///      counter; this closes the route that moves the *sink* onto a fresh balance sheet. The
+    ///      counter records an amount and not whose principal funded it, and
+    ///      `flushSocialisedLoss` is permissionless, so whoever holds shares in the incoming pool
+    ///      would be charged for a default they never funded, in a block an attacker picks.
+    ///
+    ///      Reuses `LossOutstanding` rather than inventing an error, because it is the identical
+    ///      clause `setLiquiditySource` already carries and an operator reading the revert should
+    ///      recognise it as the same problem with the same fix: call the flush first.
+    function test_setLenderPool_refusedWhileTheOutgoingPoolsBacklogIsUnplaced() public {
+        address a = _asAuction();
+        MockLenderPool pool = _poolFundsTheBook();
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        pool.setAccepting(false); // the default, stated so the test does not rest on it
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        assertGt(credit.unsocialisedLoss(), 0, "the fixture must leave a genuine pool-funded backlog");
+
+        MockLenderPool incoming = new MockLenderPool(usdc);
+        // `expectRevert` before `prank`: the cheatcode call consumes a pending prank, so the other
+        // order sends the call from this contract and fails on ownership instead of on the guard.
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.LossOutstanding.selector, credit.unsocialisedLoss())
+        );
+        vm.prank(admin);
+        credit.setLenderPool(address(incoming));
+    }
+
+    /// @notice The guard's second clause: the outgoing pool must not still have money out on loan.
+    /// @dev `outstandingPrincipal` is written down by exactly two things, `repayPrincipal` and
+    ///      `socialiseLoss`, and once this pointer moves away only the first can still reach it.
+    ///      A default on a loan the outgoing pool funded would then be reported as
+    ///      `LossBorneByTheSource` and its principal counter would never come down - so its
+    ///      `totalAssets` would overstate the book permanently and its lenders would keep exiting
+    ///      at a price that had stopped being true. That is round-10 finding 7's disease with no
+    ///      auction to end it.
+    ///
+    ///      Asserted with `unsocialisedLoss` explicitly at zero, because a test that let both
+    ///      clauses be armed at once would pass on whichever fired first and prove nothing about
+    ///      this one.
+    function test_setLenderPool_refusedWhileTheOutgoingPoolStillHasPrincipalOut() public {
+        MockLenderPool pool = _poolFundsTheBook();
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        assertEq(pool.outstandingPrincipal(), MAX_BORROW, "the outgoing pool really did fund it");
+        assertEq(credit.unsocialisedLoss(), 0, "the other clause must not be what bites here");
+
+        MockLenderPool incoming = new MockLenderPool(usdc);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CreditManager.PoolPrincipalOutstanding.selector, address(pool), MAX_BORROW
+            )
+        );
+        vm.prank(admin);
+        credit.setLenderPool(address(incoming));
+    }
+
+    /// @notice **The composed proof that the new guard did not brick the migration it guards.**
+    /// @dev Three tests that each pass in isolation say nothing about whether the states they
+    ///      assert are mutually reachable, and this repository has shipped two guards whose only
+    ///      escape hatch was gated on the thing they refused to release - `EpochHarvester`'s
+    ///      `setLenderPool` spends twenty lines on one of them. The honest question here is that
+    ///      the sole drain for `unsocialisedLoss` is `flushSocialisedLoss`, which itself refuses
+    ///      unless the pool is still the liquidity source, so the drain does depend on the pointer
+    ///      this guard refuses to move. That makes the guard necessary rather than circular: what
+    ///      it forbids never unlocked anything, since `setLiquiditySource` carries the identical
+    ///      clause and a lone sink repoint would leave the loss permanently unplaceable.
+    ///
+    ///      So this runs the whole thing in order, from a pool that refuses to take its own loss
+    ///      through to a successor funding a fresh book and absorbing a fresh default. Every state
+    ///      the two tests above assert appears here as a step that is then escaped.
+    function test_setLenderPool_theWholePoolMigrationIsStillReachable() public {
+        address a = _asAuction();
+        MockLenderPool outgoing = _poolFundsTheBook();
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+
+        // A default the pool will not take yet: both clauses of the guard are now armed.
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "remembered, not swallowed");
+        assertEq(outgoing.outstandingPrincipal(), MAX_BORROW, "and still recorded as lent");
+
+        // The drain the guard points an operator at, and the only one there is.
+        outgoing.setAccepting(true);
+        credit.flushSocialisedLoss();
+        assertEq(credit.unsocialisedLoss(), 0, "the backlog placed where it was funded");
+        assertEq(outgoing.outstandingPrincipal(), 0, "which is also what clears the second clause");
+
+        // Both pointers now move, in the order the deployment script uses: funder first, sink
+        // second, so the pool is never the loss sink for a book it does not fund.
+        MockLenderPool incoming = new MockLenderPool(usdc);
+        usdc.mint(address(incoming), FLOAT);
+        vm.startPrank(admin);
+        credit.setLiquiditySource(address(incoming));
+        credit.setLenderPool(address(incoming));
+        vm.stopPrank();
+        assertEq(credit.liquiditySource(), address(incoming));
+        assertEq(credit.lenderPool(), address(incoming));
+
+        // And the successor is a working balance sheet, not just a stored address: it funds a
+        // fresh loan and absorbs the default on it.
+        incoming.setAccepting(true);
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        assertEq(incoming.outstandingPrincipal(), MAX_BORROW, "the incoming pool funds the book");
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        assertEq(incoming.socialisedTotal(), MAX_BORROW, "and takes the loss on what it funded");
+        assertEq(outgoing.socialisedTotal(), MAX_BORROW, "while the outgoing one keeps only its own");
+    }
+
     /// @notice The three socialisation states, composed. A refusing pool is not an edge
     ///         case: it is the only pool that exists before Phase 4, and asserting
     ///         "the flush reverts while the pool refuses" on its own would pass forever
     ///         while every liquidation was bricked.
+    /// @dev The pool funds the loan here as well as sinking the loss. Before round 11 it only
+    ///      sank the loss while the treasury float funded the book, and the deferral this test
+    ///      asserts happened anyway - which was the bug, not the fixture. See
+    ///      `_poolFundsTheBook`. Nothing else about the test moved: the states it composes, and
+    ///      the amounts, are the ones it always asserted.
     function test_socialisedLoss_isRememberedWhileThePoolRefusesAndDeliveredOnceItCannot() public {
         address a = _asAuction();
-        MockLenderPool pool = new MockLenderPool();
-        vm.prank(admin);
-        credit.setLenderPool(address(pool));
+        MockLenderPool pool = _poolFundsTheBook();
 
         vm.prank(alice);
         credit.borrow(MAX_BORROW);
@@ -1409,6 +1625,76 @@ contract CreditManagerTest is Test {
         credit.flushSocialisedLoss();
         assertEq(credit.unsocialisedLoss(), 0);
         assertEq(pool.socialisedTotal(), MAX_BORROW);
+    }
+
+    /// @dev Round 10, finding 1 - the one the whole round turned on, and the reason this mock now
+    ///      has a third state. A pool clamps a write-down to what it has actually lent, so it can
+    ///      accept a call and absorb none of it. That is not an edge case: the deploy script wires
+    ///      the pool as the loss sink while the treasury is still the liquidity source, so the
+    ///      pool's `outstandingPrincipal` is zero and *every* loss absorbed nothing. `_socialise`
+    ///      read "did not revert" as "fully placed" and the remainder existed on no ledger at all -
+    ///      not in `unsocialisedLoss`, not in `lifetimeSocialisedLoss`, nowhere.
+    ///
+    ///      Before the pool had a body it reverted `NotImplemented`, which made the `catch` fire
+    ///      and the loss visible. Building the pool is what broke the deferral, and no test could
+    ///      see it because this mock only ever reverted or absorbed in full.
+    ///
+    ///      **Round 11 closed the deploy-script route described above, and partial absorption is
+    ///      still reachable without it.** A pool that is not the liquidity source is no longer
+    ///      offered the loss at all, so "outstandingPrincipal is zero because the treasury funds
+    ///      the book" cannot happen any more. But the pool clamps to its own book-level
+    ///      `outstandingPrincipal`, and the loss is sized from one borrower's debt, and those two
+    ///      numbers are maintained independently: `repayPrincipal` clamps the counter at zero
+    ///      rather than underflowing when yield carries a repayment past principal, and an
+    ///      earlier socialisation has already written it down for money that is not coming back.
+    ///      So the pool can still accept a call and absorb less than it was asked for, and the
+    ///      caller must still not read "did not revert" as "fully placed".
+    function test_socialisedLoss_partialAbsorptionIsDeferredNotDiscarded() public {
+        address a = _asAuction();
+        // The pool funds the book as well as sinking the loss - see `_poolFundsTheBook`.
+        MockLenderPool pool = _poolFundsTheBook();
+        pool.setAccepting(true);
+        // Accepts the call, absorbs a quarter of it, and says so.
+        pool.setAbsorbCap(MAX_BORROW / 4);
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+
+        assertEq(pool.socialisedTotal(), MAX_BORROW / 4, "the pool took what it could");
+        assertEq(
+            credit.unsocialisedLoss(),
+            MAX_BORROW - MAX_BORROW / 4,
+            "the rest must be remembered, not erased"
+        );
+        assertEq(credit.debtOf(alice), 0, "and the liquidation still completed");
+    }
+
+    /// @dev The same hole in the explicit path. `flushSocialisedLoss` zeroed the counter before the
+    ///      call and only restored it in the `catch`, so a partial acceptance wiped the difference
+    ///      on a call that reported success.
+    ///
+    ///      Since round 11 the flush also refuses outright unless the pool is the liquidity
+    ///      source, so this fixture is the only one in which the function has any work to do -
+    ///      see `_poolFundsTheBook`.
+    function test_flushSocialisedLoss_keepsWhatThePoolWouldNotTake() public {
+        address a = _asAuction();
+        MockLenderPool pool = _poolFundsTheBook();
+
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        vm.prank(a);
+        credit.writeDownLoss(alice, MAX_BORROW);
+        assertEq(credit.unsocialisedLoss(), MAX_BORROW);
+
+        pool.setAccepting(true);
+        pool.setAbsorbCap(MAX_BORROW / 2);
+        credit.flushSocialisedLoss();
+
+        assertEq(pool.socialisedTotal(), MAX_BORROW / 2);
+        assertEq(credit.unsocialisedLoss(), MAX_BORROW - MAX_BORROW / 2, "the flush ate the remainder");
     }
 
     function test_flushSocialisedLoss_revertsWithNothingToDo() public {
@@ -1447,5 +1733,346 @@ contract CreditManagerTest is Test {
         // Five days of a sixty-day stream, at 90% of the bonds, is about 450 USDC.
         // Before the fix this was ~5,400: the whole remaining pot rated over five days.
         assertLt(credit.claimableOf(jit), 700e6, "five days of staking earns five days of yield");
+    }
+
+    // ── the two setter guards (audit round 16) ───────────────────────────────
+
+    /// @notice **The mirror of `LenderPool.setCreditManager`'s own refusal, which had never been
+    ///         built on this side.** A pool must not be repointed away from while it still carries
+    ///         marks nothing will ever be able to clear.
+    ///
+    /// @dev Audit round 16, executed, owner-sequenced with no attacker. `LenderPool` refuses to
+    ///      change its manager while `totalImpairment != 0` and spends eighteen lines explaining
+    ///      why a stale per-borrower reserve is invisible at the swap. This function checked the
+    ///      outgoing pool's principal and its own backlog and said nothing about the impairment, so
+    ///      **the rule was enforced on one side of one pointer pair.**
+    ///
+    ///      Afterwards `_setImpairment` targets the *new* pool, so nothing can clear the old one's
+    ///      map and the old pool can never be repointed either. It is recoverable, by pointing back
+    ///      and refreshing, and that recovery appeared in no comment and no test while the one the
+    ///      file did prescribe was wrong.
+    ///
+    ///      **`exitReserve()` cannot be the detector**, which is why this needed a new view rather
+    ///      than a new clause: it clamps to `outstandingPrincipal`, and the clause immediately
+    ///      above has just forced that to zero. The interface's only impairment-shaped number reads
+    ///      zero in exactly the state that matters.
+    ///
+    ///      The other two clauses are asserted at zero, so this cannot pass on whichever fires
+    ///      first - the same discipline the two tests above already use.
+    function test_setLenderPool_refusedWhileTheOutgoingPoolStillCarriesAMark() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        pool.setImpairment(alice, 1_000e6);
+
+        assertEq(pool.outstandingPrincipal(), 0, "the principal clause must not be what bites here");
+        assertEq(credit.unsocialisedLoss(), 0, "nor the backlog clause");
+        assertEq(pool.exitReserve(), 0, "and the blinded detector must read zero, which is the finding");
+
+        MockLenderPool incoming = new MockLenderPool(usdc);
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.PoolImpairmentOutstanding.selector, address(pool), 1_000e6)
+        );
+        vm.prank(admin);
+        credit.setLenderPool(address(incoming));
+    }
+
+    /// @notice And the guard does not brick the migration it guards: the mark is clearable without
+    ///         moving the pointer.
+    /// @dev The companion that stops this becoming the fourth mutually-unsatisfiable pair in this
+    ///      file. Unlike `unsocialisedLoss`, whose only drain depends on the very pointer its guard
+    ///      refuses to move, a mark's drains work on the *outgoing* pool right up to the
+    ///      assignment. **Audit round 17 corrected the reason this used to give** - it said the
+    ///      drains "touch neither pointer", and both `refreshImpairment` and `refreshImpairments`
+    ///      read `lenderPool`. The conclusion is unchanged and the escape below still runs: the
+    ///      guard forbids nothing that was previously reachable, because clearing the mark first is
+    ///      a step the owner can always take.
+    ///
+    ///      **And it now calls the function its own docstring names.** Round 17 also caught this
+    ///      body calling the single-borrower `refreshImpairment(alice)` while the text cited the
+    ///      bounded `refreshImpairments(n)`. Both are drains, so it exercises each.
+    function test_setLenderPool_theMarkIsClearableWithoutMovingThePointer() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        pool.setImpairment(alice, 1_000e6);
+        pool.setImpairment(bob, 500e6);
+
+        // No auction is wired, so the derived figure is zero and the refresh releases. Made by a
+        // stranger, because that is the property: the remedy needs no privilege.
+        vm.prank(makeAddr("anybody"));
+        credit.refreshImpairment(alice);
+        assertEq(pool.impairmentOf(alice), 0, "the single-borrower drain left the mark standing");
+
+        vm.prank(makeAddr("anybody else"));
+        assertEq(credit.refreshImpairments(8), 1, "the bounded drain reported the wrong count");
+        assertEq(pool.totalImpairment(), 0, "the mark survived a refresh that could see it");
+
+        MockLenderPool incoming = new MockLenderPool(usdc);
+        vm.prank(admin);
+        credit.setLenderPool(address(incoming));
+        assertEq(credit.lenderPool(), address(incoming), "the migration is still reachable");
+    }
+
+    /// @notice **An auction that cannot answer the new selector is refused at wiring time, under
+    ///         the owner's hand, rather than inside the repayment path.**
+    ///
+    /// @dev Audit round 16, six agents. `_impairmentFor` makes a bare, un-`try`ed
+    ///      `recognisedRecoveryOf` call, and it is reached unguarded from `_repay` - the path this
+    ///      codebase repeatedly promises is never blockable and deliberately not `whenNotPaused`.
+    ///      The setter validated only `vault()`, so an auction answering that and not the new
+    ///      member would brick **every repayment for every borrower under liquidation**.
+    ///
+    ///      `EpochHarvester.setCustodyAdapter` already implements exactly this pattern and states
+    ///      the reason: fail at wiring time under the owner's hand, not inside a permissionless
+    ///      call. The rule was written into one file and not applied when a new interface member
+    ///      landed on the repayment path.
+    ///
+    ///      Probed at `address(0)`, which no auction can have a live recovery for, so the probe
+    ///      reads a value it can ignore and is testing only that the call answers at all.
+    function test_setLiquidationAuction_refusesAnAuctionThatCannotAnswerTheRecoveryProbe() public {
+        HalfAnAuction incomplete = new HalfAnAuction(address(vault));
+
+        // It answers the check the setter already made, which is the whole point: the old guard
+        // passes it.
+        assertEq(incomplete.vault(), address(vault), "fixture: this must clear the existing check");
+
+        vm.expectRevert(CreditManager.LiquidationAuctionIncomplete.selector);
+        vm.prank(admin);
+        credit.setLiquidationAuction(address(incomplete));
+    }
+
+    /// @notice **The guard above covered one of the three selectors, and not the one called
+    ///         first.** Audit round 17, seven agents, executed.
+    ///
+    /// @dev The auction here answers `vault()`, `recognisedRecoveryOf`, `liveAuctionCount` and
+    ///      `openWorkoutCount` - everything the setter looked at - and does not answer
+    ///      `workoutsOpenFor`, which `_impairmentFor` reaches **first and unconditionally for
+    ///      every borrower**. `recognisedRecoveryOf` is only reached when `auctionOf` is non-zero,
+    ///      which on a freshly wired auction is nobody, so the probe that existed tested the one
+    ///      call that could not be made.
+    ///
+    ///      The state it let through is unrecoverable. `setLiquidationAuction` reads
+    ///      `liveAuctionCount()` on the pointer it has just broken, and
+    ///      `CollateralVault.setCreditManager` needs a zero total debt that repayment can no
+    ///      longer reach. There is no way back, so this test is the whole of the defence.
+    function test_setLiquidationAuction_refusesTheAuctionThatPassedTheOldProbe() public {
+        TwoThirdsOfAnAuction incomplete = new TwoThirdsOfAnAuction(address(vault));
+
+        // Every check the previous version of the guard made, passed.
+        assertEq(incomplete.vault(), address(vault), "fixture: clears the vault-binding check");
+        assertEq(incomplete.recognisedRecoveryOf(address(0)), 0, "fixture: clears the round-16 probe");
+
+        vm.expectRevert(CreditManager.LiquidationAuctionIncomplete.selector);
+        vm.prank(admin);
+        credit.setLiquidationAuction(address(incomplete));
+    }
+
+    /// @notice And the middle selector is required on its own account too.
+    /// @dev One test per member, deliberately, rather than one test over a mock missing all three.
+    ///      A mock answering none of them trips whichever probe runs first and says nothing about
+    ///      the other two - which is how the guard came to cover one of three in the first place.
+    ///      If `_impairmentFor` gains a fourth external call it gains a fourth probe and a fourth
+    ///      test here.
+    function test_setLiquidationAuction_refusesAnAuctionThatCannotAnswerAuctionOf() public {
+        NoAuctionOf incomplete = new NoAuctionOf(address(vault));
+
+        assertEq(incomplete.workoutsOpenFor(address(0)), 0, "fixture: answers the first probe");
+        assertEq(incomplete.recognisedRecoveryOf(address(0)), 0, "fixture: answers the third probe");
+
+        vm.expectRevert(CreditManager.LiquidationAuctionIncomplete.selector);
+        vm.prank(admin);
+        credit.setLiquidationAuction(address(incomplete));
+    }
+
+    /// @notice The same rule, one pointer over: a pool that cannot be enumerated is refused.
+    /// @dev Audit round 17. `refreshImpairments` calls `impairedBorrowerCount` and
+    ///      `impairedBorrowerAt` bare, and both arrived in the round that built the walk - the same
+    ///      commit range that applied this rule to the auction pointer next door.
+    ///
+    ///      Lower stakes than the auction probe, and the guard says so: both drains reach the pool
+    ///      through `_setImpairment`, which `try`s each leg, so a pool that cannot answer strands
+    ///      the bulk sweep rather than bricking repayment. Refused at wiring time anyway, because
+    ///      the sweep is the only bounded way to clear a stale mark and a frozen queue is what a
+    ///      stale mark costs.
+    function test_setLenderPool_refusesAPoolThatCannotBeEnumerated() public {
+        UncountablePool incomplete = new UncountablePool();
+
+        vm.expectRevert(CreditManager.LenderPoolIncomplete.selector);
+        vm.prank(admin);
+        credit.setLenderPool(address(incomplete));
+    }
+
+    /// @notice **A bounded sweep reaches the oldest mark, which is the one that matters.**
+    ///         Audit round 17, eight agents, executed.
+    /// @dev The walk restarted at `count - 1` on every call, so any bound below the set size
+    ///      re-visited the same tail forever. Marks append, so the oldest - the one the clock has
+    ///      had longest to make stale, and therefore the one holding the queue shut - sits nearest
+    ///      index 0 and was reached last or never.
+    ///
+    ///      **The fixture has to hold the set still, and getting that wrong makes this test
+    ///      vacuous.** The first version let each visit release its mark, which shrinks the set, so
+    ///      the tail moved down by one every call and even the cursorless walk reached index 0 in
+    ///      three calls - it passed against the defect. The stale-mark state the finding is about
+    ///      is one where the visited entry *stays*, which is the fixed point the old NatSpec's
+    ///      "always make progress" missed. Refusing the write reproduces that with no auction
+    ///      wiring: the set is constant at three, so a cursorless walk visits the tail three times.
+    ///
+    ///      Observed as the attempted call rather than as cleared state, for the same reason - the
+    ///      write is refused, so the only evidence the oldest was reached is that it was asked.
+    function test_refreshImpairments_boundedCallsReachTheOldestMark() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        address oldest = makeAddr("oldest");
+        pool.setImpairment(oldest, 1_000e6);
+        pool.setImpairment(alice, 1_000e6);
+        pool.setImpairment(bob, 1_000e6);
+        assertEq(pool.impairedBorrowerAt(0), oldest, "fixture: the oldest mark must sit at index 0");
+
+        // No auction is wired, so every derived figure is zero and every visit attempts a release.
+        // Refusing them keeps the set at three entries for the whole test.
+        vm.mockCallRevert(address(pool), abi.encodeWithSelector(ILenderPool.releaseImpairment.selector), bytes(""));
+        vm.expectCall(address(pool), abi.encodeCall(ILenderPool.releaseImpairment, (oldest)));
+
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(makeAddr("sweeper"));
+            credit.refreshImpairments(1);
+        }
+
+        assertEq(pool.impairedBorrowerCount(), 3, "fixture: the set must not have shrunk");
+    }
+
+    /// @notice The count it returns is writes that landed, not borrowers it looked at.
+    /// @dev Audit round 17. `refreshed` incremented once per iteration while every write is
+    ///      `try`-swallowed, so a pool refusing all of them reported a full sweep. The return value
+    ///      is what an operator reads to decide whether to call again, so reporting a visit as a
+    ///      refresh tells them to stop exactly when they should not.
+    function test_refreshImpairments_reportsWritesThatLandedNotBorrowersVisited() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        pool.setImpairment(alice, 1_000e6);
+        pool.setImpairment(bob, 1_000e6);
+
+        // Only the write refuses. The enumeration still answers, deliberately: a pool that cannot
+        // even be counted reverts the sweep outright at the bare `impairedBorrowerCount` call, and
+        // `setLenderPool` now refuses to wire one in the first place. The state worth testing is
+        // the one `_setImpairment`'s `try`/`catch` exists for - the pool declining a write while
+        // the manager carries on, which is exactly how a mark comes to be stale.
+        vm.mockCallRevert(address(pool), abi.encodeWithSelector(ILenderPool.releaseImpairment.selector), bytes(""));
+
+        vm.prank(makeAddr("sweeper"));
+        assertEq(credit.refreshImpairments(2), 0, "a sweep that wrote nothing reported refreshes");
+        assertEq(pool.totalImpairment(), 2_000e6, "fixture: the writes really must have been refused");
+    }
+
+    /// @notice An empty set still refreshes the two book-level terms of the reserve.
+    /// @dev Audit round 17. `count == 0` returned before reaching `_pushLossReserves`, so the two
+    ///      terms of `exitReserve` that are not per-borrower went unrefreshed in exactly the state
+    ///      where nothing else was going to refresh them - no marks means no other call into this
+    ///      function does any work either.
+    function test_refreshImpairments_refreshesTheBookTermsOnAnEmptySet() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        assertEq(pool.impairedBorrowerCount(), 0, "fixture: the set has to be empty");
+
+        // Asserted as the call rather than as pool state, because `MockLenderPool.setLossReserves`
+        // is a deliberate no-op - it exists so the manager's push has somewhere to land, not so a
+        // test can read it back. What is being pinned is that the push happens at all.
+        vm.expectCall(
+            address(pool), abi.encodeCall(ILenderPool.setLossReserves, (credit.unsocialisedLoss(), credit.insuranceFund()))
+        );
+
+        vm.prank(makeAddr("sweeper"));
+        assertEq(credit.refreshImpairments(5), 0, "an empty set cannot refresh a borrower");
+    }
+
+    /// @notice The walk survives the set shrinking underneath it, swap-pop and all.
+    /// @dev **Untested everywhere in this repo until audit round 17**, because `MockLenderPool`
+    ///      tracked additions and never removals, and the only real-pool exercise of the sweep runs
+    ///      a one-element set where `_untrackImpaired`'s `index != last` branch is unreachable. So
+    ///      the one interaction the downward walk exists to survive had no coverage at all.
+    ///
+    ///      Round 17 attacked the direction from six angles and it held; the mock is what could not
+    ///      express the attack. Fixed there, pinned here.
+    ///
+    ///      **This one passes against the pre-cursor walk too, and that is the correct result.** It
+    ///      is not a regression test for the cursor - it is the coverage the downward walk never
+    ///      had. The direction was always right; what was missing was any test that could tell.
+    function test_refreshImpairments_survivesASwapPopMidWalk() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        address[3] memory marked = [makeAddr("first"), makeAddr("second"), makeAddr("third")];
+        for (uint256 i; i < 3; ++i) {
+            pool.setImpairment(marked[i], 1_000e6);
+        }
+        assertEq(pool.impairedBorrowerCount(), 3, "fixture: three marks to walk");
+
+        // One call across the whole set. Each release swap-pops, so the array mutates under the
+        // cursor on every iteration - which is the case the direction was chosen for.
+        vm.prank(makeAddr("sweeper"));
+        assertEq(credit.refreshImpairments(3), 3, "the walk skipped an entry the swap-pop moved");
+
+        assertEq(pool.impairedBorrowerCount(), 0, "an entry outlived a walk that spanned the set");
+        assertEq(pool.totalImpairment(), 0);
+        for (uint256 i; i < 3; ++i) {
+            assertEq(pool.impairmentOf(marked[i]), 0, "a mark survived the sweep");
+        }
+    }
+}
+
+/// @notice The auction shape audit round 17 executed: everything the old probe looked at, and
+///         neither of the two selectors the repayment path always calls.
+/// @dev `_impairmentFor` calls `workoutsOpenFor`, then `auctionOf`, then `recognisedRecoveryOf`.
+///      This answers only the last, plus the two counters the setter reads off the *outgoing*
+///      pointer - so it cleared every check the setter made and bricked repayment anyway.
+contract TwoThirdsOfAnAuction {
+    address public immutable vault;
+
+    constructor(address vault_) {
+        vault = vault_;
+    }
+
+    function recognisedRecoveryOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function liveAuctionCount() external pure returns (uint256) {
+        return 0;
+    }
+
+    function openWorkoutCount() external pure returns (uint256) {
+        return 0;
+    }
+}
+
+/// @notice Answers the first and third probes and not the middle one.
+contract NoAuctionOf {
+    address public immutable vault;
+
+    constructor(address vault_) {
+        vault = vault_;
+    }
+
+    function workoutsOpenFor(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function recognisedRecoveryOf(address) external pure returns (uint256) {
+        return 0;
+    }
+}
+
+/// @notice A pool that answers every clause `setLenderPool` already had, and cannot be walked.
+contract UncountablePool {
+    function outstandingPrincipal() external pure returns (uint256) {
+        return 0;
+    }
+
+    function totalImpairment() external pure returns (uint256) {
+        return 0;
+    }
+}
+
+/// @notice An auction that answers `vault()` and nothing else on the impairment surface.
+/// @dev Deliberately not built on `MockLiquidationAuction`, which implements
+///      `recognisedRecoveryOf` and so cannot express the state this is about. The finding is a
+///      *partial* implementation passing a *partial* check.
+contract HalfAnAuction {
+    address public immutable vault;
+
+    constructor(address vault_) {
+        vault = vault_;
     }
 }

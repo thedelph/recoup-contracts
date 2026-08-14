@@ -122,4 +122,27 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
     function queuePosition(address) external view returns (uint256, uint256) {
         revert NotImplemented(); // TODO(phase-4)
     }
+
+    // ── The impairment surface, answered rather than stubbed ─────────────────
+    //
+    // `CreditManager.setLenderPool` probes `impairedBorrowerCount()` and refuses a pool that
+    // cannot answer, and it reads the outgoing pool's `totalImpairment()` to refuse stranding a
+    // mark. Both were added by an internal audit round after the phase-4 pool was written, and a
+    // skeleton that reverts on them is a skeleton the deploy script cannot wire at all.
+    //
+    // Zero is not a placeholder here, it is the truth: this contract has no way to be impaired.
+    // Nothing can lend from it, so nothing can be marked against it, and the guards above are
+    // asking a question whose answer for a dormant pool is genuinely none. `impairedBorrowerAt`
+    // gets no body for the same reason - there is no index 0 to return, and the manager's walk
+    // never reaches it while the count is zero.
+    //
+    // These stay when the phase-4 pool lands; there they carry the real set.
+
+    function totalImpairment() external pure returns (uint256) {
+        return 0;
+    }
+
+    function impairedBorrowerCount() external pure returns (uint256) {
+        return 0;
+    }
 }

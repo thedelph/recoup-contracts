@@ -8,7 +8,7 @@ import {IDexFiFarm} from "../../src/interfaces/IDexFiFarm.sol";
 
 /// @notice Stand-in for the DexFi Treasury Bond ("NFTBondsMigration"), mirroring the
 ///         verified contract's shape: ERC-1155, single fungible TOKEN_ID = 0, and a
-///         whitelist gate on wallet↔wallet transfers (mint/burn exempt) — the check
+///         whitelist gate on wallet↔wallet transfers (mint/burn exempt) - the check
 ///         passes if any of msg.sender / from / to is whitelisted, exactly like the
 ///         real `_update` override. The signed-mint entrypoint is mirrored minus the
 ///         EIP-712 check (payment + deadline are enforced; bonds auto-stake for the

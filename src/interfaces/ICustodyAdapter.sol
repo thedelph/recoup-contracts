@@ -41,6 +41,29 @@ interface ICustodyAdapter {
     ///         winner). Requires the adapter to be on DexFi's transfer whitelist.
     function transferBonds(address to, uint256 amount) external;
 
+    /// @notice Running total of USDC this adapter has measured arriving *from the farm*
+    ///         and forwarded on to the yield recipient. Never decreases.
+    /// @dev The corroboration signal an epoch is rated against. `EpochHarvester.harvest`
+    ///      sizes an epoch from its own USDC balance - it has to, because farm yield
+    ///      reaches it through several paths that report nothing - and a balance has no
+    ///      sender attribution, so the harvester needs a second number to tell an epoch
+    ///      the farm funded from one a stranger funded with a transfer.
+    ///
+    ///      Implementations MUST count only what they measured the farm pay, and MUST NOT
+    ///      count a raw balance or a swept amount that could include a donation. Audit
+    ///      round 11 priced what an implementation that conflates the two gives away:
+    ///      ~$1.82 of donated USDC bought a write to `CreditManager.lastDistributeAt`,
+    ///      the anti-just-in-time window's only input, and repeating that purchase at
+    ///      `Config.YIELD_STREAM_DURATION` intervals stopped a long accrual window from
+    ///      ever forming - turning a $495 just-in-time take into $5,940.
+    ///
+    ///      It counts every farm-touching path, not just `claimYield`. That is the whole
+    ///      reason it is a counter rather than a boolean: this farm is MasterChef-style,
+    ///      so `stake`, `unstake` and `mintBonds` settle the position too, and a signal
+    ///      that only noticed claims would read a wholly legitimate epoch as
+    ///      uncorroborated whenever a bond moved in the same block.
+    function farmYieldDelivered() external view returns (uint256);
+
     /// @notice The CollateralVault this adapter is bound to. The vault reads this
     ///         to reject a custody swap to an adapter wired for a different vault.
     function vault() external view returns (address);

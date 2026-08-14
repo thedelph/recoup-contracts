@@ -44,9 +44,27 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
 
     event LenderYieldAccrued(uint256 amount, uint256 totalPending);
     event LenderYieldFlushed(uint256 amount);
+    /// @notice A repoint left an outgoing pool's accrued share undelivered, so it was parked
+    ///         against that pool rather than carried to the incoming one.
+    /// @param totalParked The sum across all pools, which `harvest` nets off `claimed`.
+    event LenderYieldParked(address indexed pool, uint256 amount, uint256 totalParked);
+    /// @notice A parked share was finally delivered to the pool it belongs to.
+    event ParkedLenderYieldFlushed(address indexed pool, uint256 amount);
     event ProtocolFeeAccrued(uint256 indexed epoch, uint256 amount, uint256 totalPending);
     event ProtocolFeeFlushed(address indexed wallet, uint256 amount);
     event CreditManagerSet(address indexed creditManager);
+    /// @param seededCorroboration The incoming adapter's `farmYieldDelivered` at the swap, which
+    ///        becomes the new high-water mark. Emitted rather than left implicit because a wrong
+    ///        value here declines every subsequent epoch, and that is worth being able to see.
+    event CustodyAdapterSet(address indexed adapter, uint256 seededCorroboration);
+    /// @notice An epoch was declined because the farm had not funded it.
+    /// @param epoch The epoch this would have been, had it run. Not consumed - `epochCount` is
+    ///        untouched, exactly as in the zero-yield case.
+    /// @param farmYieldSinceLastEpoch Farm-attributed USDC delivered since the last accepted
+    ///        epoch, which fell short of `Config.MIN_EPOCH_FARM_YIELD`.
+    /// @param claimed What the balance said the epoch was worth. The gap between these two is the
+    ///        donation, and it is not lost - it stays here and joins the next real epoch.
+    event EpochDeclinedUncorroborated(uint256 indexed epoch, uint256 farmYieldSinceLastEpoch, uint256 claimed);
 
     IERC20 public immutable usdc;
     /// @notice The credit manager epochs are delivered into.
@@ -66,16 +84,62 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     uint256 public override lastHarvestAt;
     uint256 public epochCount;
 
-    /// @notice Lender share held here because `LenderPool.distributeYield` is Phase 4
-    ///         and reverts until then. Tracked rather than skipped, so the lender share
+    /// @notice Lender share accrued here rather than pushed, so an epoch never depends on the
+    ///         pool being able to take delivery. Tracked rather than skipped, so the lender share
     ///         of every epoch before the pool opens is still owed and payable.
+    /// @dev This used to say "because `LenderPool.distributeYield` is Phase 4 and reverts until
+    ///      then". The pool was built on 2026-08-10 and no longer reverts, but the counter is not
+    ///      scaffolding that can now be removed: `distributeYield` still refuses an empty pool
+    ///      (`NoSharesOutstanding`), and holding the share is what keeps that refusal from
+    ///      destroying it. `flushLenderYield` is the separate, permissionless delivery.
     uint256 public pendingLenderYield;
+
+    /// @notice Lender share that accrued while a given pool was wired and which that pool could
+    ///         not take when it was repointed away from. Payable to that pool forever.
+    /// @dev **Audit round 11: the repoint used to hand this to the incoming pool.** The
+    ///      carry-forward rested on one sentence in `setLenderPool`'s NatSpec - "a pool that cannot
+    ///      take delivery has no depositors to be short-changed" - and nothing anywhere enforced
+    ///      it. `LenderPool.setEpochHarvester` is `onlyOwner` and unguarded, so an owner could
+    ///      point a live pool full of depositors away from this harvester, watch delivery start
+    ///      reverting `NotEpochHarvester`, and then repoint here to a pool of their own that would
+    ///      collect the first pool's accrued epochs.
+    ///
+    ///      The obvious fix - refuse the repoint while a share is outstanding - is the deadlock
+    ///      `setLenderPool` spends twenty lines explaining, and it is genuinely unfixable in that
+    ///      direction: the only function that can clear the counter is the delivery that is
+    ///      failing. So the money is **parked per pool** instead of being either carried or
+    ///      blocked. The repoint never blocks, and the outgoing pool's share stays claimable by
+    ///      that pool, through `flushLenderYieldTo`, for as long as this contract exists. Neither
+    ///      half of the deadlock is reachable because there is no condition to satisfy.
+    ///
+    ///      A mapping cannot be summed, and `harvest` sizes an epoch from this contract's raw USDC
+    ///      balance less what is already spoken for - so `totalOwedToPools` exists beside it and
+    ///      that subtraction reads it. Without that, a parked share would be counted a second time
+    ///      as fresh epoch yield and paid out to borrowers.
+    mapping(address => uint256) public owedToPool;
+
+    /// @notice Sum of `owedToPool`. The third category of USDC sitting here that is not this
+    ///         epoch's yield, alongside `pendingLenderYield` and `pendingProtocolFee`.
+    uint256 public totalOwedToPools;
 
     /// @notice Protocol fee accrued but not yet collected.
     /// @dev Held for the same reason as the lender share: the fee wallet is a USDC
     ///      recipient like any other, and USDC is blacklistable. Pushing it inside
     ///      `harvest` let one frozen wallet stop every epoch, borrowers included.
     uint256 public pendingProtocolFee;
+
+    /// @notice The custody adapter's `farmYieldDelivered` as of the last epoch this contract
+    ///         accepted. An epoch is corroborated by the *increase* on this mark, never by the
+    ///         absolute figure.
+    /// @dev A high-water mark rather than a per-epoch reading, because the adapter's counter is
+    ///      monotonic and shared with every other path that touches the farm. Money delivered
+    ///      while an epoch was declined - or while nobody was calling `harvest` at all - is still
+    ///      sitting here, so it must still count towards the next epoch's corroboration. Storing
+    ///      the mark and subtracting is what makes that true without a second counter to keep in
+    ///      step.
+    ///
+    ///      Re-seeded on every custody swap. See `setCustodyAdapter`.
+    uint256 public lastCorroboratedYield;
 
     constructor(IERC20 usdc_, ICreditManager creditManager_, address initialOwner) Ownable(initialOwner) {
         if (address(usdc_) == address(0) || address(creditManager_) == address(0)) revert ZeroAddress();
@@ -91,9 +155,31 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
 
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
+    /// @notice Point this contract at the custody adapter it claims from.
+    /// @dev **The re-seed on the last line is not bookkeeping - it is the whole reason this
+    ///      setter needs reading.** `lastCorroboratedYield` is a high-water mark against
+    ///      `adapter.farmYieldDelivered()`, which is per-adapter and starts at zero. Carry a mark
+    ///      earned under the outgoing adapter across to a fresh one and the subtraction in
+    ///      `harvest` saturates to zero on every call, so every epoch is declined as
+    ///      uncorroborated - forever, because the only thing that could raise the incoming
+    ///      counter past the stale mark is the epochs the stale mark is refusing to run.
+    ///
+    ///      That is the same mutually-unsatisfiable shape `setLenderPool`'s NatSpec spends twenty
+    ///      lines on: the function that could clear the condition was gated on the condition. It
+    ///      has now been reached through a reverting pool, through arithmetic in
+    ///      `_tryDeliverLenderYield`, and it would have been reached here through a counter that
+    ///      resets. The pattern is worth naming: any state this contract carries *about* a wiring
+    ///      pointer has to be re-derived when that pointer moves, not preserved across it.
+    ///
+    ///      The call also doubles as a shape check on the incoming adapter. An address that does
+    ///      not answer `farmYieldDelivered()` reverts here, at wiring time and under the owner's
+    ///      hand, rather than inside the permissionless `harvest` where a revert freezes every
+    ///      borrower's write-down.
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
         if (address(adapter) == address(0)) revert ZeroAddress();
         custodyAdapter = adapter;
+        lastCorroboratedYield = adapter.farmYieldDelivered();
+        emit CustodyAdapterSet(address(adapter), lastCorroboratedYield);
     }
 
     /// @notice Repoint the pool the lender share is paid to.
@@ -103,24 +189,52 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     ///      An earlier version refused outright while `pendingLenderYield != 0`, on the
     ///      reasoning that the share belongs to the pool that earned it. The reasoning
     ///      is right; the guard was not, because it assumed a flush is always possible.
-    ///      `LenderPool.distributeYield` reverts `NotImplemented` until Phase 4 and the
-    ///      deploy script wires exactly that pool - so the only function that could
-    ///      clear the counter could never succeed, and the only function that could
-    ///      replace the pool read that counter. The two were mutually unsatisfiable:
-    ///      every epoch's lender share was locked here permanently and Phase 4 could
-    ///      never be wired at all.
+    ///      When the guard was written `LenderPool.distributeYield` reverted
+    ///      `NotImplemented`, so the only function that could clear the counter could
+    ///      never succeed, and the only function that could replace the pool read that
+    ///      counter. The two were mutually unsatisfiable: every epoch's lender share was
+    ///      locked here permanently and Phase 4 could never be wired at all.
     ///
-    ///      Carrying the share forward to the incoming pool is the right answer in the
-    ///      case that actually arises: a pool that cannot take delivery has no
-    ///      depositors to be short-changed.
+    ///      The pool has had a real body since 2026-08-10, so that particular deadlock is
+    ///      gone - but the guard stays removed, because the shape recurs for any pool that
+    ///      cannot take delivery: one that no longer recognises this harvester, or one
+    ///      whose own transfer is blocked.
+    ///
+    ///      **What the undeliverable share does instead used to be "follow the pointer", and audit
+    ///      round 11 was right that it should not.** The reasoning was that a pool which cannot
+    ///      take delivery has no depositors to be short-changed - which nothing enforces and which
+    ///      the protocol's own wiring falsifies: `LenderPool.setEpochHarvester` is `onlyOwner` and
+    ///      unguarded, so pointing a live pool away from this harvester is exactly how you make
+    ///      delivery revert, and the repoint then handed that pool's depositors' accrued epochs to
+    ///      a different pool. Nothing about "cannot accept" implies "empty".
+    ///
+    ///      So the share is **parked against the outgoing pool** - see `owedToPool` - and stays
+    ///      claimable by it forever through the permissionless `flushLenderYieldTo`. That keeps
+    ///      both properties at once, which no guard here could: the repoint can never block, and
+    ///      the money can never be redirected. Note what is *not* parked - a pool that took
+    ///      delivery leaves nothing behind, so the ordinary migration is unchanged.
     /// @dev `nonReentrant` because it reaches `_tryDeliverLenderYield`, which makes an
     ///      external call to the outgoing pool. Without it that pool could re-enter
-    ///      `harvest` and move the counter the helper is mid-way through writing.
+    ///      `harvest` and move the counter the helper is mid-way through writing - and now also
+    ///      the counter the park below reads.
     function setLenderPool(address lenderPool_) external onlyOwner nonReentrant {
         if (lenderPool_ == address(0)) revert ZeroAddress();
         address outgoing = lenderPool;
         if (outgoing != address(0) && outgoing != lenderPool_) {
             _tryDeliverLenderYield(outgoing);
+
+            // Read after the delivery attempt, not before: the helper has already decremented by
+            // whatever actually left, so what is left standing is precisely the part the outgoing
+            // pool could not take. Everything still counted here accrued while `outgoing` was the
+            // wired pool - anything owed to a pool before that was parked by its own repoint - so
+            // the whole residue belongs to `outgoing` and none of it to the incoming pool.
+            uint256 undelivered = pendingLenderYield;
+            if (undelivered != 0) {
+                pendingLenderYield = 0;
+                owedToPool[outgoing] += undelivered;
+                totalOwedToPools += undelivered;
+                emit LenderYieldParked(outgoing, undelivered, totalOwedToPools);
+            }
         }
         lenderPool = lenderPool_;
         emit LenderPoolSet(lenderPool_);
@@ -174,11 +288,30 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // EOA can upgrade, so a revert in `withdraw(0)` is a live possibility - and
         // letting it propagate would freeze USDC that is already sitting here and
         // needs no farm call at all.
-        try adapter.claimYield() returns (uint256) {} catch {}
-        // Both carried balances come off the top. They are this contract's USDC but not
-        // this epoch's yield, and counting either as `claimed` would pay it out a second
-        // time - the lender share to borrowers, or the protocol fee to everyone.
-        uint256 claimed = usdc.balanceOf(address(this)) - pendingLenderYield - pendingProtocolFee;
+        //
+        // The return value is kept, not discarded. It cannot *size* the epoch - the paragraph
+        // above is why - and since audit round 11 it is no longer what decides whether the epoch
+        // is real either; the adapter's `farmYieldDelivered` counter does that, and it sees every
+        // farm-touching path rather than this one call. What is left to `corroborated` is the
+        // narrower claim that the farm paid out *inside this very call*, which is all the cooldown
+        // clock below needs.
+        uint256 corroborated;
+        try adapter.claimYield() returns (uint256 c) {
+            corroborated = c;
+        } catch {}
+        // All three carried balances come off the top. They are this contract's USDC but not this
+        // epoch's yield, and counting any of them as `claimed` would pay it out a second time -
+        // the lender share to borrowers, or the protocol fee to everyone.
+        //
+        // **`totalOwedToPools` is the third one and it is the easy one to miss.** It was added
+        // when the repoint stopped carrying an undeliverable share to the incoming pool and
+        // started parking it against the pool that earned it; the money does not move at the park,
+        // so it is still sitting in this balance. Left out of this line it reads as fresh yield to
+        // every subsequent epoch, gets split four ways, and is then still owed to the pool it was
+        // parked for - so the second payment comes out of somebody else's epoch. Any future
+        // balance this contract holds on someone else's behalf belongs on this line too.
+        uint256 claimed =
+            usdc.balanceOf(address(this)) - pendingLenderYield - pendingProtocolFee - totalOwedToPools;
 
         // Split per PRD §4.4, computed before the cooldown decision because the
         // borrower share is what decides whether this epoch did anything.
@@ -186,11 +319,16 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
 
         // A dust threshold, not a zero check. `claimed` is sized from this contract's
         // USDC balance with no attribution - it has to be, because yield reaches here
-        // through unmeasured side paths - so anyone can advance an epoch by transferring
-        // a couple of units. That is not merely a wasted cooldown: advancing the epoch
-        // resets `CreditManager.lastDistributeAt`, which is the input the stream's
-        // anti-just-in-time window is derived from. Pinning it cheaply is what turns
-        // the stream-compression bug from theoretical into a funded attack.
+        // through unmeasured side paths - so anyone can raise it by transferring a
+        // couple of units.
+        //
+        // This branch only answers whether the epoch is worth *running*. It is not, and never
+        // was, a defence against a donation: a floor denominated in absolute dollars cannot price
+        // a right whose value scales with the pot behind it, and round 10 measured the price at
+        // $1.82. Who funded the epoch is the separate question asked immediately below, against a
+        // quantity a donation cannot move. Two questions, two floors - see
+        // `Config.MIN_EPOCH_FARM_YIELD` for why they are not the same constant even at the same
+        // value.
         if (toBorrowers < Config.MIN_EPOCH_YIELD) {
             // Deliberately does NOT advance `lastHarvestAt`. An epoch that distributed
             // nothing should not consume the cooldown - a transient zero (DexFi
@@ -203,7 +341,72 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
             return;
         }
 
-        lastHarvestAt = block.timestamp;
+        // ── Did the farm fund this epoch, or did a stranger? ─────────────────────
+        //
+        // **Audit round 11, and the reason this is an early return rather than a guard on the
+        // `distributeYield` call further down.** Round 10 priced a donated epoch at 1,818,182
+        // units - about $1.82 - and gated `lastHarvestAt` on `corroborated` so the donation could
+        // not burn five days of cooldown. It guarded one clock and left the other open. `harvest`
+        // fell straight through to `creditManager.distributeYield`, which writes
+        // `lastDistributeAt`, and that is the sole record of how long the money took to earn. So
+        // the same $1.82 still bought a write to the anti-just-in-time window's only input - and
+        // because `lastHarvestAt` was deliberately *not* advanced, the pin was repeatable every
+        // block rather than once per cooldown.
+        //
+        // What that was worth, measured in `test/EpochHarvester.t.sol`: eleven donations of $1.82,
+        // spaced one `Config.YIELD_STREAM_DURATION` apart across a sixty-day farm outage, turned a
+        // just-in-time round trip worth $495 into one worth $5,940, and left a holder staked for
+        // all sixty days with $671 of a $6,600 epoch instead of the whole of it. Note the
+        // mechanism, because it is not the obvious one: no running stream is ever shortened -
+        // `duration >= remaining` makes `streamEndsAt` monotonically non-decreasing - the pins
+        // simply stop a long accrual window from ever *forming*, which costs the attacker nothing.
+        //
+        // The obvious fix is to gate `distributeYield` on `corroborated`, and it is wrong. That
+        // boolean is not a donation detector; it asks "did the farm accrue since anything last
+        // touched it", and `depositBonds`/`withdrawBonds` both settle the farm through the
+        // adapter. A wholly legitimate epoch therefore reads as uncorroborated whenever a bond
+        // moved in the same block, and gating on it strands that epoch's borrower share for up to
+        // `MIN_EPOCH_GAP`. It was tried, it broke three existing tests for exactly that reason,
+        // and it was reverted: delaying money owed to borrowers in order to close a timing attack
+        // needs a sharper signal than a boolean.
+        //
+        // The sharper signal was already being computed on every farm-touching path and thrown
+        // away. `farmYieldDelivered` counts USDC the adapter *measured the farm pay* and forwarded
+        // on; it moves on a claim, a stake, an unstake or a mint alike, and a donation cannot move
+        // it at all. Rating this epoch against the increase since the last accepted one asks the
+        // right question and answers it for every path, so no legitimate epoch is delayed by a
+        // second.
+        //
+        // Declining returns without touching a single piece of state - not `lastHarvestAt`, not
+        // `epochCount`, not `lastDistributeAt`, not a cent. That is the point of the shape: the
+        // donated USDC stays in this contract's balance and is counted into `claimed` by the next
+        // real epoch, so the griefer's money ends up paying borrowers and nothing is stranded.
+        uint256 delivered = adapter.farmYieldDelivered();
+        // Saturating, not a bare subtraction. The mark is re-seeded on every custody swap, so it
+        // can only sit at or below the live adapter's counter and this can only underflow if an
+        // adapter breaks its own monotonicity promise. But an underflow here would revert the one
+        // permissionless function that moves un-epoched USDC out of this contract, and this
+        // codebase has already had two deadlocks of precisely that shape - `setLenderPool`'s
+        // refusal and `_tryDeliverLenderYield`'s subtraction. Declining an epoch is recoverable;
+        // reverting on an assumption about an external contract is not.
+        uint256 fromFarm = delivered > lastCorroboratedYield ? delivered - lastCorroboratedYield : 0;
+        if (fromFarm < Config.MIN_EPOCH_FARM_YIELD) {
+            emit EpochDeclinedUncorroborated(epochCount + 1, fromFarm, claimed);
+            return;
+        }
+        lastCorroboratedYield = delivered;
+
+        // The cooldown clock, still keyed on `corroborated` rather than on the floor just above,
+        // and that is the conservative choice rather than an oversight. `corroborated != 0` means
+        // the farm paid out inside this call. An epoch corroborated the other way - a
+        // `withdrawBonds` that swept an outage's worth of yield in here while the farm's claim
+        // path was down - has no reason to be rate limited: the pot is real and the window it is
+        // rated over is the one it genuinely accrued in. Advancing the clock for those too would
+        // delay the next honest epoch by up to `MIN_EPOCH_GAP` and buy nothing, because the floor
+        // above already means a second epoch cannot run until the farm has delivered another
+        // `MIN_EPOCH_FARM_YIELD` - a rate limit no donation can pay for. Round 10 needed this line
+        // to be the entire defence; it no longer is.
+        if (corroborated != 0) lastHarvestAt = block.timestamp;
         uint256 epoch = ++epochCount;
 
         // The protocol fee takes the rounding remainder so the parts always sum to
@@ -212,9 +415,15 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         uint256 toInsurance = (claimed * Config.SPLIT_INSURANCE_BPS) / Config.BPS;
         uint256 toProtocol = claimed - toBorrowers - toLenders - toInsurance;
 
-        // Non-zero by the branch above, so no guard needed here.
+        // Non-zero by the branch above, so no guard needed on the approval.
         usdc.forceApprove(address(creditManager), toBorrowers);
         creditManager.receiveYield(toBorrowers);
+        // Unconditional, and correctly so now. This line writes `lastDistributeAt`, and round 11
+        // recorded it as the open finding; the corroboration floor above is the fix. It works by
+        // declining the whole epoch rather than by running a half-epoch that pays borrowers and
+        // skips the write - which is what the one-line `if (corroborated != 0)` here would do, and
+        // a borrower share delivered into `undistributedYield` with nothing rating it is money
+        // stranded, not money protected. Anything reaching this line has been funded by the farm.
         creditManager.distributeYield(toBorrowers);
 
         if (toInsurance != 0) {
@@ -256,26 +465,83 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         if (_tryDeliverLenderYield(pool) == 0) revert FlushDeliveredNothing();
     }
 
+    /// @notice Deliver a share parked for a pool this harvester no longer points at.
+    /// @dev Permissionless and takes the pool as an argument, which is the pair of properties
+    ///      that make the park safe. `owedToPool` is keyed by the pool that earned the share, so
+    ///      this can only ever move money to that address - there is no destination to choose and
+    ///      therefore nothing for an owner to redirect. And because anyone may call it, a pool
+    ///      that becomes able to take delivery again does not need this contract's owner to
+    ///      cooperate in being paid.
+    ///
+    ///      Deliberately separate from `flushLenderYield` rather than folded into it. That
+    ///      function pays the *currently wired* pool out of the live counter; conflating the two
+    ///      would mean a caller asking for a flush could not tell which of the two payments they
+    ///      got, and would put a stranger's balance inside the path the epoch clock uses.
+    ///
+    ///      Reverts loudly on a no-op for the same reason its sibling does: a caller who asked for
+    ///      a delivery wants to know it did not land.
+    function flushLenderYieldTo(address pool) external nonReentrant {
+        if (pool == address(0)) revert ZeroAddress();
+        if (owedToPool[pool] == 0) revert NothingToFlush();
+
+        if (_tryDeliverParkedYield(pool) == 0) revert FlushDeliveredNothing();
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────────
 
-    /// @dev Hands a pool the lender share it accrued, tolerating a pool that cannot
-    ///      take delivery.
-    ///
-    ///      Delivery is measured rather than assumed: a pool that pulls short would
-    ///      otherwise have the difference silently forgiven, leaving USDC here that no
-    ///      counter claims. The counter is written back from what actually left, so a
-    ///      partial pull stays owed.
+    /// @dev Hands the currently wired pool the live lender share, tolerating a pool that cannot
+    ///      take delivery. The counter is written back from what actually left, so a partial pull
+    ///      stays owed - see `_push` for why delivery is measured rather than assumed.
     /// @return delivered USDC that actually left this contract.
     function _tryDeliverLenderYield(address pool) private returns (uint256 delivered) {
         uint256 amount = pendingLenderYield;
         if (amount == 0) return 0;
 
+        delivered = _push(pool, amount);
+        // Decrement, do not assign. `amount` is a snapshot taken before an external call, so a
+        // pool that called back in and moved this counter would have that increment erased by an
+        // assignment. `CreditManager.settlePrincipal` documents the identical hazard and avoids it
+        // the same way; this was the one place in the codebase that still assigned.
+        //
+        // The clause that used to be here - "`setLenderPool` reaches this helper without
+        // `nonReentrant`" - has been false since that guard was added, and is removed rather than
+        // kept as a scarier-sounding reason. The discipline stands on its own: both callers are
+        // guarded *today*, and a snapshot taken across an external call must not be written back
+        // wholesale regardless of who is guarding the door this week.
+        pendingLenderYield -= delivered;
+        if (delivered != 0) emit LenderYieldFlushed(delivered);
+    }
+
+    /// @dev The same delivery, against the share parked for a pool this harvester has since been
+    ///      pointed away from. Both counters are decremented by what actually left, for the reason
+    ///      the sibling above states.
+    /// @return delivered USDC that actually left this contract.
+    function _tryDeliverParkedYield(address pool) private returns (uint256 delivered) {
+        uint256 amount = owedToPool[pool];
+        if (amount == 0) return 0;
+
+        delivered = _push(pool, amount);
+        owedToPool[pool] -= delivered;
+        totalOwedToPools -= delivered;
+        if (delivered != 0) emit ParkedLenderYieldFlushed(pool, delivered);
+    }
+
+    /// @dev Offer `amount` to `pool` and report what it actually took. Extracted so the live
+    ///      counter and the parked one cannot drift in how they deliver: every hazard below was
+    ///      paid for once already and a second copy would be a second chance to get one wrong.
+    ///      It writes no counter itself - the caller owns that, because the two hold their balance
+    ///      in different places.
+    /// @return delivered USDC that actually left this contract.
+    function _push(address pool, uint256 amount) private returns (uint256 delivered) {
         uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.forceApprove(pool, amount);
         // A pool that reverts must not be able to trap the share - see setLenderPool.
         try ILenderPool(pool).distributeYield(amount) {} catch {}
         usdc.forceApprove(pool, 0); // leave no standing allowance
 
+        // Delivery is measured rather than assumed: a pool that pulls short would otherwise have
+        // the difference silently forgiven, leaving USDC here that no counter claims.
+        //
         // Clamped, not just subtracted. The call above is wrapped so a hostile pool
         // cannot revert the repoint - but this line sits outside the try/catch, so a
         // pool that *pushes* USDC back during `distributeYield` made the subtraction
@@ -284,14 +550,6 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // NatSpec says was already fixed once, reachable through arithmetic instead.
         uint256 balanceAfter = usdc.balanceOf(address(this));
         delivered = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
-        // Decrement, do not assign. `amount` is a snapshot taken before an external
-        // call, and `setLenderPool` reaches this helper without `nonReentrant`, so a
-        // pool that calls back into `harvest` increments this counter mid-flight - an
-        // assignment would erase that increment. `CreditManager.settlePrincipal`
-        // documents the identical hazard and avoids it the same way; this was the one
-        // place in the codebase that still assigned.
-        pendingLenderYield -= delivered;
-        if (delivered != 0) emit LenderYieldFlushed(delivered);
     }
 
     /// @notice Deliver the accumulated protocol fee once the wallet can receive it.

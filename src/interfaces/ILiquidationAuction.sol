@@ -41,6 +41,25 @@ interface ILiquidationAuction {
     /// @return price current Dutch price in USDC for the whole lot
     function currentPrice(uint256 auctionId) external view returns (uint256 price);
 
+    /// @notice The live auction against a borrower, or 0. One at a time.
+    /// @dev Read by `CreditManager` to size the impairment a live liquidation carries in the
+    ///      lender pool. Zero is unambiguous: ids are pre-incremented so none is ever issued.
+    function auctionOf(address borrower) external view returns (uint256 auctionId);
+
+    /// @notice USDC an in-flight fill has already paid in against this borrower's loan.
+    /// @dev Non-zero only inside a `bid`, between the winner's payment landing and the first
+    ///      statement that applies that payment to `debtOf`. `CreditManager` nets it off the mark
+    ///      so the recovery is recognised before the winner's ERC-1155 callback can spend the
+    ///      un-netted figure on a third party. Zero at rest, and zero for every borrower with no
+    ///      fill in flight.
+    ///
+    ///      **The window ends at the debt reduction, not at the write-down**, and audit round 16 is
+    ///      the difference. This sentence used to say "the debt being written down", which is a
+    ///      wider window: the repayment leg reduces `debtOf` and re-derives the mark well before
+    ///      any loss is booked, so a slot still standing there let the same fill be subtracted
+    ///      twice. The implementation now matches this description; it did not before.
+    function recognisedRecoveryOf(address borrower) external view returns (uint256 recovered);
+
     /// @notice Auctions opened and not yet filled, cancelled, expired or superseded.
     /// @dev Exposed so the vault can refuse to repoint away from an auction that still
     ///      has work in flight. The outgoing auction is the only caller `seize` and

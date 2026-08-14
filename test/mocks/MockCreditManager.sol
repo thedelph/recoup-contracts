@@ -17,6 +17,13 @@ contract MockCreditManager {
         vault = vault_;
     }
 
+    // This mock used to carry a `liquidationAuction` pointer and an `unsocialisedLoss` counter,
+    // both added so `LenderPool`'s round-10 exit gate could read them: the gate asked its manager
+    // which auction was authoritative and whether a loss had already been recognised. The gate was
+    // deleted when impairment pricing replaced it - the pool is pushed its reserves and makes no
+    // call into its manager at all now - so nothing read either field any more, and a mock surface
+    // that answers a question nobody asks is the next reader's false lead.
+
     /// @notice Records that the vault settled a position before changing its bonds.
     ///         The real accumulator lives in CreditManager; the vault only has to call
     ///         this at the right moment, which is what these suites check.

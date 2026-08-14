@@ -31,8 +31,31 @@ contract LiquidationForkTest is Test {
     uint256 internal constant NAV = 25.15e8; // USD 8dp, 2026-07-24 snapshot
     uint256 internal constant BONDS = 100;
     uint256 internal constant FLOAT = 50_000e6;
-    /// @dev 100 bonds at $25.15 is $2,515 of collateral; 35% of that is the ceiling.
-    uint256 internal constant MAX_BORROW = 880.25e6;
+    /// @dev Borrowing power at the ceiling, derived rather than written down.
+    ///
+    ///      **This was the literal `880.25e6`, 35% of $2,515, and it stayed 35% after the ceiling
+    ///      moved to 25% on 2026-08-07.** That change derived the same figure across 67 unit tests
+    ///      and missed the fork suite, so these tests had been reverting `ExceedsMaxLtv(3500)`
+    ///      since - unnoticed, because fork tests skip unless `RUN_FORK_TESTS=true` and CI does not
+    ///      set it. The ratchet moves `MAX_LTV_BPS` at least twice more, so this must not be a
+    ///      number.
+    uint256 internal constant MAX_BORROW =
+        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+
+    /// @dev The NAV at which a position borrowed at the ceiling sits exactly on the liquidation
+    ///      threshold. Derived because it depends on two parameters that both move.
+    uint256 internal constant NAV_AT_THRESHOLD = (MAX_BORROW * Config.USDC_TO_NAV_SCALE * Config.BPS)
+        / (BONDS * Config.LIQUIDATION_THRESHOLD_BPS);
+
+    /// @dev Comfortably past the threshold, and deliberately still worth more than the loan so a
+    ///      mid-auction fill leaves a real surplus to split.
+    ///
+    ///      **This was the literal `15e8`**, chosen when the ceiling was 3500 and the threshold
+    ///      5800, where it put the position at 5,868 bps. Against 2500/5000 the same $15.00 leaves
+    ///      it at 4,191 bps - healthy - so `liquidate` reverted `PositionHealthy` and three fork
+    ///      tests failed at the fixture rather than in the code under test. Second literal in this
+    ///      file pinned to a parameter that has already moved once and will move again.
+    uint256 internal constant CRASHED_NAV = (NAV_AT_THRESHOLD * 9) / 10;
 
     IDexFiBond internal bond = IDexFiBond(Config.DEXFI_BOND_NFT);
     IDexFiFarm internal farm = IDexFiFarm(Config.DEXFI_FARM);
@@ -108,10 +131,13 @@ contract LiquidationForkTest is Test {
     }
 
     /// @dev Drop the price far enough to put a max-LTV position past the liquidation
-    ///      threshold. One post is capped at roughly a tenth per day, and LTV has to
-    ///      travel from 3,500 bps to past 5,800, so this has to go through the second
-    ///      key - the same path `test_largeNavMoveNeedsTheSecondKey` pins in the Phase-2
-    ///      fork suite, used here in anger.
+    ///      threshold. One post is capped at roughly a tenth per day and LTV has to travel from
+    ///      `MAX_LTV_BPS` to past `LIQUIDATION_THRESHOLD_BPS`, so this has to go through the second
+    ///      key - the same path `test_largeNavMoveNeedsTheSecondKey` pins in the Phase-2 fork
+    ///      suite, used here in anger.
+    ///
+    ///      This comment named 3,500 and 5,800 until the fork suite was repaired; both figures had
+    ///      been wrong since 2026-08-07. Naming the constants instead is the point.
     function _crashNavTo(uint256 nav) internal {
         vm.prank(keeper);
         oracle.postNav(nav);
@@ -137,7 +163,7 @@ contract LiquidationForkTest is Test {
 
         // $15.00 a bond: past the threshold at 5,868 bps, but still worth more than the
         // loan, so a mid-auction fill leaves a real surplus to split.
-        _crashNavTo(15e8);
+        _crashNavTo(CRASHED_NAV);
 
         vm.prank(keeper);
         credit.liquidate(alice);
@@ -154,8 +180,13 @@ contract LiquidationForkTest is Test {
         vm.warp(block.timestamp + elapsed);
         assertEq(auction.currentPremiumBps(id), 8_200);
 
+        // Recomputed from the crash NAV rather than written down, and rounded up the way the
+        // auction rounds. `1_230e6` was 82% of $1,500 and true only while the crash was $15.00.
+        uint256 numerator = BONDS * CRASHED_NAV * 8_200;
+        uint256 denominator = Config.BPS * Config.USDC_TO_NAV_SCALE;
+        uint256 expectedPrice = (numerator + denominator - 1) / denominator;
         uint256 price = auction.currentPrice(id);
-        assertEq(price, 1_230e6, "100 bonds at $15.00, 82% of NAV");
+        assertEq(price, expectedPrice, "the whole lot at 82% of the crashed NAV");
 
         uint256 stakedBefore = adapter.stakedBalance();
         deal(Config.USDC_BASE, winner, price);
@@ -200,7 +231,7 @@ contract LiquidationForkTest is Test {
     function test_expiryToWorkoutOnLiveState() public {
         vm.skip(!run);
         _openPosition();
-        _crashNavTo(15e8);
+        _crashNavTo(CRASHED_NAV);
 
         vm.prank(keeper);
         credit.liquidate(alice);
@@ -246,7 +277,7 @@ contract LiquidationForkTest is Test {
     function test_liquidationSurvivesAStaleFeedThatStopsBorrowing() public {
         vm.skip(!run);
         _openPosition();
-        _crashNavTo(15e8);
+        _crashNavTo(CRASHED_NAV);
 
         vm.warp(block.timestamp + Config.NAV_STALENESS + 1);
         assertTrue(oracle.isStale());
