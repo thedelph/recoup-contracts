@@ -78,6 +78,14 @@ interface ICreditManager {
     /// @notice Retry placing losses the lender pool could not accept. Permissionless.
     function flushSocialisedLoss() external;
 
+    /// @notice Re-state the reserve the lender pool holds against a borrower, from auction and
+    ///         vault state. Permissionless.
+    /// @dev The auction calls this on every terminal transition, inside a `try`/`catch` - its exits
+    ///      must survive a pool that reverts everything. Anyone may call it because that `catch`
+    ///      means a release can be dropped, and a dropped release depresses the exit price for
+    ///      every lender until somebody calls this.
+    function refreshImpairment(address borrower) external;
+
     /// @return Losses recognised on the books but not yet accepted by the lender pool.
     function unsocialisedLoss() external view returns (uint256);
 

@@ -64,6 +64,7 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     error AuctionStillRunning(uint256 finishesAt);
     error WorkoutStillRunning(uint256 forceableAt);
     error WorkoutNotOpen(uint256 auctionId);
+    error WorkoutAlreadyOpen(address borrower);
     error WorkoutNotClosed(uint256 auctionId);
     error AuctionLapsed(uint256 auctionId);
     error NothingToDispose(uint256 auctionId);
@@ -86,6 +87,13 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     event WorkoutLotDisposed(uint256 indexed auctionId, address indexed to, uint256 bondCount);
     /// @param supersededBy The fresh auction opened over the same position.
     event AuctionSuperseded(uint256 indexed auctionId, address indexed borrower, uint256 supersededBy);
+    /// @notice The manager refused the impairment refresh this transition sent it, so the lender
+    ///         pool is still carrying whatever reserve it had.
+    /// @dev The whole reason the notification is best-effort is that these exits must not be
+    ///      blockable. That trade leaves a stale mark behind, and a stale mark that nobody can see
+    ///      is a permanently wrong exit price - so it is emitted. Anyone can put it right with the
+    ///      permissionless `CreditManager.refreshImpairment`.
+    event ImpairmentRefreshFailed(uint256 indexed auctionId, address indexed borrower);
 
     struct Auction {
         address borrower;
@@ -143,8 +151,51 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      `bid` would happily operate on.
     uint256 public nextAuctionId;
     mapping(uint256 => Auction) public auctions;
-    /// @notice The live auction for a borrower, or 0. One at a time.
-    mapping(address => uint256) public auctionOf;
+    /// @inheritdoc ILiquidationAuction
+    /// @dev Also read by `CreditManager._impairmentFor`, which is why it is on the interface now:
+    ///      the impairment a live liquidation carries is sized from this auction's floor, and the
+    ///      manager only ever holds the borrower.
+    mapping(address => uint256) public override auctionOf;
+
+    /// @inheritdoc ILiquidationAuction
+    /// @dev **Non-zero only inside a `_bid` frame, and audit round 15 is why it exists.**
+    ///
+    ///      `_bid` holds `auctionOf` set across the winner's ERC-1155 callback on purpose, so the
+    ///      mark cannot be *released* early. What nothing stopped was the callback *spending* that
+    ///      standing mark on somebody else: `LenderPool.serviceQueue` is permissionless, its
+    ///      `nonReentrant` is a different contract's guard, and the attacker supplies the very fill
+    ///      that releases the mark three statements later. Riskless, atomic, and it fires on
+    ///      auctions where the realised loss ends at zero, so a queued lender was crystallised at a
+    ///      discount for a default that never happened.
+    ///
+    ///      The winner's payment is already inside this contract one statement before `seize` hands
+    ///      them control, so the recovery is a **fact** by then rather than a forecast. Recording it
+    ///      here is audit round 13's own rule - recognise a recovery when it is realised, never when
+    ///      it is predicted - applied one statement earlier than it used to be.
+    ///
+    ///      **Not a settlement flag and not a counterparty's balance.** Trail of Bits' Maple v2
+    ///      finding was a griefer blocking settlement by funding an address the protocol read, so
+    ///      this is measured as a delta across this contract's own pull. A donation before or after
+    ///      cancels out, and this contract also holds `totalUnclaimedRewards`, so the level is not
+    ///      the loan's cash and could never be used as one.
+    ///
+    ///      **Safe to leave public and safe to read from the callback**, because the callback can
+    ///      only re-derive the same reduced figure. Only `_bid` writes it, and only `_bid` clears
+    ///      it.
+    ///
+    ///      **The clear must stay above the first statement that applies this fill to `debtOf`,
+    ///      and that is the rule rather than "before the trailing refresh".** This slot and
+    ///      `currentDebtOf` are the two terms of one subtraction in `CreditManager._impairmentFor`,
+    ///      and they must never describe the same dollars. Audit round 16: the clear used to sit
+    ///      below `_settleFill`, which reaches `CreditManager._repay`, which re-derives the mark on
+    ///      its way out with the debt already reduced. Eleven of twelve agents found it and two
+    ///      executed it. The comment that would have caught it had been written, and it enumerated
+    ///      the one call site where the hazard is harmless.
+    ///
+    ///      **One recognition per auction, because there are no partial fills.** `bid` takes no
+    ///      amount. If a partial-fill overload is ever added this must become additive, and the
+    ///      clear must move with it under the rule above rather than to wherever it currently is.
+    mapping(address => uint256) public override recognisedRecoveryOf;
 
     /// @notice Liquidation caller rewards awaiting collection.
     mapping(address => uint256) public rewardOf;
@@ -226,6 +277,23 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         if (msg.sender != creditManager) revert NotCreditManager();
         if (borrower == address(0) || caller == address(0)) revert ZeroAddress();
 
+        // **No second liquidation over a borrower who already has a workout open.** Audit round 13,
+        // and the harm is that a workout's recovery ends up in the defaulter's pocket.
+        //
+        // A workout records `debtAtExpiry` and settles against *live* debt, on the assumption that
+        // nothing else zeroes live debt while it is open. A second auction does exactly that: the
+        // borrower re-collateralises with `depositBonds`, calls the permissionless `liquidate`, lets
+        // the lot fill at the floor, and `writeDownLoss` clears the remaining live debt to insurance
+        // and lenders without touching `w.debtAtExpiry` or `w.recovered`. DexFi's manual redemption
+        // then arrives at `workoutSettle`, which compares it against a live debt of zero, reads the
+        // whole payment as surplus, and credits it to `claimableOf[borrower]`. Traced: lenders and
+        // insurance absorb the full defaulted debt while the borrower collects the recovery.
+        //
+        // `CreditManager.borrow` has carried this exact guard, against this exact borrower state,
+        // since round 8. It was never applied to the other thing a borrower can do while a workout
+        // is open. Same rule, same reason, one contract over.
+        if (workoutsOpenFor[borrower] != 0) revert WorkoutAlreadyOpen(borrower);
+
         // A lapsed auction is superseded rather than blocking, and that is a security
         // property, not a convenience. `startNav` is frozen for the life of an auction,
         // and `cancel` - the only thing that clears a healed one - is permissionless,
@@ -243,6 +311,12 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             auctions[live].settled = true;
             liveAuctionCount--;
             emit AuctionSuperseded(live, borrower, nextAuctionId + 1);
+            // The lapsed auction can no longer recover anything, so the mark it was sized from is
+            // now wrong in the dangerous direction. Restating it here rather than leaving it to
+            // the caller escalates to the full debt for the rest of this call; `liquidate`
+            // re-derives it against the fresh auction the moment this function returns, and the
+            // interim is the conservative figure rather than the stale one.
+            _refreshImpairment(live, borrower);
         }
 
         uint256 bonds = _vault.bondCount(borrower);
@@ -379,13 +453,143 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         uint256 penaltyDue =
             (ICreditManager(cm).currentDebtOf(borrower) * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
 
+        // `settled` clears here, before any external call: it is this contract's own re-entrancy
+        // defence, `_live` reads it, and it must not be reachable from the callback.
+        //
+        // **`auctionOf` no longer clears alongside it, and this is the third contract to learn the
+        // same lesson.** Round 11 moved `liveAuctionCount--` below `_settleFill` because the lender
+        // pool's exit gate had started reading that counter as a solvency signal from inside the
+        // winner's ERC-1155 hook. `auctionOf` has now become exactly that kind of signal too:
+        // `CreditManager._impairmentFor` reads it to decide whether a borrower is still under
+        // liquidation, and `refreshImpairment` is permissionless. Cleared here, a winning bidder
+        // who was also a lender could call it from their own `onERC1155Received`, see no live
+        // auction, have the mark released, and leave at the pre-loss price - the loss certain,
+        // recorded nowhere yet.
+        //
+        // Cleared after settlement instead, so the callback window reads a pointer that is still
+        // set and nothing can observe this liquidation as resolved from inside it.
+        //
+        // **The round-12 note this replaces claimed that over-marking for one call frame "is the
+        // safe direction".** It is not, in general: an over-mark is only safe while every exit is
+        // self-initiated, and `serviceQueue` pays exits their owner did not initiate, which turns
+        // an over-mark into someone else's cash inside the same frame.
+        //
+        // **The sentence that used to end that paragraph was false, and audit round 15 executed
+        // the consequence three times.** It said the over-marking "is the thing the impairment
+        // redesign removed". The redesign did the opposite: audit round 13 replaced a mark that was
+        // zero across the whole ordinary 50-68% LTV band with one that is always the full debt, so
+        // the over-mark inside this frame went from rare and small to routine and maximal. The
+        // comment named the hole and then dismissed it with a claim the code refutes.
+        //
+        // What closes it is the recognition below, not this ordering. The two are complements: the
+        // pointer stays set so nothing reads "resolved", and the recovery is netted off so nothing
+        // can be paid out of a shortfall this transaction has already covered.
+        //
+        // The gate masked the release half when it was found, which is the only reason that one is
+        // a test (`test_impairment_cannotBeReleasedFromInsideTheSeizeCallback`) rather than an
+        // incident. The spending half had no such luck and became a finding.
         a.settled = true;
+
+        // **Recognise the recovery before the winner is handed control, not after.** Audit round 15
+        // executed the gap three times: holding `auctionOf` set across the callback stops the mark
+        // being released early, and stops nothing from being *spent* at it. The callback can call
+        // the permissionless `LenderPool.serviceQueue` and settle a queued lender against a
+        // shortfall that this very transaction is about to cover, on an auction whose realised loss
+        // ends at zero. See `recognisedRecoveryOf`.
+        //
+        // Measured as a delta across our own pull rather than trusting `price`, the same way
+        // `_repay` measures what actually moved and for the same reason. Clamped at the write as
+        // well as at the read, mirroring `LenderPool.impair`: a figure above the fill or above the
+        // global cap describes no reachable state, and a clamp at only one end is one refactor away
+        // from being no clamp at all.
+        //
+        // **The debt is deliberately not repaid here.** Repaying first cures the position and
+        // `_vault.seize` refuses a position that is no longer liquidatable, which is set out where
+        // the ordering above is chosen. So this nets the mark rather than moving the debt, and the
+        // debt itself is still written down in `_settleFill` exactly as before.
+        //
+        // **Across the winner's callback the mark is neither an over-mark nor an under-mark: it is
+        // the exact shortfall this fill will leave**, because it is re-derived from the live debt
+        // at every write and this slot holds only what has been paid in and not yet applied. A
+        // callback `repayFor` lowers the debt and the mark follows it dollar for dollar; `borrow`
+        // is refused while this pointer stands, so it cannot move the other way.
+        //
+        // **The claim here used to be "the mark stays an over-mark and never becomes an
+        // under-mark", and audit round 16 refuted it by execution.** The proof it gave quantified
+        // over `_bid`'s own frame and the statement that broke it was three calls deeper, in
+        // another contract, added by a different round. The clear below is what makes the claim
+        // true rather than intended; a claim of safety that only holds inside the frame you were
+        // looking at is a claim about your attention, not about the code.
+        uint256 heldBefore = usdc.balanceOf(address(this));
+        usdc.safeTransferFrom(msg.sender, address(this), price);
+        uint256 credited = usdc.balanceOf(address(this)) - heldBefore;
+        if (credited > price) credited = price;
+        if (credited > Config.GLOBAL_BORROW_CAP) credited = Config.GLOBAL_BORROW_CAP;
+        recognisedRecoveryOf[borrower] = credited;
+        _refreshImpairment(auctionId, borrower);
+
+        _vault.seize(borrower, msg.sender);
+
+        // **Cleared here: after the winner's callback, and before the first statement that applies
+        // this fill to `debtOf`.** This slot means "paid in and *not yet* on the books as a debt
+        // reduction", so its life has to end where the debt reduction begins.
+        //
+        // Audit round 16, eleven of twelve agents, executed twice. It used to sit below
+        // `_settleFill`, which reaches `CreditManager._repay` - and that has re-derived the mark on
+        // its way out since audit round 13. At that statement the debt had already fallen by the
+        // fill and this slot still recorded the same fill as unspent, so the same dollars were
+        // netted twice: `max(debtNow - repaid - price, 0)` stored against a true residual of
+        // `debtNow - repaid`. At or above a half-debt fill it saturated to zero, emitted
+        // `ImpairmentReleased`, and left `exitAssets() == totalAssets()` with a certain loss
+        // unbooked - which is exactly the state audit round 15 existed to remove.
+        //
+        // The comment this replaces reasoned about the same hazard for the trailing refresh below,
+        // where it genuinely is harmless because `auctionOf` is deleted by then and
+        // `_impairmentFor` answers zero regardless. **The enumeration found the one call site where
+        // the hazard does not matter and stopped there.**
+        //
+        // Nothing is lost by clearing this early. What the netting had to cover was the winner's
+        // callback, and that closed when `seize` returned. From here to the write-down the mark is
+        // re-derived from the live debt at every write, so it reads `debtNow - repaid` - the exact
+        // residual - rather than an over-mark somebody could be paid at.
+        delete recognisedRecoveryOf[borrower];
+
+        _settleFill(auctionId, borrower, cm, price, penaltyDue);
+
+        // **`liveAuctionCount` is decremented last, and audit round 11 is why.** It used to sit
+        // beside `a.settled` above, which is correct effects-before-interactions for a counter
+        // nobody outside this contract reads. That stopped being true when the lender pool's exit
+        // gate started reading it as a solvency signal: `seize` hands bonds to the winner via
+        // ERC-1155, which calls `onERC1155Received` on a contract winner, and `_settleFill` books
+        // the shortfall only afterwards. So a winning bidder who was also a lender saw
+        // `liveAuctionCount == 0` from inside their own callback - the loss certain, recorded
+        // nowhere yet - and could redeem out of the pool at the pre-loss price.
+        //
+        // **That gate has since been deleted and this ordering still stands, for a sharper reason
+        // than the one that produced it.** Nothing outside this contract reads this counter for
+        // pricing any more, but the `delete auctionOf[borrower]` on the next line is read for
+        // exactly that, by `_impairmentFor` through the permissionless `refreshImpairment`. The two
+        // statements are one block now: everything that could tell an observer "this liquidation is
+        // over" stays true until the winner's callback has had its turn and the shortfall is
+        // booked, so a winning bidder cannot observe a released mark from inside their own hook.
+        // Keeping the pair together is what stops the next edit separating them.
+        //
+        // Moving it here is safe for the original concern: re-entering `bid` is refused by
+        // `nonReentrant` and by `a.settled`, neither of which depends on this counter.
+        // `closeWorkout` already orders the same pair this way round, booking the loss before
+        // clearing its own live-work state; the two settlement paths now agree.
         liveAuctionCount--;
+
+        // Strictly before the refresh below, and strictly after the callback above. The refresh
+        // has to see no live auction or it would re-derive a mark against this settled one; the
+        // callback has to see one, for the reason set out where `settled` is written.
         delete auctionOf[borrower];
 
-        usdc.safeTransferFrom(msg.sender, address(this), price);
-        _vault.seize(borrower, msg.sender);
-        _settleFill(auctionId, borrower, cm, price, penaltyDue);
+        // A fill short of the debt has already released the mark through `writeDownLoss`, but a
+        // fill that covers it has not: `_creditProceeds` returns early when there is no penalty
+        // and no surplus to hand over, which is exactly a fill *at* the debt, so the manager can
+        // come out of a clean settlement never having been told anything at all.
+        _refreshImpairment(auctionId, borrower);
     }
 
     /// @dev Split out of `_bid` because the two together do not fit in the EVM's stack.
@@ -449,6 +653,52 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         emit LiquidationPenaltyTaken(auctionId, auctions[auctionId].caller, callerReward, penalty - callerReward);
     }
 
+    /// @dev Tell `CreditManager` to re-derive the reserve the lender pool holds against this
+    ///      position, because what this auction can still recover has just changed.
+    ///
+    ///      **The `try`/`catch` is the exit-of-last-resort property, not defensive habit.**
+    ///      `expireToWorkout` promises in writing that it survives "a `LenderPool` that reverts
+    ///      everything", and `cancel` reads `currentDebtOf` rather than calling `settle` because
+    ///      "the exits must never depend on wiring". A bare call here would put a fourth contract's
+    ///      revert in front of all three exits and make permanently stranded collateral reachable
+    ///      again - which is strictly worse than the stale mark this notification exists to prevent.
+    ///      The failure is emitted rather than swallowed, and `refreshImpairment` is permissionless,
+    ///      so a stuck reserve is both visible and fixable by anybody.
+    ///
+    ///      **The call sites were derived from the storage the exits write, not from the
+    ///      interface.** Audit round 11 found the previous exit gate blind to the withdrawal queue
+    ///      precisely because its coverage had been enumerated from `IERC4626` rather than from the
+    ///      contract. Re-run this and expect hits in five functions - `start`'s supersede branch,
+    ///      `_bid`, `cancel`, `expireToWorkout` and `closeWorkout`:
+    ///
+    ///          grep -nE "settled = true|liveAuctionCount--|delete auctionOf|status = WorkoutStatus|workoutsOpenFor\[[^]]+\](\+\+|--)" src/LiquidationAuction.sol
+    ///
+    ///      **Two of the seven call sites are invisible to that grep, and both for the same
+    ///      reason: they are not transitions, they only change the exposure.**
+    ///
+    ///      `workoutSettle` is one. Left out, the mark would stay at the full debt while DexFi had
+    ///      already paid part of it back, over-marking every lender who left afterwards for money
+    ///      that is already sitting in the protocol.
+    ///
+    ///      `_bid`'s **pre-seize** recognition is the other, added with the round-15 fix. It fires
+    ///      before any liveness register moves, which is the exact opposite of the rule below and
+    ///      is the point of it: the winner's cash is in this contract by then, so the recovery is a
+    ///      fact, and it has to be netted off before the winner's ERC-1155 callback can spend the
+    ///      un-netted figure through the permissionless `LenderPool.serviceQueue`. Enumerating from
+    ///      the liveness registers alone would miss it, which is why this paragraph exists rather
+    ///      than a longer grep.
+    ///
+    ///      Every *other* call site sits **after** the liveness registers are written, so the
+    ///      refresh reads the state the transition left rather than the one it is leaving.
+    function _refreshImpairment(uint256 auctionId, address borrower) private {
+        address cm = creditManager;
+        if (cm == address(0)) return;
+        try ICreditManager(cm).refreshImpairment(borrower) {}
+        catch {
+            emit ImpairmentRefreshFailed(auctionId, borrower);
+        }
+    }
+
     function _accrueReward(uint256 auctionId, uint256 amount) private {
         if (amount == 0) return;
         address caller = auctions[auctionId].caller;
@@ -509,15 +759,35 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         liveAuctionCount--;
         delete auctionOf[borrower];
         emit AuctionCancelled(auctionId, borrower);
+
+        // The position healed, so there is no expected shortfall left to reserve. Nothing else in
+        // this contract ever told the manager a cancelled auction had happened - `cancel` only
+        // ever read from it - and a reserve nobody releases sits on every lender's exit price for
+        // good.
+        _refreshImpairment(auctionId, borrower);
     }
 
     // ── Workout (PRD §4.5, the expiry path) ──────────────────────────────────
 
     /// @inheritdoc ILiquidationAuction
-    /// @dev **Permissionless, and it touches no external protocol.** No adapter call,
-    ///      no bond transfer, no USDC transfer, no lender pool. That is the whole point:
-    ///      this is the exit of last resort, and an exit that can fail while holding a
-    ///      third party's collateral is not an exit.
+    /// @dev **Permissionless, and nothing it does can be refused.** No adapter call, no
+    ///      bond transfer, no USDC transfer. That is the whole point: this is the exit of
+    ///      last resort, and an exit that can fail while holding a third party's
+    ///      collateral is not an exit.
+    ///
+    ///      It reaches the lender pool twice, and both are wrapped in `try`/`catch` for precisely
+    ///      this paragraph's sake. The obvious one is the impairment refresh at the end, which
+    ///      re-sizes the reserve to a workout's whole debt; see `_refreshImpairment`. The other is
+    ///      indirect and is the reason this sentence keeps needing rewriting: `_vault.reassign`
+    ///      settles the position, which reaches `CreditManager._accrue`, whose zero-bond branch
+    ///      moves a slice to insurance and pushes the loss reserves.
+    ///
+    ///      This docstring has now been wrong twice in the same way - it said "no lender pool"
+    ///      flatly, then "exactly one outbound call", and audit round 13 caught the second version
+    ///      the round after the first. **A count of outbound calls is the wrong thing to promise**,
+    ///      because it is a claim about the whole call tree written from one function's body. What
+    ///      this exit actually needs is that no reachable call can revert it, which is a property
+    ///      of the `try`/`catch` wrappers rather than of how many there are.
     ///
     ///      It is not literally unconditional, and an earlier version of this comment
     ///      wrongly claimed it was: `reassign` carries the vault's own liquidatable
@@ -552,9 +822,35 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
 
         a.settled = true;
         liveAuctionCount--;
-        delete auctionOf[borrower];
-
+        // `auctionOf` is deliberately NOT cleared here. It is cleared below, after
+        // `workoutsOpenFor` is incremented, so that the two liveness registers overlap rather
+        // than leaving a gap between them.
+        //
+        // **Audit round 17.** `_vault.reassign` settles the position, which reaches
+        // `CreditManager._settle`, which since audit round 16 refreshes the impairment whenever
+        // the settle moved the debt. Clearing here put that refresh in a window where the
+        // borrower had neither an auction nor a workout, so `_impairmentFor` answered zero and
+        // released the whole mark mid-call - the exact hazard the comment beside the trailing
+        // refresh already warned about, arriving from a statement three calls deeper in another
+        // contract that a different round added.
+        //
+        // With the clear moved down, that nested refresh reads the auction branch and re-derives
+        // the same figure the trailing refresh is about to set: the auction has lapsed with no
+        // fill, so `recognisedRecoveryOf` is zero and the branch answers the whole debt, which is
+        // what an open workout is sized at. The mark is flat across the transition instead of
+        // dipping through zero, and a notification swallowed by a reverting pool now leaves a
+        // stale-high mark rather than no mark at all - the direction this file's exits are
+        // written to fail in.
         uint256 lot = _vault.reassign(borrower, address(this));
+        // **Audit round 12, and `start` has carried the identical guard all along.** `reassign`
+        // returns 0 rather than reverting on an empty position, and that early return also skips
+        // its own liquidatable check - so a position emptied out from under a live auction (anyone
+        // may `repayFor` to clear the debt, and `withdrawBonds` skips its LTV branch at zero debt)
+        // could be pushed through this exit instead of `cancel`, opening a workout over nothing.
+        // The cost is not cosmetic: `workoutsOpenFor` blocks that borrower from borrowing again,
+        // and `openWorkoutCount` blocks four separate wiring setters, until somebody else pays gas
+        // to close it. Executed PoC.
+        if (lot == 0) revert NothingToAuction(borrower);
         uint256 debt = ICreditManager(cm).currentDebtOf(borrower);
 
         workouts[auctionId] = Workout({
@@ -569,9 +865,21 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         _openWorkouts.push(auctionId);
         workoutsOpenFor[borrower]++;
         _workoutIndex[auctionId] = _openWorkouts.length;
+        // Only now, with the workout registered, is it safe to stop answering as a live auction.
+        // See the note above `reassign`: between these two statements the borrower is covered by
+        // both registers, which is the overlap that keeps `_impairmentFor` from ever reading them
+        // as an unmarked position.
+        delete auctionOf[borrower];
 
         emit AuctionExpiredToWorkout(auctionId);
         emit WorkoutOpened(auctionId, borrower, lot, debt);
+
+        // Escalation, not release. After the liveness registers above, `workoutsOpenFor` is the
+        // state the manager reads, and it sizes an open workout at the whole debt: the recovery is
+        // a manual redemption DexFi has not paid yet, so the auction's floor has stopped bounding
+        // anything. Placed after the workout is registered, or the refresh would read a borrower
+        // with neither an auction nor a workout and release the mark entirely.
+        _refreshImpairment(auctionId, borrower);
     }
 
     /// @notice Pay recovered USDC into an open workout. Permissionless.
@@ -606,6 +914,12 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // shrink the total penalty and cannot double-charge it either.
         (, uint256 charged) = _distribute(auctionId, w.borrower, cm, received, w.penaltyRemaining, false);
         w.penaltyRemaining -= charged;
+
+        // Not a terminal transition, and that is why it is easy to miss. The tranche just paid down
+        // real debt, so the workout's exposure has genuinely shrunk; without this the mark would
+        // stay at the debt as it stood at expiry and over-mark every lender who leaves afterwards,
+        // for money DexFi has already handed over.
+        _refreshImpairment(auctionId, w.borrower);
     }
 
     /// @notice Close a workout: cleanly once the debt is gone, or by force once it has
@@ -640,6 +954,13 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         workoutsOpenFor[w.borrower]--;
         _removeOpenWorkout(auctionId);
         emit WorkoutClosed(auctionId, w.recovered, residual);
+
+        // Both branches reach here and both need it. The forced branch has already released the
+        // mark through `writeDownLoss`, but a workout that closes cleanly - the debt repaid in
+        // full - writes nothing down and so would otherwise leave the reserve standing over a
+        // position that came good. After the decrement, so the refresh sees a borrower with no
+        // open workout.
+        _refreshImpairment(auctionId, w.borrower);
     }
 
     /// @notice Move yield earned by workout positions into the insurance fund.
@@ -753,6 +1074,17 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         if (block.timestamp > a.startedAt + Config.AUCTION_DURATION) revert AuctionLapsed(auctionId);
         return _lotPrice(_vault.bondCount(a.borrower), a.startNav, _premiumBps(a.startedAt));
     }
+
+    // `floorProceeds` used to live here: what the lot would fetch at the auction floor, which
+    // `CreditManager._impairmentFor` credited as assumed recovery when sizing the lender pool's
+    // reserve. It was deleted in the round-13 fix rather than left as a public view.
+    //
+    // Two reasons, and the second is the one that matters. It had no caller left - the impairment
+    // now reserves the whole debt and recognises recovery only when a bid actually pays it in, so
+    // nothing in `src/` asked this question any more. And a view that answers "what will this
+    // probably recover" is exactly the shape of the mistake round 12 took apart: it invites the
+    // next caller to price something off a forecast that moves on the clock. `currentPrice` is
+    // what a bidder needs and it reverts once lapsed, which is the honest behaviour for a quote.
 
     /// @notice The decay curve on its own, in bps of NAV.
     /// @dev Refuses once lapsed for the same reason `currentPrice` does, and round 7

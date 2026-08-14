@@ -21,7 +21,7 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///         the real-ABI mocks: deposit → stake → claim → unstake → withdraw → seize,
 ///         the whitelist gate, and the withdrawal LTV rule.
 contract CollateralVaultTest is Test {
-    uint256 internal constant NAV = 25.15e8; // USD 8dp — 2026-07-24 real snapshot
+    uint256 internal constant NAV = 25.15e8; // USD 8dp - 2026-07-24 real snapshot
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");

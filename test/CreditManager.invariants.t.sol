@@ -2,12 +2,15 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 
 import {Config} from "../src/Config.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
 import {TreasuryLiquiditySource} from "../src/TreasuryLiquiditySource.sol";
+import {LenderPool} from "../src/LenderPool.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {ICollateralVault} from "../src/interfaces/ICollateralVault.sol";
 import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
@@ -200,6 +203,7 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
     DirectCallAdapter internal adapter;
     CreditManager internal credit;
     TreasuryLiquiditySource internal liquidity;
+    LenderPool internal pool;
     CreditHandler internal handler;
 
     address[3] internal actors;
@@ -225,6 +229,7 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         );
         credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
         liquidity = new TreasuryLiquiditySource(usdc, admin);
+        pool = new LenderPool(IERC20(address(usdc)), admin);
 
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
@@ -248,6 +253,23 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         credit.setLiquiditySource(address(liquidity));
         credit.setEpochHarvester(harvester);
         liquidity.setCreditManager(address(credit));
+        // **A real pool as the loss sink, and audit round 16 is why.** This suite never called
+        // `setLenderPool`, so `_setImpairment` returned on its first line and every notification
+        // this manager sends was a no-op the fuzzer could not tell from a working one. That matters
+        // here specifically because `_repay` and `_settle` both end in that call: the refresh audit
+        // round 13 put on the first, and the one audit round 16 added to the second, were
+        // unreachable in the suite that fuzzes them.
+        //
+        // **Sink only, not also the liquidity source, and that is deliberate.** The treasury still
+        // funds the book here, which is the state `DeployBase` actually ships, so
+        // `outstandingPrincipal` stays zero and every reserve in the pool clamps to it. The
+        // notifications land; the prices do not move. Marking the pool as a real funder as well
+        // would make this a second copy of the auction suite's fixture rather than coverage of
+        // this manager's own paths - and `LiquidationAuction.invariants.t.sol` is where the priced
+        // lifecycle now lives.
+        credit.setLenderPool(address(pool));
+        pool.setCreditManager(address(credit));
+        pool.setEpochHarvester(harvester);
         vm.stopPrank();
 
         bond.setWhitelisted(address(farm), true);
@@ -358,6 +380,15 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
     ///      `MockLiquidationAuction` here is a bare stub wired only to satisfy the
     ///      vault's pointer check, so a liquidation is not reachable in this fixture at
     ///      all. `LiquidationAuction.invariants.t.sol` is where that lives.
+    ///
+    ///      **A real `LenderPool` is wired as the loss sink since audit round 16**, so the
+    ///      `_setImpairment` call at the tail of `_repay` and `_settle` reaches a contract rather
+    ///      than returning on its first line. It cannot be asserted non-zero here for the same
+    ///      reason a liquidation cannot: with a stub auction `_impairmentFor` answers zero for
+    ///      everyone, so what this buys is that the notification path executes, not that a mark
+    ///      lands. The priced lifecycle is asserted in the auction suite, which is the one that can
+    ///      reach it. Said out loud so a later reader does not add a non-zero assertion here and
+    ///      find it unsatisfiable.
     ///
     ///      Each actor starts with 5,000 bonds staked at 25.15e8, so $125,750 of
     ///      collateral, and `borrow` is bounded to $5,000 a call.

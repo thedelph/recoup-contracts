@@ -365,6 +365,40 @@ contract LiquidationAuctionTest is Test {
         assertFalse(auction.isLiquidating(alice));
     }
 
+    /// @notice A workout cannot be opened over a position that has nothing left in it.
+    /// @dev **Audit round 12, executed PoC.** `CollateralVault.reassign` returns 0 rather than
+    ///      reverting on an empty position, and that early return also skips its own liquidatable
+    ///      check - so both halves of the guard `start` carries were missing here. Anyone could
+    ///      clear the debt with the permissionless `repayFor`, let the borrower take their bonds
+    ///      out (`withdrawBonds` skips its LTV branch entirely at zero debt, even under a live
+    ///      auction), and then push the position through this exit rather than `cancel`.
+    ///
+    ///      The damage is that `workoutsOpenFor` blocks that borrower from ever borrowing again and
+    ///      `openWorkoutCount` blocks four separate wiring setters, until some third party pays gas
+    ///      to close a workout over nothing. `cancel` is the correct exit and remains available,
+    ///      which is what the second half asserts: the fix refuses the wrong door without closing
+    ///      the right one.
+    function test_expireToWorkout_refusesAPositionWithNoCollateral() public {
+        uint256 id = _openAuction();
+
+        address friend = makeAddr("friend");
+        usdc.mint(friend, MAX_BORROW);
+        vm.startPrank(friend);
+        usdc.approve(address(credit), MAX_BORROW);
+        credit.repayFor(alice, MAX_BORROW);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        vault.withdrawBonds(BONDS);
+        assertEq(vault.bondCount(alice), 0, "the fixture must leave the position empty");
+
+        skip(Config.AUCTION_DURATION + 1);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NothingToAuction.selector, alice));
+        auction.expireToWorkout(id);
+
+        assertEq(auction.openWorkoutCount(), 0, "a workout was opened over nothing");
+    }
+
     function test_cancel_revertsWhileStillLiquidatable() public {
         uint256 id = _openAuction();
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.StillLiquidatable.selector, uint256(20_000)));
@@ -459,13 +493,27 @@ contract LiquidationAuctionTest is Test {
         assertLt(price, MAX_BORROW, "the whole point: the lot is worth less than the loan");
 
         _fundBidder(bidder, price);
+        uint256 shortfall = MAX_BORROW - price;
+
+        // The old assertion was `unsocialisedLoss == shortfall - 100e6`: the residual was banked
+        // as a claim to be placed on lenders later. Audit round 11 found that wrong here, because
+        // there are no lenders in this fixture - the treasury float funded this loan and no lender
+        // pool is wired at all. The residual was already borne by the treasury, which lent
+        // `MAX_BORROW` and will only ever see the 100 of insurance plus what the lot fetched, so
+        // recording it a second time as a placeable claim counted the same loss twice. The second
+        // copy was a bearer instrument: `flushSocialisedLoss` is permissionless, so it could be
+        // pointed at whoever held pool shares in a later era, and an executed PoC did exactly
+        // that. The amount is unchanged and still asserted to the wei; what changed is that it is
+        // reported as already borne rather than banked as owed.
+        vm.expectEmit(true, false, false, true, address(credit));
+        emit CreditManager.LossBorneByTheSource(address(liquidity), shortfall - 100e6);
+
         vm.prank(bidder);
         auction.bid(id);
 
-        uint256 shortfall = MAX_BORROW - price;
         assertEq(credit.debtOf(alice), 0, "the position is resolved either way");
         assertEq(credit.insuranceFund(), 0, "insurance absorbed what it could");
-        assertEq(credit.unsocialisedLoss(), shortfall - 100e6, "and the rest is remembered for lenders");
+        assertEq(credit.unsocialisedLoss(), 0, "and the rest is the funder's, not a claim on lenders");
         assertEq(credit.claimableOf(alice), 0, "no surplus, so nothing for the borrower");
         assertEq(auction.rewardOf(keeper), 0, "and no penalty to pay the caller from");
         assertEq(bond.bondBalance(bidder), BONDS);
@@ -808,6 +856,21 @@ contract LiquidationAuctionTest is Test {
     ///      under one condition would all pass forever while the combined state was a
     ///      permanent strand - which is exactly how round-4 finding #1 survived review.
     function test_aLiveAuctionAlwaysHasAnExitUnderEveryAdverseConditionAtOnce() public {
+        // Condition 4 has to be arranged first, before the loan exists, and that is a fact about
+        // the protocol rather than about the fixture. Since audit round 11 a pool is only offered
+        // a loss while it is also the liquidity source - a balance sheet that lent nothing cannot
+        // be charged for a default - and `setLiquiditySource` refuses to move while any principal
+        // is outstanding. So "the lender pool refuses every loss" is only an adverse condition at
+        // all if the pool is the one that funded the loan, and it can only become that before the
+        // borrow. Wiring it as a bare loss sink here, as this test used to, would leave the
+        // condition doing nothing and the test claiming six adversities while exercising five.
+        MockLenderPool pool = new MockLenderPool(usdc);
+        usdc.mint(address(pool), FLOAT);
+        vm.startPrank(admin);
+        credit.setLiquiditySource(address(pool));
+        credit.setLenderPool(address(pool));
+        vm.stopPrank();
+
         uint256 id = _openAuction();
 
         // 1. DexFi revokes the adapter's transfer whitelist entry.
@@ -816,10 +879,8 @@ contract LiquidationAuctionTest is Test {
         farm.setRevertOnWithdraw(true);
         // 3. The borrower is USDC-blacklisted, so nothing can be pushed to them.
         usdc.setBlocked(alice, true);
-        // 4. The lender pool refuses every loss.
-        MockLenderPool pool = new MockLenderPool();
-        vm.prank(admin);
-        credit.setLenderPool(address(pool));
+        // 4. The lender pool - which funded this loan - refuses every loss. Wired above.
+        assertFalse(pool.accepting());
         // 5. The insurance fund is empty.
         assertEq(credit.insuranceFund(), 0);
         // 6. The NAV feed has gone stale.
@@ -845,7 +906,20 @@ contract LiquidationAuctionTest is Test {
 
         // And the loss can still be recognised on schedule, with the pool still refusing.
         skip(Config.WORKOUT_MAX_DURATION);
+
+        // Condition 4 has to bite, not merely be configured, and the post-state cannot tell the
+        // difference: a pool that is never asked and a pool that is asked and refuses leave the
+        // counter reading the same number. Round 11 is why that matters here. The old wiring -
+        // a pool that sank losses without funding anything - is the exact state the round
+        // decided should never produce a deferral at all, so this condition had to be re-stated
+        // in terms of who funded the loan, and re-stating a condition is when one goes hollow.
+        //
+        // It is asserted from the outside because the mock cannot testify to it: `socialiseLoss`
+        // increments a counter and then reverts, and the revert rolls the increment back with
+        // everything else, so a refusal is invisible in the mock's own storage by construction.
+        vm.expectCall(address(pool), abi.encodeCall(MockLenderPool.socialiseLoss, (MAX_BORROW)));
         auction.closeWorkout(id);
+
         assertEq(credit.debtOf(alice), 0);
         assertEq(credit.unsocialisedLoss(), MAX_BORROW, "remembered, not lost");
         assertEq(auction.openWorkoutCount(), 0);
@@ -924,11 +998,21 @@ contract LiquidationAuctionTest is Test {
         auction.expireToWorkout(id);
         skip(Config.WORKOUT_MAX_DURATION);
 
+        // The old assertion was `unsocialisedLoss == MAX_BORROW - 300e6`, labelled "and the rest
+        // is lenders'". The residual is the point of this test and the figure is untouched, but
+        // whose it is was wrong: the treasury float funded this loan and no lender pool is wired,
+        // so round 11 stopped recording a loss the funder is already carrying as a claim on
+        // somebody else. The recognition still happens on schedule, permissionlessly, for the
+        // exact amount insurance could not reach - it is now reported against the source that
+        // bears it instead of being banked against a pool that lent nothing.
+        vm.expectEmit(true, false, false, true, address(credit));
+        emit CreditManager.LossBorneByTheSource(address(liquidity), MAX_BORROW - 300e6);
+
         auction.closeWorkout(id); // permissionless
 
         assertEq(credit.debtOf(alice), 0);
         assertEq(credit.insuranceFund(), 0, "insurance absorbed what it could");
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW - 300e6, "and the rest is lenders'");
+        assertEq(credit.unsocialisedLoss(), 0, "the residual is the funder's, not a claim to place");
         assertEq(auction.openWorkoutCount(), 0);
     }
 
@@ -1022,10 +1106,21 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.debtOf(alice), defaulted, "no fresh debt to forgive");
 
         skip(Config.WORKOUT_MAX_DURATION);
+
+        // The old assertion was `unsocialisedLoss == defaulted`, labelled "lenders eat the default
+        // and nothing more". The bound is what this test is about and it is asserted just as
+        // tightly - the write-off is exactly the debt that stood at expiry, not a wei of anything
+        // borrowed since. Round 11 corrected who eats it: the treasury float funded this loan and
+        // there is no lender pool here, so the loss is borne by the source rather than banked as a
+        // claim on lenders who funded none of it. Asserting the emitted amount keeps the "and
+        // nothing more" half honest, which is the half the round-5 regression was about.
+        vm.expectEmit(true, false, false, true, address(credit));
+        emit CreditManager.LossBorneByTheSource(address(liquidity), defaulted);
+
         auction.closeWorkout(id);
 
         assertEq(credit.debtOf(alice), 0);
-        assertEq(credit.unsocialisedLoss(), defaulted, "lenders eat the default and nothing more");
+        assertEq(credit.unsocialisedLoss(), 0, "and nothing banked against a pool that lent none of it");
 
         // And borrowing works again once the workout is resolved.
         vm.prank(alice);

@@ -96,7 +96,7 @@ contract DeployTestnet is DeployBase {
         Deployed memory d = _deployProtocol(e, p, msg.sender);
 
         // Mirrors the mainnet gate that DexFi controls. On mainnet this is the one
-        // integration ask and cannot be self-served (PRD §14 ask #5).
+        // integration ask and cannot be self-served (§14 ask #5).
         bond.setWhitelisted(address(farm), true);
         bond.setWhitelisted(address(d.adapter), true);
 

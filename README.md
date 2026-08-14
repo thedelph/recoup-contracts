@@ -7,8 +7,20 @@ yield pays the debt down automatically. Debt only ever decreases.
 Status: **deployed to Base Sepolia** (2026-08-03), nothing on mainnet. The collateral layer, the
 credit core, the epoch harvester and the liquidation auction are implemented, and the whole loan
 lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling through to
-the workout path - is fork-tested against the live DexFi contracts. Lending is an interfaced
-skeleton, built in deliberate phases. Nothing touches real funds before an external audit.
+the workout path - is fork-tested against the live DexFi contracts. Lending reaches the credit core
+through an interfaced seam, and the pool behind that seam is a skeleton here for the reason in the
+next paragraph. Nothing touches real funds before an external audit.
+
+**`LenderPool` is finished, and I am holding it back on purpose.** The real one - the ERC-4626
+vault, the withdrawal queue, the yield stream and the impairment pricing - is written, tested and
+audited in my private tree. It is not in this repository because one finding against it is open. A
+loss-making position carries no impairment until somebody volunteers to liquidate it, and the
+protocol pays that volunteer nothing when the sale falls short of the debt, so in the gap between a
+loan going bad and a caller acting, the pool prices every exit at the full pre-loss price and a
+lender who leaves first is paid out of the lenders who stay. The fix changes what several other
+fixes should look like, so I am researching it before writing any of them. Publishing a pool with
+that open is worse than publishing none, so the skeleton stays until the finding is closed. The
+`ILenderPool` interface here is the real one and is what the finished contract implements.
 
 Testnet addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json), all
 verified on Basescan. The testnet deployment runs against a **mock** DexFi stack, because the real
@@ -75,7 +87,7 @@ LiquidationAuction: implemented. A Dutch auction over the whole position, decayi
 to the winner, and an unfilled auction moves the *claim* to a workout queue while the units stay
 staked and earning. Three exits, and the guards exist to prove no state closes all of them.
 
-LenderPool: skeleton, implemented per phase.
+LenderPool: skeleton here, finished in private and withheld over one open finding (see above).
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
 
@@ -176,10 +188,10 @@ what it does not is a tested quantity rather than an assurance:
 
 Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
 re-audited**, because the rate at which fix rounds produce their own defects has stayed stubbornly
-high: **fourteen rounds so far, and five of the last six found defects in the round before them.**
-Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) covers
-the rounds over the code published here; the later ones also cover the lender pool, which is not in
-this repository yet.
+high: **seventeen rounds so far, and eight of the last nine found defects in the round before them.**
+Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) is
+written up as far as round nine. The rounds after it are not written up there yet: their fixes are
+in the code published here, and several of them are about the lender pool, which is not.
 
 Four habits came out of that and now apply by default:
 

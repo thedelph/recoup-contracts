@@ -44,15 +44,39 @@ contract MockLiquidationAuction {
         workoutsOpenFor[borrower] = n;
     }
 
+    /// @notice The live auction per borrower.
+    /// @dev `CreditManager._impairmentFor` reads this, so a mock that did not answer made
+    ///      `liquidate` revert on a typed call to a function that was not there - the same reason
+    ///      this file exists at all. `start` writes it, so the mock cannot report a liquidation it
+    ///      never opened.
+    ///
+    ///      A `floorProceeds` mapping sat beside this until the round-13 fix. It is gone with the
+    ///      view: the impairment reserves the whole debt while a liquidation is open and no longer
+    ///      credits a predicted recovery, so there is nothing here left to stub.
+    mapping(address => uint256) public auctionOf;
+
+    /// @notice USDC an in-flight fill has already credited against the borrower's loan.
+    /// @dev Added with the round-15 fix, and it is the same trap as `auctionOf` above: this file is
+    ///      duck-typed, `CreditManager` makes a typed call into it, and a typed call to a function
+    ///      that is not there reverts the whole fixture rather than returning zero. Writable so a
+    ///      test can stage the netting without an auction, which the real contract only ever
+    ///      reaches from inside a `bid`.
+    mapping(address => uint256) public recognisedRecoveryOf;
+
+    function setRecognisedRecovery(address borrower, uint256 amount) external {
+        recognisedRecoveryOf[borrower] = amount;
+    }
+
     function setLiveWork(uint256 liveAuctions, uint256 openWorkouts) external {
         liveAuctionCount = liveAuctions;
         openWorkoutCount = openWorkouts;
     }
 
-    function start(address borrower, address caller) external returns (uint256) {
+    function start(address borrower, address caller) external returns (uint256 id) {
         lastBorrower = borrower;
         lastCaller = caller;
         startCalls++;
-        return nextId++;
+        id = nextId++;
+        auctionOf[borrower] = id;
     }
 }

@@ -522,6 +522,29 @@ contract ReferralRegistryTest is Test {
         registry.registerFor(CODE, address(0));
     }
 
+    /// @notice Nobody outside the constructor may mint the reserved tombstone.
+    /// @dev **Audit round 12.** `NON_BINDABLE` is a public constant, so anyone could read it and
+    ///      write it into `referrerOf` for an advertised-but-unclaimed code. That is not squatting,
+    ///      which the contract accepts and reasons about at length: it is a permanent brick.
+    ///      `register` then reverts `CodeTaken` for the real owner and `bind` reverts
+    ///      `CodeNotBindable` for every referee, forever - write-once mappings, no owner, no
+    ///      transfer, so there is no price at which it can be undone. The event it emitted was
+    ///      byte-identical to genuine brand protection, so the payout calculator would have skipped
+    ///      it as official rather than flagging it.
+    function test_registerFor_cannotMintTheReservedSentinel() public {
+        // Resolved before the cheatcodes: reading the constant is itself a call, and as an inline
+        // argument it is the one `expectRevert` arms against.
+        address sentinel = registry.NON_BINDABLE();
+
+        vm.expectRevert(abi.encodeWithSelector(ReferralRegistry.CodeNotBindable.selector, CODE));
+        vm.prank(attacker);
+        registry.registerFor(CODE, sentinel);
+
+        // Still claimable by whoever it was advertised for, which is the whole point.
+        _register(alice, CODE);
+        assertEq(registry.referrerOf(CODE), alice, "the code was bricked anyway");
+    }
+
     function test_registerFor_respectsWriteOnce() public {
         _register(alice, CODE);
         vm.expectRevert(abi.encodeWithSelector(ReferralRegistry.CodeTaken.selector, CODE, alice));

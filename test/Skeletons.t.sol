@@ -12,6 +12,7 @@ import {NAVOracle} from "../src/NAVOracle.sol";
 import {ICollateralVault} from "../src/interfaces/ICollateralVault.sol";
 import {ICreditManager} from "../src/interfaces/ICreditManager.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
+import {ILenderPool} from "../src/interfaces/ILenderPool.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 import {Config} from "../src/Config.sol";
 import {MockBond} from "./mocks/MockBond.sol";
@@ -94,7 +95,10 @@ contract SkeletonsTest is Test {
         vm.expectRevert(EpochHarvester.NotImplemented.selector);
         harvester.harvestRange(0, 1);
 
-        // The LenderPool's protocol flows are the remaining phase-4 stubs.
+        // The LenderPool's protocol flows are the remaining phase-4 stubs *in this repository*.
+        // The pool is finished in the private tree; it is held back from publication while one
+        // finding against it is open, so what ships here is still the dormant skeleton and
+        // `queuePosition` still reverts.
         vm.expectRevert(LenderPool.NotImplemented.selector);
         pool.queuePosition(address(this));
     }
@@ -111,6 +115,60 @@ contract SkeletonsTest is Test {
         // wired it must refuse to take deposits rather than strand funds.
         vm.expectRevert(CollateralVault.AdapterNotSet.selector);
         vault.depositBonds(1);
+    }
+
+    // ── ILenderPool conformance ──────────────────────────────────────────────
+    //
+    // Round 11: `LenderPool` implemented `ILenderPool` by intention alone, so nothing checked, and
+    // both protocol call sites into the pool swallow a failed call in a `catch` - a drifted
+    // signature would have shown up as a payment that silently never happened rather than as a
+    // build failure. The declaration is the fix.
+    //
+    // Two of the three tests that make the declaration observable are not in this repository,
+    // because both need the finished pool: one type-checks the implicit conversion that only
+    // compiles while `LenderPool is ILenderPool`, and one reads a `YieldDistributed` log off a
+    // pool that actually distributed something. The skeleton published here is deliberately not
+    // `is ILenderPool` and cannot distribute. What survives the omission is the test below, which
+    // is the one that pins the published ABI itself - it reads only the interface, so it holds the
+    // topics an indexer would build against whether or not the implementation ships with it.
+
+    /// @dev **The assertion the drift needed and did not have.** `ILenderPool` published
+    ///      `YieldDistributed(uint256)` while the contract emitted three parameters. A different
+    ///      arity is a different `topic0`, so every other test in this repo passed - they read
+    ///      storage, or they match on the declaration they were compiled against, which is the one
+    ///      that drifted. Only an indexer built from the published ABI would have noticed, by
+    ///      seeing no yield events at all.
+    ///
+    ///      So this pins the topic against a **string literal**, not against the declaration. The
+    ///      literal is the published ABI: changing the event's shape has to break this test on
+    ///      purpose, which is the moment to think about who is already matching on the old topic.
+    function test_lenderPoolEventTopicsMatchThePublishedAbi() public pure {
+        assertEq(
+            ILenderPool.YieldDistributed.selector,
+            keccak256("YieldDistributed(uint256,uint256,uint256)"),
+            "three parameters: amount, ratePerSecond, streamEndsAt"
+        );
+
+        assertEq(ILenderPool.Lent.selector, keccak256("Lent(uint256)"));
+        assertEq(ILenderPool.PrincipalRepaid.selector, keccak256("PrincipalRepaid(uint256)"));
+        assertEq(ILenderPool.PrincipalSurplusStreamed.selector, keccak256("PrincipalSurplusStreamed(uint256)"));
+        assertEq(ILenderPool.Impaired.selector, keccak256("Impaired(address,uint256,uint256)"));
+        assertEq(ILenderPool.ImpairmentReleased.selector, keccak256("ImpairmentReleased(address,uint256,uint256)"));
+        assertEq(ILenderPool.LossReservesSet.selector, keccak256("LossReservesSet(uint256,uint256,uint256)"));
+        assertEq(ILenderPool.LossSocialised.selector, keccak256("LossSocialised(uint256)"));
+        assertEq(ILenderPool.WithdrawalQueued.selector, keccak256("WithdrawalQueued(address,uint256,uint256)"));
+        assertEq(
+            ILenderPool.QueuedWithdrawalServiced.selector,
+            keccak256("QueuedWithdrawalServiced(address,uint256,uint256)")
+        );
+        assertEq(
+            ILenderPool.WithdrawalRequestCancelled.selector,
+            keccak256("WithdrawalRequestCancelled(address,uint256,uint256)")
+        );
+        assertEq(
+            ILenderPool.QueuedWithdrawalReleasedAsDust.selector,
+            keccak256("QueuedWithdrawalReleasedAsDust(address,uint256,uint256)")
+        );
     }
 
     function test_onlyRoleGatesOnStubs() public {

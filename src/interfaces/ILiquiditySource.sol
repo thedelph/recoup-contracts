@@ -8,12 +8,25 @@ pragma solidity ^0.8.24;
 ///      the Phase 4 swap is `ILenderPool is IERC4626, ILiquiditySource` with the
 ///      duplicate declarations dropped.
 ///
-///      The PRD has `borrow` pulling straight from the LenderPool, but the pool's
-///      lending functions are Phase 4 and its ERC-4626 accounting carries two known
-///      deferred issues (share-price manipulation on an unset decimals offset, and
-///      loss recognition lagging the auction window) that are harmless only while it
-///      cannot lend. This seam lets Phase 2 borrow against a plain treasury float and
-///      keeps those dormant until the phase that fixes them.
+///      The PRD has `borrow` pulling straight from the LenderPool. This seam lets Phase 2
+///      borrow against a plain treasury float instead, which is still the wiring the deploy
+///      script ships.
+///
+///      It used to name two deferred issues in the pool's ERC-4626 accounting that were
+///      "harmless only while it cannot lend". The first, share-price manipulation on an unset
+///      decimals offset, was closed when the pool was built - the offset is 3. The second, loss
+///      recognition lagging the auction window, was round-10 finding 7, and it took three attempts
+///      to close: a gate refusing the ERC-4626 exits while an auction or workout was live (round 11
+///      found it left the withdrawal queue open, which is a self-service exit), the same gate
+///      extended over the queue, and finally the gate deleted outright in favour of impairment
+///      pricing. `CreditManager` now marks the expected shortfall into `LenderPool` the moment an
+///      auction opens, every terminal transition of the auction releases it, and exits price on
+///      `exitAssets()` while entries stay on `totalAssets()` - so a leaver already carries the
+///      expected loss and an entrant cannot buy the discount. Nothing is refused and nothing is
+///      routed anywhere; the price simply stopped being stale.
+///
+///      **Do not read that as "the swap is safe now."** Round 11 left further open items against
+///      this seam, recorded in the private security notes rather than here. The swap still waits.
 ///
 ///      **Token movement is pull-based in both directions, and each receiver verifies
 ///      its own receipt:**
