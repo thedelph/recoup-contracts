@@ -264,6 +264,25 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         address liveManager = ICollateralVault(address(_vault)).creditManager();
         if (liveManager != creditManager_) revert CreditManagerNotLive(liveManager);
 
+        // **Checked because all three exits now call `resolveBounty` bare.** A manager that
+        // answers everything else and not that one installs cleanly and then reverts `cancel`,
+        // `_bid` and `expireToWorkout` alike - the state the header comment calls permanently
+        // stranded collateral, arrived at through a setter that reported success.
+        //
+        // **It probes the counter and not the function itself, and the difference is worth
+        // stating rather than hiding.** `resolveBounty` is gated on the manager's own auction
+        // pointer, so calling it here would revert `NotLiquidationAuction` whenever this setter
+        // runs before `CreditManager.setLiquidationAuction` - refusing a legitimate wiring order
+        // with an error about the wrong thing. `totalBountyParked` is the storage that only a
+        // manager carrying the park exposes, so it is evidence of the right implementation
+        // rather than proof of the selector. Bare, not `try`: this setter is `onlyOwner` and
+        // already refuses while any work is live, so failing loudly costs nothing.
+        //
+        // **This adds one check; it does not fix the shape.** Round eighteen's finding is that
+        // the rule needs to be "every selector this contract calls bare on this pointer", and
+        // the others are still unprobed. That stays open.
+        ICreditManager(creditManager_).totalBountyParked();
+
         creditManager = creditManager_;
         emit CreditManagerSet(creditManager_);
     }
@@ -311,6 +330,13 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             auctions[live].settled = true;
             liveAuctionCount--;
             emit AuctionSuperseded(live, borrower, nextAuctionId + 1);
+            // **The fourth exit, and the one a bounty fix forgets.** Superseding resolves
+            // nothing - no fill, no workout, no loss recognised - so the escrow the lapsed
+            // auction was holding goes back to the borrower rather than to the caller who
+            // opened it and then let it lapse. That return happens *before* `liquidate` reads
+            // `bountyEscrowOf` again on the way out of this call, which is what lets the same
+            // escrow roll straight forward onto this new auction and this new caller.
+            ICreditManager(creditManager).resolveBounty(live, false);
             // The lapsed auction can no longer recover anything, so the mark it was sized from is
             // now wrong in the dangerous direction. Restating it here rather than leaving it to
             // the caller escalates to the full debt for the rest of this call; `liquidate`
@@ -585,6 +611,19 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // callback has to see one, for the reason set out where `settled` is written.
         delete auctionOf[borrower];
 
+        // **A fill is the outcome the bounty was bought for, so the escrow is earned here.**
+        // Paid on every fill, not only a short one: the caller decides whether to open an
+        // auction hours before anyone bids, and cannot know then how well it will clear.
+        // Conditioning the reward on the clearing price would put back exactly the uncertainty
+        // this mechanism exists to remove - the penalty share already is contingent that way,
+        // and pays zero on the short fills that cost lenders money. The cost is stated rather
+        // than hidden: on a fill with a surplus the caller is paid twice, out of what the
+        // borrower prepaid.
+        //
+        // After the liveness registers, like every other post-settlement call here, so nothing
+        // can observe a resolved auction from inside the winner's callback.
+        ICreditManager(cm).resolveBounty(auctionId, true);
+
         // A fill short of the debt has already released the mark through `writeDownLoss`, but a
         // fill that covers it has not: `_creditProceeds` returns early when there is no penalty
         // and no surplus to hand over, which is exactly a fill *at* the debt, so the manager can
@@ -730,7 +769,14 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         usdc.forceApprove(cm, target);
         ICreditManager(cm).repayFor(borrower, target);
         usdc.forceApprove(cm, 0);
-        repaid = balanceBefore - usdc.balanceOf(address(this));
+        // Clamped rather than bare, matching `EpochHarvester._push` and the manager's own
+        // three. Underflow is not reachable today - `repayFor` only pulls, and nothing on
+        // that path pushes USDC back here - so this buys no behaviour change now. It is
+        // here because `repaid` is what `_distribute` derives the write-down and the
+        // surplus from, and a revert in this line would take out the fill path, the
+        // workout settlement and the exit of last resort together.
+        uint256 balanceAfter = usdc.balanceOf(address(this));
+        repaid = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
     }
 
     /// @inheritdoc ILiquidationAuction
@@ -740,8 +786,16 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      worse than useless: a borrower who has lost keys or been blacklisted is
     ///      exactly the one who cannot call it.
     ///
-    ///      Nothing is returned, because nothing was ever taken. The lot has been in
+    ///      No collateral is returned, because none was ever taken. The lot has been in
     ///      custody, staked and earning, for the whole auction.
+    ///
+    ///      **The prepaid bounty IS returned, and audit round eighteen is why.** With the
+    ///      escrow paid at open, a stranger opened an auction, cured the position with a
+    ///      one-dollar `repayFor` and cancelled here in the same transaction, keeping
+    ///      twenty-four dollars for work nobody did and leaving the position permanently
+    ///      unarmed. This function and `repayFor` are both permissionless on purpose, so that
+    ///      strangers can help; that generosity was the whole attack. A cancel resolves
+    ///      nothing, so it earns nothing and hands the escrow back.
     function cancel(uint256 auctionId) external nonReentrant {
         Auction storage a = _live(auctionId);
         address borrower = a.borrower;
@@ -759,6 +813,11 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         liveAuctionCount--;
         delete auctionOf[borrower];
         emit AuctionCancelled(auctionId, borrower);
+
+        // Back to the borrower, so the position is armed again for whoever liquidates it next.
+        // Returning it as claimable surplus instead would close the theft and keep the disarm,
+        // which is half of what round eighteen actually measured.
+        ICreditManager(creditManager).resolveBounty(auctionId, false);
 
         // The position healed, so there is no expected shortfall left to reserve. Nothing else in
         // this contract ever told the manager a cancelled auction had happened - `cancel` only
@@ -873,6 +932,13 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
 
         emit AuctionExpiredToWorkout(auctionId);
         emit WorkoutOpened(auctionId, borrower, lot, debt);
+
+        // **Earned.** An expiry to workout is a resolution, not a lapse: the lot is reassigned
+        // out of the borrower's control, the debt is frozen at expiry and a recovery process
+        // opens. It is also the outcome that pays the caller least by every other route - no
+        // fill means no surplus, so no penalty share - which is exactly the case the escrow was
+        // introduced for. Maker pays its keepers on the same no-fill branch, through `redo`.
+        ICreditManager(cm).resolveBounty(auctionId, true);
 
         // Escalation, not release. After the liveness registers above, `workoutsOpenFor` is the
         // state the manager reads, and it sizes an open workout at the whole debt: the recovery is

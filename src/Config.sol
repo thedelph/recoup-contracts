@@ -76,6 +76,40 @@ library Config {
     ///      magic number that cannot be found when the split is retuned.
     uint256 internal constant LIQUIDATION_CALLER_SHARE_BPS = 5_000;
 
+    /// @notice Prepaid by the borrower and released to whoever opens their liquidation
+    ///         auction. USDC, 6dp.
+    /// @dev The penalty split above pays the caller out of `surplus`, and a fill short of
+    ///      the debt leaves no surplus, so on exactly the liquidations that matter most the
+    ///      caller earns nothing. Until somebody volunteers, the lender pool carries no
+    ///      mark and every exit is priced before the loss. This constant is what pays the
+    ///      volunteer.
+    ///
+    ///      Liquity's shape: charged at `borrow`, escrowed, refunded if the position never
+    ///      goes bad. The payer is the party whose position caused the work, which keeps it
+    ///      off the lenders and out of the insurance fund - drawing on insurance would raise
+    ///      `exitReserve` through `insuranceCover` and lower every lender's exit price, so
+    ///      that funding route is partly circular.
+    ///
+    ///      **The value is a judgement, not a measurement.** Nobody has measured what a
+    ///      liquidation bot on Base actually needs to show up for a position of this size.
+    ///      It is set large against gas (a `liquidate` costs cents) because what it buys is
+    ///      attention and a contested ordering slot, not gas. 25 USDC is 5% of the smallest
+    ///      bountied position; Liquity's 200 LUSD against a 2000 LUSD minimum is 10%.
+    uint256 internal constant LIQUIDATION_CALL_BOUNTY = 25e6;
+
+    /// @notice The smallest resulting debt that carries a bounty. USDC, 6dp.
+    /// @dev Maker's dust guard: a position too small to be worth the payment does not get
+    ///      one. Keyed on the debt a borrow *results in* rather than on the amount borrowed,
+    ///      because keying on the amount makes the charge opt-out - twenty borrows of just
+    ///      under the threshold reach the per-account cap having paid nothing, for a few
+    ///      cents of gas on Base.
+    ///
+    ///      Deliberately low enough that most of the existing suite is charged. A threshold
+    ///      set high enough to miss the tests would ship the whole mechanism dormant, with
+    ///      every consumer untested and the suite reporting green over a quantity that is
+    ///      always zero.
+    uint256 internal constant MIN_BOUNTIED_DEBT = 500e6;
+
     // ── Workout queue (PRD §4.5, the expiry path) ────────────────────────────
     /// @notice How long a workout may stay open before anyone can force the residual
     ///         debt to be recognised as a loss.

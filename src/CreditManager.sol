@@ -24,9 +24,22 @@ import {INAVOracle} from "./interfaces/INAVOracle.sol";
 ///
 ///          usdc.balanceOf(this) >= totalClaimable + undistributedYield
 ///                                  + pendingPrincipal + insuranceFund
+///                                  + totalBountyEscrowed + totalBountyParked
+///                                  + totalBountyOwed
 ///
-///      Every USDC balance this contract holds is spoken for by one of those four.
-///      Borrowed principal is never held here - it passes through in a single call.
+///      Every USDC balance this contract holds is spoken for by one of those seven.
+///      Borrowed principal is never held here - it passes through in a single call, less
+///      the liquidation bounty, which is withheld from the disbursement and is the reason
+///      the last three terms exist. They are the same money at three stages of one life:
+///      prepaid by the borrower, parked against the auction it opened, then owed to the
+///      caller whose auction resolved it. All three have named claimants, so none may be
+///      swept by a migration.
+///
+///      **A term added here has to be added to every one-sided bound that names the others,
+///      in the same commit.** These are `assertGe` sites: a right-hand side that is too
+///      small only makes the bound easier to clear, so a forgotten term leaves the
+///      assertion green and quietly narrows what it claims. That has already happened once
+///      on this mechanism, when the first two terms arrived.
 contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -73,6 +86,12 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error LiquidationAuctionIncomplete();
     /// @notice The incoming pool does not answer the enumeration the bounded impairment sweep needs.
     error LenderPoolIncomplete();
+    error BorrowBelowBounty(uint256 amount, uint256 bountyDue);
+    error NoBountyOwed();
+    /// @notice A `fundBounty` top-up would take the escrow past what one liquidation pays out.
+    error BountyFundingOverflows(uint256 wouldHold, uint256 cap);
+    /// @notice A `fundBounty` top-up cannot reach a liquidation that has already started.
+    error BountyFundingWhileLiquidating(address borrower);
 
     event LiquiditySourceSet(address indexed source);
     event LenderPoolSet(address indexed lenderPool);
@@ -103,6 +122,21 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      visible from storage.
     event LossBorneByTheSource(address indexed source, uint256 amount);
     event ReservesMigrated(address indexed to, uint256 amount);
+    event BountyEscrowed(address indexed borrower, uint256 amount, uint256 escrowNow);
+    event BountyRefunded(address indexed borrower, uint256 amount);
+    event BountySettledAgainstDebt(address indexed borrower, uint256 amount);
+    /// @notice An escrow moved out of the borrower's hands and against the auction just opened.
+    event BountyParked(
+        uint256 indexed auctionId, address indexed borrower, address indexed caller, uint256 amount
+    );
+    event BountyReleased(address indexed borrower, address indexed caller, uint256 amount);
+    /// @notice An auction ended without resolving anything, so the escrow went back to the
+    ///         borrower and the position is armed again for whoever calls next.
+    event BountyReturned(uint256 indexed auctionId, address indexed borrower, uint256 amount);
+    event BountyClaimed(address indexed caller, uint256 amount);
+    /// @notice A liquidated position is live again with nothing prepaid for the next caller.
+    /// @dev The re-arm residual, emitted rather than silently tolerated. See `liquidate`.
+    event BountyDepleted(address indexed borrower);
 
     IERC20 public immutable usdc;
     ICollateralVault public immutable vault;
@@ -147,6 +181,51 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      and keeps the difference here, so the counter fills on a partial acceptance and not
     ///      just on a refusal.
     uint256 public unsocialisedLoss;
+
+    /// @notice What each borrower has prepaid towards the reward for whoever liquidates them.
+    /// @dev Withheld from the disbursement at `borrow`, never added to `debtOf`. Keeping it off
+    ///      the debt ledger is not tidiness: `_settle` writes debt down with streamed yield and
+    ///      cannot tell which part of a debt it is paying, so a bounty carried as debt would be
+    ///      cleared by other borrowers' yield share and then refunded in cash. And
+    ///      `_impairmentFor` reserves `currentDebtOf`, so it would inflate every mark and lower
+    ///      every lender's exit price - which is the opposite of the point, since the whole
+    ///      mechanism exists to make an honest mark appear sooner.
+    mapping(address => uint256) public bountyEscrowOf;
+    /// @notice Sum of `bountyEscrowOf`. Tracked so solvency is checkable in one read.
+    uint256 public totalBountyEscrowed;
+
+    /// @notice An escrow taken out of a borrower's hands by `liquidate` and held against the
+    ///         auction it opened, until that auction says which way it resolved.
+    /// @dev The claimant is fixed at open - whoever called `liquidate` - because the work being
+    ///      rewarded is theirs and the exits that resolve an auction are permissionless, so
+    ///      `msg.sender` at the far end is somebody else entirely.
+    ///
+    ///      The borrower is stored rather than read back from the auction, and that is the
+    ///      point rather than duplication for convenience: `resolveBounty` sits on all three
+    ///      exits and must not be able to revert, so it makes no external call at all. Three
+    ///      plain slots, unpacked, because a silent downcast in the one function that may not
+    ///      fail is a worse trade than the gas.
+    struct ParkedBounty {
+        address claimant;
+        address borrower;
+        uint256 amount;
+    }
+
+    /// @notice The escrow held against each live auction, by auction id.
+    /// @dev Keyed on the auction rather than the borrower because a borrower can carry a lapsed
+    ///      auction and a live one within a single `liquidate` call, through `start`'s supersede
+    ///      branch, and the two have different claimants.
+    mapping(uint256 => ParkedBounty) public parkedBountyOf;
+    /// @notice Sum of `parkedBountyOf`. The third pot, and it belongs in every solvency term
+    ///         that already names the other two.
+    uint256 public totalBountyParked;
+
+    /// @notice Released bounties awaiting collection by whoever opened the auction.
+    mapping(address => uint256) public bountyOwedTo;
+    /// @notice Sum of `bountyOwedTo`. Separate from `totalBountyEscrowed` because the two have
+    ///         different claimants and different drains; one counter for both would be
+    ///         uncheckable against either map.
+    uint256 public totalBountyOwed;
 
     /// @notice Where the next bounded impairment sweep resumes: the index in the pool's impaired
     ///         set that `refreshImpairments` will step down from.
@@ -566,6 +645,35 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             revert ExceedsMaxLtv(LtvMath.ltvBps(newDebt, collateral));
         }
 
+        // **The prepaid liquidation bounty.** Withheld from the disbursement, never added to
+        // `debtOf`, so caps, LTV, `_impairmentFor` and the pool's exit price are all unmoved
+        // by it. It exists because the penalty-funded caller reward is derived from an
+        // auction's surplus, and a fill short of the debt leaves no surplus - so on the
+        // liquidations that actually cost lenders money the caller is paid nothing, and the
+        // pool's mark waits on an unrewarded volunteer.
+        //
+        // **Topped up to the constant, not accumulated**, so a borrower who draws five times
+        // pays once. If a previous position was liquidated the escrow is empty and this is the
+        // full charge; if the debt merely reached zero and nothing has refunded it yet, the
+        // escrow is still armed and this is free.
+        //
+        // **The dust guard keys on the resulting debt, not on `amount`.** Keying on the amount
+        // makes the charge opt-out: twenty borrows just under the threshold reach the
+        // per-account cap having paid nothing, for a few cents of gas on Base.
+        uint256 bountyDue;
+        if (newDebt >= Config.MIN_BOUNTIED_DEBT) {
+            uint256 held = bountyEscrowOf[msg.sender];
+            if (held < Config.LIQUIDATION_CALL_BOUNTY) {
+                bountyDue = Config.LIQUIDATION_CALL_BOUNTY - held;
+            }
+            // One transaction-wide cliff: existing debt just under the threshold, and a borrow
+            // small enough to cross it without funding the charge. Refused by name rather than
+            // clamped, because a silently under-funded escrow pays a smaller bounty than the
+            // constant advertises, and the caller has no way to know before spending the gas.
+            // The fix is to borrow more, which the error says.
+            if (amount < bountyDue) revert BorrowBelowBounty(amount, bountyDue);
+        }
+
         debtOf[msg.sender] = newDebt;
         totalDebt = newTotal;
         emit Borrowed(msg.sender, amount);
@@ -573,12 +681,26 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // Verify the source actually delivered rather than trusting it. A short
         // delivery would otherwise be silently covered from this contract's own
         // balance, which belongs to claimants, the harvester and the insurance fund.
+        //
+        // Clamped, like the other three balance deltas. Audit round 17 listed three
+        // unclamped sites and this was not among them; it is the same expression in the
+        // inbound direction, so it is fixed with them. Fixing the shape rather than the
+        // three instances is the lesson round 18 recorded one contract over, where a
+        // probe list enumerated from one function's call set left the same setter's own
+        // selectors unprobed.
         uint256 balanceBefore = usdc.balanceOf(address(this));
         ILiquiditySource(source).lend(amount);
-        uint256 delivered = usdc.balanceOf(address(this)) - balanceBefore;
+        uint256 balanceAfter = usdc.balanceOf(address(this));
+        uint256 delivered = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
         if (delivered != amount) revert LiquidityNotDelivered(amount, delivered);
 
-        usdc.safeTransfer(msg.sender, amount);
+        if (bountyDue != 0) {
+            bountyEscrowOf[msg.sender] += bountyDue;
+            totalBountyEscrowed += bountyDue;
+            emit BountyEscrowed(msg.sender, bountyDue, bountyEscrowOf[msg.sender]);
+        }
+
+        usdc.safeTransfer(msg.sender, amount - bountyDue);
     }
 
     /// @inheritdoc ICreditManager
@@ -770,11 +892,44 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      claiming looks like it lost them money when it merely ran early.
     function claimSurplus() external nonReentrant {
         _settle(msg.sender, vault.bondCount(msg.sender));
+        // **Belt and braces, and unreachable today - which is the honest way to describe it
+        // rather than letting a later reader mistake it for the live path.** Every route a
+        // debt has to zero already refunds: `_repay` does it at the end, and `_settle` does it
+        // in the branch where yield clears the last of the debt. Detaching needs
+        // `totalDebt == 0` (see the vault's `setCreditManager`), so a detached manager cannot
+        // be holding an escrow either.
+        //
+        // It stays because `_settle` returns on its first line once detached, so if a future
+        // edit narrows either of those two hooks this becomes the only reachable refund, and
+        // this function is the one exit deliberately kept open through a migration. A test
+        // staging the state would have to fake it, so there is no test - the argument is the
+        // guarantee, and it is written here rather than asserted somewhere it would pass
+        // vacuously.
+        _refundBounty(msg.sender);
         uint256 amount = claimableOf[msg.sender];
         if (amount == 0) revert NothingToClaim();
         claimableOf[msg.sender] = 0;
         totalClaimable -= amount;
         emit SurplusClaimed(msg.sender, amount);
+        usdc.safeTransfer(msg.sender, amount);
+    }
+
+    /// @notice Collect liquidation bounties earned by opening auctions.
+    /// @dev Pull, not push, and for the same reason `LiquidationAuction.claimReward` is: a
+    ///      `safeTransfer` inside `liquidate` would let a USDC blacklist on a keeper's address
+    ///      make that keeper unable to liquidate at all. `liquidate` is the one path this
+    ///      contract repeatedly promises is never blockable - it is deliberately not
+    ///      `whenNotPaused`, deliberately does not check NAV staleness, and deliberately does
+    ///      not check custody solvency - so putting a revertible token transfer on it would
+    ///      contradict three statements in its own docstring.
+    ///
+    ///      Open while detached, like `claimSurplus` and for the same reason.
+    function claimBounty() external nonReentrant {
+        uint256 amount = bountyOwedTo[msg.sender];
+        if (amount == 0) revert NoBountyOwed();
+        bountyOwedTo[msg.sender] = 0;
+        totalBountyOwed -= amount;
+        emit BountyClaimed(msg.sender, amount);
         usdc.safeTransfer(msg.sender, amount);
     }
 
@@ -805,7 +960,17 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // erased by an assignment, or, in the other direction, would leave the counter
         // higher than what is owed so the next call pays the excess out of USDC
         // backing `totalClaimable` and the insurance fund.
-        uint256 delivered = balanceBefore - usdc.balanceOf(address(this));
+        // Clamped, not just subtracted, matching `EpochHarvester._push`, which explains
+        // the same expression at length. A source that *pushes* USDC back during
+        // `repayPrincipal` made this underflow and revert - and this is the sole drain of
+        // `pendingPrincipal`, which `setLiquiditySource` refuses to move a pointer past,
+        // so a source that could not be settled could not be replaced either. That is the
+        // mutually-unsatisfiable shape again, reached through arithmetic.
+        //
+        // Zero is also the right answer on that branch rather than a fudge: a source that
+        // returned more than it took has delivered nothing net.
+        uint256 balanceAfter = usdc.balanceOf(address(this));
+        uint256 delivered = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         pendingPrincipal -= delivered;
         emit PrincipalSettled(delivered);
     }
@@ -860,7 +1025,73 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         ) / Config.BPS;
         emit LiquidationTriggered(borrower, msg.sender, maxReward);
 
-        ILiquidationAuction(auction).start(borrower, msg.sender);
+        // The returned id is the key the escrow below parks against, so it is captured rather
+        // than discarded. It is also the only handle this contract ever has on a specific
+        // auction: `auctionOf` names the live one and is deleted by three of the four exits.
+        uint256 auctionId = ILiquidationAuction(auction).start(borrower, msg.sender);
+
+        // **The prepaid bounty is parked against the auction, not paid for opening it.** Audit
+        // round eighteen executed the version that paid here: a stranger called this function,
+        // claimed, cured the position with a one-dollar `repayFor` and cancelled, all in one
+        // transaction. Spend 1,000,000, take 25,000,000, move no collateral, and leave the
+        // position permanently disarmed so the keeper who liquidated it for real afterwards was
+        // paid nothing against a control of 25,000,000. Both `cancel` and `repayFor` are
+        // permissionless on purpose, so that strangers can help; two guards written to be
+        // generous were the whole attack.
+        //
+        // **Three claims that used to stand here were refuted by execution**, and all three were
+        // the same error - reasoning about the borrower as the only adversary. The lot goes into
+        // "a six-hour Dutch auction" (it was exposed for zero blocks), the deposit "was
+        // refundable anyway" (`_refundBounty` needs `debtOf == 0`, which the attacker never
+        // allows), and the grief "costs the griefer their collateral" (a stranger has none).
+        //
+        // **The trade-off they rested on was not real either.** Paying at the terminal
+        // transition was rejected because it hands the borrower a cheap grief - heal, force a
+        // cancel, the keeper is never paid. But this function is permissionless, so the borrower
+        // can always be the caller: paying at open never removed that grief, it only changed who
+        // was short-changed and added a third-party theft on top. The grief is now accepted and
+        // recorded: a keeper can lose their gas to a borrower who cures in the next block, which
+        // is worth several cents against the twenty-four dollars this closes.
+        //
+        // **A claw-back on `cancel` would not have been enough** - `claimBounty` is
+        // permissionless and the attacker chooses the ordering, which is why the money has to
+        // leave `bountyEscrowOf` here and not be creditable until an exit says so.
+        //
+        // **Parking rather than simply deferring is load-bearing.** Left in
+        // `bountyEscrowOf[borrower]`, a fill that covered the debt would reach `_refundBounty`
+        // through the auction's own `repayFor` and hand the escrow back to the borrower before
+        // any exit could credit it, because that helper keys on `debtOf == 0` alone. Emptying
+        // the map here makes it a no-op on every auction path, which is what lets
+        // `writeDownLoss` stay out of the bounty accounting entirely.
+        //
+        // Placed after `start` succeeds, so a reverting `start` cannot park against an id that
+        // does not exist - and after the supersede branch inside it has returned any escrow the
+        // lapsed auction was holding, which is what lets that escrow roll forward to this
+        // auction and this caller in the same call.
+        //
+        // **Not gated on the escrow being non-zero.** A position that cannot be liquidated is
+        // strictly worse than one liquidated for nothing, so this parks whatever is there,
+        // including nothing. The empty case is what the dust guard creates on purpose: a
+        // position under `MIN_BOUNTIED_DEBT` was never charged and NAV can still carry it past
+        // the threshold. `fundBounty` is how anyone arms such a position without borrowing.
+        //
+        // **One incentive this creates, disclosed rather than gated.** The NAV keeper can post a
+        // legitimate price that tips a position past the threshold and back-run it here for a
+        // known prize - now contingent on the auction resolving rather than certain at open, but
+        // not removed. There is no clean mitigation in this architecture: any delay between a
+        // post and liquidatability contradicts this function's own rule that liquidation keeps
+        // pricing on the last known NAV through a keeper outage.
+        uint256 bounty = bountyEscrowOf[borrower];
+        if (bounty != 0) {
+            bountyEscrowOf[borrower] = 0;
+            totalBountyEscrowed -= bounty;
+            parkedBountyOf[auctionId] =
+                ParkedBounty({claimant: msg.sender, borrower: borrower, amount: bounty});
+            totalBountyParked += bounty;
+            emit BountyParked(auctionId, borrower, msg.sender, bounty);
+        } else {
+            emit BountyDepleted(borrower);
+        }
 
         // Marked the moment the auction exists rather than when it resolves, and it has to be
         // after `start` because the mark is derived from the auction that call creates. Until this
@@ -868,6 +1099,99 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // recognition gap the whole impairment mechanism exists to close.
         _setImpairment(borrower, _impairmentFor(borrower));
         _pushLossReserves();
+    }
+
+    /// @inheritdoc ICreditManager
+    /// @dev **The other half of `liquidate`'s park, and the only thing that can spend it.**
+    ///      `earned` is the auction's judgement on its own exit: `_bid` and `expireToWorkout`
+    ///      resolved the position and pass true, `cancel` and `start`'s supersede branch resolved
+    ///      nothing and pass false. Those four are the complete set of ways an auction ends, and
+    ///      a park that outlived all of them would be USDC no address could ever reach.
+    ///
+    ///      **Deliberately as close to unable-to-revert as a function gets: storage only, no
+    ///      external call, no `nonReentrant`, no `whenNotPaused`, no `whileAttached`.** It sits
+    ///      on all three exits, and `LiquidationAuction`'s governing property is that a state
+    ///      where every exit reverts is permanently stranded collateral. `nonReentrant` in
+    ///      particular would be a live hazard rather than a precaution: `_bid` already calls
+    ///      `repayFor` and `writeDownLoss` on this contract, both of which take that lock, and a
+    ///      fourth call in the same frame is exactly the shape that deadlocks.
+    ///
+    ///      A zero park is a no-op rather than a revert. `liquidate` opens auctions for
+    ///      positions that were never charged - see the dust guard - so the empty case is the
+    ///      normal one for a small loan, not an error.
+    function resolveBounty(uint256 auctionId, bool earned) external {
+        if (msg.sender != liquidationAuction) revert NotLiquidationAuction();
+
+        ParkedBounty memory parked = parkedBountyOf[auctionId];
+        if (parked.amount == 0) return;
+
+        delete parkedBountyOf[auctionId];
+        totalBountyParked -= parked.amount;
+
+        if (earned) {
+            bountyOwedTo[parked.claimant] += parked.amount;
+            totalBountyOwed += parked.amount;
+            emit BountyReleased(parked.borrower, parked.claimant, parked.amount);
+        } else {
+            // Back to the borrower's own escrow rather than to `claimableOf`, because the
+            // position is still live and still liquidatable later. Refunding it as surplus would
+            // close the theft and keep the disarm, which is half the round-eighteen finding.
+            bountyEscrowOf[parked.borrower] += parked.amount;
+            totalBountyEscrowed += parked.amount;
+            emit BountyReturned(auctionId, parked.borrower, parked.amount);
+        }
+    }
+
+    /// @inheritdoc ICreditManager
+    /// @dev **Permissionless, and mirroring `fundInsurance` for the same reason it is.** Round
+    ///      eighteen found `BorrowBelowBounty` and `PerAccountCapExceeded` have no shared
+    ///      feasibility check: a borrower whose debt sits within `LIQUIDATION_CALL_BOUNTY` of the
+    ///      per-account cap is refused for borrowing too little to fund the charge and refused
+    ///      again for borrowing enough, so no amount satisfies both. Arming a position through
+    ///      `borrow` is therefore not always possible, and this is the route that always is.
+    ///
+    ///      **It still earns its place now the strip is closed**, which is worth saying because
+    ///      the obvious reading is that returning the escrow on `cancel` removed the need. It
+    ///      does not: `expireToWorkout` legitimately spends the escrow while debt is live,
+    ///      `borrow` is refused outright while a workout is open, and a position can come out of
+    ///      a forced close carrying debt, no escrow and no reachable borrow.
+    ///
+    ///      Capped at the constant rather than accumulating, the same rule `borrow` uses, so a
+    ///      donation cannot inflate what one liquidation pays out. An amount that would overshoot
+    ///      is refused by name instead of silently clamped - clamping would take more USDC than
+    ///      it credited.
+    ///
+    ///      **Refused while a liquidation is in flight, and that guard is not tidiness.** A park
+    ///      is fixed at `liquidate` and cannot be topped up afterwards, so USDC paid in during a
+    ///      live auction cannot reach the caller working on it. Left open, the money would sit in
+    ///      `bountyEscrowOf` until `writeDownLoss` cleared the debt, and then be refundable to the
+    ///      borrower who had just defaulted - a donation to a stranger's failure, which is not
+    ///      what anyone calling this is buying. It reads the same two registers `borrow` already
+    ///      reads on this pointer, so no new selector is reached and no new probe is owed.
+    function fundBounty(address borrower, uint256 amount) external nonReentrant {
+        if (borrower == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+
+        address auction = liquidationAuction;
+        if (auction != address(0)) {
+            if (
+                ILiquidationAuction(auction).auctionOf(borrower) != 0
+                    || ILiquidationAuction(auction).workoutsOpenFor(borrower) != 0
+            ) {
+                revert BountyFundingWhileLiquidating(borrower);
+            }
+        }
+
+        uint256 held = bountyEscrowOf[borrower];
+        if (held + amount > Config.LIQUIDATION_CALL_BOUNTY) {
+            revert BountyFundingOverflows(held + amount, Config.LIQUIDATION_CALL_BOUNTY);
+        }
+
+        bountyEscrowOf[borrower] = held + amount;
+        totalBountyEscrowed += amount;
+        emit BountyEscrowed(borrower, amount, held + amount);
+
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
     }
 
     /// @notice Book the non-debt part of a liquidation: the insurance fund's cut of the
@@ -1287,6 +1611,14 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      value outright, and detachment is one-way (see `setCreditManager` on the
     ///      vault), so there is no longer a re-attach that could pay them.
     ///
+    ///      **The two bounty pots stay, for the same reason `totalClaimable` does: their
+    ///      claimants are named.** `totalBountyEscrowed` belongs to the borrowers who prepaid
+    ///      it and `totalBountyOwed` to the callers who earned it, and `claimSurplus` and
+    ///      `claimBounty` both keep working while detached so both remain reachable. Leaving
+    ///      them out of `spokenFor` would sweep individually-owed money into the incoming
+    ///      manager as insurance, which is precisely the failure this function exists to
+    ///      avoid, one pot along.
+    ///
     ///      Delivery is measured rather than assumed, matching every other value-moving
     ///      leg in this contract.
     function migrateReserves() external onlyOwner nonReentrant {
@@ -1294,7 +1626,8 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         if (live == address(this)) revert StillAttached();
         if (live == address(0)) revert ZeroAddress();
 
-        uint256 spokenFor = totalClaimable + pendingPrincipal;
+        uint256 spokenFor =
+            totalClaimable + pendingPrincipal + totalBountyEscrowed + totalBountyParked + totalBountyOwed;
         uint256 balance = usdc.balanceOf(address(this));
         if (balance <= spokenFor) revert ZeroAmount();
         uint256 amount = balance - spokenFor;
@@ -1319,7 +1652,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         ICreditManager(live).fundInsurance(amount);
         usdc.forceApprove(live, 0);
 
-        uint256 delivered = balance - usdc.balanceOf(address(this));
+        // Clamped for the same reason as `settlePrincipal`, but note the difference
+        // honestly: here the next line reverts anyway, so this changes a `Panic(0x11)`
+        // into `LiquidityNotDelivered(amount, 0)` and nothing else. That is worth having
+        // on a one-shot owner call whose failure has to be diagnosable, and it is not a
+        // behaviour fix. Recorded so nobody later reads the three clamps as one change.
+        uint256 balanceAfter = usdc.balanceOf(address(this));
+        uint256 delivered = balance > balanceAfter ? balance - balanceAfter : 0;
         if (delivered != amount) revert LiquidityNotDelivered(amount, delivered);
         emit ReservesMigrated(live, amount);
     }
@@ -1520,9 +1859,15 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         //
         // **Gated on `reduced != 0`, which is the only branch that moves the number.** A yield
         // overflow lands in `claimableOf` and leaves the debt alone; a settle at zero pending does
-        // nothing at all. So this costs nothing on the ordinary deposit, withdraw and transfer
-        // paths, which is where `_settle` is otherwise hot - the vault calls it on every bond-count
-        // change, twice on a transfer.
+        // nothing at all.
+        //
+        // **This comment used to claim the gate costs nothing on the ordinary deposit, withdraw
+        // and transfer paths. That was false and audit round 17 executed it.** `reduced` is
+        // non-zero whenever a borrower with debt has pending yield, which for a self-repaying loan
+        // is the normal state of every borrowing position on every bond-count change - the hot path
+        // itself, twice on a transfer. The two external calls below fire routinely. What the gate
+        // actually skips is the two cases with nothing to say: a position carrying no debt, and one
+        // with no yield pending.
         //
         // **This does not make the mark self-maintaining and is not meant to.** Nothing has to
         // settle a liquidated borrower, so a mark can still go stale on the clock with no
@@ -1536,7 +1881,34 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         if (reduced != 0) {
             _setImpairment(borrower, _impairmentFor(borrower));
             _pushLossReserves();
+            // The one path where a debt reaches zero with no transaction from the borrower.
+            // Yield alone can clear a loan, and when it does the prepaid liquidation bounty
+            // has nothing left to insure, so it goes back. Lazy by design, exactly like
+            // `claimableOf` itself: nothing has to happen at the instant the debt hits zero,
+            // and the refund lands on whichever of this, `_repay` or `claimSurplus` runs
+            // first. There is no state where the money is unreachable and no keeper is needed.
+            if (debt - reduced == 0) _refundBounty(borrower);
         }
+    }
+
+    /// @dev Hand a borrower's prepaid liquidation bounty back. A pure relabel from one
+    ///      solvency term to another, the same shape `writeDownLoss` uses to move insurance
+    ///      into `pendingPrincipal`: no token moves, no external call, so this is safe to
+    ///      call from `_settle`, which deliberately carries no `nonReentrant`.
+    ///
+    ///      **Keyed on zero debt alone**, with no auction or workout check, because no
+    ///      reachable state needs the escrow of a debt-free borrower: `liquidate` reverts
+    ///      `NoDebt`, an auction over a zero-debt position is always cancellable since
+    ///      `exceedsLtv(0, ...)` is false, and `closeWorkout` clamps its write-off at
+    ///      `currentDebtOf`.
+    function _refundBounty(address borrower) private {
+        uint256 held = bountyEscrowOf[borrower];
+        if (held == 0 || debtOf[borrower] != 0) return;
+        bountyEscrowOf[borrower] = 0;
+        totalBountyEscrowed -= held;
+        claimableOf[borrower] += held;
+        totalClaimable += held;
+        emit BountyRefunded(borrower, held);
     }
 
     function _pending(address borrower, uint256 bonds) private view returns (uint256) {
@@ -1634,6 +2006,38 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         pendingPrincipal += paid;
         emit Repaid(borrower, paid);
 
+        // **The prepaid bounty settles the last slice of the debt rather than being handed
+        // back in cash.** Without this a borrower who drew 500 received 475 and would have to
+        // find 500 to clear the loan, getting the 25 back afterwards - money they never
+        // received, sourced from somewhere else, to close a position that is exactly square.
+        // With it their cash cost of a loan is the loan. Liquity does the same when a trove
+        // closes: the escrowed gas compensation is extinguished against the debt it was
+        // charged as.
+        //
+        // **Only on a repayment that clears the debt**, or a partial repayment would quietly
+        // disarm the bounty while the position is still live and still liquidatable.
+        //
+        // **Only when the borrower is paying for themselves.** `LiquidationAuction._repay`
+        // measures what it moved as a USDC balance delta and `_distribute` derives both the
+        // surplus and the write-down from that figure, so an escrow relabel that reduced the
+        // cash the auction sent would make it under-report the debt reduction and over-credit
+        // the borrower and the insurance fund with money the auction still holds. The escrow
+        // is already zero on every auction path - **since round eighteen because `liquidate`
+        // parks it against the auction rather than releasing it, which is a different
+        // mechanism reaching the same state, and the sentence here used to name the old one.**
+        // This gate keeps that unreachability structural rather than a property of the current
+        // call graph, which is why it survives a change to how the escrow leaves.
+        uint256 fromEscrow;
+        if (payer == borrower && paid == debt) {
+            uint256 held = bountyEscrowOf[borrower];
+            fromEscrow = held > paid ? paid : held;
+            if (fromEscrow != 0) {
+                bountyEscrowOf[borrower] = held - fromEscrow;
+                totalBountyEscrowed -= fromEscrow;
+                emit BountySettledAgainstDebt(borrower, fromEscrow);
+            }
+        }
+
         // **The mark is the debt, so it has to move when the debt does.** Audit round 13.
         //
         // The six notification sites were all auction transitions, derived from "how does a
@@ -1654,6 +2058,11 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         _setImpairment(borrower, _impairmentFor(borrower));
         _pushLossReserves();
 
-        usdc.safeTransferFrom(payer, address(this), paid);
+        // Whatever the tail settlement did not consume goes back, because a debt-free
+        // position has nothing left for the bounty to insure. No-ops unless the debt is now
+        // zero.
+        _refundBounty(borrower);
+
+        usdc.safeTransferFrom(payer, address(this), paid - fromEscrow);
     }
 }

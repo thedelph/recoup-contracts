@@ -332,6 +332,19 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         (bool ok,) = address(usdc).call(abi.encodeCall(IERC20.transfer, (yieldRecipient, amount)));
         // Not ignored any more: exits still succeed either way, but the amount has to
         // be reported or it leaves the protocol's accounting silently.
-        swept = ok ? amount : 0;
+        //
+        // **Measured, not inferred.** `ok` says only that the call did not revert. The
+        // return value is discarded, so a token that returns `false` without reverting
+        // satisfies it while moving nothing - and this figure feeds `farmYieldDelivered`,
+        // the harvester's corroboration watermark, so an over-report there rates an epoch
+        // against money that never arrived. This is the one raw token call in a repo that
+        // uses `SafeERC20` everywhere else, which is why it was worth checking.
+        //
+        // The balance delta is used rather than decoding the return value, because it is
+        // right for both failure shapes - a `false` return and a partial transfer - and
+        // because measuring rather than trusting an external call is already the rule in
+        // four other places here.
+        uint256 remaining = usdc.balanceOf(address(this));
+        swept = ok && amount > remaining ? amount - remaining : 0;
     }
 }

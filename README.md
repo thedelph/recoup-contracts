@@ -221,7 +221,7 @@ Four habits came out of that and now apply by default:
   audited twice for correctness and deleted on the third pass, when someone finally asked the prior
   question and found it never closed the hole it was written for.
 
-Alongside the audits: stateful invariant fuzzing over four suites (21 invariants), and the mainnet
+Alongside the audits: stateful invariant fuzzing over four suites (27 invariants), and the mainnet
 fork tests above, which are the real integration proof.
 
 An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does
@@ -230,6 +230,16 @@ everything passing. **All four suites** now carry a deterministic reachability t
 state was actually reached. The last two were added on 2026-08-03, and one of them found that a
 suite really had been vacuous: seven invariants had been running against a protocol in which no
 borrow could succeed. [REVIEW.md](REVIEW.md) has the detail.
+
+**A reachability test is a floor, not a guarantee, and round nineteen's first job was finding out
+where the floor is.** The auction suite passed its reachability test and still fuzzed nothing: the
+handler exposed a wiring setter, every external non-view function on a handler is a fuzz action
+whether it was meant to be one or not, and once the fuzzer had repointed that field the read which
+followed reverted and took the whole handler call with it - auction included. It had been opening
+auctions at a healthy rate and rolling every one of them back for three audit rounds. So each suite
+now also carries `invariant_theHandlerNeverDropsAFrame`, which fails if any handler call reverts at
+all. That is the half a reachability test cannot cover, because the ghost that would record the
+evidence dies with the frame; only the runner, counting from outside, can see it.
 
 ### What is knowingly not mitigated
 

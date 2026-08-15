@@ -119,6 +119,25 @@ contract ReferralRegistryInvariants is Test {
 
     /// @dev The reason there is no `transferCode`, made into a property. Code ownership being
     ///      write-once is also what lets `boundCode` store only the code and derive the referrer.
+    /// @notice No handler call may revert. Every action in this handler wraps its interesting call
+    ///         in `try`, or guards it, so a handler *frame* that dies is a fixture fault rather
+    ///         than a meaningless random sequence.
+    /// @dev **Added to all five suites at once, because the bug that prompted it was found in one
+    ///      and existed in three.** `LiquidationAuction.invariants.t.sol` opened auctions at a
+    ///      healthy rate and rolled every one of them back, for three audit rounds, because a
+    ///      statement after the `try` reverted and `fail_on_revert = false` discards a reverting
+    ///      frame. Nothing inside a handler can detect that - the ghost that would record it dies
+    ///      with the frame. Only the runner, counting frames from outside, can.
+    ///
+    ///      Deterministic: a property of the handler's code rather than of the random walk, so it
+    ///      cannot flake the way a per-run reachability floor does.
+    ///
+    ///      Empty body on purpose. The assertion is the config line, enforced by the runner. The
+    ///      global `fail_on_revert = false` in `foundry.toml` stays correct for every other
+    ///      invariant here and is what lets the `try`/`catch` idiom work at all.
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_theHandlerNeverDropsAFrame() public view {}
+
     function invariant_aRegisteredCodeNeverChangesOwner() public view {
         uint256 n = handler.knownCodeCount();
         for (uint256 i; i < n; ++i) {
