@@ -14,13 +14,29 @@ next paragraph. Nothing touches real funds before an external audit.
 **`LenderPool` is finished, and I am holding it back on purpose.** The real one - the ERC-4626
 vault, the withdrawal queue, the yield stream and the impairment pricing - is written, tested and
 audited in my private tree. It is not in this repository because one finding against it is open. A
-loss-making position carries no impairment until somebody volunteers to liquidate it, and the
-protocol pays that volunteer nothing when the sale falls short of the debt, so in the gap between a
-loan going bad and a caller acting, the pool prices every exit at the full pre-loss price and a
-lender who leaves first is paid out of the lenders who stay. The fix changes what several other
-fixes should look like, so I am researching it before writing any of them. Publishing a pool with
-that open is worse than publishing none, so the skeleton stays until the finding is closed. The
-`ILenderPool` interface here is the real one and is what the finished contract implements.
+loss-making position carries no impairment until somebody calls `liquidate`, so in the gap between a
+loan going bad and that call, the pool prices every exit at the full pre-loss price and a lender who
+leaves first is paid out of the lenders who stay.
+
+That gap used to be unbounded, because the protocol paid the caller nothing when the sale fell short
+of the debt and nobody was obliged to volunteer. It is not unbounded now. `liquidate` carries a
+bounty the borrower prepaid at `borrow` - `Config.LIQUIDATION_CALL_BOUNTY`, 25 USDC, charged on any
+position above `MIN_BOUNTIED_DEBT` - and a short fill is the one outcome it exists to pay for. Audit
+round eighteen then found the first version of that bounty extractable: paying at open let a stranger
+open an auction, cure the position for a dollar and cancel it in the same transaction, keeping the
+deposit and leaving the position disarmed for whoever liquidated it for real afterwards. Since
+2026-08-15 the escrow parks against the auction id and is credited only by the transitions that
+actually resolved the position.
+
+**The finding is narrowed, not closed.** The window is bounded by transaction ordering now rather
+than by whether a caller ever appears, and that bound is not zero. `postNav` is public, so the price
+post that makes a position liquidatable can be back-run, and a lender exiting can out-bid the
+liquidator for position in the same block. No calibration of the bounty closes an ordering race, and
+I have no clean mitigation for it in this architecture: any delay between a post and liquidatability
+contradicts the rule that keeps liquidation priced on the last known NAV through a keeper outage.
+Publishing a pool with that open is worse than publishing none, so the skeleton stays until it is
+closed. The `ILenderPool` interface here is the real one and is what the finished contract
+implements.
 
 Testnet addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json), all
 verified on Basescan. The testnet deployment runs against a **mock** DexFi stack, because the real
@@ -93,8 +109,8 @@ All parameters live in src/Config.sol - no magic numbers anywhere else.
 
 Design notes that matter for review:
 
-- **The custody adapter is the only address that needs DexFi whitelisting.** It is ~90 lines,
-  immutable, holds no USDC at rest (claims sweep onward to the yield recipient in the same call),
+- **The custody adapter is the only address that needs DexFi whitelisting.** It is ~140 lines of
+  code, immutable, holds no USDC at rest (claims sweep onward to the yield recipient in the same call),
   and only the vault can call it. The `ICustodyAdapter` interface keeps custody swappable (direct-call vs a
   Safe-based backend) without touching vault accounting.
 - The DexFi-facing interfaces (`IDexFiBond`, `IDexFiFarm`) were built from the verified sources of
@@ -188,7 +204,7 @@ what it does not is a tested quantity rather than an assurance:
 
 Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
 re-audited**, because the rate at which fix rounds produce their own defects has stayed stubbornly
-high: **seventeen rounds so far, and eight of the last nine found defects in the round before them.**
+high: **eighteen rounds so far, and nine of the last ten found defects in the round before them.**
 Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) is
 written up as far as round nine. The rounds after it are not written up there yet: their fixes are
 in the code published here, and several of them are about the lender pool, which is not.
