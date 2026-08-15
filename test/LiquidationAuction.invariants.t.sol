@@ -17,9 +17,9 @@ import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 import {MockBond} from "./mocks/MockBond.sol";
-import {MockLenderPool} from "./mocks/MockLenderPool.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
+import {MockLenderPool} from "./mocks/MockLenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
 /// @notice Drives the whole liquidation lifecycle in random order against a NAV that
@@ -64,6 +64,23 @@ contract AuctionHandler is Test {
     uint256 public impairmentsOpenedByAnAuction;
     uint256 public impairmentsReleasedByAnAuction;
 
+    /// @notice The three branches the prepaid bounty can take, counted separately.
+    /// @dev **One ghost per branch, and audit round eighteen is why it is not one ghost for the
+    ///      mechanism.** `invariant_bountyOwedEqualsSumOfOwed` used to live in
+    ///      `CreditManager.invariants.t.sol`, where `liquidate` is not a handler action and the
+    ///      auction is a bare stub - so it compared 0 to 0 on every run of 128,000 calls, the
+    ///      tenth distinct way a test in this repo has gone vacuous. Its sibling on the *charge*
+    ///      side did have a reachability tripwire and was neuter-verified. Nobody asked whether
+    ///      the *release* was reachable in the suite that declared it, and a tripwire proves only
+    ///      the transition it names.
+    ///
+    ///      Counted from the manager's own storage rather than from "the call did not revert",
+    ///      for the same reason `_countRelease` is: a bounty that was meant to move and a bounty
+    ///      that moved are different claims, and only the second is the mechanism.
+    uint256 public bountiesParked;
+    uint256 public bountiesReleased;
+    uint256 public bountiesReturned;
+
     constructor(
         CollateralVault vault_,
         CreditManager credit_,
@@ -71,6 +88,7 @@ contract AuctionHandler is Test {
         MockNavOracle oracle_,
         MockUSDC usdc_,
         MockBond bond_,
+        MockLenderPool pool_,
         address keeper_,
         address[] memory actors_
     ) {
@@ -80,17 +98,38 @@ contract AuctionHandler is Test {
         oracle = oracle_;
         usdc = usdc_;
         bond = bond_;
+        pool = pool_;
         keeper = keeper_;
         actors = actors_;
     }
 
     /// @dev The pool is read, never driven. Its state is the evidence that an impairment landed;
     ///      this handler has no business calling it, because only the manager may.
-    MockLenderPool internal pool;
-
-    function setPool(MockLenderPool pool_) external {
-        pool = pool_;
-    }
+    ///
+    /// @dev **`immutable`, and injected rather than set, because a setter here is a fuzz target.**
+    ///      This used to be a plain storage slot behind `function setPool(MockLenderPool) external`.
+    ///      `targetContract(address(handler))` targets every external non-view function on the
+    ///      handler, so the fuzzer called that setter with a fuzzed - and therefore codeless -
+    ///      address about 45 times per 500-call run. From the first such call onward, the
+    ///      `pool.impairmentOf(...)` read inside `liquidate`'s `try` **success block** reverted on
+    ///      the extcodesize check, and a revert in the success block of a try/catch is not caught
+    ///      by `catch` - it propagates and rolls back the whole handler call, **including the
+    ///      auction that had just opened**.
+    ///
+    ///      Measured on the tree that had it: `liquidate` reported 444 calls and **31 reverts**
+    ///      per run while every other action reverted zero times, and `startedCount()` was 0. Those
+    ///      31 were not failures to liquidate. They were successful liquidations being destroyed
+    ///      one line later, roughly 370 of them across twelve runs. The suite was not failing to
+    ///      reach auctions; it was erasing the ones it reached.
+    ///
+    ///      `bid` and `cancel` read the same pointer and reported zero reverts, which looks like a
+    ///      contradiction and is the same fact: both return early on an empty `startedAuctions`,
+    ///      and it was empty precisely because every push had been rolled back.
+    ///
+    ///      The setter arrived in audit round sixteen, the change that wired the real pool in so
+    ///      the impairment lifecycle would stop being unreachable. **The fix for one vacuity built
+    ///      the next one**, and it hid for three rounds because a vacuous suite reports green.
+    MockLenderPool internal immutable pool;
 
     function _actor(uint256 seed) internal view returns (address) {
         return actors[seed % actors.length];
@@ -106,10 +145,17 @@ contract AuctionHandler is Test {
 
     // ── actions ──────────────────────────────────────────────────────────────
 
+    /// @dev **The upper bound has to sit above `MIN_BOUNTIED_DEBT`, not on it.** It used to be
+    ///      exactly 500e6, which is the dust threshold, so a single draw charged the prepaid
+    ///      bounty only when `bound` returned its maximum exactly - about one seed in five
+    ///      hundred million - and reaching the threshold in two draws needs both to land while
+    ///      NAV is high. Measured across 24,000 calls, `bountiesParked` was zero. Above the
+    ///      threshold, roughly a fifth of successful draws arm a position, and `MAX_LTV_BPS`
+    ///      still refuses anything the collateral cannot carry, so nothing is being forced.
     function borrow(uint256 actorSeed, uint256 amount) external {
         address a = _actor(actorSeed);
         vm.prank(a);
-        try credit.borrow(bound(amount, 1, 500e6)) {} catch {}
+        try credit.borrow(bound(amount, 1, 620e6)) {} catch {}
     }
 
     function repay(uint256 actorSeed, uint256 amount) external {
@@ -126,12 +172,57 @@ contract AuctionHandler is Test {
         oracle.setNav(bound(navSeed, 1e8, 30e8));
     }
 
+    /// @notice Moves NAV to a price derived from one actor's own debt, so the walk can land
+    ///         either side of that position's liquidation threshold on purpose.
+    /// @dev **Added beside `moveNav`, never instead of it.** The fuzzed state space stays a strict
+    ///      superset of the one every invariant in this file was previously proved over - a suite
+    ///      that only ever visits liquidatable states has stopped testing the healthy ones, which
+    ///      would be the same mistake one level up.
+    ///
+    ///      The pivot is inverted straight out of `LtvMath.exceedsLtv`'s own cross-multiplication,
+    ///      `debt * USDC_TO_NAV_SCALE * BPS > thresholdBps * bondCount * nav`, so it is the NAV at
+    ///      which this position sits exactly on the threshold. The draw spans 80% to 120% of it,
+    ///      which puts both sides of the guard in reach of one action - and that is what makes the
+    ///      heal-then-`cancel` path reachable from the same walk that opened the auction, instead
+    ///      of needing a second lucky uniform draw.
+    ///
+    ///      **Why it was needed, measured rather than assumed.** With the pool pointer fixed (see
+    ///      `pool` above) the uniform draw alone opened a mean of 2.0 auctions per 500-call run
+    ///      across 20 seeds, and **2 of those 20 runs opened none at all**. That is enough to stop
+    ///      the file being vacuous and not enough to explore the auction lifecycle, which is what
+    ///      the file is for: only half the runs filled a single bid.
+    ///
+    ///      **What the bias costs, stated rather than left to be discovered.** At equal depth the
+    ///      fuzzer now spends more of its budget near thresholds and proportionally less on NAVs
+    ///      far from any of them. That is accepted because the far states are the ones where every
+    ///      auction action is a no-op and the invariants are trivially true, and because uniform
+    ///      `moveNav` is still a separate selector - so the metrics table shows the split rather
+    ///      than hiding it.
+    function moveNavNearThreshold(uint256 actorSeed, uint256 offsetSeed) external {
+        address a = _actor(actorSeed);
+        uint256 debt = credit.currentDebtOf(a);
+        uint256 bonds = vault.bondCount(a);
+        if (debt == 0 || bonds == 0) return;
+
+        uint256 pivot =
+            (debt * Config.USDC_TO_NAV_SCALE * Config.BPS) / (Config.LIQUIDATION_THRESHOLD_BPS * bonds);
+        if (pivot == 0) return;
+
+        oracle.setNav(bound(offsetSeed, (pivot * 4) / 5, (pivot * 6) / 5));
+        navsDrawnNearThreshold++;
+    }
+
+    /// @notice Times the biased draw actually fired, so the bias is measurable rather than assumed.
+    uint256 public navsDrawnNearThreshold;
+
     function liquidate(uint256 actorSeed) external {
         address a = _actor(actorSeed);
+        uint256 parkedBefore = credit.totalBountyParked();
         vm.prank(keeper);
         try credit.liquidate(a) {
             startedAuctions.push(auction.auctionOf(a));
             if (pool.impairmentOf(a) != 0) impairmentsOpenedByAnAuction++;
+            if (credit.totalBountyParked() > parkedBefore) bountiesParked++;
         } catch {}
     }
 
@@ -145,11 +236,23 @@ contract AuctionHandler is Test {
         (address borrower,,,,,,,) = auction.auctions(id);
         uint256 markedBefore = pool.impairmentOf(borrower);
         address buyer = _actor(actorSeed);
+        // **Funded, and this line is the difference between a suite that fills auctions and one
+        // that only tries.** The buyer used to be an actor holding nothing but what they had
+        // borrowed, which is by construction less than their own collateral is worth, so every
+        // fuzzed bid failed the transfer and was swallowed by the `try`. Measured while adding
+        // the bounty invariant: `bidsFilled`, `cancelsDone` and both bounty release counters were
+        // **zero across 256 runs and 128,000 calls**, so every invariant in this file that talks
+        // about a resolved auction was holding over a state space with no resolutions in it. The
+        // deterministic tripwire below reached them and reported the suite healthy, which is
+        // exactly how a fixture-level vacuity survives a reachability check.
+        usdc.mint(buyer, 100_000e6);
         vm.startPrank(buyer);
         usdc.approve(address(auction), type(uint256).max);
+        uint256 owedBefore = credit.bountyOwedTo(keeper);
         try auction.bid(id, type(uint256).max) {
             bidsFilled++;
             _countRelease(borrower, markedBefore);
+            if (credit.bountyOwedTo(keeper) > owedBefore) bountiesReleased++;
         } catch {}
         vm.stopPrank();
     }
@@ -159,9 +262,11 @@ contract AuctionHandler is Test {
         uint256 id = startedAuctions[idSeed % startedAuctions.length];
         (address borrower,,,,,,,) = auction.auctions(id);
         uint256 markedBefore = pool.impairmentOf(borrower);
+        uint256 escrowBefore = credit.bountyEscrowOf(borrower);
         try auction.cancel(id) {
             cancelsDone++;
             _countRelease(borrower, markedBefore);
+            if (credit.bountyEscrowOf(borrower) > escrowBefore) bountiesReturned++;
         } catch {}
     }
 
@@ -173,8 +278,10 @@ contract AuctionHandler is Test {
 
     function expire(uint256 idSeed) external {
         if (startedAuctions.length == 0) return;
+        uint256 owedBefore = credit.bountyOwedTo(keeper);
         try auction.expireToWorkout(startedAuctions[idSeed % startedAuctions.length]) {
             workoutsOpened++;
+            if (credit.bountyOwedTo(keeper) > owedBefore) bountiesReleased++;
         } catch {}
     }
 
@@ -203,6 +310,14 @@ contract AuctionHandler is Test {
     function claimReward() external {
         vm.prank(keeper);
         try auction.claimReward() {} catch {}
+    }
+
+    /// @dev The drain on `bountyOwedTo`, and the reason the invariant that sums it is not just
+    ///      watching a number go up. Without a claim action the map only ever grows, so an
+    ///      accounting error on the way out would never be reached.
+    function claimBounty() external {
+        vm.prank(keeper);
+        try credit.claimBounty() {} catch {}
     }
 
     // ── views the invariants need ────────────────────────────────────────────
@@ -339,10 +454,29 @@ contract LiquidationAuctionInvariants is Test {
             vm.stopPrank();
         }
 
-        handler = new AuctionHandler(vault, credit, auction, oracle, usdc, bond, keeper, actors);
-        handler.setPool(pool);
+        handler = new AuctionHandler(vault, credit, auction, oracle, usdc, bond, pool, keeper, actors);
         targetContract(address(handler));
     }
+
+    /// @notice No handler call may revert. Every action in `AuctionHandler` wraps its interesting
+    ///         call in `try`, so a handler *frame* that dies is always a fixture fault rather than
+    ///         a meaningless random sequence.
+    /// @dev **This is the assertion that would have caught the defect this file was rewritten for,
+    ///      and no assertion inside the handler could have.** When the fuzzer was rewiring `pool`
+    ///      to a random address, `liquidate` reported 444 calls and 31 reverts per run - those 31
+    ///      were successful liquidations dying one line later, taking the auction and any counter
+    ///      that recorded it down with them. A ghost cannot see that, because the ghost is rolled
+    ///      back too. Only the runner, counting frames from outside, can.
+    ///
+    ///      Deterministic: it is a property of the handler's code, not of the random walk, so
+    ///      unlike a per-run reachability floor it cannot flake.
+    ///
+    ///      Empty body on purpose - the assertion is the config line above it, and it is enforced
+    ///      by the runner. This is the one place in the repo where `fail_on_revert` is true; the
+    ///      global `false` in `foundry.toml` is still correct for every other suite and is what
+    ///      lets the `try`/`catch` idiom work at all.
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_theHandlerNeverDropsAFrame() public view {}
 
     /// @notice The auction is immutable and has no sweep, so any USDC it holds beyond
     ///         unclaimed rewards is stranded forever. Round-1 finding #1's exact shape.
@@ -388,6 +522,56 @@ contract LiquidationAuctionInvariants is Test {
         }
     }
 
+    /// @notice Every USDC of prepaid bounty is in exactly one of the three pots, and each
+    ///         counter agrees with the map or the parks it claims to total.
+    /// @dev **This invariant lived in `CreditManager.invariants.t.sol` and compared 0 to 0 on
+    ///      every run**, because `liquidate` is not a handler action there and cannot be. It is
+    ///      here because this is the suite that reaches the transitions it is about: `liquidate`
+    ///      parks, `_bid` and `expireToWorkout` release, `cancel` returns, `claimBounty` drains.
+    ///
+    ///      **`assertEq`, not `assertGe`, and that is the whole point of it.** The solvency bound
+    ///      below is one-sided, so a counter that drifted *low* would leave it green while
+    ///      quietly narrowing what it claims - the exact failure this file already records
+    ///      against the escrow counter one round earlier.
+    ///
+    ///      The parked leg is summed over the auctions the handler actually started, so an id
+    ///      that was parked against and never resolved is caught rather than assumed away.
+    ///
+    ///      **This used to say the fuzzer opened zero auctions across 24,000 calls, and it was
+    ///      right.** The cause was not reachability and was not the two fixture blockers fixed
+    ///      before it - a borrow bound sitting on the dust threshold and an unfunded bidder, both
+    ///      real and neither sufficient. It was `setPool`, and the whole diagnosis is on the `pool`
+    ///      field above. Auctions were being opened at a healthy rate and destroyed one line later.
+    ///
+    ///      Measured after the fix, one run of depth 500 per seed, twenty seeds:
+    ///
+    ///      | fixture | auctions per run | runs opening none |
+    ///      |---|---|---|
+    ///      | `setPool` present | 0.00 | 20 of 20 |
+    ///      | pool injected | 2.00 | 2 of 20 |
+    ///      | + `moveNavNearThreshold` | 3.45 | 0 of 20 |
+    ///
+    ///      Bids follow the same shape: 0 of 20 runs, then 10, then 13.
+    function invariant_everyPrepaidBountyIsInExactlyOnePot() public view {
+        uint256 escrowed;
+        uint256 owed;
+        for (uint256 i = 0; i < handler.actorCount(); i++) {
+            escrowed += credit.bountyEscrowOf(handler.actors(i));
+            owed += credit.bountyOwedTo(handler.actors(i));
+        }
+        owed += credit.bountyOwedTo(handler.keeper());
+
+        uint256 parked;
+        for (uint256 i = 0; i < handler.startedCount(); i++) {
+            (,, uint256 amount) = credit.parkedBountyOf(handler.startedAuctions(i));
+            parked += amount;
+        }
+
+        assertEq(credit.totalBountyEscrowed(), escrowed, "escrow counter must equal its map");
+        assertEq(credit.totalBountyParked(), parked, "park counter must equal the live parks");
+        assertEq(credit.totalBountyOwed(), owed, "owed counter must equal its map");
+    }
+
     /// @notice The vault ledger still equals what is actually staked, with liquidations
     ///         and workouts moving positions around underneath it.
     function invariant_accountingSurvivesLiquidation() public view {
@@ -402,7 +586,8 @@ contract LiquidationAuctionInvariants is Test {
         assertGe(
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.insuranceFund(),
+                + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
+                + credit.totalBountyOwed(),
             "balance must cover every claim on it"
         );
     }
@@ -419,10 +604,30 @@ contract LiquidationAuctionInvariants is Test {
     ///      fires once per run against counters that reset each run, so it would demand
     ///      that all six behaviours occur in *every* random 500-call sequence, and fail
     ///      on the first unlucky one.
+    ///
+    ///      **And that is not a guess. It was tried and measured.** With the fixture as it now
+    ///      stands, `afterInvariant` asserting nothing more than `startedCount() > 0` failed a
+    ///      256-run campaign with `0 <= 0` - one unlucky run in 256, which is exactly the flake
+    ///      rate the paragraph above predicted. There is no cross-run accumulator available
+    ///      either: the runner reverts to the post-`setUp` snapshot between runs, so nothing in
+    ///      EVM state survives to be totalled.
+    ///
+    ///      **So the vacuity guard is deliberately split in two, and neither half is a campaign
+    ///      floor.** This test proves every transition is reachable at all;
+    ///      `invariant_theHandlerNeverDropsAFrame` proves the fuzzer is not silently discarding
+    ///      the ones it reaches. The second is the half this file did not have, and it is the half
+    ///      that mattered - a suite can pass a reachability tripwire and still fuzz nothing, which
+    ///      is precisely what happened here for three audit rounds.
     function test_handlerCanReachEveryStateTheInvariantsCheck() public {
         handler.borrow(0, 500e6); // alice, at a healthy LTV
         handler.borrow(1, 500e6); // bob
         handler.borrow(2, 500e6); // carol
+
+        // The biased draw has to be shown firing, not just present. Its guard returns early on a
+        // position with no debt or no bonds, so a version that silently never fired would leave
+        // the uniform walk doing all the work and this file back where it started.
+        handler.moveNavNearThreshold(0, 0);
+        assertEq(handler.navsDrawnNearThreshold(), 1, "the biased NAV draw must actually fire");
 
         handler.moveNav(8e8); // everyone is now underwater
         handler.liquidate(0);
@@ -439,15 +644,25 @@ contract LiquidationAuctionInvariants is Test {
         assertGt(pool.totalImpairment(), 0, "and the summed reserve must be real");
         assertGt(pool.exitReserve(), 0, "and it must reach the price a leaver is paid at");
 
+        // **A ghost per bounty branch, because a tripwire proves only the transition it names.**
+        // The round-eighteen finding was a bounty invariant declared in a suite that could not
+        // reach a liquidation at all, sitting beside a sibling that had been neuter-verified. So
+        // each of the three branches is asserted reachable on its own, and `assertGt` on the
+        // parked total is what stops the whole set passing over a charge that never happened.
+        assertEq(handler.bountiesParked(), 3, "opening an auction must park the escrow");
+        assertGt(credit.totalBountyParked(), 0, "and the parked total must be real money");
+
         // One is bought.
         handler.bid(0, 1);
         assertEq(handler.bidsFilled(), 1, "auctions must be fillable");
+        assertEq(handler.bountiesReleased(), 1, "and a fill must earn the escrow");
 
         // One heals and is cancelled.
         handler.moveNav(30e8);
         handler.cancel(1);
         assertGt(handler.impairmentsReleasedByAnAuction(), 0, "a terminal transition must release");
         assertEq(handler.cancelsDone(), 1, "auctions must be cancellable");
+        assertEq(handler.bountiesReturned(), 1, "and a cancel must give the escrow back");
 
         // One runs out of time, is partly recovered, then written off.
         handler.moveNav(8e8);

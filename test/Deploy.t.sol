@@ -241,7 +241,10 @@ contract DeployTest is Test, DeployBase {
         d.credit.borrow(500e6);
         vm.stopPrank();
 
-        assertEq(usdc.balanceOf(borrower), 500e6);
+        // The disbursement is the loan less the prepaid liquidation bounty; the debt is the
+        // whole loan. 500e6 is exactly the smallest bountied position, so this one is charged.
+        assertEq(usdc.balanceOf(borrower), 500e6 - Config.LIQUIDATION_CALL_BOUNTY);
+        assertEq(d.credit.bountyEscrowOf(borrower), Config.LIQUIDATION_CALL_BOUNTY);
         assertEq(d.credit.debtOf(borrower), 500e6);
     }
 

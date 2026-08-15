@@ -53,6 +53,10 @@ contract CreditHandler is Test {
     uint256 public principalSettlementsDone;
     uint256 public withdrawsDone;
     uint256 public withdrawsRefusedByLtv;
+    /// @notice Borrows that actually withheld a liquidation bounty. Read by the reachability
+    ///         tripwire, because a dust threshold set wrong would make the two bounty
+    ///         invariants above pass over a quantity that is always zero.
+    uint256 public bountiesCharged;
 
     constructor(
         MockUSDC usdc_,
@@ -79,9 +83,11 @@ contract CreditHandler is Test {
     function borrow(uint256 actorSeed, uint256 amount) external {
         address a = _actor(actorSeed);
         amount = bound(amount, 1, 5_000e6);
+        uint256 escrowBefore = credit.bountyEscrowOf(a);
         vm.prank(a);
         try credit.borrow(amount) {
             borrowCount++;
+            if (credit.bountyEscrowOf(a) > escrowBefore) ++bountiesCharged;
         } catch {}
     }
 
@@ -292,6 +298,25 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
     }
 
     /// @dev PRD §8: "Sum of user debts == CreditManager total debt."
+    /// @notice No handler call may revert. Every action in this handler wraps its interesting call
+    ///         in `try`, or guards it, so a handler *frame* that dies is a fixture fault rather
+    ///         than a meaningless random sequence.
+    /// @dev **Added to all five suites at once, because the bug that prompted it was found in one
+    ///      and existed in three.** `LiquidationAuction.invariants.t.sol` opened auctions at a
+    ///      healthy rate and rolled every one of them back, for three audit rounds, because a
+    ///      statement after the `try` reverted and `fail_on_revert = false` discards a reverting
+    ///      frame. Nothing inside a handler can detect that - the ghost that would record it dies
+    ///      with the frame. Only the runner, counting frames from outside, can.
+    ///
+    ///      Deterministic: a property of the handler's code rather than of the random walk, so it
+    ///      cannot flake the way a per-run reachability floor does.
+    ///
+    ///      Empty body on purpose. The assertion is the config line, enforced by the runner. The
+    ///      global `fail_on_revert = false` in `foundry.toml` stays correct for every other
+    ///      invariant here and is what lets the `try`/`catch` idiom work at all.
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_theHandlerNeverDropsAFrame() public view {}
+
     function invariant_totalDebtEqualsSumOfDebts() public view {
         uint256 sum;
         for (uint256 i; i < actors.length; ++i) {
@@ -319,15 +344,44 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         lastBorrowCount = borrows;
     }
 
+    /// @dev The prepaid liquidation bounty is real money held here, so the counter that
+    ///      speaks for it in the solvency assertion has to agree with the map it claims to
+    ///      total. Without this the counter is a ghost: `assertGe` below would keep passing
+    ///      against a total that had drifted low, because a lower figure only makes the
+    ///      solvency bound easier to clear.
+    function invariant_bountyEscrowEqualsSumOfEscrows() public view {
+        uint256 sum;
+        for (uint256 i; i < actors.length; ++i) {
+            sum += credit.bountyEscrowOf(actors[i]);
+        }
+        assertEq(credit.totalBountyEscrowed(), sum);
+    }
+
+    /// **`invariant_bountyOwedEqualsSumOfOwed` used to sit here and it compared 0 to 0 on every
+    /// run**, across 128,000 measured calls, because `liquidate` is not one of this handler's
+    /// actions and cannot be: `MockLiquidationAuction` here is a bare stub wired only to satisfy
+    /// the vault's pointer check, and the file already said so twenty lines further down. Its
+    /// docstring claimed "the handler is the only caller of `liquidate` in this suite"; the
+    /// handler never called it at all. Audit round eighteen found it - the tenth distinct way a
+    /// test in this repo has gone vacuous, and the sibling of the one directly above, which does
+    /// have a reachability tripwire and was neuter-verified.
+    ///
+    /// It now lives in `LiquidationAuction.invariants.t.sol`, which reaches `liquidate`,
+    /// `cancel`, `expireToWorkout` and `claimBounty`, with a ghost per branch behind it. **The
+    /// lesson is not "move the invariant" but "an invariant belongs in the suite that can reach
+    /// its subject", and a tripwire on one transition says nothing about its sibling.**
+
     /// @dev Solvency. Every USDC this contract holds is spoken for exactly once:
     ///      surplus owed to borrowers, yield not yet allocated, principal owed back to
-    ///      the funding source, and the insurance fund. Borrowed principal is never
-    ///      held here - it passes straight through.
+    ///      the funding source, the insurance fund, and the two liquidation-bounty pots.
+    ///      Borrowed principal is never held here - it passes straight through, less the
+    ///      bounty withheld from the disbursement, which is why the last two terms exist.
     function invariant_balanceCoversEveryClaimOnIt() public view {
         assertGe(
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.insuranceFund()
+                + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
+                + credit.totalBountyOwed()
         );
     }
 
@@ -396,6 +450,13 @@ contract CreditManagerInvariantsTest is StdInvariant, Test {
         handler.borrow(0, 5_000e6);
         assertEq(handler.borrowCount(), 1, "borrowing must be possible");
         assertEq(credit.totalDebt(), 5_000e6, "the borrow must have landed");
+
+        // The prepaid liquidation bounty has to be reachable here or both bounty invariants
+        // are checking a quantity that is always zero, and would report green over a dust
+        // threshold set above anything this fixture can borrow.
+        assertEq(handler.bountiesCharged(), 1, "the bounty charge was never exercised");
+        assertEq(credit.totalBountyEscrowed(), Config.LIQUIDATION_CALL_BOUNTY, "and it is held");
+        assertEq(credit.debtOf(actors[0]), 5_000e6, "the bounty is withheld from cash, not added to debt");
 
         // An epoch arrives. Nothing is payable at the instant of distribution - the
         // borrower's share streams over YIELD_STREAM_DURATION, which is the whole

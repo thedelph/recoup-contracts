@@ -471,12 +471,34 @@ contract LiquidationAuctionTest is Test {
 
         vm.prank(alice);
         credit.claimSurplus();
-        assertEq(usdc.balanceOf(alice), MAX_BORROW + 113.175e6, "the loan plus the surplus");
+        // The loan she actually received was the borrow less the prepaid bounty, and the
+        // bounty is not coming back - it went to the keeper who opened the auction.
+        assertEq(
+            usdc.balanceOf(alice),
+            MAX_BORROW - Config.LIQUIDATION_CALL_BOUNTY + 113.175e6,
+            "the loan plus the surplus"
+        );
 
         vm.prank(keeper);
         auction.claimReward();
         assertEq(usdc.balanceOf(keeper), penalty / 2);
         assertEq(usdc.balanceOf(address(auction)), 0, "nothing left at rest");
+
+        // **On a full fill the caller is paid twice, and that is intended.** The penalty share
+        // above prices the position having been penalised, which only exists because the lot
+        // sold for more than the debt. The prepaid bounty prices the act of opening the
+        // auction at all, which is what makes the pool's mark exist and is worth the same
+        // whether the sale clears the debt or misses it by half. Both are charged to the
+        // borrower and neither touches a lender. Liquity pays its gas compensation on top of
+        // the liquidation gain for the same reason, and Maker pays `tip + chip x tab`
+        // regardless of how the auction ends.
+        vm.prank(keeper);
+        credit.claimBounty();
+        assertEq(
+            usdc.balanceOf(keeper),
+            penalty / 2 + Config.LIQUIDATION_CALL_BOUNTY,
+            "the penalty share and the prepaid bounty both"
+        );
     }
 
     /// @notice A fill below the debt must still fill. A position nobody can buy is
@@ -517,6 +539,156 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.claimableOf(alice), 0, "no surplus, so nothing for the borrower");
         assertEq(auction.rewardOf(keeper), 0, "and no penalty to pay the caller from");
         assertEq(bond.bondBalance(bidder), BONDS);
+    }
+
+    /// @notice **The short fill now pays the caller, and this is the finding it closes.**
+    /// @dev Audit round seventeen: an insolvent position carries no impairment until somebody
+    ///      calls `liquidate`, and on a fill short of the debt the protocol paid that caller
+    ///      exactly nothing - `repaid` is clamped to the debt, so there is no surplus, so no
+    ///      penalty, so no reward. Every lender exit in that window was priced before the loss.
+    ///
+    ///      The penalty leg is asserted to still be zero on purpose. Nothing about this change
+    ///      manufactures a surplus that does not exist; what changed is that the work of
+    ///      opening the auction is paid for out of money the borrower prepaid, so the volunteer
+    ///      the whole mechanism waits on now has a reason to turn up.
+    ///
+    ///      **It narrows the window rather than closing it.** The loss-creating event is a
+    ///      public NAV post, and an exiter can back-run it and out-bid the liquidator for
+    ///      position in the same block. No calibration of this reward closes an ordering race,
+    ///      and it should not be recorded as having done so.
+    function test_shortFill_paysTheCallerFromTheEscrowWhenThePenaltyCannot() public {
+        uint256 id = _openAuction();
+        assertEq(
+            credit.bountyOwedTo(keeper),
+            0,
+            "not yet - since round eighteen, opening an auction earns nothing on its own"
+        );
+        assertEq(
+            credit.totalBountyParked(),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "it is parked against the auction until an exit says which way it went"
+        );
+
+        skip(Config.AUCTION_DURATION);
+        uint256 price = auction.currentPrice(id);
+        assertLt(price, MAX_BORROW, "a fill short of the debt");
+
+        _fundBidder(bidder, price);
+        vm.prank(bidder);
+        auction.bid(id);
+
+        assertEq(auction.rewardOf(keeper), 0, "still no surplus, so still no penalty share");
+        assertEq(credit.totalBountyParked(), 0, "the fill resolved it, so the park is empty");
+        assertEq(
+            credit.bountyOwedTo(keeper),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "and only now is it earned"
+        );
+
+        vm.prank(keeper);
+        credit.claimBounty();
+        assertEq(
+            usdc.balanceOf(keeper),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "but the caller is paid, which is the point"
+        );
+        assertEq(credit.totalBountyOwed(), 0);
+        assertEq(credit.bountyEscrowOf(alice), 0, "and the escrow is spent, not double-counted");
+    }
+
+    /// @dev **Audit round eighteen, the critical.** A stranger opened the auction, cured the
+    ///      position with a dust `repayFor` and cancelled, all in one transaction: the lot was
+    ///      exposed for zero blocks, nothing was resolved, and the whole escrow left with them
+    ///      for a dollar. Measured then: spend 1,000,000, take 25,000,000, and the position was
+    ///      left permanently disarmed, so the keeper who liquidated it for real afterwards was
+    ///      paid nothing against a control of 25,000,000.
+    ///
+    ///      The escrow now parks against the auction id and is credited only by the transitions
+    ///      that actually resolved the position, so opening one is no longer a payday. **Both
+    ///      halves are asserted**, because closing the theft while leaving the position disarmed
+    ///      would still be the round-seventeen state the mechanism was built to remove.
+    ///
+    ///      **The claim is attempted before the cancel on purpose.** `claimBounty` is
+    ///      permissionless and the attacker chooses the ordering, which is exactly why a
+    ///      claw-back hook on `cancel` would not have been sufficient.
+    function test_cancel_returnsTheEscrowSoOpeningAnAuctionIsNotAPayday() public {
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "premise: armed");
+
+        // Just past the threshold, which is where every real liquidation begins and the only
+        // band in which a dust cure is cheap enough for the strip to pay for itself.
+        oracle.setNav((NAV_AT_THRESHOLD * 999) / 1000);
+
+        address griefer = makeAddr("griefer");
+        uint256 dust = 1e6;
+        usdc.mint(griefer, dust);
+        uint256 heldBefore = usdc.balanceOf(griefer);
+
+        vm.startPrank(griefer);
+        credit.liquidate(alice);
+        uint256 id = auction.auctionOf(alice);
+        assertEq(credit.bountyOwedTo(griefer), 0, "opening it earns nothing on its own");
+        usdc.approve(address(credit), dust);
+        credit.repayFor(alice, dust);
+        auction.cancel(id);
+        vm.expectRevert(CreditManager.NoBountyOwed.selector);
+        credit.claimBounty();
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(griefer), heldBefore - dust, "the strip costs the griefer the cure");
+        assertEq(vault.bondCount(alice), BONDS, "no collateral moved, as before");
+        assertEq(
+            credit.bountyEscrowOf(alice),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "and the position is still armed for the liquidation that matters"
+        );
+
+        // The control the round-eighteen bundle insisted on: the honest keeper who resolves the
+        // position afterwards is paid in full, so the zero above is the guard doing its job and
+        // not a fixture in which nobody is ever paid.
+        oracle.setNav(CRASHED_NAV);
+        vm.prank(keeper);
+        credit.liquidate(alice);
+        uint256 second = auction.auctionOf(alice);
+        skip(Config.AUCTION_DURATION);
+        _fundBidder(bidder, auction.currentPrice(second));
+        vm.prank(bidder);
+        auction.bid(second);
+
+        assertEq(credit.bountyOwedTo(keeper), Config.LIQUIDATION_CALL_BOUNTY, "the keeper is paid");
+    }
+
+    /// @dev **The re-arm residual, pinned as accepted rather than left to be discovered.** A
+    ///      borrower whose escrow was spent by a real liquidation carries none until they borrow
+    ///      again or somebody calls `fundBounty`, so the next caller earns nothing from it.
+    ///      `liquidate` must still work: a position that cannot be liquidated is strictly worse
+    ///      than one liquidated for nothing. The empty case announces itself with an event
+    ///      rather than passing in silence.
+    ///
+    ///      **The reachable empty case changed with the fix, and the first draft of this test
+    ///      got it wrong.** It used to be a borrower liquidated once and cancelled back to
+    ///      health; a cancel now returns the escrow, so that state no longer exists. Nor does
+    ///      "resolved, then unarmed": every resolution drives the debt to zero, and a borrower
+    ///      with no debt cannot be liquidated at all. What is left is the case the dust guard
+    ///      creates on purpose - a position under `MIN_BOUNTIED_DEBT`, never charged, which NAV
+    ///      can still carry past the liquidation threshold.
+    function test_liquidate_stillWorksWithAnEmptyEscrowAndSaysSo() public {
+        uint256 dustLoan = Config.MIN_BOUNTIED_DEBT - 1;
+        vm.prank(alice);
+        credit.borrow(dustLoan);
+        assertEq(credit.bountyEscrowOf(alice), 0, "under the dust threshold, so never charged");
+        assertEq(usdc.balanceOf(alice), dustLoan, "and the whole draw was disbursed");
+
+        oracle.setNav(CRASHED_NAV);
+        address second = makeAddr("secondCaller");
+        vm.expectEmit(true, false, false, false, address(credit));
+        emit CreditManager.BountyDepleted(alice);
+        vm.prank(second);
+        credit.liquidate(alice);
+
+        assertGt(auction.auctionOf(alice), 0, "the auction opened regardless, which is the rule");
+        assertEq(credit.bountyOwedTo(second), 0, "unrewarded, and that is the recorded residual");
     }
 
     /// @dev Near the floor `price < debt + penalty` is routine, not exotic. An unclamped
@@ -692,6 +864,54 @@ contract LiquidationAuctionTest is Test {
         vm.prank(bidder);
         auction.bid(second);
         assertEq(bond.bondBalance(bidder), BONDS);
+    }
+
+    /// @notice A superseded auction hands its escrow to the auction that replaces it.
+    /// @dev **The fourth exit, and the one a bounty fix forgets.** Superseding resolves nothing -
+    ///      no fill, no workout, no loss recognised - so the escrow parked against the lapsed
+    ///      auction must not stay with the caller who opened it and then let it lapse. Left
+    ///      unhandled it would be stranded against a settled id that no exit can ever reach
+    ///      again, which is USDC no address could claim.
+    ///
+    ///      The ordering is what makes the hand-over free rather than special-cased: `start`
+    ///      returns the escrow to `bountyEscrowOf` from inside the supersede branch, and
+    ///      `liquidate` reads that map again after `start` returns, so the same money re-parks
+    ///      against the new id for the new caller in one call.
+    function test_liquidate_supersedingRollsTheEscrowOnToTheNewCallerAndAuction() public {
+        address firstCaller = makeAddr("firstCaller");
+        vm.prank(alice);
+        credit.borrow(MAX_BORROW);
+        oracle.setNav(SOFT_NAV);
+
+        vm.prank(firstCaller);
+        credit.liquidate(alice);
+        uint256 first = auction.auctionOf(alice);
+        (,, uint256 parkedFirst) = credit.parkedBountyOf(first);
+        assertEq(parkedFirst, Config.LIQUIDATION_CALL_BOUNTY, "parked against the first auction");
+
+        skip(Config.AUCTION_DURATION + 1);
+
+        address secondCaller = makeAddr("secondCaller");
+        vm.prank(secondCaller);
+        credit.liquidate(alice); // supersedes the lapsed one
+        uint256 second = auction.auctionOf(alice);
+        assertEq(second, first + 1, "premise: a fresh auction, not the old one");
+
+        (,, uint256 parkedOld) = credit.parkedBountyOf(first);
+        assertEq(parkedOld, 0, "the lapsed auction holds nothing");
+        (address claimant,, uint256 parkedNew) = credit.parkedBountyOf(second);
+        assertEq(parkedNew, Config.LIQUIDATION_CALL_BOUNTY, "and the escrow moved across whole");
+        assertEq(claimant, secondCaller, "to the caller who actually opened the live auction");
+        assertEq(credit.totalBountyParked(), Config.LIQUIDATION_CALL_BOUNTY, "counted once, not twice");
+
+        // And it pays out to the second caller, not the first.
+        skip(Config.AUCTION_DURATION);
+        _fundBidder(bidder, auction.currentPrice(second));
+        vm.prank(bidder);
+        auction.bid(second);
+
+        assertEq(credit.bountyOwedTo(secondCaller), Config.LIQUIDATION_CALL_BOUNTY);
+        assertEq(credit.bountyOwedTo(firstCaller), 0, "the caller who let it lapse earns nothing");
     }
 
     /// @notice The floor is reachable at the last instant of the window, not an
@@ -1014,6 +1234,119 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.insuranceFund(), 0, "insurance absorbed what it could");
         assertEq(credit.unsocialisedLoss(), 0, "the residual is the funder's, not a claim to place");
         assertEq(auction.openWorkoutCount(), 0);
+    }
+
+    /// @notice Arming a position is refused once its liquidation has started.
+    /// @dev A park is fixed at `liquidate` and cannot be topped up, so money paid in during a
+    ///      live auction cannot reach the caller working on it. Accepting it would take payment
+    ///      for a service this contract cannot deliver, and would leave the amount sitting in
+    ///      `bountyEscrowOf` until `writeDownLoss` cleared the debt - refundable, at that point,
+    ///      to the borrower who had just defaulted.
+    ///
+    ///      Both registers are checked, because they cover different halves of a liquidation's
+    ///      life and `expireToWorkout` moves a position from one to the other.
+    function test_fundBounty_refusedOnceALiquidationHasStarted() public {
+        uint256 id = _openAuction();
+        assertEq(credit.bountyEscrowOf(alice), 0, "premise: parked against the auction");
+
+        address stranger = makeAddr("stranger");
+        usdc.mint(stranger, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.startPrank(stranger);
+        usdc.approve(address(credit), Config.LIQUIDATION_CALL_BOUNTY);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.BountyFundingWhileLiquidating.selector, alice)
+        );
+        credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.stopPrank();
+
+        // And still refused once the auction has become a workout, which clears `auctionOf` and
+        // sets `workoutsOpenFor` - so a check on only the first register would let it through.
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+        assertEq(auction.auctionOf(alice), 0, "premise: the first register is clear");
+        assertGt(auction.workoutsOpenFor(alice), 0, "and the second one is not");
+
+        vm.startPrank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.BountyFundingWhileLiquidating.selector, alice)
+        );
+        credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.stopPrank();
+    }
+
+    /// @notice A borrower holds no escrow for as long as their auction is live.
+    /// @dev **This is the property that keeps `writeDownLoss` out of the bounty accounting, and
+    ///      it is named for the property rather than for the bug because the bug it was written
+    ///      against turned out not to exist here.**
+    ///
+    ///      Round eighteen's prescription warned of a landmine: once the release is gated, a
+    ///      genuine default reaches `writeDownLoss` still holding the escrow, and that function
+    ///      is the one `debtOf` writer that never refunds - so completing the pattern
+    ///      symmetrically would hand a defaulter the deposit meant to pay whoever cleaned up
+    ///      after them. **Built as written into `writeDownLoss` and executed, that refund
+    ///      changes nothing at all.** `_refundBounty` needs `bountyEscrowOf[borrower] != 0`,
+    ///      and under parking the borrower holds nothing from `liquidate` onwards. The landmine
+    ///      is real for the design the note assumed - gating the release *in place* - and
+    ///      unreachable for the one actually built.
+    ///
+    ///      So the thing worth pinning is the precondition, not the symptom. Delete the line in
+    ///      `liquidate` that empties `bountyEscrowOf` and twenty tests in this file go red,
+    ///      several by arithmetic underflow on the double-counted total; this one names why.
+    ///
+    ///      Both `writeDownLoss` callers are exercised, because they credit at different
+    ///      moments and a check on one says nothing about the other: `_distribute` on a short
+    ///      fill, where the caller is credited in the same transaction, and the forced
+    ///      `closeWorkout`, where it happened at expiry hours earlier.
+    function test_liquidate_leavesTheBorrowerNoEscrowWhileTheAuctionIsLive() public {
+        // Path one: a short fill. `_distribute` repays what it can and writes the rest down.
+        uint256 id = _openAuction();
+        assertEq(credit.bountyEscrowOf(alice), 0, "held by the auction, not by the borrower");
+        assertEq(credit.totalBountyParked(), Config.LIQUIDATION_CALL_BOUNTY, "and it is parked");
+
+        skip(Config.AUCTION_DURATION);
+        uint256 price = auction.currentPrice(id);
+        assertLt(price, MAX_BORROW, "premise: the fill cannot cover the debt");
+        _fundBidder(bidder, price);
+        vm.prank(bidder);
+        auction.bid(id);
+
+        assertEq(credit.debtOf(alice), 0, "premise: writeDownLoss drove the debt to zero");
+        assertEq(credit.claimableOf(alice), 0, "the defaulter is refunded nothing");
+        assertEq(credit.bountyEscrowOf(alice), 0, "and holds no escrow to be refunded later");
+        assertEq(credit.bountyOwedTo(keeper), Config.LIQUIDATION_CALL_BOUNTY, "the caller has it");
+        assertEq(credit.totalBountyParked(), 0);
+
+        // Path two: an expiry to workout, forced closed past the window.
+        address bob = makeAddr("bob");
+        bond.mint(bob, 1_000);
+        vm.startPrank(bob);
+        bond.setApprovalForAll(address(vault), true);
+        vault.depositBonds(BONDS);
+        vm.stopPrank();
+
+        oracle.setNav(NAV);
+        vm.prank(bob);
+        credit.borrow(MAX_BORROW);
+        assertEq(credit.bountyEscrowOf(bob), Config.LIQUIDATION_CALL_BOUNTY, "premise: armed");
+
+        oracle.setNav(CRASHED_NAV);
+        vm.prank(keeper);
+        credit.liquidate(bob);
+        assertEq(credit.bountyEscrowOf(bob), 0, "and emptied the moment the auction opened");
+
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(auction.auctionOf(bob));
+        assertEq(credit.totalBountyParked(), 0, "the expiry spent the park");
+        uint256 owedBeforeTheWriteDown = credit.bountyOwedTo(keeper);
+
+        skip(Config.WORKOUT_MAX_DURATION + 1);
+        auction.closeWorkout(1 + id); // bob's auction id, one past alice's
+
+        assertEq(credit.debtOf(bob), 0, "premise: the forced close wrote the residual down");
+        assertEq(credit.claimableOf(bob), 0, "and this defaulter is refunded nothing either");
+        assertEq(credit.bountyEscrowOf(bob), 0);
+        assertEq(credit.bountyOwedTo(keeper), owedBeforeTheWriteDown, "nothing moved at all");
     }
 
     function test_closeWorkout_revertsForAWorkoutThatIsNotOpen() public {
@@ -1435,6 +1768,71 @@ contract LiquidationAuctionTest is Test {
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.pendingPrincipal(),
             "only individually-payable claims stay behind"
+        );
+    }
+
+    /// @notice An unclaimed liquidation bounty is not a trapped pot. It has a name on it.
+    /// @dev The same defect as round 6b's, one pot along, and the one place this mechanism
+    ///      could lose money outright: `migrateReserves` sends everything not in `spokenFor`
+    ///      to the incoming manager **as insurance**, so a bounty left out of that sum would
+    ///      be converted into a general reserve and the keeper who earned it would never be
+    ///      paid. The invariant suite cannot catch it either, because this function is
+    ///      `onlyOwner` and only callable once detached.
+    ///
+    ///      Only `totalBountyOwed` can be non-zero here, and that is worth stating rather than
+    ///      leaving as an accident of the fixture: detaching requires `totalDebt == 0`, and
+    ///      every route a debt has to zero already refunds the escrow, so `totalBountyEscrowed`
+    ///      is provably zero at this point. Since round eighteen `totalBountyParked` has to be
+    ///      zero too, and it is by the same argument - a park only exists while an auction is
+    ///      live, and a live auction means live debt.
+    function test_migrateReserves_leavesAnEarnedBountyWithTheCallerWhoEarnedIt() public {
+        uint256 id = _openAuction();
+        assertEq(credit.bountyOwedTo(keeper), 0, "opening it earns nothing on its own");
+        assertEq(credit.totalBountyParked(), Config.LIQUIDATION_CALL_BOUNTY, "it is parked");
+
+        skip(Config.AUCTION_DURATION);
+        _fundBidder(bidder, auction.currentPrice(id));
+        vm.prank(bidder);
+        auction.bid(id); // resolves the position, so the manager can be detached
+
+        assertEq(credit.totalDebt(), 0);
+        assertEq(credit.totalBountyEscrowed(), 0, "spent by the liquidation, not still held");
+        assertEq(credit.totalBountyParked(), 0, "and the park emptied when the fill resolved it");
+        assertEq(credit.totalBountyOwed(), Config.LIQUIDATION_CALL_BOUNTY, "and owed to the keeper");
+
+        CreditManager next =
+            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        vm.prank(admin);
+        vault.setCreditManager(address(next));
+
+        // With the bounty the only thing left, there is nothing free to migrate at all: the
+        // whole balance is spoken for. Before this change the same call would have found
+        // exactly the bounty unaccounted for and sent it on as insurance.
+        vm.prank(admin);
+        vm.expectRevert(CreditManager.ZeroAmount.selector);
+        credit.migrateReserves();
+
+        // Give it something that genuinely is unspoken for, and only that moves.
+        usdc.mint(address(this), 1_000e6);
+        usdc.approve(address(credit), 1_000e6);
+        credit.fundInsurance(1_000e6);
+
+        vm.prank(admin);
+        credit.migrateReserves();
+
+        assertEq(next.insuranceFund(), 1_000e6, "the insurance moved and nothing else went with it");
+        assertEq(
+            credit.totalBountyOwed(),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "the migration did not convert the bounty into the incoming manager's insurance"
+        );
+
+        vm.prank(keeper);
+        credit.claimBounty();
+        assertEq(
+            usdc.balanceOf(keeper),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "and it is still actually backed by USDC left behind"
         );
     }
 

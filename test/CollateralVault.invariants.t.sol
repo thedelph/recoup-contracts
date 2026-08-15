@@ -80,10 +80,18 @@ contract VaultHandler is Test {
         return actors[seed % actors.length];
     }
 
+    /// @dev **The zero check has to come before `bound`, not after it.** It used to read
+    ///      `bound(amount, 1, bond.bondBalance(a))` with `if (amount == 0) return;` underneath,
+    ///      and once an actor had deposited everything they held that `bound` was called with a
+    ///      max of 0 against a min of 1. `StdUtils.bound` reverts on that, which kills the whole
+    ///      handler frame - so `fail_on_revert = false` discarded the call, and the guard written
+    ///      for exactly this case sat one line below something that could never reach it.
+    ///      Mirrors `withdraw` below, which has always read the balance first.
     function deposit(uint256 actorSeed, uint256 amount) external {
         address a = _actor(actorSeed);
-        amount = bound(amount, 1, bond.bondBalance(a));
-        if (amount == 0) return;
+        uint256 heldOutside = bond.bondBalance(a);
+        if (heldOutside == 0) return;
+        amount = bound(amount, 1, heldOutside);
         vm.prank(a);
         vault.depositBonds(amount);
         ghostTotalBondCount += amount;
@@ -237,6 +245,25 @@ contract CollateralVaultInvariants is Test {
     }
 
     /// Vault accounting always equals what is actually staked in the farm.
+    /// @notice No handler call may revert. Every action in this handler wraps its interesting call
+    ///         in `try`, or guards it, so a handler *frame* that dies is a fixture fault rather
+    ///         than a meaningless random sequence.
+    /// @dev **Added to all five suites at once, because the bug that prompted it was found in one
+    ///      and existed in three.** `LiquidationAuction.invariants.t.sol` opened auctions at a
+    ///      healthy rate and rolled every one of them back, for three audit rounds, because a
+    ///      statement after the `try` reverted and `fail_on_revert = false` discards a reverting
+    ///      frame. Nothing inside a handler can detect that - the ghost that would record it dies
+    ///      with the frame. Only the runner, counting frames from outside, can.
+    ///
+    ///      Deterministic: a property of the handler's code rather than of the random walk, so it
+    ///      cannot flake the way a per-run reachability floor does.
+    ///
+    ///      Empty body on purpose. The assertion is the config line, enforced by the runner. The
+    ///      global `fail_on_revert = false` in `foundry.toml` stays correct for every other
+    ///      invariant here and is what lets the `try`/`catch` idiom work at all.
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_theHandlerNeverDropsAFrame() public view {}
+
     function invariant_accountingMatchesFarmStake() public view {
         (uint256 staked,) = farm.userInfo(address(adapter));
         assertEq(staked, handler.sumBondCounts(), "sum(bondCount) == farm stake");

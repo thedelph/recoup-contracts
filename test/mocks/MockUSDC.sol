@@ -12,6 +12,15 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 contract MockUSDC is ERC20 {
     mapping(address => bool) public blocked;
 
+    /// @notice Transfers to `account` return `false` instead of reverting or moving.
+    /// @dev A second, different failure shape, and the suite had no way to express it.
+    ///      Real USDC reverts, so this models the other well-known ERC-20 class - the
+    ///      tokens that signal failure in the return value - which is what the adapter's
+    ///      one raw `call` had to be checked against. Audit round 17 found that
+    ///      `_trySweepUsdc` read "the call did not revert" as "the money moved"; with
+    ///      only `blocked` available, no test in the tree could reach that branch.
+    mapping(address => bool) public silentlyFails;
+
     error Blocked(address account);
 
     constructor() ERC20("Mock USDC", "USDC") {}
@@ -27,6 +36,16 @@ contract MockUSDC is ERC20 {
     /// @notice Make transfers to or from `account` revert, as USDC's blacklist does.
     function setBlocked(address account, bool value) external {
         blocked[account] = value;
+    }
+
+    /// @notice Make transfers to `account` return false, moving nothing, without reverting.
+    function setSilentlyFails(address account, bool value) external {
+        silentlyFails[account] = value;
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        if (silentlyFails[to]) return false;
+        return super.transfer(to, value);
     }
 
     function _update(address from, address to, uint256 value) internal override {

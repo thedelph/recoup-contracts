@@ -515,6 +515,40 @@ contract CollateralVaultTest is Test {
         assertEq(adapter.unreportedYield(), 0, "and the counter went with it");
     }
 
+    /// @dev Audit round 17: `_trySweepUsdc` read "the low-level call did not revert" as
+    ///      "the money moved". A token that returns `false` without reverting satisfies
+    ///      the first and not the second, and the swept figure feeds the harvester's
+    ///      corroboration watermark - so an over-report there rates an epoch against
+    ///      money that never arrived.
+    ///
+    ///      This branch was unreachable from the suite until `MockUSDC.setSilentlyFails`
+    ///      existed: the mock could only revert, which the old code already handled. The
+    ///      defect survived because the only failure shape the tests could express was
+    ///      the one that was covered.
+    function test_adapter_aSilentlyFailingTransferIsNotCountedAsSwept() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        farm.setPendingYield(address(adapter), 500e6);
+        usdc.setSilentlyFails(yieldSink, true);
+
+        vm.prank(alice);
+        vault.withdrawBonds(50);
+
+        assertEq(usdc.balanceOf(yieldSink), 0, "premise: nothing actually moved");
+        assertEq(usdc.balanceOf(address(adapter)), 500e6, "premise: the USDC is still here");
+        assertEq(adapter.unreportedYield(), 500e6, "so it is carried, not counted as delivered");
+
+        // And the carry is honest: once the token behaves, the same money sweeps once.
+        usdc.setSilentlyFails(yieldSink, false);
+        farm.setPendingYield(address(adapter), 0);
+        vm.prank(alice);
+        vault.withdrawBonds(10);
+
+        assertEq(usdc.balanceOf(yieldSink), 500e6, "delivered exactly once");
+        assertEq(adapter.unreportedYield(), 0, "and the counter cleared");
+    }
+
     /// @dev **The blacklist-trap regression.** The adapter's sweep is deliberately
     ///      best-effort so a USDC pause or blacklist can never brick a collateral
     ///      exit - but `setYieldRecipient`, the designated escape from a recipient

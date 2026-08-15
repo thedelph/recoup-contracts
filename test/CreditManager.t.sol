@@ -200,7 +200,11 @@ contract CreditManagerTest is Test {
 
         assertEq(credit.debtOf(alice), MAX_BORROW);
         assertEq(credit.totalDebt(), MAX_BORROW);
-        assertEq(usdc.balanceOf(alice), MAX_BORROW);
+        // The disbursement is the loan less the prepaid liquidation bounty; the debt, and so
+        // the LTV, are the full loan. That asymmetry is the whole reason the bounty is held
+        // off the debt ledger, and this is the test that pins it.
+        assertEq(usdc.balanceOf(alice), MAX_BORROW - Config.LIQUIDATION_CALL_BOUNTY);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY);
         assertEq(credit.currentLtvBps(alice), Config.MAX_LTV_BPS);
     }
 
@@ -550,7 +554,8 @@ contract CreditManagerTest is Test {
         assertGe(
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.insuranceFund(),
+                + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
+                + credit.totalBountyOwed(),
             "distribution promised more than the contract holds"
         );
     }
@@ -841,6 +846,9 @@ contract CreditManagerTest is Test {
         uint256 owed = credit.claimableOf(alice);
         assertGt(owed, 0);
         assertEq(credit.totalDebt(), 0);
+        // The settle that cleared the debt also handed the prepaid bounty back, because a
+        // debt-free position has nothing left for it to insure.
+        assertEq(credit.bountyEscrowOf(alice), 0, "bounty refunded when yield cleared the debt");
 
         CreditManager fresh =
             new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
@@ -849,7 +857,248 @@ contract CreditManagerTest is Test {
 
         vm.prank(alice);
         credit.claimSurplus();
-        assertEq(usdc.balanceOf(alice), 500e6 + owed, "recorded surplus still payable");
+        // Alice is square on the loan itself: she received the disbursement, the debt was
+        // cleared by yield, and everything recorded as hers, refunded bounty included, paid out.
+        assertEq(
+            usdc.balanceOf(alice),
+            500e6 - Config.LIQUIDATION_CALL_BOUNTY + owed,
+            "recorded surplus still payable"
+        );
+    }
+
+    /// @dev A third party clearing the debt refunds the escrow rather than consuming it. The
+    ///      tail settlement is gated on the borrower paying for themselves, so `repayFor`
+    ///      cannot spend money that is not the payer's - it goes back to the borrower who
+    ///      prepaid it, as claimable.
+    function test_repayFor_refundsTheEscrowRatherThanSpendingIt() public {
+        vm.prank(alice);
+        credit.borrow(500e6);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY);
+        uint256 bobBefore = 500e6;
+
+        usdc.mint(bob, bobBefore);
+        vm.startPrank(bob);
+        usdc.approve(address(credit), bobBefore);
+        credit.repayFor(alice, 500e6);
+        vm.stopPrank();
+
+        assertEq(credit.debtOf(alice), 0);
+        // Bob paid the whole debt in cash. None of it came out of alice's escrow.
+        assertEq(usdc.balanceOf(bob), 0, "no part of the debt was met from the escrow");
+        assertEq(credit.bountyEscrowOf(alice), 0);
+        assertEq(credit.totalBountyEscrowed(), 0);
+        assertEq(
+            credit.claimableOf(alice),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "the prepaid bounty went back to the borrower who prepaid it"
+        );
+    }
+
+    // ── The prepaid liquidation bounty ───────────────────────────────────────
+
+    /// @dev The dust guard. A position under the threshold is never charged, so the smallest
+    ///      borrows this contract permits keep disbursing to the wei - which matters, because
+    ///      a floor on borrow size would have been a risk-parameter change touching fixtures
+    ///      all over this suite, and the mechanism does not need one.
+    function test_borrow_belowTheDustThresholdIsNotCharged() public {
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT - 1);
+
+        assertEq(usdc.balanceOf(alice), Config.MIN_BOUNTIED_DEBT - 1, "disbursed in full");
+        assertEq(credit.bountyEscrowOf(alice), 0);
+        assertEq(credit.totalBountyEscrowed(), 0);
+    }
+
+    /// @dev The guard keys on the debt a borrow results in, not on the amount borrowed.
+    ///      Keying on the amount would make the charge opt-out: a borrower could walk to the
+    ///      per-account cap in slices that are each under the threshold and never pay it.
+    function test_borrow_crossingTheThresholdInSlicesIsStillCharged() public {
+        uint256 slice = Config.MIN_BOUNTIED_DEBT / 2;
+        vm.startPrank(alice);
+        credit.borrow(slice);
+        assertEq(credit.bountyEscrowOf(alice), 0, "under the threshold, nothing charged yet");
+
+        credit.borrow(slice); // now at MIN_BOUNTIED_DEBT
+        vm.stopPrank();
+
+        assertEq(credit.debtOf(alice), Config.MIN_BOUNTIED_DEBT);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "charged on the crossing");
+        assertEq(usdc.balanceOf(alice), Config.MIN_BOUNTIED_DEBT - Config.LIQUIDATION_CALL_BOUNTY);
+    }
+
+    /// @dev Topped up to the constant rather than accumulated, so a borrower who draws
+    ///      repeatedly pays for one bounty and not one per draw.
+    function test_borrow_repeatedDrawsTopUpRatherThanAccumulate() public {
+        vm.startPrank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+        credit.borrow(60e6);
+        credit.borrow(60e6);
+        vm.stopPrank();
+
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "charged exactly once");
+        assertEq(
+            usdc.balanceOf(alice),
+            Config.MIN_BOUNTIED_DEBT + 120e6 - Config.LIQUIDATION_CALL_BOUNTY
+        );
+    }
+
+    /// @dev The one transaction-wide cliff: existing debt just under the threshold, and a
+    ///      borrow small enough to cross it without funding the charge. Refused by name rather
+    ///      than clamped, because an under-funded escrow would pay a smaller bounty than the
+    ///      constant advertises and the caller would have no way to know before spending gas.
+    function test_borrow_revertsWhenTheCrossingDrawCannotFundTheBounty() public {
+        vm.startPrank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT - 1);
+
+        uint256 tooSmall = Config.LIQUIDATION_CALL_BOUNTY - 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CreditManager.BorrowBelowBounty.selector, tooSmall, Config.LIQUIDATION_CALL_BOUNTY
+            )
+        );
+        credit.borrow(tooSmall);
+        vm.stopPrank();
+    }
+
+    /// @notice Anyone may arm anyone's position, capped at the charge.
+    /// @dev **Audit round eighteen: `BorrowBelowBounty` and `PerAccountCapExceeded` have no
+    ///      shared feasibility check.** A borrower whose debt sits within
+    ///      `LIQUIDATION_CALL_BOUNTY` of the per-account cap would be refused for drawing too
+    ///      little to fund the charge and refused again for drawing enough, so no borrow re-arms
+    ///      them. The arithmetic hole is unchanged and is asserted below.
+    ///
+    ///      **What did change is its reachability, and that is worth recording rather than
+    ///      quietly banking.** The only executed route into that state was the strip - liquidate,
+    ///      cure, cancel - and parking the escrow closed it: the round-eighteen PoC for the band
+    ///      now fails on its own premise, `escrow emptied: 25000000 != 0`. No other route into it
+    ///      was found. So this function has **no demonstrated trigger today**. It is kept because
+    ///      the hole is arithmetic rather than incidental, and because the two caps it sits
+    ///      between are committed to become admin-settable and to ratchet - a cap that moves down
+    ///      past a live position reopens exactly this band, with no code change to notice it.
+    ///
+    ///      Permissionless for the same reason `fundInsurance` is: whoever expects to profit from
+    ///      liquidating a position can arm it themselves for less than the reward.
+    function test_fundBounty_armsAPositionNoBorrowAmountCouldArm() public {
+        // The arithmetic, stated where a parameter move would break it: any position whose
+        // headroom is under the charge has an empty feasible band.
+        assertLt(
+            Config.LIQUIDATION_CALL_BOUNTY,
+            Config.PER_ACCOUNT_BORROW_CAP,
+            "premise: the charge fits inside the cap at all"
+        );
+
+        // A reachable unarmed position: under the dust threshold, so never charged.
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT - 1);
+        assertEq(credit.bountyEscrowOf(alice), 0, "premise: unarmed, and legitimately so");
+        assertEq(usdc.balanceOf(alice), Config.MIN_BOUNTIED_DEBT - 1, "the whole draw disbursed");
+
+        address stranger = makeAddr("stranger");
+        usdc.mint(stranger, 2 * Config.LIQUIDATION_CALL_BOUNTY);
+        uint256 heldBefore = usdc.balanceOf(address(credit));
+
+        vm.startPrank(stranger);
+        usdc.approve(address(credit), 2 * Config.LIQUIDATION_CALL_BOUNTY);
+        credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
+
+        // Capped at the charge, and refused rather than clamped: a clamp would take more USDC
+        // than it credited.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CreditManager.BountyFundingOverflows.selector,
+                Config.LIQUIDATION_CALL_BOUNTY + 1,
+                Config.LIQUIDATION_CALL_BOUNTY
+            )
+        );
+        credit.fundBounty(alice, 1);
+        vm.stopPrank();
+
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "armed by a stranger");
+        assertEq(credit.totalBountyEscrowed(), Config.LIQUIDATION_CALL_BOUNTY);
+        assertEq(
+            usdc.balanceOf(address(credit)) - heldBefore,
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "and the USDC actually arrived, so the escrow is funded and not just recorded"
+        );
+    }
+
+    /// @dev **The borrower's cash cost of a loan is the loan.** They receive the draw less the
+    ///      bounty, and the bounty settles the last slice of the debt on the way out, so they
+    ///      never have to find money they were not given. Without this rule a fully repaid
+    ///      position would require the borrower to source the bounty from somewhere else and
+    ///      claim it back afterwards, which is a real defect and not a convenience.
+    function test_repay_theEscrowSettlesTheTailSoNoExtraCashIsNeeded() public {
+        vm.startPrank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+        uint256 received = usdc.balanceOf(alice);
+        assertEq(received, Config.MIN_BOUNTIED_DEBT - Config.LIQUIDATION_CALL_BOUNTY);
+
+        // Holding only what was disbursed, and approving only that.
+        usdc.approve(address(credit), received);
+        credit.repay(Config.MIN_BOUNTIED_DEBT);
+        vm.stopPrank();
+
+        assertEq(credit.debtOf(alice), 0, "the whole debt is cleared");
+        assertEq(usdc.balanceOf(alice), 0, "every disbursed wei went back and no more");
+        assertEq(credit.pendingPrincipal(), Config.MIN_BOUNTIED_DEBT, "the source is owed the full loan");
+        assertEq(credit.bountyEscrowOf(alice), 0);
+        assertEq(credit.totalBountyEscrowed(), 0);
+        assertEq(credit.claimableOf(alice), 0, "consumed by the debt, not handed back twice");
+    }
+
+    /// @dev A partial repayment must not disarm the bounty. The position is still live and
+    ///      still liquidatable, so the prepayment still has something to insure.
+    function test_repay_partialRepaymentLeavesTheEscrowIntact() public {
+        vm.startPrank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+        usdc.approve(address(credit), 100e6);
+        credit.repay(100e6);
+        vm.stopPrank();
+
+        assertGt(credit.debtOf(alice), 0);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "still armed");
+    }
+
+    /// @dev The passive path. Yield alone can take a debt to zero with no transaction from the
+    ///      borrower, and when it does the bounty has nothing left to insure. The refund is
+    ///      lazy, like `claimableOf` itself, so it lands on whichever settle gets there first.
+    function test_settle_refundsTheEscrowWhenYieldClearsTheDebt() public {
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+
+        _distribute(700e6);
+        credit.settle(alice);
+
+        assertEq(credit.debtOf(alice), 0);
+        assertEq(credit.bountyEscrowOf(alice), 0, "refunded by the settle that cleared the debt");
+        assertEq(credit.totalBountyEscrowed(), 0);
+        assertGe(
+            credit.claimableOf(alice),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "and it is claimable rather than stranded"
+        );
+    }
+
+    /// @dev A debt that reached zero passively but has not been refunded yet is still armed,
+    ///      so re-borrowing against it costs nothing. The escrow that would have come back is
+    ///      still sitting there and still doing its job.
+    function test_borrow_afterAPassiveZeroDoesNotChargeTwice() public {
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+
+        _distribute(700e6);
+        credit.settle(alice); // debt cleared and the escrow refunded
+
+        uint256 balanceBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+
+        // Refunded, so this is a fresh position and it pays again - which is correct.
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY);
+        assertEq(
+            usdc.balanceOf(alice),
+            balanceBefore + Config.MIN_BOUNTIED_DEBT - Config.LIQUIDATION_CALL_BOUNTY
+        );
     }
 
     /// @dev **The counter-overwrite regression.** `settlePrincipal` snapshots

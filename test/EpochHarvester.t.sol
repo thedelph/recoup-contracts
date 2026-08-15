@@ -760,7 +760,8 @@ contract EpochHarvesterTest is Test {
         assertGe(
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.insuranceFund()
+                + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
+                + credit.totalBountyOwed()
         );
     }
 

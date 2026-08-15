@@ -37,6 +37,12 @@ interface ICreditManager {
     ///         any loss reaches lenders. Permissionless; pulls against an allowance.
     function fundInsurance(uint256 amount) external;
 
+    /// @notice Top a position's prepaid liquidation bounty back up to the full charge, so
+    ///         somebody is paid for liquidating it. Permissionless; pulls against an
+    ///         allowance. Exists because arming a position through `borrow` is not always
+    ///         reachable - see the implementation.
+    function fundBounty(address borrower, uint256 amount) external;
+
     /// @notice Spread an epoch's borrower share across every bond, in one write.
     ///         EpochHarvester only, and the USDC must already have been delivered.
     /// @dev Positions are not iterated. Each one works out its own share lazily from
@@ -74,6 +80,20 @@ interface ICreditManager {
     /// @notice Recognise unrecoverable debt: insurance first, then socialised to
     ///         lenders. LiquidationAuction only.
     function writeDownLoss(address borrower, uint256 amount) external;
+
+    /// @return Sum of the bounties currently parked against live auctions.
+    /// @dev Also the marker `LiquidationAuction.setCreditManager` checks a candidate manager
+    ///      for, because only one carrying the park can answer it.
+    function totalBountyParked() external view returns (uint256);
+
+    /// @notice Settle the bounty parked against an auction. LiquidationAuction only.
+    /// @param earned True from the exits that resolved the position (`_bid`,
+    ///        `expireToWorkout`), which credit the caller who opened it; false from the
+    ///        exits that resolved nothing (`cancel`, `start`'s supersede branch), which
+    ///        return the escrow to the borrower so the position stays armed.
+    /// @dev Must not revert. It sits on every auction exit, and a state where all of them
+    ///      revert is permanently stranded collateral.
+    function resolveBounty(uint256 auctionId, bool earned) external;
 
     /// @notice Retry placing losses the lender pool could not accept. Permissionless.
     function flushSocialisedLoss() external;

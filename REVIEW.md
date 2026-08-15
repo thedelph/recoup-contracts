@@ -133,7 +133,7 @@ testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Four suites, 21 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
+Four suites, 27 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
 one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no state
 in which all three of an auction's exits revert, because that state would be permanently stranded
 collateral and only a fuzzer looking for it would ever find it.
@@ -154,6 +154,25 @@ seven were wrong - re-run with debt reachable, they all still pass - but nothing
 It is written up here rather than quietly fixed because the distinction between "our invariants
 pass" and "our invariants were exercised" is the one an auditor should care about, and this repo
 would rather show you the machinery that caught it than the clean result.
+
+**It happened again, and the second time the tripwire did not catch it.** The auction suite passed
+its reachability test and was still fuzzing nothing. Its handler exposed a wiring setter, and every
+external non-view function on a handler is a fuzz action whether it was written to be one or not, so
+the fuzzer repointed that field at a random address about 45 times a run. The read which followed
+then reverted **inside the success block of a `try`**, where `catch` does not catch it, so the whole
+handler call reverted and the runner discarded it - along with the auction that had just opened. On
+the broken fixture `liquidate` reported 444 calls and 31 reverts per run while every other action
+reverted zero times: those 31 were successful liquidations being destroyed one line later, roughly
+370 across twelve runs.
+
+The fix is that the pool is now a constructor argument, so the selector does not exist. The durable
+part is that each suite carries `invariant_theHandlerNeverDropsAFrame`, which fails if any handler
+call reverts at all. Every action in these handlers is `try`-wrapped, so a dead frame is always a
+fixture fault - and it is the one class of fault no assertion inside a handler can report, because
+the ghost that would record it dies with the frame. Sweeping every suite with that check turned up
+two more instances immediately, one of them an assertion that had been failing invisibly for
+rounds. The measured effect: auctions opened per 500-call run went from 0.00 to 3.45, and runs
+opening none from 20 of 20 to 0 of 20.
 
 ## What has been reviewed
 

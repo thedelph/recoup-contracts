@@ -64,6 +64,36 @@ contract ConfigTest is Test {
         assertGt(Config.LIQUIDATION_CALLER_SHARE_BPS, 0);
     }
 
+    /// @dev **Derived, not asserted**, in the style of the referral outflow test below. The
+    ///      prepaid bounty exists precisely because the penalty-funded reward pays zero when
+    ///      an auction fills short of the debt. If it were worth less than the best case the
+    ///      penalty route could ever pay, the fix would be smaller than the hole it was
+    ///      written for - and nothing else in the tree ties the two together, so retuning
+    ///      `LIQUIDATION_PENALTY_BPS` could make that true silently.
+    function test_liquidationBountyIsPayableAndAffordable() public pure {
+        assertGt(Config.LIQUIDATION_CALL_BOUNTY, 0);
+
+        // A bounty larger than the position it is charged on cannot come out of the
+        // disbursement. This relation is what makes `borrow`'s subtraction safe rather
+        // than merely untested.
+        assertLt(Config.LIQUIDATION_CALL_BOUNTY, Config.MIN_BOUNTIED_DEBT);
+
+        // A threshold above the per-account cap would make the mechanism unreachable: no
+        // position could ever be bountied, every consumer would ship untested, and the
+        // suite would report green over a quantity that is always zero.
+        assertLe(Config.MIN_BOUNTIED_DEBT, Config.PER_ACCOUNT_BORROW_CAP);
+
+        uint256 bestCasePenaltyReward = (
+            ((Config.MIN_BOUNTIED_DEBT * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS)
+                * Config.LIQUIDATION_CALLER_SHARE_BPS
+        ) / Config.BPS;
+        assertGe(
+            Config.LIQUIDATION_CALL_BOUNTY,
+            bestCasePenaltyReward,
+            "the prepaid bounty must beat the penalty route it exists to backstop"
+        );
+    }
+
     /// @dev A workout must be allowed to run longer than DexFi's own quoted redemption
     ///      turnaround, or the force-close would recognise a loss on debt that was
     ///      about to be paid. `AUCTION_DURATION` bounds it from the other side: the
