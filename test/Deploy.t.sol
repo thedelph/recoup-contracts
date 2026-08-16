@@ -408,6 +408,48 @@ contract DeployTest is Test, DeployBase {
         _assertPhase4Wiring(d, _paramsOwnedHere());
     }
 
+    // ── the gap inside the switchover (audit round 19, critical 3) ───────────
+
+    /// @notice A switchover that dies part-way and leaves the protocol paused is a named failure.
+    /// @dev **Audit round 19, critical 3.** `_wirePhase4` is three owner transactions rather than
+    ///      one - a broadcast emits one per external call - so there is a gap between the legs in
+    ///      which the pool funds the book while `credit.lenderPool` is still zero. A borrow drawn
+    ///      there and defaulted strands the pool's principal permanently, and every wiring
+    ///      assertion still passes over it. `_wirePhase4` now pauses across the gap.
+    ///
+    ///      **Why the pause is sufficient is narrower than it sounds, and worth stating here so
+    ///      nobody widens the gap believing they are narrowing it.** Pausing this protocol stops
+    ///      neither `liquidate` nor `writeDownLoss` nor `flushSocialisedLoss`, and the lender pool
+    ///      is not `Pausable` at all. It is enough only because `setLiquiditySource` already
+    ///      refuses while `totalDebt` or `pendingPrincipal` is non-zero, so no pre-existing
+    ///      position can be carried into the gap - a fresh `borrow` is the only door, and `borrow`
+    ///      is the one function in `CreditManager` carrying `whenNotPaused`.
+    ///
+    ///      **The two tests that build the hazard itself are not in this repository**, for the
+    ///      same reason the second half of the switchover test above is not: both need a pool that
+    ///      accepts deposits and lends, and the skeleton published here does neither. What is here
+    ///      is the half that is about the deploy script - that a half-run switchover leaving the
+    ///      protocol paused fails by name rather than as a silent outage. Under an EOA owner that
+    ///      is one transaction to repair; under the timelock this protocol is heading for it is a
+    ///      48-hour outage nobody is watching for.
+    function test_deploy_phase4WiringRefusesAProtocolLeftPaused() public {
+        (Deployed memory d,) = _liveProtocol();
+
+        this.exposedWirePhase4(d);
+        _assertPhase4Wiring(d, _paramsOwnedHere());
+        assertFalse(d.credit.paused(), "the switchover must hand the protocol back open");
+        assertFalse(d.vault.paused(), "both of them");
+
+        d.credit.pause();
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.SwitchoverLeftPaused.selector, "credit"));
+        this.exposedAssertPhase4Wiring(d, _paramsOwnedHere());
+
+        d.credit.unpause();
+        d.vault.pause();
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.SwitchoverLeftPaused.selector, "vault"));
+        this.exposedAssertPhase4Wiring(d, _paramsOwnedHere());
+    }
+
     // ── the yieldRecipient footgun ───────────────────────────────────────────
 
     /// @dev The regression that motivated this work: the old script passed `admin`

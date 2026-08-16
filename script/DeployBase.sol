@@ -92,6 +92,15 @@ abstract contract DeployBase is Script {
     ///      charged - which is precisely the state round 11 found shipped.
     error LenderRolesDisagree(address liquiditySource, address lenderPool);
 
+    /// @dev **Audit round 19, critical 3.** Raised when the switchover is asked to move the funding
+    ///      pointer while the protocol is still open for business. The gap between the legs is what
+    ///      this guards; see `_wirePhase4` for why a pause closes it completely.
+    error SwitchoverNotPaused(string what);
+
+    /// @dev The other end of the same problem: a switchover that half-ran and left the protocol
+    ///      paused is a legible failure rather than a silent outage nobody is watching for.
+    error SwitchoverLeftPaused(string what);
+
     uint256 internal constant ANVIL_CHAIN_ID = 31337;
 
     /// @dev Deterministic local stand-in for the treasury. Anything but the deployer:
@@ -230,8 +239,17 @@ abstract contract DeployBase is Script {
         // relationship the code refuses to honour is worse than no wiring at all, because
         // `_assertWiring` was asserting it and reporting the deployment healthy.
         //
-        // So the lender legs move out of the shipping path entirely and into `_wirePhase4`, which
-        // sets the liquidity source and the loss sink together or not at all.
+        // So the lender legs move out of the shipping path entirely and into `_wirePhase4`.
+        //
+        // That sentence used to end "which sets the liquidity source and the loss sink together or
+        // not at all", and **audit round 19 measured it false**: a broadcast emits one transaction
+        // per external call, so the legs are separate transactions and there is a gap between them.
+        // The one-transaction-per-external-call fact was already written down elsewhere in this
+        // codebase - `DeployReferral.s.sol` states it plainly - and the two facts had simply never
+        // been put next to each other. Nothing here decayed; the contradiction shipped fully
+        // formed, which is a different failure from prose going stale and is not the kind a grep
+        // for staleness finds. `_wirePhase4` now pauses across the gap rather than claiming there
+        // is not one.
         d.harvester.setCustodyAdapter(ICustodyAdapter(address(d.adapter)));
         d.harvester.setProtocolFeeWallet(p.protocolFeeWallet);
 
@@ -293,12 +311,59 @@ abstract contract DeployBase is Script {
     ///         epoch harvested before this line stays accrued in `pendingLenderYield` and is
     ///         delivered whole by the first `flushLenderYield` after it. Nothing is lost by
     ///         waiting; something is given away by not.
+    ///
+    ///      **Audit round 19, critical 3: the "one operation" above was never true, and the pause
+    ///      is what makes it true enough.** A `forge script` broadcast emits one transaction per
+    ///      external call, so these legs are separate transactions for an EOA owner and separately
+    ///      queued operations under the Safe or timelock this file's sibling script is written for.
+    ///      In the gap after leg 2 the pool funds the book while `credit.lenderPool` is still zero,
+    ///      so `CreditManager._socialise` finds no sink, emits `LossBorneByTheSource` and returns
+    ///      **above** the line that would have deferred the loss - leaving the pool's
+    ///      `outstandingPrincipal` standing against a loan that no longer exists, with no backlog
+    ///      for `flushSocialisedLoss` to drain and no assertion in this file able to see it.
+    ///      Measured: 500,000,000 stranded, `_assertPhase4Wiring` passing over it, and the pool
+    ///      welded to that manager for good because `setCreditManager` then refuses.
+    ///
+    ///      **Why a pause is sufficient here, which is a narrower claim than it sounds.** Pausing
+    ///      this protocol does not stop the dangerous paths in general: `liquidate`,
+    ///      `writeDownLoss`, `flushSocialisedLoss` and every `LenderPool` entry point are all
+    ///      ungated, and `LenderPool` is not `Pausable` at all. `borrow` is the *only* function in
+    ///      `CreditManager` carrying `whenNotPaused`. It is enough because of what leg 2 already
+    ///      demands: `setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is
+    ///      non-zero, so **no pre-existing position can be carried into the gap and defaulted
+    ///      there** - and by the identity `outstandingPrincipal == pendingPrincipal + totalDebt`
+    ///      that same precondition also pins the pool's own principal at zero on entry. A fresh
+    ///      borrow is the only door into the gap, and the pause is the lock on that one door.
+    ///      Do not "improve" this by relaxing leg 2's precondition; it is half the reason the
+    ///      pause works.
+    ///
+    ///      The vault is paused for the same span. Its `depositBonds`/`depositETH` are the only
+    ///      other `whenNotPaused` functions in the protocol, and new collateral arriving mid-
+    ///      switchover is the same class of mistake even though it is not the one that was measured.
+    ///
+    ///      **What this does NOT do, recorded rather than glossed.** The pause is enforced by this
+    ///      script, not by the chain. An operator who transcribes the three legs into a Safe by hand
+    ///      can omit it, and nothing on chain refuses them. The guard below catches that on the
+    ///      queued path - `run()` is executed against live state to *generate* those calls, so this
+    ///      read is a real one there - but it cannot catch an operator who never runs the script.
     function _wirePhase4(Deployed memory d) internal {
+        d.credit.pause();
+        d.vault.pause();
+
+        // Read back rather than trusted. On the queued path this is a live read against the chain
+        // the calls are being generated for, which is the case that matters: a protocol that is
+        // already open for business must not have a funding pointer moved underneath it.
+        if (!d.credit.paused()) revert SwitchoverNotPaused("credit");
+        if (!d.vault.paused()) revert SwitchoverNotPaused("vault");
+
         if (d.credit.pendingPrincipal() != 0) d.credit.settlePrincipal();
 
         d.credit.setLiquiditySource(address(d.pool));
         d.credit.setLenderPool(address(d.pool));
         d.harvester.setLenderPool(address(d.pool));
+
+        d.vault.unpause();
+        d.credit.unpause();
     }
 
     /// @dev Ownership moves last, after everything is wired.
@@ -497,6 +562,17 @@ abstract contract DeployBase is Script {
         // `repayPrincipal` are `onlyCreditManager`, so a pool pointing at the wrong manager funds
         // nothing and the first borrow reverts - and they are now asserted in `_assertCoreGraph`
         // above, along with everything else the switchover leaves alone.
+
+        // **The pause has to come back off, and nothing else was watching for that.** `_wirePhase4`
+        // pauses across the gap, which means a run that dies part-way - a reverted leg, a Safe
+        // signer who stops signing, an operator who queued four of the five calls - leaves the
+        // protocol unable to take a borrow or a deposit with no error anywhere saying so. Under an
+        // EOA owner the fix is one transaction; under the timelock this protocol is heading for it
+        // is a 48-hour wait, which is exactly the situation somebody needs to be told about rather
+        // than left to discover. Asserted here because this is the check an operator runs after the
+        // queued calls execute.
+        if (d.credit.paused()) revert SwitchoverLeftPaused("credit");
+        if (d.vault.paused()) revert SwitchoverLeftPaused("vault");
     }
 
     function _requireOwner(address contractAddr, address actual, address expected) private pure {

@@ -51,6 +51,11 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     error ZeroAddress();
     error RenounceDisabled();
     error AuctionAlreadyLive(uint256 auctionId);
+    /// @dev **Audit round 19, critical 2.** The re-strike window has closed: this auction has been
+    ///      lapsing and re-striking since `openedAt` and may not be re-struck again. The remedy is
+    ///      `expireToWorkout`, which is permissionless and legal the moment the current window
+    ///      lapses, and which arms the forced close that bounds the lender pool's mark.
+    error AuctionResetWindowClosed(uint256 auctionId, uint256 closedAt);
     error UnknownAuction(uint256 auctionId);
     error AuctionClosed(uint256 auctionId);
     error NothingToAuction(address borrower);
@@ -85,8 +90,15 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     event WorkoutClosed(uint256 indexed auctionId, uint256 recovered, uint256 writtenOff);
     event WorkoutYieldSwept(uint256 amount);
     event WorkoutLotDisposed(uint256 indexed auctionId, address indexed to, uint256 bondCount);
-    /// @param supersededBy The fresh auction opened over the same position.
-    event AuctionSuperseded(uint256 indexed auctionId, address indexed borrower, uint256 supersededBy);
+    /// @notice A lapsed auction re-struck in place at the current NAV, keeping its id.
+    /// @param resetBy Whoever called `liquidate` to re-strike it. Recorded because it is *not* the
+    ///        party who gets paid - the parked bounty stays with whoever opened the auction - and an
+    ///        indexer that assumed otherwise would be reading audit round 19's finding back in.
+    /// @dev Replaces `AuctionSuperseded`, which announced a fresh auction id. There is no longer a
+    ///      second auction to name.
+    event AuctionReset(
+        uint256 indexed auctionId, address indexed borrower, address indexed resetBy, uint256 nav, uint256 startPrice
+    );
     /// @notice The manager refused the impairment refresh this transition sent it, so the lender
     ///         pool is still carrying whatever reserve it had.
     /// @dev The whole reason the notification is best-effort is that these exits must not be
@@ -156,6 +168,16 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      the impairment a live liquidation carries is sized from this auction's floor, and the
     ///      manager only ever holds the borrower.
     mapping(address => uint256) public override auctionOf;
+
+    /// @notice When this auction was *first* opened, as opposed to when its current price window
+    ///         started. Zero for an id that was never issued.
+    /// @dev **Audit round 19, critical 2, and the whole point is that this one does not move.**
+    ///      `Auction.startedAt` is reset by every re-strike, which is what makes the Dutch price
+    ///      restart - and is also what let an unfunded stranger keep a position live forever, six
+    ///      hours at a time, holding the lender pool's withdrawal queue shut. This is the clock the
+    ///      re-strike window is measured against, so re-striking cannot extend its own deadline.
+    ///      Written once, at open, and never again.
+    mapping(uint256 => uint256) public firstOpenedAt;
 
     /// @inheritdoc ILiquidationAuction
     /// @dev **Non-zero only inside a `_bid` frame, and audit round 15 is why it exists.**
@@ -313,36 +335,72 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // is open. Same rule, same reason, one contract over.
         if (workoutsOpenFor[borrower] != 0) revert WorkoutAlreadyOpen(borrower);
 
-        // A lapsed auction is superseded rather than blocking, and that is a security
-        // property, not a convenience. `startNav` is frozen for the life of an auction,
-        // and `cancel` - the only thing that clears a healed one - is permissionless,
-        // unrewarded and optional. Left to block, a stale ticket becomes a perpetual
-        // call option struck at 68% of an arbitrarily old price, fillable whenever the
-        // borrower re-levers, while no correctly-priced replacement can ever open.
+        // A lapsed auction is re-struck rather than blocking, and that is a security property, not
+        // a convenience. `startNav` is frozen for the life of an auction, and `cancel` - the only
+        // thing that clears a healed one - is permissionless, unrewarded and optional. Left to
+        // block, a stale ticket becomes a perpetual call option struck at 68% of an arbitrarily old
+        // price, fillable whenever the borrower re-levers, while no correctly-priced replacement
+        // can ever open.
         //
-        // Superseding is also strictly better than the floor fill it replaces: the new
-        // auction restarts at 100% of *current* NAV and decays again.
+        // **Audit round 19 rewrote how, and it is the same shape Maker's `Clipper.redo` uses:
+        // reset the auction in place, keeping its id, rather than settling it and minting a new
+        // one.** The old version was two separate criticals wearing one branch:
+        //
+        //  1. Minting a new id meant the parked bounty had to be unwound off the lapsed auction and
+        //     re-parked against the new one - and `liquidate` re-reads `bountyEscrowOf` immediately
+        //     after this function returns, so the escrow rolled forward onto whoever made *this*
+        //     call. The borrower could therefore wait one second past a keeper's lapse, re-strike,
+        //     and take the 25 USDC the keeper had earned. Measured: keeper 0, borrower 25,000,000.
+        //     Resetting in place removes the unwind entirely, so there is nothing to re-park and no
+        //     claimant to overwrite. The keeper who opened the auction keeps the claim through
+        //     every re-strike, whoever pays for them.
+        //  2. Settling and re-opening bumped the liveness registers each lap and started a fresh
+        //     clock, so an attacker with no capital at all could keep a position live indefinitely
+        //     and hold the lender pool's whole withdrawal queue shut. `firstOpenedAt` does not move,
+        //     so the window below is a real deadline rather than one the attacker keeps extending.
+        //
+        // Re-striking is still strictly better than the floor fill it replaces: the price restarts
+        // at 100% of *current* NAV and decays again. What is no longer claimed is that it is
+        // strictly better full stop - that was only ever true of a neutral re-striker. A borrower
+        // or a griefer re-strikes at the top of the curve precisely so the lot never reaches the
+        // floor where it would fill, which is why the deadline exists.
         uint256 live = auctionOf[borrower];
         if (live != 0) {
-            if (block.timestamp <= auctions[live].startedAt + Config.AUCTION_DURATION) {
+            Auction storage stale = auctions[live];
+            if (block.timestamp <= stale.startedAt + Config.AUCTION_DURATION) {
                 revert AuctionAlreadyLive(live);
             }
-            auctions[live].settled = true;
-            liveAuctionCount--;
-            emit AuctionSuperseded(live, borrower, nextAuctionId + 1);
-            // **The fourth exit, and the one a bounty fix forgets.** Superseding resolves
-            // nothing - no fill, no workout, no loss recognised - so the escrow the lapsed
-            // auction was holding goes back to the borrower rather than to the caller who
-            // opened it and then let it lapse. That return happens *before* `liquidate` reads
-            // `bountyEscrowOf` again on the way out of this call, which is what lets the same
-            // escrow roll straight forward onto this new auction and this new caller.
-            ICreditManager(creditManager).resolveBounty(live, false);
-            // The lapsed auction can no longer recover anything, so the mark it was sized from is
-            // now wrong in the dangerous direction. Restating it here rather than leaving it to
-            // the caller escalates to the full debt for the rest of this call; `liquidate`
-            // re-derives it against the fresh auction the moment this function returns, and the
-            // interim is the conservative figure rather than the stale one.
-            _refreshImpairment(live, borrower);
+
+            // The bound. Measured from the first open, never from the last re-strike, so re-striking
+            // cannot buy more time to re-strike. Past it the only legal move is `expireToWorkout` -
+            // permissionless, and already legal, since the window above has lapsed - which arms
+            // `WORKOUT_MAX_DURATION` and the forced close that ends the mark.
+            uint256 closesAt = firstOpenedAt[live] + Config.AUCTION_RESET_WINDOW;
+            if (block.timestamp > closesAt) revert AuctionResetWindowClosed(live, closesAt);
+
+            // Re-read everything the price depends on, exactly as a fresh open would. The lot can
+            // have changed - the borrower may have deposited or the vault may have moved bonds -
+            // and pricing a re-strike off the original lot would sell a quantity that is not there.
+            uint256 restruckBonds = _vault.bondCount(borrower);
+            if (restruckBonds == 0) revert NothingToAuction(borrower);
+            uint256 restruckNav = navOracle.navPerBond();
+            if (restruckNav == 0) revert NavUnset();
+
+            stale.startedAt = uint96(block.timestamp);
+            stale.bondCount = restruckBonds;
+            stale.startNav = restruckNav;
+            stale.startPrice = _lotPrice(restruckBonds, restruckNav, Config.AUCTION_START_PREMIUM_BPS);
+            stale.debt = ICreditManager(creditManager).debtOf(borrower);
+
+            emit AuctionReset(live, borrower, caller, restruckNav, stale.startPrice);
+
+            // **No `resolveBounty` and no `liveAuctionCount` change, and both omissions are the
+            // fix rather than oversights.** Nothing resolved: the same auction is still open, still
+            // holds the same park, and is still counted once. The old branch's impairment refresh
+            // is gone for the same reason - it existed to correct a mark that settling the auction
+            // would have invalidated mid-call, and nothing is settled here. `liquidate` re-derives
+            // the mark the moment this returns, as it always did.
+            return live;
         }
 
         uint256 bonds = _vault.bondCount(borrower);
@@ -382,6 +440,9 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             debt: ICreditManager(creditManager).debtOf(borrower)
         });
         auctionOf[borrower] = auctionId;
+        // Written here and nowhere else. The re-strike branch above deliberately does not touch it -
+        // that is what makes `AUCTION_RESET_WINDOW` a deadline rather than a rolling extension.
+        firstOpenedAt[auctionId] = block.timestamp;
         liveAuctionCount++;
 
         emit AuctionStarted(auctionId, borrower, caller, bonds, startPrice);

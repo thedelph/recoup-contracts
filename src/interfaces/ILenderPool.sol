@@ -79,10 +79,16 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     /// @notice Reserve the shortfall a borrower's live liquidation is expected to produce.
     ///         CreditManager only, and an idempotent **set** rather than an add: the estimate is
     ///         re-stated as the position moves.
-    function impair(address borrower, uint256 amount) external;
+    /// @return wrote Whether the stored mark actually changed. Both of these return it because both
+    ///         are idempotent and therefore silent on a no-op - no write, no event, no revert - and
+    ///         a caller that treats "did not revert" as "did something" reports work it did not do.
+    ///         Audit round 19 measured that: five refreshes, `refreshed = 1` each time, zero
+    ///         `Impaired` events, the withdrawal queue shut on the unchanged mark throughout.
+    function impair(address borrower, uint256 amount) external returns (bool wrote);
 
     /// @notice Drop a borrower's reserve because the position resolved. CreditManager only.
-    function releaseImpairment(address borrower) external;
+    /// @return wrote Whether a mark was actually cleared. See `impair` above.
+    function releaseImpairment(address borrower) external returns (bool wrote);
 
     /// @notice Set the reserves that belong to no single position: a loss the manager has
     ///         recognised but this pool has not absorbed, and the insurance fund standing in front

@@ -844,21 +844,30 @@ contract LiquidationAuctionTest is Test {
     ///         price the moment the borrower re-levers. Refusing the stale fill is only
     ///         safe *because* supersession replaces it, so both halves are asserted
     ///         together - refusing without a replacement would just be a stuck position.
-    function test_bid_lapsesAfterTheWindowAndLiquidateSupersedesIt() public {
+    ///
+    ///         **Audit round 19 changed how the replacement happens, not whether it does.** It used
+    ///         to settle the lapsed auction and mint a new id; it now re-strikes the same auction in
+    ///         place, Maker `Clipper.redo`-style, because minting a new id was what let the parked
+    ///         bounty be re-assigned to whoever made that call - see the test below. The two things
+    ///         this test actually cares about are unchanged: the stale fill is refused, and a fresh
+    ///         price is reachable.
+    function test_bid_lapsesAfterTheWindowAndLiquidateReStrikesIt() public {
         uint256 first = _openAuctionAt(SOFT_NAV);
-        skip(Config.AUCTION_DURATION + 5 days);
+        // Inside `Config.AUCTION_RESET_WINDOW`, because a re-strike past that is refused outright -
+        // asserted in its own test rather than smuggled in here.
+        skip(Config.AUCTION_DURATION + 1 hours);
 
         _fundBidder(bidder, 5_000e6);
         vm.prank(bidder);
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionLapsed.selector, first));
         auction.bid(first, type(uint256).max);
 
-        // The replacement reprices from scratch at current NAV, which is the thing the
+        // The re-strike reprices from scratch at current NAV, which is the thing the
         // stale floor fill was standing in for.
         vm.prank(keeper);
         credit.liquidate(alice);
         uint256 second = auction.auctionOf(alice);
-        assertEq(second, first + 1);
+        assertEq(second, first, "the same auction, re-struck rather than replaced");
         assertEq(auction.currentPremiumBps(second), Config.AUCTION_START_PREMIUM_BPS, "priced fresh, not at a floor");
 
         vm.prank(bidder);
@@ -866,18 +875,78 @@ contract LiquidationAuctionTest is Test {
         assertEq(bond.bondBalance(bidder), BONDS);
     }
 
-    /// @notice A superseded auction hands its escrow to the auction that replaces it.
-    /// @dev **The fourth exit, and the one a bounty fix forgets.** Superseding resolves nothing -
-    ///      no fill, no workout, no loss recognised - so the escrow parked against the lapsed
-    ///      auction must not stay with the caller who opened it and then let it lapse. Left
-    ///      unhandled it would be stranded against a settled id that no exit can ever reach
-    ///      again, which is USDC no address could claim.
+    /// @notice The re-strike window is a deadline measured from the first open, and re-striking
+    ///         cannot extend it.
+    /// @dev **Audit round 19, critical 2, and this is the bound the whole finding turned on.** The
+    ///      re-strike was free, permissionless and unbounded, and each one restarted the auction's
+    ///      liveness register - which `CreditManager._impairmentFor` keys the lender pool's mark on.
+    ///      So an attacker holding no capital could keep a position live forever, six hours at a
+    ///      time, and hold the entire withdrawal queue shut over idle cash while
+    ///      `openWorkoutCount` never left zero and no clock was ever armed.
     ///
-    ///      The ordering is what makes the hand-over free rather than special-cased: `start`
-    ///      returns the escrow to `bountyEscrowOf` from inside the supersede branch, and
-    ///      `liquidate` reads that map again after `start` returns, so the same money re-parks
-    ///      against the new id for the new caller in one call.
-    function test_liquidate_supersedingRollsTheEscrowOnToTheNewCallerAndAuction() public {
+    ///      Both halves asserted together, deliberately. A test that only showed the refusal would
+    ///      pass just as happily against an auction that can never be resolved at all, which is a
+    ///      worse bug than the one being fixed - so the workout that the refusal is supposed to
+    ///      leave reachable is actually taken here.
+    function test_liquidate_reStrikingIsBoundedAndThenTheWorkoutIsTheOnlyMoveLeft() public {
+        // Holds nothing at any point, which is the whole shape of the finding: the freeze cost the
+        // attacker gas and no capital at all.
+        address griefer = makeAddr("reStrikeGriefer");
+        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 opened = auction.firstOpenedAt(id);
+        assertEq(opened, block.timestamp, "premise: the open stamps the clock");
+
+        // Re-strike as often as the window allows. Each lap is a full lapse plus one second, which
+        // is the cheapest cadence available to a griefer.
+        uint256 laps;
+        while (block.timestamp + Config.AUCTION_DURATION + 1 <= opened + Config.AUCTION_RESET_WINDOW) {
+            skip(Config.AUCTION_DURATION + 1);
+            vm.prank(griefer);
+            credit.liquidate(alice);
+            assertEq(auction.auctionOf(alice), id, "still one auction, re-struck in place");
+            assertEq(auction.firstOpenedAt(id), opened, "and re-striking never moves its own deadline");
+            laps++;
+        }
+        assertGt(laps, 0, "fixture: the window has to permit at least one re-strike");
+
+        // Past the deadline the door is shut, by name.
+        skip(Config.AUCTION_DURATION + 1);
+        vm.prank(griefer);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationAuction.AuctionResetWindowClosed.selector, id, opened + Config.AUCTION_RESET_WINDOW
+            )
+        );
+        credit.liquidate(alice);
+
+        // And what is left is the bounded path: permissionless, already legal, and it arms the
+        // forced close that ends the lender pool's mark.
+        assertEq(auction.openWorkoutCount(), 0, "premise: no clock was armed while re-strikes ran");
+        auction.expireToWorkout(id);
+        assertEq(auction.openWorkoutCount(), 1, "the workout clock is armed");
+        assertEq(auction.liveAuctionCount(), 0, "and the auction is no longer live");
+    }
+
+    /// @notice A re-struck auction keeps its parked bounty with the caller who opened it.
+    /// @dev **Audit round 19, critical 1, and this test asserted the exact opposite before it.** It
+    ///      used to be called `..._supersedingRollsTheEscrowOnToTheNewCallerAndAuction`, and it
+    ///      pinned the hand-over as correct behaviour using two strangers, `firstCaller` and
+    ///      `keeper`. Substituting the *borrower* for the second one was the whole finding: a keeper
+    ///      opens the auction and does the work, the borrower waits one second past the lapse,
+    ///      re-strikes, and the 25 USDC lands on them instead. Measured on a genuine default with a
+    ///      short fill - keeper 0, borrower 25,000,000, borrower's total out equal to `MAX_BORROW`.
+    ///      The keeper's only defence was one second wide: `expireToWorkout` is legal from
+    ///      `>= finishesAt` and the re-strike from `> finishesAt`, and nobody is paid to use it.
+    ///
+    ///      **`require(msg.sender != borrower)` was measured to move nothing** - a second wallet is
+    ///      paid identically - so the fix is structural rather than an identity check. Re-striking
+    ///      in place means there is no unwind and no re-park at all: `resolveBounty` is not called,
+    ///      the park never leaves the id, and the claimant field is never rewritten. Nothing can be
+    ///      re-assigned because nothing moves.
+    ///
+    ///      The borrower is used here as the second caller on purpose. The old test's two strangers
+    ///      are what made it look safe.
+    function test_liquidate_reStrikingLeavesTheParkedBountyWithTheCallerWhoOpenedIt() public {
         address firstCaller = makeAddr("firstCaller");
         vm.prank(alice);
         credit.borrow(MAX_BORROW);
@@ -887,31 +956,31 @@ contract LiquidationAuctionTest is Test {
         credit.liquidate(alice);
         uint256 first = auction.auctionOf(alice);
         (,, uint256 parkedFirst) = credit.parkedBountyOf(first);
-        assertEq(parkedFirst, Config.LIQUIDATION_CALL_BOUNTY, "parked against the first auction");
+        assertEq(parkedFirst, Config.LIQUIDATION_CALL_BOUNTY, "parked against the auction at open");
 
         skip(Config.AUCTION_DURATION + 1);
 
-        address secondCaller = makeAddr("secondCaller");
-        vm.prank(secondCaller);
-        credit.liquidate(alice); // supersedes the lapsed one
+        // The borrower themselves, which is the adversary the old version never substituted in.
+        vm.prank(alice);
+        credit.liquidate(alice);
         uint256 second = auction.auctionOf(alice);
-        assertEq(second, first + 1, "premise: a fresh auction, not the old one");
+        assertEq(second, first, "premise: the same auction, re-struck rather than replaced");
 
-        (,, uint256 parkedOld) = credit.parkedBountyOf(first);
-        assertEq(parkedOld, 0, "the lapsed auction holds nothing");
-        (address claimant,, uint256 parkedNew) = credit.parkedBountyOf(second);
-        assertEq(parkedNew, Config.LIQUIDATION_CALL_BOUNTY, "and the escrow moved across whole");
-        assertEq(claimant, secondCaller, "to the caller who actually opened the live auction");
+        (address claimant,, uint256 parked) = credit.parkedBountyOf(first);
+        assertEq(parked, Config.LIQUIDATION_CALL_BOUNTY, "the escrow never left the auction it was parked against");
+        assertEq(claimant, firstCaller, "and it still belongs to whoever opened it, not to whoever re-struck it");
+        assertEq(credit.bountyEscrowOf(alice), 0, "it never passed back through the borrower's escrow");
         assertEq(credit.totalBountyParked(), Config.LIQUIDATION_CALL_BOUNTY, "counted once, not twice");
 
-        // And it pays out to the second caller, not the first.
+        // And when it finally resolves, it pays the opener - not the borrower who re-struck it.
+        // This is the assertion the finding inverted, so it is the one that matters most here.
         skip(Config.AUCTION_DURATION);
         _fundBidder(bidder, auction.currentPrice(second));
         vm.prank(bidder);
         auction.bid(second);
 
-        assertEq(credit.bountyOwedTo(secondCaller), Config.LIQUIDATION_CALL_BOUNTY);
-        assertEq(credit.bountyOwedTo(firstCaller), 0, "the caller who let it lapse earns nothing");
+        assertEq(credit.bountyOwedTo(firstCaller), Config.LIQUIDATION_CALL_BOUNTY, "the keeper is paid for the work");
+        assertEq(credit.bountyOwedTo(alice), 0, "and the borrower collects nothing by re-striking it");
     }
 
     /// @notice The floor is reachable at the last instant of the window, not an
@@ -1561,6 +1630,38 @@ contract LiquidationAuctionTest is Test {
     ///      position is underwater - all three exits closed at once, with collateral
     ///      inside. Both setters are asserted together because guarding only one leaves
     ///      the pair able to disagree, which produces the same dead state.
+    /// @notice An auction pointer that cannot answer must not weld both setters shut forever.
+    /// @dev **Audit round 19.** Every wiring probe in this protocol enumerates the *incoming*
+    ///      address's selectors; the two live-work reads are on the *outgoing* one and were bare.
+    ///      The vault's incoming probe checks `vault()` and nothing else, so a stub answering only
+    ///      that installs cleanly - and from that moment `setLiquidationAuction` reverted forever
+    ///      on both contracts, and with it `vault.setCreditManager`, which is the escape from every
+    ///      other unrecoverable state in that contract. Owner error rather than an attack, but the
+    ///      state was permanent on an immutable contract holding third-party collateral.
+    ///
+    ///      The guard is not loosened for a real auction: this only decides what an address that
+    ///      cannot answer means, and a real `LiquidationAuction` answers both from plain storage.
+    ///      The test below still proves the refusal over genuine live work.
+    function test_setLiquidationAuction_aPointerThatCannotAnswerIsNotAWeld() public {
+        // A stub with the one selector the incoming probes demand, and nothing else.
+        StubAuction stub = new StubAuction(address(vault));
+        LiquidationAuction next =
+            new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+
+        vm.startPrank(admin);
+        vault.setLiquidationAuction(address(stub));
+        assertEq(vault.liquidationAuction(), address(stub), "premise: the stub really does install");
+
+        // Before the fix both of these reverted on the stub's missing `liveAuctionCount`, with no
+        // owner call able to repair it.
+        vault.setLiquidationAuction(address(next));
+        assertEq(vault.liquidationAuction(), address(next), "the repoint is reachable again");
+
+        // And the escape hatch the vault depends on most is open too.
+        vault.setCreditManager(address(credit));
+        vm.stopPrank();
+    }
+
     function test_setLiquidationAuction_refusesWhileWorkIsInFlight() public {
         LiquidationAuction next =
             new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
@@ -1873,5 +1974,19 @@ contract LiquidationAuctionTest is Test {
         vm.prank(admin);
         vm.expectRevert(LiquidationAuction.RenounceDisabled.selector);
         auction.renounceOwnership();
+    }
+}
+
+/// @notice An address that satisfies every *incoming* wiring probe and answers nothing else.
+/// @dev Deliberately minimal, because the finding is about what the probes do not ask. `vault()` is
+///      the whole of `CollateralVault.setLiquidationAuction`'s incoming check, so this installs -
+///      and before audit round 19's fix, the two live-work reads on the outgoing pointer then made
+///      both of that contract's pointer setters revert for good. It must stay this bare: adding
+///      `liveAuctionCount` here would make the test pass against the defect it exists to catch.
+contract StubAuction {
+    address public immutable vault;
+
+    constructor(address vault_) {
+        vault = vault_;
     }
 }

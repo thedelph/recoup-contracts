@@ -2208,6 +2208,46 @@ contract CreditManagerTest is Test {
         assertEq(pool.totalImpairment(), 2_000e6, "fixture: the writes really must have been refused");
     }
 
+    /// @notice A refresh that lands on the value already stored is not a refresh, and must not be
+    ///         counted as one.
+    /// @dev **Audit round 19, and it is a defect in round 17's own fix** - the test directly above
+    ///      pins that fix and passes throughout, which is why this needed its own name rather than
+    ///      an extra assertion up there. PR #159 moved the count from iterations to calls that
+    ///      landed; `impair` returns early and *silently* when `amount == previous`, so the `try`
+    ///      succeeded, the call had "landed", and a no-op was counted.
+    ///
+    ///      Why it matters rather than being a cosmetic count: `refreshImpairments` is the operator
+    ///      remedy the `QueueHeldByReserve` refusal points at. The measured trace was five
+    ///      consecutive calls each returning 1, zero `Impaired` events, `exitReserve` unmoved, and
+    ///      the withdrawal queue shut over idle cash the whole time. The number told whoever was
+    ///      watching that the sweep was working on precisely the occasion it could not work - the
+    ///      mark was correct rather than stale, so there was nothing for a refresh to recompute.
+    function test_refreshImpairments_doesNotCountAMarkThatWasAlreadyRight() public {
+        MockLenderPool pool = _poolFundsTheBook();
+        _wireAuction();
+
+        vm.prank(alice);
+        credit.borrow(DEBT_AT_THRESHOLD + 1);
+        oracle.setNav(BOUNDARY_NAV);
+
+        // Opening the liquidation writes the mark, and that write is a real one.
+        credit.liquidate(alice);
+        uint256 mark = pool.impairmentOf(alice);
+        assertGt(mark, 0, "fixture: alice has to actually be marked, or every sweep below is trivial");
+
+        // Nothing about the position changes from here, so `_impairmentFor` keeps deriving exactly
+        // the figure already stored. Every one of these is a genuine no-op, and the count must say
+        // so - this is the state `QueueHeldByReserve` sends an operator to `refreshImpairments` in.
+        uint256 totalBefore = pool.totalImpairment();
+        for (uint256 i; i < 5; ++i) {
+            vm.prank(makeAddr("sweeper"));
+            assertEq(credit.refreshImpairments(1), 0, "a sweep that changed nothing reported a refresh");
+        }
+
+        assertEq(pool.impairmentOf(alice), mark, "and the mark is exactly where it started");
+        assertEq(pool.totalImpairment(), totalBefore, "as is the book-level total it feeds");
+    }
+
     /// @notice An empty set still refreshes the two book-level terms of the reserve.
     /// @dev Audit round 17. `count == 0` returned before reaching `_pushLossReserves`, so the two
     ///      terms of `exitReserve` that are not per-borrower went unrefreshed in exactly the state

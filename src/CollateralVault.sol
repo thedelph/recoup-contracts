@@ -140,9 +140,14 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         // sit at zero with an auction ticket still ticking.
         address auction = liquidationAuction;
         if (auction != address(0)) {
-            uint256 liveAuctions = ILiquidationAuction(auction).liveAuctionCount();
+            // **Audit round 19.** Bare reads on an address this setter is not replacing and does
+            // not control. It matters more here than anywhere else in the protocol: this function
+            // is the escape from every other unrecoverable state in this contract, and a stub
+            // installed at `liquidationAuction` - which needs only to answer `vault()` to get in -
+            // bricked it permanently. See `_outgoingAuctionWork` for why an unanswerable auction is
+            // treated as idle rather than as busy.
+            (uint256 liveAuctions, uint256 openWorkouts) = _outgoingAuctionWork(auction);
             if (liveAuctions != 0) revert AuctionHasLiveWork(liveAuctions);
-            uint256 openWorkouts = ILiquidationAuction(auction).openWorkoutCount();
             if (openWorkouts != 0) revert AuctionHasLiveWork(openWorkouts);
         }
         address boundVault = address(ICreditManager(creditManager_).vault());
@@ -177,13 +182,36 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      Gated on the outgoing auction reporting no live auctions and no open
     ///      workouts, and on the incoming one being bound back to this vault, the same
     ///      way `setCreditManager` does.
+    ///
+    /// @dev **Audit round 19, and the twin of `CreditManager._outgoingAuctionWork`.** Both setters
+    ///      above read two selectors off an auction pointer they are not installing, bare. This
+    ///      contract's incoming probe is the weakest in the protocol - it checks `vault()` and
+    ///      nothing else, while three functions read four selectors off that pointer bare - so a
+    ///      stub answering only `vault()` installs, and from then on `setLiquidationAuction` *and*
+    ///      `setCreditManager` revert forever, on an immutable contract holding third-party
+    ///      collateral.
+    ///
+    ///      Treating an unanswerable outgoing auction as idle is the safe direction rather than the
+    ///      convenient one: a real `LiquidationAuction` answers both with plain storage getters
+    ///      that cannot revert, so the only address that fails to answer never held live work for
+    ///      this guard to protect. Catching can only make a repoint more possible, never a genuine
+    ///      one less refused.
+    function _outgoingAuctionWork(address auction) private view returns (uint256 live, uint256 open) {
+        try ILiquidationAuction(auction).liveAuctionCount() returns (uint256 n) {
+            live = n;
+        } catch {}
+        try ILiquidationAuction(auction).openWorkoutCount() returns (uint256 n) {
+            open = n;
+        } catch {}
+    }
+
     function setLiquidationAuction(address liquidationAuction_) external onlyOwner {
         if (liquidationAuction_ == address(0)) revert ZeroAddress();
         address current = liquidationAuction;
         if (current != address(0)) {
-            uint256 liveAuctions = ILiquidationAuction(current).liveAuctionCount();
+            // Audit round 19: bare reads on the outgoing pointer. See `_outgoingAuctionWork`.
+            (uint256 liveAuctions, uint256 openWorkouts) = _outgoingAuctionWork(current);
             if (liveAuctions != 0) revert AuctionHasLiveWork(liveAuctions);
-            uint256 openWorkouts = ILiquidationAuction(current).openWorkoutCount();
             if (openWorkouts != 0) revert AuctionHasLiveWork(openWorkouts);
             // **Counting queue entries is not the same as counting assets.**
             // `closeWorkout` pops the queue but leaves the lot parked under the
