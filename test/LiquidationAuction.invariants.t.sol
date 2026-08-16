@@ -41,6 +41,15 @@ contract AuctionHandler is Test {
 
     address[] public actors;
     uint256[] public startedAuctions;
+    /// @dev Membership test for `startedAuctions`, so a re-strike cannot enter it twice. See
+    ///      `liquidate` below.
+    mapping(uint256 => bool) public seenAuction;
+    /// @notice How many times a lapsed auction was re-struck in place rather than opened fresh.
+    /// @dev A coverage ghost for audit round 19's re-strike branch. It is read by the tripwire
+    ///      below: a campaign that never re-strikes leaves `AUCTION_RESET_WINDOW`, the deadline and
+    ///      the "the park never moves" property quantified over a branch it never enters, which is
+    ///      the vacuity shape this file has produced twice already.
+    uint256 public reStrikes;
 
     /// @notice Coverage ghosts. Every action here is wrapped in `try`, so a fixture
     ///         that silently never reaches a liquidation would report six green
@@ -220,7 +229,20 @@ contract AuctionHandler is Test {
         uint256 parkedBefore = credit.totalBountyParked();
         vm.prank(keeper);
         try credit.liquidate(a) {
-            startedAuctions.push(auction.auctionOf(a));
+            uint256 id = auction.auctionOf(a);
+            // **Recorded once per id, and audit round 19 is why this is not a bare `push`.** A
+            // lapsed auction is now re-struck in place rather than settled and replaced, so
+            // `liquidate` succeeding twice over one position returns the *same* id. Pushing it
+            // again made `invariant_everyPrepaidBountyIsInExactlyOnePot` sum one park twice and
+            // read `25000000 != 50000000` - a defect in the checker, not in the ledger it checks.
+            // The set that invariant quantifies over is "auction ids that have existed", and a
+            // re-strike does not create one.
+            if (!seenAuction[id]) {
+                seenAuction[id] = true;
+                startedAuctions.push(id);
+            } else {
+                reStrikes++;
+            }
             if (pool.impairmentOf(a) != 0) impairmentsOpenedByAnAuction++;
             if (credit.totalBountyParked() > parkedBefore) bountiesParked++;
         } catch {}
@@ -572,6 +594,50 @@ contract LiquidationAuctionInvariants is Test {
         assertEq(credit.totalBountyOwed(), owed, "owed counter must equal its map");
     }
 
+    /// @notice With no auction live, no bounty is parked against one.
+    /// @dev **Audit round 19 asked for this by name, and it is the discriminator the invariant
+    ///      above cannot be.** That one sums `parkedBountyOf` over the very set that produced
+    ///      `totalBountyParked`, so a park that was never unwound at an auction's close still
+    ///      balances against itself perfectly. This states the terminal condition instead: every
+    ///      exit that clears `liveAuctionCount` must also have resolved the park in the same frame.
+    ///
+    ///      Today that is a three-hop argument - all four `liveAuctionCount--` sites pair with a
+    ///      bare `resolveBounty`, therefore the implication holds - and three setters gate on that
+    ///      counter while trusting the conclusion. An argument holding up three setters should be
+    ///      an assertion. It also guards the change round 19 made: re-striking an auction in place
+    ///      deliberately does *not* resolve the park, which is only safe because it does not clear
+    ///      the counter either.
+    function invariant_noParkSurvivesTheLastLiveAuction() public view {
+        if (auction.liveAuctionCount() != 0) return;
+        assertEq(credit.totalBountyParked(), 0, "a park outlived every auction that could spend it");
+    }
+
+    /// @notice What the lending side believes it has lent equals what the manager believes is owed.
+    /// @dev **The identity audit round 19 derived and then measured at six checkpoints, asserted
+    ///      here for the first time.** `outstandingPrincipal == pendingPrincipal + totalDebt` held
+    ///      exactly through a 628,750,000 borrow, a yield stream, a crash to half NAV, a short fill
+    ///      and a forced `closeWorkout`.
+    ///
+    ///      It is stated in this suite because this is the fixture where the lending side is both
+    ///      the funder and the loss sink, which is the wiring the Phase-4 switchover produces. A
+    ///      fixture that wires the pool as loss sink only pins `outstandingPrincipal` at zero by
+    ///      construction, and the equation would fail on the first borrow.
+    ///
+    ///      **What it is worth knowing for is what it makes unreachable**, not what it protects.
+    ///      It kills `repayPrincipal`'s surplus branch, `unsocialisedLoss`, `flushSocialisedLoss`,
+    ///      `unplacedLoss`, `exitReserve()`'s backlog term, both `LossOutstanding` guards and
+    ///      `_socialise`'s partial-acceptance path - which is round 10's own fix. None of that is
+    ///      deleted, deliberately: switching a dormant quantity back on is a change to every one of
+    ///      those consumers at once rather than to one of them. If this assertion ever fails, the
+    ///      failure is the news - it means one of them just became live.
+    function invariant_theBooksAgreeOnWhatIsOwed() public view {
+        assertEq(
+            pool.outstandingPrincipal(),
+            credit.pendingPrincipal() + credit.totalDebt(),
+            "the lending side and the manager's debt have to be the same money"
+        );
+    }
+
     /// @notice The vault ledger still equals what is actually staked, with liquidations
     ///         and workouts moving positions around underneath it.
     function invariant_accountingSurvivesLiquidation() public view {
@@ -651,6 +717,21 @@ contract LiquidationAuctionInvariants is Test {
         // parked total is what stops the whole set passing over a charge that never happened.
         assertEq(handler.bountiesParked(), 3, "opening an auction must park the escrow");
         assertGt(credit.totalBountyParked(), 0, "and the parked total must be real money");
+
+        // **The re-strike branch, audit round 19.** A lapsed auction is re-struck in place rather
+        // than replaced, so it must be reachable here or every property that quantifies over it -
+        // the deadline, and the fact that the park never changes hands - is asserted over a branch
+        // the campaign may never enter. Asserted on the *outcomes* rather than only on the ghost:
+        // the id must not move, and the park must still belong to whoever opened it.
+        uint256 idBefore = auction.auctionOf(handler.actors(0));
+        (address claimantBefore,, uint256 parkedBefore) = credit.parkedBountyOf(idBefore);
+        handler.passTime(Config.AUCTION_DURATION + 1);
+        handler.liquidate(0);
+        assertEq(handler.reStrikes(), 1, "a lapsed auction must be re-strikeable");
+        assertEq(auction.auctionOf(handler.actors(0)), idBefore, "re-striking must not mint a new id");
+        (address claimantAfter,, uint256 parkedAfter) = credit.parkedBountyOf(idBefore);
+        assertEq(claimantAfter, claimantBefore, "nor hand the park to whoever re-struck it");
+        assertEq(parkedAfter, parkedBefore, "nor move the money");
 
         // One is bought.
         handler.bid(0, 1);

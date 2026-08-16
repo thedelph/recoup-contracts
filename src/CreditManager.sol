@@ -472,6 +472,32 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         emit EpochHarvesterSet(epochHarvester_);
     }
 
+    /// @dev **Audit round 19: the two reads below are on the OUTGOING pointer and were bare.**
+    ///      Every probe in this file enumerates the *incoming* address's selectors, and this setter
+    ///      says its list "has to stay that way" while its own first statements call two selectors
+    ///      on the address it is replacing. Measured: a stub implementing only `vault()` installs
+    ///      cleanly, and afterwards this function reverts forever - and on the vault's twin so does
+    ///      `setCreditManager`, which is the escape from every other unrecoverable state there.
+    ///      Fourth round running that a bare selector arrived ahead of its probe.
+    ///
+    ///      **Why treating an unanswerable outgoing auction as "no work" is the safe direction, and
+    ///      not merely the convenient one.** A real `LiquidationAuction` answers both of these with
+    ///      plain getters over storage - `liveAuctionCount` is a public `uint256`, `openWorkoutCount`
+    ///      reads an array length - and neither can revert. So the only address that fails to answer
+    ///      is one that was never a real auction, and an address that was never a real auction is
+    ///      holding no live work for this guard to protect. Catching therefore unblocks exactly the
+    ///      repoints that were protecting nothing, and cannot loosen the guard over a genuine
+    ///      auction. It only ever makes a repoint more possible, so it cannot create the
+    ///      mutually-unsatisfiable window this codebase has shipped three times.
+    function _outgoingAuctionWork(address current) private view returns (uint256 live, uint256 open) {
+        try ILiquidationAuction(current).liveAuctionCount() returns (uint256 n) {
+            live = n;
+        } catch {}
+        try ILiquidationAuction(current).openWorkoutCount() returns (uint256 n) {
+            open = n;
+        } catch {}
+    }
+
     /// @dev Refuses while the outgoing auction still has work in flight, for the same
     ///      reason the vault's twin does: `creditLiquidationProceeds` and
     ///      `writeDownLoss` are gated on this pointer, so a repoint makes every
@@ -482,9 +508,8 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         if (liquidationAuction_ == address(0)) revert ZeroAddress();
         address current = liquidationAuction;
         if (current != address(0)) {
-            uint256 liveAuctions = ILiquidationAuction(current).liveAuctionCount();
+            (uint256 liveAuctions, uint256 openWorkouts) = _outgoingAuctionWork(current);
             if (liveAuctions != 0) revert AuctionHasLiveWork(liveAuctions);
-            uint256 openWorkouts = ILiquidationAuction(current).openWorkoutCount();
             if (openWorkouts != 0) revert AuctionHasLiveWork(openWorkouts);
         }
         // The incoming check its twin on the vault already had. Without it this manager
@@ -1404,10 +1429,19 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             }
             --cursor;
             address borrower = ILenderPool(pool).impairedBorrowerAt(cursor);
-            // Counted on the write landing, not on the visit. Audit round 17: `refreshed` used to
-            // increment once per iteration while every write here is `try`-swallowed, so a pool
-            // refusing all of them reported a full sweep. The return value is what an operator
-            // reads to decide whether to call again.
+            // Counted on the mark moving, not on the visit and not on the call landing. Audit round
+            // 17: `refreshed` used to increment once per iteration while every write here is
+            // `try`-swallowed, so a pool refusing all of them reported a full sweep. **Audit round
+            // 19 found the same trace after that fix, through a different cause**: `impair` returns
+            // early and *silently* when the figure has not changed, so the `try` succeeded and a
+            // no-op counted. Five calls, `refreshed = 1` each, zero `Impaired` events, `exitReserve`
+            // unmoved and the queue still shut on that mark - reported as work done to the one
+            // operator the refusal exists to direct.
+            //
+            // The direction of the remaining error is worth stating: this can now under-report a
+            // sweep that genuinely had nothing to do, and can never over-report one. An operator
+            // told "nothing moved" may call again for nothing; an operator told "something moved"
+            // is right.
             if (_setImpairment(borrower, _impairmentFor(borrower))) refreshed++;
         }
         impairmentCursor = cursor;
@@ -1539,24 +1573,34 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      leave identical storage, but only one of them emits `ImpairmentReleased` - and an
     ///      indexer that never sees a release cannot tell a resolved position from a permanently
     ///      marked one.
-    /// @return landed Whether the pool actually took the figure. Every caller but
+    /// @return moved Whether the pool's stored mark actually changed. Every caller but
     ///         `refreshImpairments` ignores it and must keep ignoring it - they sit on liquidation
     ///         paths that a refusal here is not allowed to change the course of. The bulk sweep is
     ///         the one caller that *reports* to somebody, so it is the one that needs to know the
     ///         difference between a mark it refreshed and a mark it merely looked at.
-    function _setImpairment(address borrower, uint256 amount) private returns (bool landed) {
+    ///
+    ///         **Audit round 19: this used to mean "the call did not revert", and that is a third
+    ///         thing.** Round 17 found `refreshImpairments` reporting visits as refreshes and PR
+    ///         #159 moved the count from iterations to calls that landed. A landing on an unchanged
+    ///         value is still not a refresh: `impair` returns early and silently when
+    ///         `amount == previous`, so the `try` succeeded, this returned true, and the sweep told
+    ///         an operator it had refreshed a mark it had not touched - over a withdrawal queue
+    ///         frozen on that exact mark. The pool now says whether it wrote; this reports what it
+    ///         said rather than inferring it from a second read, which would be a new selector
+    ///         called bare on the pool pointer and would owe a probe in `setLenderPool`.
+    function _setImpairment(address borrower, uint256 amount) private returns (bool moved) {
         address pool = lenderPool;
         if (pool == address(0)) return false;
 
         if (amount == 0) {
-            try ILenderPool(pool).releaseImpairment(borrower) {
-                return true;
+            try ILenderPool(pool).releaseImpairment(borrower) returns (bool wrote) {
+                return wrote;
             } catch {
                 return false;
             }
         } else {
-            try ILenderPool(pool).impair(borrower, amount) {
-                return true;
+            try ILenderPool(pool).impair(borrower, amount) returns (bool wrote) {
+                return wrote;
             } catch {
                 return false;
             }

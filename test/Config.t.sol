@@ -94,6 +94,32 @@ contract ConfigTest is Test {
         );
     }
 
+    /// @notice The re-strike window has to leave room for at least one re-strike, and has to end.
+    /// @dev **Audit round 19, critical 2.** `AUCTION_RESET_WINDOW` is what stops an unfunded
+    ///      stranger holding the lender pool's withdrawal queue shut indefinitely by re-striking a
+    ///      lapsed auction every six hours. Two ways to get it wrong, and both are silent:
+    ///
+    ///      Set at or below `AUCTION_DURATION` and no re-strike is ever reachable, which quietly
+    ///      restores the perpetual call option struck at a frozen NAV that re-striking exists to
+    ///      remove - the auction would simply block until the workout.
+    ///
+    ///      Set too long and the bound stops being one. The first draft of this constant was 14
+    ///      days, matching `WORKOUT_MAX_DURATION`, and the round's own 30-lap proof-of-concept -
+    ///      7.5 days of re-strikes - **still passed against it**. That is why the upper bound below
+    ///      is asserted against the *worst case a lender actually experiences*: this window plus the
+    ///      workout that follows it, since reaching the workout does not end the mark.
+    function test_reStrikeWindowLeavesRoomForARestrikeAndStillEnds() public pure {
+        assertGt(Config.AUCTION_RESET_WINDOW, Config.AUCTION_DURATION, "no re-strike would ever be reachable");
+
+        // At least two full cycles, or "bounded" collapses to "one attempt" and a single
+        // unfavourable six-hour window sends a saleable lot to redemption.
+        assertGe(Config.AUCTION_RESET_WINDOW, Config.AUCTION_DURATION * 2);
+
+        // The whole time a lender's queued exit can be held up by this mechanism, end to end.
+        // Kept under a month so the number stays one somebody would accept being told in advance.
+        assertLe(Config.AUCTION_RESET_WINDOW + Config.WORKOUT_MAX_DURATION, 30 days);
+    }
+
     /// @dev A workout must be allowed to run longer than DexFi's own quoted redemption
     ///      turnaround, or the force-close would recognise a loss on debt that was
     ///      about to be paid. `AUCTION_DURATION` bounds it from the other side: the

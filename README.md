@@ -28,6 +28,20 @@ deposit and leaving the position disarmed for whoever liquidated it for real aft
 2026-08-15 the escrow parks against the auction id and is credited only by the transitions that
 actually resolved the position.
 
+**Audit round nineteen then found that fix extractable too, and the fix for it was structural.**
+Superseding a lapsed auction used to settle it and mint a new id, which forced the parked bounty to
+be unwound and re-parked - and the manager re-reads the escrow immediately afterwards, so it landed
+on whoever made that call. A borrower could wait one second past a keeper's lapse, re-strike, and
+take the payment the keeper had earned; their defence was one second wide and nobody is paid to use
+it. Gating the caller was measured to move the number by zero, because a second wallet is paid
+identically. Since 2026-08-16 a lapsed auction is **re-struck in place, keeping its id** - the shape
+Maker's `Clipper.redo` uses - so there is no unwind, nothing to re-park, and no claimant to
+overwrite. The same change bounds a second finding: re-strikes are measured against a first-open
+timestamp that never moves, so past `Config.AUCTION_RESET_WINDOW` the only move left is the
+permissionless `expireToWorkout`, which arms the forced close. That constant was first written at 14
+days and the proof-of-concept still passed against it, which is why it is 48 hours: a bound longer
+than the attack is not a bound.
+
 **The finding is narrowed, not closed.** The window is bounded by transaction ordering now rather
 than by whether a caller ever appears, and that bound is not zero. `postNav` is public, so the price
 post that makes a position liquidatable can be back-run, and a lender exiting can out-bid the
@@ -204,7 +218,7 @@ what it does not is a tested quantity rather than an assurance:
 
 Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
 re-audited**, because the rate at which fix rounds produce their own defects has stayed stubbornly
-high: **eighteen rounds so far, and nine of the last ten found defects in the round before them.**
+high: **nineteen rounds so far, and ten of the last eleven found defects in the round before them.**
 Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) is
 written up as far as round nine. The rounds after it are not written up there yet: their fixes are
 in the code published here, and several of them are about the lender pool, which is not.

@@ -123,9 +123,16 @@ contract MockLenderPool {
     ///
     ///      Mirrors the real pool exactly, swap-pop included, because a mock that removes in a
     ///      different order would test a walk the production contract never performs.
-    function setImpairment(address borrower, uint256 amount) external {
+    /// @return wrote Whether the stored mark actually moved, mirroring the real pool's return.
+    ///         **This has to mirror it, not merely compile against it.** A mock that always answered
+    ///         `true` would leave the silent-no-op branch unreachable from the suite, which is
+    ///         exactly how audit round 19's `refreshImpairments` defect survived round 17's fix -
+    ///         and the same shape as `MockUSDC` being unable to fail silently until round 18 taught
+    ///         it how.
+    function setImpairment(address borrower, uint256 amount) external returns (bool wrote) {
         uint256 previous = impairmentOf[borrower];
-        if (amount == previous) return;
+        if (amount == previous) return false;
+        wrote = true;
         impairmentOf[borrower] = amount;
         totalImpairment = totalImpairment + amount - previous;
         if (previous == 0 && amount != 0) {
@@ -133,7 +140,8 @@ contract MockLenderPool {
             _impaired.push(borrower);
         } else if (amount == 0) {
             uint256 indexPlusOne = _impairedIndexPlusOne[borrower];
-            if (indexPlusOne == 0) return;
+            // The map was already written above, so this is a real write however the set ends up.
+            if (indexPlusOne == 0) return wrote;
             uint256 index = indexPlusOne - 1;
             uint256 last = _impaired.length - 1;
             if (index != last) {
@@ -146,12 +154,12 @@ contract MockLenderPool {
         }
     }
 
-    function impair(address borrower, uint256 amount) external {
-        this.setImpairment(borrower, amount);
+    function impair(address borrower, uint256 amount) external returns (bool wrote) {
+        return this.setImpairment(borrower, amount);
     }
 
-    function releaseImpairment(address borrower) external {
-        this.setImpairment(borrower, 0);
+    function releaseImpairment(address borrower) external returns (bool wrote) {
+        return this.setImpairment(borrower, 0);
     }
 
     function impairedBorrowerCount() external view returns (uint256) {

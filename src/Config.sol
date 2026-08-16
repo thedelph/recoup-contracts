@@ -68,6 +68,51 @@ library Config {
     // bonds out of their fund. Left at 6800 until they name a level.
     uint256 internal constant AUCTION_FLOOR_BPS = 6_800; // 68% of NAV
     uint256 internal constant AUCTION_DURATION = 6 hours;
+
+    /// @notice How long after a position's first liquidation a lapsed auction may still be re-struck
+    ///         at a fresh price. After this, the only move left is the workout.
+    /// @dev **Audit round 19, critical 2.** Re-striking a lapsed auction is necessary - a frozen
+    ///      `startNav` left to block becomes a perpetual call option struck at an arbitrarily old
+    ///      price - but the re-strike was free, permissionless and *unbounded*, and it re-opened the
+    ///      auction's liveness register every time. `CreditManager._impairmentFor` keys the lender
+    ///      pool's mark on that register, so an attacker holding no capital at all could keep a
+    ///      position perpetually live and hold the whole withdrawal queue shut over idle cash.
+    ///      Measured: 30 re-strikes over 7 days, 30 of 30 `serviceQueue` calls refused, 19,371 USDC
+    ///      idle, the lender paid nothing, and `openWorkoutCount` never leaving zero - so the
+    ///      forced close that bounds every *other* path was never armed at all.
+    ///
+    ///      This is the bound. Once it passes, `start` refuses to re-strike and the only legal move
+    ///      on a lapsed auction is the permissionless `expireToWorkout`, which arms
+    ///      `WORKOUT_MAX_DURATION` and its forced close. The mark can therefore stand for at most
+    ///      this window plus that one, rather than for as long as somebody keeps paying gas.
+    ///
+    ///      **48 hours is eight full auction cycles, and the derivation matters because the first
+    ///      draft of this got it wrong in the expensive direction.** It was written as 14 days, to
+    ///      match `WORKOUT_MAX_DURATION`, and the round-19 proof-of-concept - 30 re-strikes over 7.5
+    ///      days - **still passed against it**. A bound longer than the attack is not a bound. The
+    ///      two constants also answer different questions: this one asks how long we keep trying to
+    ///      *sell*, and `WORKOUT_MAX_DURATION` asks how long an off-chain *redemption* may take. Only
+    ///      the second is pinned to DexFi's quoted "48h+".
+    ///
+    ///      The trade-off, both directions stated because neither is free. Too short pushes a lot
+    ///      that would have sold into a workout, which is a real redemption and removes a bond from
+    ///      DexFi's fund - the outcome both sides least want - and gives the borrower a worse
+    ///      recovery. Too long leaves the lender pool's withdrawal queue shut for that whole period
+    ///      at the price of gas. Reaching the workout does **not** end the mark, so the worst case is
+    ///      this window *plus* `WORKOUT_MAX_DURATION`; at 14 days that was 28, and the second half is
+    ///      unavoidable while the first is not.
+    ///
+    ///      Eight cycles is generous against the thing re-striking exists for: each one restarts at
+    ///      100% of *current* NAV and decays to `AUCTION_FLOOR_BPS`, so a lot that has failed to
+    ///      clear eight successive floors at eight successive prices is not being mispriced, it is
+    ///      unsaleable, and the workout is the correct answer rather than a failure.
+    ///
+    ///      **The value is a judgement, not a measurement**, the same admission
+    ///      `LIQUIDATION_CALL_BOUNTY` makes: nobody has observed how many re-strikes a real falling
+    ///      market needs. Must exceed `AUCTION_DURATION` or no re-strike is ever reachable;
+    ///      asserted in `Config.t.sol`.
+    uint256 internal constant AUCTION_RESET_WINDOW = 48 hours;
+
     uint256 internal constant LIQUIDATION_PENALTY_BPS = 500; // of debt; split 50/50 caller/insurance
     /// @notice The liquidation caller's share of the penalty; the remainder, including
     ///         any odd wei, goes to the insurance fund.
