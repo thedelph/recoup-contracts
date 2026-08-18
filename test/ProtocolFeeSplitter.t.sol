@@ -12,8 +12,16 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///
 ///         The point of these tests is not that a percentage is computed correctly. It is
 ///         that the two properties the arrangement is *sold* on actually hold: that
-///         neither party can redirect the other's leg, and that the two legs always sum
-///         to exactly what arrived.
+///         neither party can redirect the other's leg **of what has arrived here**, and that
+///         the two legs always sum to exactly what arrived.
+///
+///         **The emphasis is load-bearing and audit round 21 is why.** These tests can only
+///         ever speak for money already at the splitter. The redirect that mattered happened
+///         one hop upstream, in `EpochHarvester.setProtocolFeeWallet`, over a backlog that had
+///         not been flushed here yet - MEASURED at 60.000000 of DexFi's money becoming 0 across
+///         three epochs. That half of the guarantee is tested in `EpochHarvester.t.sol`, under
+///         `test_setProtocolFeeWallet_leavesTheBacklogWithTheWalletThatEarnedIt`, and it has to
+///         be, because nothing this contract can be asked will ever reveal it.
 contract ProtocolFeeSplitterTest is Test {
     MockUSDC internal usdc;
     ProtocolFeeSplitter internal splitter;

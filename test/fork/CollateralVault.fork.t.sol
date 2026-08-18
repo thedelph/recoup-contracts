@@ -13,6 +13,9 @@ import {IDexFiBond} from "../../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
 import {MockNavOracle} from "../mocks/MockNavOracle.sol";
+import {RiskParams} from "../../src/RiskParams.sol";
+import {IRiskParams} from "../../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "../helpers/RiskParamsFixture.sol";
 
 /// @notice Base mainnet fork tests against the LIVE DexFi contracts (PRD Phase 1
 ///         integration proof). Run with:
@@ -27,7 +30,7 @@ import {MockNavOracle} from "../mocks/MockNavOracle.sol";
 ///         3. ONE `addWhitelist([adapter])` from DexFi's owner (impersonated here -
 ///            this is exactly §14 ask #5) unlocks the full lifecycle:
 ///            deposit → stake → claim (withdraw(0)) → unstake → withdraw.
-contract CollateralVaultForkTest is Test {
+contract CollateralVaultForkTest is RiskParamsFixture {
     IDexFiBond internal bond = IDexFiBond(Config.DEXFI_BOND_NFT);
     IDexFiFarm internal farm = IDexFiFarm(Config.DEXFI_FARM);
     IERC20 internal usdc = IERC20(Config.USDC_BASE);
@@ -37,9 +40,21 @@ contract CollateralVaultForkTest is Test {
 
     CollateralVault internal vault;
     DirectCallAdapter internal adapter;
+    RiskParams internal riskParams;
     address internal treasury = makeAddr("treasury");
 
     bool internal run;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    /// @dev `address(0)` skips the inherited fixture-decay detector, matching how every test in
+    ///      this file self-skips without `RUN_FORK_TESTS`: the detector needs a live setter owner
+    ///      and there is no deployed `RiskParams` at all until the fork is selected.
+    function _riskParamsOwner() internal view override returns (address) {
+        return address(0);
+    }
 
     function setUp() public {
         run = vm.envOr("RUN_FORK_TESTS", false);
@@ -53,8 +68,9 @@ contract CollateralVaultForkTest is Test {
         vm.etch(alice, "");
         vm.etch(admin, "");
 
+        riskParams = _deployRiskParams(admin);
         vault = new CollateralVault(
-            bond, INAVOracle(address(new MockNavOracle(25.15e8))), admin
+            bond, INAVOracle(address(new MockNavOracle(25.15e8))), IRiskParams(address(riskParams)), admin
         );
         adapter = new DirectCallAdapter(bond, farm, usdc, address(vault), admin, treasury);
         vm.startPrank(admin);
@@ -63,6 +79,10 @@ contract CollateralVaultForkTest is Test {
         // so suites that never run a liquidation still need a stand-in.
         MockLiquidationAuction auctionStub = new MockLiquidationAuction();
         auctionStub.setVault(address(vault));
+        // Audit round 20: the setters also check the risk authority agrees with the vault's.
+        auctionStub.setRiskParams(address(riskParams));
+        // Audit round 21: and the NAV feed, anchored on the vault's answer.
+        auctionStub.setNavOracle(address(vault.navOracle()));
         vault.setLiquidationAuction(address(auctionStub));
         vm.stopPrank();
 

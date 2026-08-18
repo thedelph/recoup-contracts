@@ -9,7 +9,8 @@ credit core, the epoch harvester and the liquidation auction are implemented, an
 lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling through to
 the workout path - is fork-tested against the live DexFi contracts. Lending reaches the credit core
 through an interfaced seam, and the pool behind that seam is a skeleton here for the reason in the
-next paragraph. Nothing touches real funds before an external audit.
+next paragraph. No third-party money is accepted before an external audit; the exact shape of
+that gate, and what it deliberately does not cover, is spelled out further down.
 
 **`LenderPool` is finished, and I am holding it back on purpose.** The real one - the ERC-4626
 vault, the withdrawal queue, the yield stream and the impairment pricing - is written, tested and
@@ -48,9 +49,30 @@ post that makes a position liquidatable can be back-run, and a lender exiting ca
 liquidator for position in the same block. No calibration of the bounty closes an ordering race, and
 I have no clean mitigation for it in this architecture: any delay between a post and liquidatability
 contradicts the rule that keeps liquidation priced on the last known NAV through a keeper outage.
-Publishing a pool with that open is worse than publishing none, so the skeleton stays until it is
-closed. The `ILenderPool` interface here is the real one and is what the finished contract
-implements.
+
+**And rounds twenty and twenty-one found a second, larger one, which is now the main reason the
+pool is not here.** A lender who asks to withdraw parks a request, and the pool holds back the
+un-impaired value of those queued shares from everybody else. Separately, and correctly, it refuses
+to service the queue at all while a position is marked down. Each rule is defensible on its own.
+Together they mean a parker reserves a claim they are forbidden to be paid, at a price they would
+never be paid at, and nothing permissionless drains it. Measured: a parker holding 15.8% of the book
+makes one free request and an unqueued lender's `maxWithdraw` goes from 3,567.125000 to zero for the
+whole workout, against a real entitlement of 563.230263 - a 6.66x over-reservation. `available()`
+reaches zero, which halts borrowing protocol-wide. The request is free, revocable at will, and the
+parked shares keep earning, so the cost of holding it is negative.
+
+Four candidate fixes were built and each one failed, which is why this is deferred to its own piece
+of work rather than patched: a clamp to what is actually available is inert against the holdback
+already flooring at zero; reserving only the queue's pro-rata share re-prices every lender who
+stayed, which is a branch this codebase already built, broke and deleted; charging for a request
+makes the lock cost something without making it smaller; and expiring a parked request turns an
+exclusive lock into a periodic one with a cheaper renewal for the parker than anyone else gets. What
+is left is one change - price the queue against the impairment and serve it while marked - and it
+needed an anchor on the NAV oracle that only landed in round twenty-one.
+
+**Publishing a pool with either of those open is worse than publishing none, so the skeleton stays
+until they are closed.** The `ILenderPool` interface here is the real one and is what the finished
+contract implements.
 
 Testnet addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json), all
 verified on Basescan. The testnet deployment runs against a **mock** DexFi stack, because the real
@@ -63,9 +85,12 @@ which are the real integration proof.
 DexFi - max LTV 3500 -> 2500 bps, liquidation threshold 5800 -> 5000, and both borrow caps down.
 Those parameters are `internal constant`, inlined at compile time, and the Sepolia contracts were
 deployed on 2026-08-03, so **the deployed bytecode still enforces the old values**. Source and
-chain genuinely disagree here, and the source is the intended one. Closing it needs a redeploy,
-which is queued behind moving those four into bounded, timelocked storage so the next change is not
-a redeploy either.
+chain genuinely disagree here, and the source is the intended one. **The half of that which was
+queued has since landed**: the four parameters now live in bounded, timelocked storage in
+[`src/RiskParams.sol`](src/RiskParams.sol) rather than as compile-time constants, so the next
+change to them is a transaction rather than a redeploy. What is left is the redeploy itself, which
+is what puts a `RiskParams` on chain at all. Until then the deployed contracts have no `RiskParams`
+to read, cannot be retuned, and the divergence stands.
 
 **Reviewing this repo?** [REVIEW.md](REVIEW.md) is a reading guide: where bonds can and cannot go,
 who controls what, what revoking the whitelist would do, and which tests to run first.
@@ -141,9 +166,14 @@ Requires [Foundry](https://getfoundry.sh).
 forge install   # restores pinned deps (forge-std v1.16.2, openzeppelin v5.6.1)
 forge build
 forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: the
-                # four invariant suites dominate, and a short timeout will kill
-                # the run mid-flight rather than fail it
+                # invariant suites dominate, and a short timeout will kill the
+                # run mid-flight rather than fail it
 ```
+
+That reports **569 passed, 0 failed, 13 skipped across 27 suites** on this tree. The count is
+quoted with the tree it was measured on rather than as a standing claim, because it is a derived
+number and nothing here checks it for you: the skips are the fork tests below, which need
+`RUN_FORK_TESTS=true`. CI runs the same command on every push and pull request.
 
 ### Mainnet fork tests
 
@@ -218,7 +248,8 @@ what it does not is a tested quantity rather than an assurance:
 
 Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
 re-audited**, because the rate at which fix rounds produce their own defects has stayed stubbornly
-high: **nineteen rounds so far, and ten of the last eleven found defects in the round before them.**
+high: **twenty-one rounds so far, and twelve of the last thirteen found defects in the round
+before them.**
 Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) is
 written up as far as round nine. The rounds after it are not written up there yet: their fixes are
 in the code published here, and several of them are about the lender pool, which is not.
@@ -235,12 +266,12 @@ Four habits came out of that and now apply by default:
   audited twice for correctness and deleted on the third pass, when someone finally asked the prior
   question and found it never closed the hole it was written for.
 
-Alongside the audits: stateful invariant fuzzing over four suites (27 invariants), and the mainnet
+Alongside the audits: stateful invariant fuzzing over five suites (31 invariants), and the mainnet
 fork tests above, which are the real integration proof.
 
 An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does
 not fail the fixture, which means a suite that never reaches the interesting state still reports
-everything passing. **All four suites** now carry a deterministic reachability test that pins the
+everything passing. **Every suite** now carries a deterministic reachability test that pins the
 state was actually reached. The last two were added on 2026-08-03, and one of them found that a
 suite really had been vacuous: seven invariants had been running against a protocol in which no
 borrow could succeed. [REVIEW.md](REVIEW.md) has the detail.

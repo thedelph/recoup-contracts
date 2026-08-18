@@ -16,44 +16,56 @@ contract ConfigTest is Test {
         );
     }
 
-    function test_ltvOrdering() public pure {
-        // Borrow ceiling sits well below the liquidation trigger…
-        assertLt(Config.MAX_LTV_BPS, Config.LIQUIDATION_THRESHOLD_BPS);
-        // …and the liquidation trigger below the auction floor recovery, so a
-        // floor-price fill still covers debt at the threshold.
-        assertLt(Config.LIQUIDATION_THRESHOLD_BPS, Config.AUCTION_FLOOR_BPS);
-    }
-
-    /// @notice A floor-price fill must cover debt + liquidation penalty even at the
-    ///         worst LTV that can first trigger a liquidation. That worst case is one
-    ///         immediate NAV_MAX_DEVIATION_BPS drop applied to a position sitting at
-    ///         the threshold, i.e. LTV = THRESHOLD / (1 - maxDev). (Was 6500 vs a
-    ///         6767 requirement - a lender shortfall; see the private security notes.)
-    function test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger() public pure {
-        // Derive the worst drop from what NAVOracle actually accepts without a second
-        // key, not from NAV_MAX_DEVIATION_BPS directly. Those were the same number
-        // until NAV_DEVIATION_MAX_ELAPSED was introduced, at which point the real
-        // bound tripled and this test kept passing because it was pinned to the
-        // assumption rather than to the behaviour.
-        uint256 maxDropBps = (Config.NAV_MAX_DEVIATION_BPS * Config.NAV_DEVIATION_MAX_ELAPSED)
-            / Config.NAV_DEVIATION_WINDOW;
-        uint256 worstTriggerLtv =
-            (Config.LIQUIDATION_THRESHOLD_BPS * Config.BPS) / (Config.BPS - maxDropBps);
-        uint256 requiredFloor =
-            (worstTriggerLtv * (Config.BPS + Config.LIQUIDATION_PENALTY_BPS)) / Config.BPS;
-        assertGe(
+    /// @notice The four negotiated risk parameters are no longer constants, and their relations
+    ///         are no longer tested here.
+    /// @dev **Deliberately left as a signpost rather than deleted.** `test_ltvOrdering`,
+    ///      `test_auctionFloorCoversDebtAndPenaltyAtWorstTrigger` and `test_capsOrdering` used to
+    ///      live in this file and assert five relations between compile-time constants. The values
+    ///      moved into `RiskParams` storage, and a `pure` assertion about a constant says nothing
+    ///      whatever about a stored value - so all five became runtime checks inside
+    ///      `RiskParams.checkRiskParams`, and their tests moved to `RiskParameters.t.sol`, where
+    ///      both sides of every bound are exercised against a live contract.
+    ///
+    ///      The seeds those relations used to be about are still declared in `Config` as
+    ///      `DEFAULT_*`. This asserts the seeds are self-consistent, which is worth keeping: it is
+    ///      what stops a deployment being attempted with a set the constructor would reject, and
+    ///      it fails in this file rather than in a deploy script if someone edits one of the four
+    ///      declarations without checking the others.
+    function test_declaredDefaultsAreSelfConsistent() public pure {
+        assertLt(
+            Config.DEFAULT_MAX_LTV_BPS,
+            Config.DEFAULT_LIQUIDATION_THRESHOLD_BPS,
+            "the seed ceiling must sit under the seed trigger"
+        );
+        assertLt(
+            Config.DEFAULT_LIQUIDATION_THRESHOLD_BPS,
             Config.AUCTION_FLOOR_BPS,
-            requiredFloor,
-            "auction floor must cover debt + penalty at the first-triggerable LTV"
+            "the seed trigger must sit under the auction floor"
+        );
+        assertLe(
+            Config.DEFAULT_PER_ACCOUNT_BORROW_CAP,
+            Config.DEFAULT_GLOBAL_BORROW_CAP,
+            "the seed per-account cap cannot exceed the seed global cap"
+        );
+        assertLe(
+            Config.MIN_BOUNTIED_DEBT,
+            Config.DEFAULT_PER_ACCOUNT_BORROW_CAP,
+            "no position could be bountied at the seed cap"
+        );
+        assertLe(
+            Config.DEFAULT_GLOBAL_BORROW_CAP,
+            Config.GLOBAL_BORROW_CAP_MAX,
+            "the seed global cap exceeds the ceiling three contracts clamp on"
+        );
+        assertLe(
+            Config.DEFAULT_LENDER_POOL_DEPOSIT_CAP,
+            Config.GLOBAL_BORROW_CAP_MAX,
+            "the seed deposit cap exceeds the pool's own hard ceiling"
         );
     }
 
     function test_auctionDecaysDownward() public pure {
         assertGt(Config.AUCTION_START_PREMIUM_BPS, Config.AUCTION_FLOOR_BPS);
-    }
-
-    function test_capsOrdering() public pure {
-        assertLe(Config.PER_ACCOUNT_BORROW_CAP, Config.GLOBAL_BORROW_CAP);
     }
 
     /// @dev The penalty split must be exhaustive and the caller must never be able to
@@ -81,7 +93,12 @@ contract ConfigTest is Test {
         // A threshold above the per-account cap would make the mechanism unreachable: no
         // position could ever be bountied, every consumer would ship untested, and the
         // suite would report green over a quantity that is always zero.
-        assertLe(Config.MIN_BOUNTIED_DEBT, Config.PER_ACCOUNT_BORROW_CAP);
+        //
+        // The cap is settable now, so this can only speak for the seed. The live version of the
+        // same relation is enforced twice in `RiskParams` - once as the floor under
+        // `perAccountBorrowCap` and once as relation (E) - because a cap that could ratchet down
+        // past this threshold would switch the whole mechanism off with no code change to notice.
+        assertLe(Config.MIN_BOUNTIED_DEBT, Config.DEFAULT_PER_ACCOUNT_BORROW_CAP);
 
         uint256 bestCasePenaltyReward = (
             ((Config.MIN_BOUNTIED_DEBT * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS)

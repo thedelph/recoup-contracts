@@ -15,6 +15,7 @@ import {ILenderPool} from "./interfaces/ILenderPool.sol";
 import {ILiquidationAuction} from "./interfaces/ILiquidationAuction.sol";
 import {ILiquiditySource} from "./interfaces/ILiquiditySource.sol";
 import {INAVOracle} from "./interfaces/INAVOracle.sol";
+import {IRiskParams} from "./interfaces/IRiskParams.sol";
 
 /// @title CreditManager (PRD §4.3)
 /// @notice Debt accounting. No borrow interest in v1: lender return comes from the
@@ -51,7 +52,12 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error NavStale();
     error CustodyInsolvent();
     error LiquiditySourceUnset();
-    error ExceedsMaxLtv(uint256 ltvBps);
+    /// @dev Carries the ceiling as well as the offending LTV, which the two cap errors below have
+    ///      always done. It did not, and the webapp made up the difference by quoting a mirrored
+    ///      copy of the old constant - correct only while the constant was the authority. Now that
+    ///      the ceiling can move, a caller that has to supply it from somewhere else is a caller
+    ///      that can supply the wrong one.
+    error ExceedsMaxLtv(uint256 ltvBps, uint256 maxLtvBps);
     error PerAccountCapExceeded(uint256 requested, uint256 cap);
     error GlobalCapExceeded(uint256 requested, uint256 cap);
     error NoDebt();
@@ -70,6 +76,11 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error PoolPrincipalOutstanding(address pool, uint256 outstanding);
     /// @notice The outgoing pool still carries per-borrower marks that only it can be told to clear.
     error PoolImpairmentOutstanding(address pool, uint256 marked);
+    /// @notice The loss sink was pointed somewhere other than the lender pool that funds the book.
+    /// @dev Audit round 21. Carries both addresses because the operator error it catches is a
+    ///      *pair* being wrong, not one address: the fix is either to move the funder with it or to
+    ///      leave the sink where it is, and which one depends on which of the two was intended.
+    error LossSinkMustBeTheFunder(address funder, address requestedSink);
     error Detached(address liveManager);
     error NotLiquidationAuction();
     error LiquidationAuctionUnset();
@@ -82,6 +93,12 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error LiquidationOpen(address borrower);
     error StillAttached();
     error LiquidationAuctionVaultMismatch(address auctionVault);
+    error LiquidationAuctionRiskParamsMismatch(address auctionRiskParams);
+    error RiskParamsVaultMismatch(address vaultRiskParams);
+    /// @notice The incoming auction prices the lot off a different NAV feed to the vault's.
+    error LiquidationAuctionNavOracleMismatch(address auctionNavOracle);
+    /// @notice This manager was built on a different NAV feed to the vault it is bound to.
+    error NavOracleVaultMismatch(address vaultNavOracle);
     /// @notice The incoming auction does not answer the whole interface the repayment path needs.
     error LiquidationAuctionIncomplete();
     /// @notice The incoming pool does not answer the enumeration the bounded impairment sweep needs.
@@ -92,6 +109,10 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     error BountyFundingOverflows(uint256 wouldHold, uint256 cap);
     /// @notice A `fundBounty` top-up cannot reach a liquidation that has already started.
     error BountyFundingWhileLiquidating(address borrower);
+    /// @notice Only a borrower may arm their own position. Audit round 21, finding 15.
+    error BountyFundingForAnother(address borrower);
+    /// @notice An escrow insures a debt, so there has to be one. Audit round 21, finding 15.
+    error BountyFundingWithoutDebt(address borrower);
 
     event LiquiditySourceSet(address indexed source);
     event LenderPoolSet(address indexed lenderPool);
@@ -115,6 +136,12 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     event LossWrittenDown(address indexed borrower, uint256 amount, uint256 fromInsurance, uint256 socialised);
     event LossSocialised(address indexed pool, uint256 amount);
     event LossDeferred(uint256 amount, uint256 totalDeferred);
+    /// @notice A tranche of an off-chain redemption that arrived after its loss had been written
+    ///         down, booked back to the balance sheet that bore it rather than to insurance.
+    /// @param bearer Where it went: the lender pool when the pool funded the loan and absorbed the
+    ///        loss, the liquidity source otherwise. The same dispatch `_socialise` used on the way
+    ///        down, so `LossBorneByTheSource` and this event name the same party for the same loan.
+    event WrittenDownLossRecovered(address indexed borrower, uint256 amount, address indexed bearer);
     /// @notice A default whose principal the current lender pool did not fund. Nothing is deferred:
     ///         the source that lent the money bears it by not being repaid.
     /// @dev Emitted rather than silently returning, because "no counter moved" and "a loss
@@ -140,7 +167,29 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
     IERC20 public immutable usdc;
     ICollateralVault public immutable vault;
-    INAVOracle public immutable navOracle;
+
+    /// @inheritdoc ICreditManager
+    /// @notice The NAV feed this manager reads, and it reads it for exactly one thing.
+    /// @dev **Audit round 21.** `borrow`'s `isStale()` gate is the only consumer; every price this
+    ///      contract acts on otherwise comes from the vault. That is what made a divergent feed
+    ///      here silent rather than loud, and why the property this comment used to leave implied
+    ///      is now enforced by the constructor below and by `CollateralVault.setCreditManager`.
+    INAVOracle public immutable override navOracle;
+
+    /// @inheritdoc ICreditManager
+    /// @notice The live risk configuration: borrow ceiling, liquidation trigger, both caps.
+    /// @dev Immutable, and that is the whole reason it is a separate contract. A settable pointer
+    ///      would let this manager and the vault answer different questions about the same
+    ///      position.
+    ///
+    ///      **The sentence that followed - "an immutable one cannot", and "a replacement manager
+    ///      cannot arrive carrying its own constructor seeds and silently revert a ratcheted
+    ///      configuration" - was refuted by execution in audit round 20.** *This* pointer is
+    ///      immutable; *this manager* is not. A replacement manager built on a second `RiskParams`
+    ///      is precisely a replacement arriving with its own constructor seeds, and every wiring
+    ///      call accepted it. The property is real now, and it is real because the constructor
+    ///      below and `CollateralVault.setCreditManager` both refuse the mismatch.
+    IRiskParams public immutable override riskParams;
 
     /// @notice Funds borrows and receives repaid principal. A treasury float in
     ///         Phase 2, the LenderPool from Phase 4 - same interface either way.
@@ -250,13 +299,36 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///         by ACC_PRECISION.
     /// @dev Scaled because the stream runs for five days: a whole-wei rate would
     ///      truncate `pot / 432000` and strand the remainder every epoch - about 0.2%
-    ///      of a 200 USDC epoch, which is not dust. At this scale the loss over a full
-    ///      stream is at most 1 wei of USDC.
+    ///      of a 200 USDC epoch, which is not dust.
+    ///
+    ///      **The residual is at most 1 wei of USDC over a full stream, and that is a
+    ///      property of `_sliceOwed`, not of the rate.** This comment used to claim the
+    ///      bound outright. Audit round 21 measured it false: `_accrue` floored every
+    ///      slice against the time since the *last call*, and `accrueYield()` is
+    ///      permissionless and rate-limit-free, so the floor was charged per invocation.
+    ///      Hourly accrual delivered 109,999,920 of a 110,000,000 pot; a per-second caller
+    ///      delivered 5,080,000 where 5,092,592 was owed; and where the pot in wei is
+    ///      smaller than the stream in seconds every slice floored to zero while the clock
+    ///      still advanced, suppressing the whole pot for as long as anybody kept calling.
+    ///      See `_sliceOwed` for the single floor that restores the bound.
     uint256 public yieldRate;
     /// @notice When the current stream runs dry.
     uint256 public streamEndsAt;
     /// @notice Timestamp the accumulator was last brought up to date.
     uint256 public lastAccrualAt;
+    /// @notice The instant the current stream was rated: the fixed origin `_sliceOwed`
+    ///         floors against.
+    /// @dev **Its own slot, deliberately, even though it always equals `lastDistributeAt`
+    ///      today.** Both are written on adjacent lines of `distributeYield` and nothing
+    ///      else writes either, so the values agree in every reachable state - but they
+    ///      answer different questions, and the sibling this stream is modelled on has
+    ///      already seen them diverge: `LenderPool._update` freezes a stream by moving
+    ///      `lastYieldAccrualAt` and leaving `lastYieldDistributeAt` alone. Folding the
+    ///      origin into `lastDistributeAt` would make the accrual arithmetic depend on a
+    ///      field whose job is to measure the *next* epoch's rating window, so the first
+    ///      freeze path anyone adds here would move the origin out from under the
+    ///      accumulator with nothing to notice.
+    uint256 public streamStartedAt;
     /// @notice When a stream was last rated. Seeded at deploy so the first epoch
     ///         measures its accrual window from genesis rather than from zero.
     uint256 public lastDistributeAt;
@@ -266,16 +338,44 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      bonds, one USDC is 1e-5 per bond, which is 1e13 at this scale.
     uint256 internal constant ACC_PRECISION = 1e18;
 
-    constructor(IERC20 usdc_, ICollateralVault vault_, INAVOracle navOracle_, address initialOwner)
-        Ownable(initialOwner)
-    {
+    constructor(
+        IERC20 usdc_,
+        ICollateralVault vault_,
+        INAVOracle navOracle_,
+        IRiskParams riskParams_,
+        address initialOwner
+    ) Ownable(initialOwner) {
         if (
             address(usdc_) == address(0) || address(vault_) == address(0)
-                || address(navOracle_) == address(0)
+                || address(navOracle_) == address(0) || address(riskParams_) == address(0)
         ) revert ZeroAddress();
+        // **Audit round 20: the vault's answer is the reference, and it is available here.**
+        // `DeployBase._assertCoreGraph` already asserts all three risk readers agree - and it is a
+        // script assertion, so it does not run on a migration, which is a bare owner transaction
+        // with no script around it. `RiskParams.sol`'s own header rejects an alternative design on
+        // the grounds that its only mitigation would be "a script-level answer to a contract-level
+        // defect"; this is the contract-level answer for the shape that argument missed.
+        //
+        // Checked here as well as in `CollateralVault.setCreditManager` on purpose. The setter is
+        // what closes the hazard, because a manager nobody installs governs nothing; this makes the
+        // mismatch fail at deploy time under the deployer's own hand rather than one owner call
+        // later, and it means every honestly-constructed manager in existence agrees with its
+        // vault. A stub can still lie here, which is exactly why the setter check is not optional.
+        if (address(vault_.riskParams()) != address(riskParams_)) {
+            revert RiskParamsVaultMismatch(address(vault_.riskParams()));
+        }
+        // **Audit round 21: the same check, for the sibling pointer round 20 left alone.** The
+        // argument above transfers without a word changed - the vault's answer is the reference, it
+        // is in hand here, and a migration is a bare owner transaction with no script around it. It
+        // transfers with more force, in fact: the risk pointer at least had the script assertion
+        // before #199 and this one did not, so `_assertCoreGraph` could not have caught it either.
+        if (address(vault_.navOracle()) != address(navOracle_)) {
+            revert NavOracleVaultMismatch(address(vault_.navOracle()));
+        }
         usdc = usdc_;
         vault = vault_;
         navOracle = navOracle_;
+        riskParams = riskParams_;
         // Seeded rather than left at zero so the first epoch is streamed over the time
         // that actually elapsed before it. The harvester is wired some way after the
         // vault goes live, so epoch one can represent months of accrual, and its
@@ -335,13 +435,81 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      only hold loss the current pool itself funded, so this is always satisfiable - flush it
     ///      first - and it stops the one remaining way the old bearer instrument could re-form: a
     ///      backlog banked against one source and settled against the next.
+    ///      **The loss sink is carried with the funder, and audit round 21 finding 5 is why.**
+    ///      `liquiditySource` and `lenderPool` are two pointers naming one economic role - the
+    ///      balance sheet whose money is at risk - and only the second is consulted when the money
+    ///      is actually lost. Pointing the funder at a pool while the sink stands somewhere else
+    ///      makes every subsequent default land nowhere: `_socialise` emits `LossBorneByTheSource`
+    ///      and banks nothing, `_setImpairment` marks a pool with no exposure, and the funder's
+    ///      lenders exit at a price that has stopped being true. Measured: 20,000.000000 before and
+    ///      after a fill that left a 314.375000 hole, with `lifetimeSocialisedLoss` and
+    ///      `unsocialisedLoss` both zero and no way back.
+    ///
+    ///      **Carried rather than refused, because refusing both directions is a deadlock.** The
+    ///      sink-side clause in `setLenderPool` forbids leaving a pool funder; a mirror clause here
+    ///      would forbid arriving at a new one, and a pool-to-pool migration would then have no
+    ///      legal first step - the mutually-unsatisfiable shape this repository has already shipped
+    ///      three times. So this setter moves the sink itself, in the same transaction, through the
+    ///      same helper `setLenderPool` uses, so every clause the outgoing pool is owed still runs.
+    ///      There is no ordering to get wrong because there is no ordering.
     function setLiquiditySource(address liquiditySource_) external onlyOwner {
         if (liquiditySource_ == address(0)) revert ZeroAddress();
         if (totalDebt != 0 || pendingPrincipal != 0) revert DebtOutstanding(totalDebt);
         if (unsocialisedLoss != 0) revert LossOutstanding(unsocialisedLoss);
-        liquiditySource = liquiditySource_;
+
+        // Only when the incoming funder is a pool. A treasury bears a default by never being
+        // repaid and has no book to socialise against, which is exactly the state `DeployBase`
+        // ships - pool as sink, treasury as funder - and it has to stay legal.
+        //
+        // **Every external call happens before either write, and both writes happen together.**
+        // The checks below run while both pointers still hold their old, consistent values, and
+        // nothing external is reached between the two assignments - so there is no observable
+        // instant in which the funder is one pool and the sink is another. Assigning one and then
+        // calling out to the other pool would leave exactly that window open to a re-entrant
+        // `borrow`, which would fund from one balance sheet and bank the resulting default against
+        // the other. That is the very asymmetry this clause exists to close, reintroduced by the
+        // shape of the fix rather than by its logic.
+        if (lenderPool != liquiditySource_ && _fundsAsALenderPool(liquiditySource_)) {
+            _checkLenderPoolSwap(liquiditySource_);
+            lenderPool = liquiditySource_;
+            liquiditySource = liquiditySource_;
+            emit LenderPoolSet(liquiditySource_);
+        } else {
+            liquiditySource = liquiditySource_;
+        }
+
         emit LiquiditySourceSet(liquiditySource_);
         _pushLossReserves();
+    }
+
+    /// @dev Does `who` keep a lender-pool principal book, and therefore have to be charged when
+    ///      principal it funded is lost?
+    ///
+    ///      `exitReserve()` is the discriminator because it *is* the property being asked about:
+    ///      it exists only on a balance sheet whose depositors price their own exit against the
+    ///      protocol's losses, which is exactly what makes "the source bore it by never being
+    ///      repaid" false. `socialiseLoss` would be the more direct question and cannot be asked -
+    ///      it is not a view. `TreasuryLiquiditySource` implements `ILiquiditySource` and nothing
+    ///      else, so it answers no.
+    ///
+    ///      **`outstandingPrincipal()` was tried first and is WRONG**, which the treasury control
+    ///      test caught: `TreasuryLiquiditySource` declares that counter too, so the probe returned
+    ///      true for a treasury and the deploy script's own wiring - pool as sink, treasury as
+    ///      funder - stopped being legal. Recorded rather than quietly corrected, because it is the
+    ///      obvious choice: the selector `setLenderPool` probes on its *outgoing* pointer is not a
+    ///      pool test, it is a principal-book test, and the two are not the same question.
+    ///
+    ///      **Fails open, deliberately, and it is the same stance `setLenderPool` takes on its
+    ///      outgoing probe.** An address that cannot answer is not a pool with depositors to
+    ///      short-change, and letting it freeze a pointer permanently is the deadlock shape again.
+    ///      A real `LenderPool` answers this from storage it always has and cannot fail to.
+    function _fundsAsALenderPool(address who) private view returns (bool) {
+        if (who == address(0)) return false;
+        try ILenderPool(who).exitReserve() returns (uint256) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /// @notice Repoint the balance sheet that bears socialised losses.
@@ -351,7 +519,9 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      refuses while the pool has principal out. This setter decides where every future
     ///      default lands and was the one that would move under anything.
     ///
-    ///      Two clauses, mirroring those two siblings.
+    ///      Two clauses, mirroring those two siblings - and a third added by audit round 21, which
+    ///      is about the pointer pair rather than about this pool's own state. It is set out at the
+    ///      bottom of this comment because it is the one that fires first.
     ///
     ///      **A backlog banked against the outgoing pool must not be settled against the incoming
     ///      one.** `unsocialisedLoss` records an amount and not whose principal funded it, and
@@ -390,7 +560,46 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      time reached through a call to a contract that is not what it was assumed to be. The
     ///      guard protects against operator error, not against an owner who is already choosing
     ///      the addresses on both sides.
+    ///
+    ///      **The third clause, audit round 21 finding 5: the sink may not be pointed away from a
+    ///      funder that is itself a lender pool.** The second clause below measures whether the
+    ///      outgoing pool is carrying principal *at this instant*; the harm its own docstring names
+    ///      does not need principal out at the swap, it needs the outgoing pool to be the funder at
+    ///      all, because the next borrow is one transaction away. Measured on a flat book, which is
+    ///      exactly the state that clause is happy with: one borrow and one short fill later the
+    ///      funding pool's `previewRedeem` was unmoved at 20,000.000000, `lifetimeSocialisedLoss`
+    ///      was 0, `unsocialisedLoss` was 0 - the loss was not even deferred - and the second lender
+    ///      out ate 100% of a 314.375000 hole. Permanent: `flushSocialisedLoss` reverts
+    ///      `NothingToSettle` because nothing was banked and `writeDownLoss` had cleared `debtOf`.
+    ///
+    ///      **This is a wiring-layer fix on purpose.** All five sites that reach the pool -
+    ///      `_socialise`, `flushSocialisedLoss`, `_setImpairment`, `_pushLossReserves` and
+    ///      `refreshImpairments` - read `lenderPool`. Charging the funder in `_socialise` alone
+    ///      would have left the impairment leg still marking a pool with no exposure and would have
+    ///      **read like closure**; one invariant on the pointer pair covers all five at once.
+    ///
+    ///      The way forward from here is `setLiquiditySource`, which carries the sink with it.
     function setLenderPool(address lenderPool_) external onlyOwner {
+        address funder = liquiditySource;
+        if (lenderPool_ != funder && _fundsAsALenderPool(funder)) {
+            revert LossSinkMustBeTheFunder(funder, lenderPool_);
+        }
+        _checkLenderPoolSwap(lenderPool_);
+        lenderPool = lenderPool_;
+        emit LenderPoolSet(lenderPool_);
+        // Same trailing push `setLiquiditySource` makes, for the same reason: the incoming pool
+        // prices its exits off these two figures and starts out knowing neither. The loss term is
+        // zero by the guard inside the checks, so this only ever tells it the insurance cover
+        // standing in front of the impairments - which is the difference between a correct exit
+        // price and one that stands back from a fund the pool cannot see.
+        _pushLossReserves();
+    }
+
+    /// @dev Every clause `setLenderPool` owes, and no writes. Shared with `setLiquiditySource` so
+    ///      the migration path cannot be a way in through the other door that skips them, and
+    ///      split from the assignment so both callers can leave the pointer pair consistent at
+    ///      every instant an external call could observe it.
+    function _checkLenderPoolSwap(address lenderPool_) private {
         if (lenderPool_ == address(0)) revert ZeroAddress();
         if (unsocialisedLoss != 0) revert LossOutstanding(unsocialisedLoss);
 
@@ -455,15 +664,6 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         catch {
             revert LenderPoolIncomplete();
         }
-
-        lenderPool = lenderPool_;
-        emit LenderPoolSet(lenderPool_);
-        // Same trailing push `setLiquiditySource` makes, for the same reason: the incoming pool
-        // prices its exits off these two figures and starts out knowing neither. The loss term is
-        // zero by the guard above, so this only ever tells it the insurance cover standing in
-        // front of the impairments - which is the difference between a correct exit price and one
-        // that stands back from a fund the pool cannot see.
-        _pushLossReserves();
     }
 
     function setEpochHarvester(address epochHarvester_) external onlyOwner {
@@ -511,6 +711,32 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             (uint256 liveAuctions, uint256 openWorkouts) = _outgoingAuctionWork(current);
             if (liveAuctions != 0) revert AuctionHasLiveWork(liveAuctions);
             if (openWorkouts != 0) revert AuctionHasLiveWork(openWorkouts);
+
+            // **Audit round 21, and the sibling clause of round 20's own fix.** The vault's twin
+            // was taught to count the *lot* rather than the queue - "counting queue entries is not
+            // the same as counting assets" - because `closeWorkout` pops the queue and leaves the
+            // lot parked under the outgoing auction's ledger entry until the owner-gated
+            // `disposeWorkoutLot` moves it. This setter was left reading the two counters that
+            // change taught the vault not to trust, and the two pointers have to agree: `borrow`
+            // and `liquidate` both compare this one against `vault.liquidationAuction()` and revert
+            // `AuctionPointerMismatch` when they differ.
+            //
+            // MEASURED at round 21: after a forced `closeWorkout` both counters read 0 while
+            // `vault.bondCount(auction)` read 100, the vault refused `AuctionHasLiveWork(100)` and
+            // this setter succeeded - splitting the pair and taking **every new loan and every
+            // liquidation in the protocol** offline until the lot was disposed and the vault's
+            // setter followed. Two 48-hour timelock operations, out of one call that reported
+            // success.
+            //
+            // Read off the vault rather than off the auction, for the reason the `riskParams` and
+            // `navOracle` checks below give: the vault is the one contract in this graph that
+            // cannot be replaced. `bondCount` is its own storage, so this is a plain getter that
+            // cannot revert and needs no `try`, unlike the two counters above. It cannot deadlock
+            // either - it refuses exactly the state the vault already refuses, and the disposal
+            // that clears it is reachable in that state, so nothing reachable before this clause
+            // is unreachable after it.
+            uint256 heldLot = vault.bondCount(current);
+            if (heldLot != 0) revert AuctionHasLiveWork(heldLot);
         }
         // The incoming check its twin on the vault already had. Without it this manager
         // alone could be pointed at an auction with no relationship to the collateral it
@@ -518,6 +744,29 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // independently, in either order.
         address boundVault = ILiquidationAuction(liquidationAuction_).vault();
         if (boundVault != address(vault)) revert LiquidationAuctionVaultMismatch(boundVault);
+
+        // **Audit round 20, and read off the vault rather than off `riskParams` here.** The vault
+        // is the one contract in the graph that cannot be replaced, so its answer is the reference;
+        // this manager's own pointer only equals it because the constructor above insisted, and a
+        // check that compares two replaceable contracts to each other can agree with itself while
+        // both disagree with the collateral. Reading the reference directly costs one staticcall on
+        // an `onlyOwner` path and removes the transitive step from the argument.
+        //
+        // This is a fourth bare selector on the incoming pointer, and it does **not** join the
+        // three probes below. Those exist because `_impairmentFor` calls their selectors bare on a
+        // never-blockable path, so an address that cannot answer bricks `repay` for everyone;
+        // `riskParams()` is called here and nowhere else, so this call is its own probe.
+        address auctionRisk = address(ILiquidationAuction(liquidationAuction_).riskParams());
+        if (auctionRisk != address(vault.riskParams())) revert LiquidationAuctionRiskParamsMismatch(auctionRisk);
+
+        // **Audit round 21.** Read off the vault for the same reason, and it is not redundant with
+        // the vault's own setter: the two pointers are set independently and in either order, so
+        // this manager alone could otherwise be pointed at an auction pricing the lot off a feed
+        // the collateral is not valued against - and this manager is the contract that books the
+        // write-off when that lot sells short. `navOracle()` is called here and nowhere else on
+        // this path, so like the line above it is its own probe and joins none of the three below.
+        address auctionNav = address(ILiquidationAuction(liquidationAuction_).navOracle());
+        if (auctionNav != address(vault.navOracle())) revert LiquidationAuctionNavOracleMismatch(auctionNav);
 
         // **Every selector `_impairmentFor` calls, because it makes all of them bare and
         // un-`try`ed.** Reached unguarded from `_repay`, and so from `repay` and `repayFor` - the
@@ -602,9 +851,18 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // pool mark the whole of it down. `cancel` is the remedy and it is permissionless, but it
         // is unrewarded and optional, so nothing makes it happen.
         //
+        // **Audit round 20 priced that last sentence, and it was expensive.** Once
+        // `Config.AUCTION_RESET_WINDOW` has closed too, `cancel` was the *only* legal move on a
+        // healed position, and this refusal was only the second of five things that then stood with
+        // no clock on any of them: the lender pool's mark and its withdrawal queue, this refusal,
+        // four wiring setters, and the collateral that did the healing. `expireToWorkout` now
+        // dispatches a healed position into the `cancel` body rather than reverting on it, so the
+        // state has an exit the docstrings actually name. This guard is unchanged and still needed:
+        // the exit is still a call somebody has to make.
+        //
         // Refusing costs a borrower under auction nothing they are entitled to - they can still
-        // repay their way out, which clears the auction on the next `cancel` - and it removes the
-        // only input to the mark that the marked party controls.
+        // repay their way out, which clears the auction on the next `cancel` or `expireToWorkout` -
+        // and it removes the only input to the mark that the marked party controls.
         if (auction != address(0) && ILiquidationAuction(auction).auctionOf(msg.sender) != 0) {
             revert LiquidationOpen(msg.sender);
         }
@@ -656,18 +914,23 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // a borrower is never refused against a debt that yield has covered.
         _settle(msg.sender, vault.bondCount(msg.sender));
 
+        // All three gates below come from one read. `params()` rather than three single getters
+        // so this cannot combine a cap seen in one block with a ceiling seen in another - and it
+        // is one `SLOAD` in the callee rather than three, on the hottest path in the protocol.
+        IRiskParams.Params memory risk = riskParams.params();
+
         uint256 newDebt = debtOf[msg.sender] + amount;
-        if (newDebt > Config.PER_ACCOUNT_BORROW_CAP) {
-            revert PerAccountCapExceeded(newDebt, Config.PER_ACCOUNT_BORROW_CAP);
+        if (newDebt > risk.perAccountBorrowCap) {
+            revert PerAccountCapExceeded(newDebt, risk.perAccountBorrowCap);
         }
         uint256 newTotal = totalDebt + amount;
-        if (newTotal > Config.GLOBAL_BORROW_CAP) {
-            revert GlobalCapExceeded(newTotal, Config.GLOBAL_BORROW_CAP);
+        if (newTotal > risk.globalBorrowCap) {
+            revert GlobalCapExceeded(newTotal, risk.globalBorrowCap);
         }
 
         uint256 collateral = vault.collateralValue(msg.sender);
-        if (LtvMath.exceedsLtv(newDebt, collateral, Config.MAX_LTV_BPS)) {
-            revert ExceedsMaxLtv(LtvMath.ltvBps(newDebt, collateral));
+        if (LtvMath.exceedsLtv(newDebt, collateral, risk.maxLtvBps)) {
+            revert ExceedsMaxLtv(LtvMath.ltvBps(newDebt, collateral), risk.maxLtvBps);
         }
 
         // **The prepaid liquidation bounty.** Withheld from the disbursement, never added to
@@ -821,6 +1084,22 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
         yieldRate = rate;
         lastAccrualAt = block.timestamp;
+        // **The origin `_sliceOwed` floors against, and it belongs beside `lastAccrualAt`
+        // rather than anywhere else.** The two have to move together and never apart,
+        // because `_sliceOwed` is exact only while `owedByLast` is exactly zero on a
+        // stream's first call.
+        //
+        // Stating the failure precisely, because the obvious version of it is wrong and was
+        // written on this line first. A stale origin does **not** double-pay the old
+        // window: the two divisions telescope against whatever fixed origin they share, so
+        // the elapsed amounts stay right either way. What breaks is the bound.
+        // `floor(a) - floor(b)` can exceed `floor(a - b)` by one, so a stream rated against
+        // an origin it did not start at releases one wei *more* than its rate owes, and the
+        // `amount > pot` clamp in `_accrue` - documented as unreachable, and clamped only
+        // "rather than let rounding underflow the counter" - quietly becomes the thing
+        // holding the accounting up. MEASURED with the origin left at zero: a 100 USDC
+        // stream run to completion leaves a residual of 0 against the 1 the rate owes.
+        streamStartedAt = block.timestamp;
         lastDistributeAt = block.timestamp;
         streamEndsAt = block.timestamp + duration;
         emit YieldDistributed(amount, rate, streamEndsAt);
@@ -916,27 +1195,65 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      call `settle` themselves before the overflow becomes visible here, and
     ///      claiming looks like it lost them money when it merely ran early.
     function claimSurplus() external nonReentrant {
-        _settle(msg.sender, vault.bondCount(msg.sender));
-        // **Belt and braces, and unreachable today - which is the honest way to describe it
-        // rather than letting a later reader mistake it for the live path.** Every route a
-        // debt has to zero already refunds: `_repay` does it at the end, and `_settle` does it
-        // in the branch where yield clears the last of the debt. Detaching needs
-        // `totalDebt == 0` (see the vault's `setCreditManager`), so a detached manager cannot
-        // be holding an escrow either.
+        _claimSurplus(msg.sender);
+    }
+
+    /// @notice Collect a named account's surplus **to that account**. Permissionless.
+    /// @dev **Audit round 21, finding 4: a `msg.sender`-scoped pot strands any claimant that
+    ///      cannot re-issue the call, and this protocol builds exactly one such claimant on
+    ///      purpose.** `LiquidationAuction` accrues `claimableOf[auction]` while it holds a
+    ///      workout lot - staked, earning, no debt against it - and its only call site for
+    ///      `claimSurplus` reads its own mutable `creditManager` slot. Repoint that slot and
+    ///      the permission still exists while its sole holder can no longer exercise it: the
+    ///      auction is immutable, vault detachment is one-way, and `migrateReserves` leaves
+    ///      `totalClaimable` behind by design. Measured at 399,999,999 USDC-wei stranded on an
+    ///      ordinary manager migration, against a control of 400,000,000 carried across when
+    ///      one permissionless sweep happened to run first.
+    ///
+    ///      **The obvious guard is the wrong fix and was built and measured before this was.**
+    ///      Refusing `LiquidationAuction.setCreditManager` while `claimableOf(auction) != 0`
+    ///      is satisfiable only while the outgoing manager can still pay. Make it unable to -
+    ///      blacklist the auction on USDC, which is the failure the pull-not-push rule exists
+    ///      for in the first place - and the only call that could clear the counter is the one
+    ///      that is failing, so the auction is welded to a dead manager forever. That is the
+    ///      mutually-unsatisfiable shape `EpochHarvester.setLenderPool` spends twenty lines
+    ///      explaining, and it is why the money is made *reachable* here rather than the
+    ///      pointer being made *unmovable* there.
+    ///
+    ///      **Destination not chooseable**, exactly like `EpochHarvester.flushLenderYieldTo`:
+    ///      the caller chooses only *whether* the money moves, never *where*. So this grants no
+    ///      new authority over anyone's balance - `settle` is already permissionless and only
+    ///      ever helps the position it settles, and forcing a claimant to receive their own
+    ///      USDC one block early is the same class of unsolicited help as `repayFor`.
+    ///
+    ///      Reverts at zero rather than no-opping, so a caller cannot be told a strand was
+    ///      cleared when nothing moved.
+    function claimSurplusFor(address account) external nonReentrant {
+        if (account == address(0)) revert ZeroAddress();
+        _claimSurplus(account);
+    }
+
+    function _claimSurplus(address account) private {
+        _settle(account, vault.bondCount(account));
+        // **Reachable, and round 21 measured the route.** This comment used to say "unreachable
+        // today - every route a debt has to zero already refunds". It is wrong in one direction:
+        // the refund hooks all key on a debt *reduction*, and `resolveBounty(id, false)` writes
+        // an escrow with no debt reduction anywhere near it. A stranger cures a liquidated
+        // position with `repayFor` (the escrow is already parked, so `_repay`'s refund is a
+        // no-op), then `cancel` returns the park to `bountyEscrowOf[borrower]` on a borrower
+        // whose `debtOf` is already zero. `settle` cannot reach it - its refund sits inside the
+        // branch where yield clears the last of the debt - and `repay` reverts `NoDebt`. This
+        // line is the only door left, and it pays 25,000,000 through it.
         //
-        // It stays because `_settle` returns on its first line once detached, so if a future
-        // edit narrows either of those two hooks this becomes the only reachable refund, and
-        // this function is the one exit deliberately kept open through a migration. A test
-        // staging the state would have to fake it, so there is no test - the argument is the
-        // guarantee, and it is written here rather than asserted somewhere it would pass
-        // vacuously.
-        _refundBounty(msg.sender);
-        uint256 amount = claimableOf[msg.sender];
+        // It is also the one exit deliberately kept open through a migration, which is why it
+        // matters that it is a real path and not a spare.
+        _refundBounty(account);
+        uint256 amount = claimableOf[account];
         if (amount == 0) revert NothingToClaim();
-        claimableOf[msg.sender] = 0;
+        claimableOf[account] = 0;
         totalClaimable -= amount;
-        emit SurplusClaimed(msg.sender, amount);
-        usdc.safeTransfer(msg.sender, amount);
+        emit SurplusClaimed(account, amount);
+        usdc.safeTransfer(account, amount);
     }
 
     /// @notice Collect liquidation bounties earned by opening auctions.
@@ -950,12 +1267,33 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///
     ///      Open while detached, like `claimSurplus` and for the same reason.
     function claimBounty() external nonReentrant {
-        uint256 amount = bountyOwedTo[msg.sender];
+        _claimBounty(msg.sender);
+    }
+
+    /// @notice Collect a named caller's earned bounty **to that caller**. Permissionless.
+    /// @dev The sibling of `claimSurplusFor`, added in the same commit and for the reason the
+    ///      round-21 brief gives: a fix that unblocks one `msg.sender`-scoped pot has to sweep
+    ///      the class, not the instance. `bountyOwedTo` is credited to whoever called
+    ///      `liquidate`, and that caller may be a keeper *contract* behind its own upgradeable
+    ///      or ownable pointer - the same shape as the auction, with the same one-way strand if
+    ///      the pointer moves before the pot is drained. No trace is filed against it: nothing
+    ///      in this repo builds such a keeper. It is here so that the property "every pot in
+    ///      this contract is collectable by somebody other than its claimant" holds by
+    ///      construction rather than by enumeration.
+    ///
+    ///      Destination not chooseable, same as `claimSurplusFor`.
+    function claimBountyFor(address caller) external nonReentrant {
+        if (caller == address(0)) revert ZeroAddress();
+        _claimBounty(caller);
+    }
+
+    function _claimBounty(address caller) private {
+        uint256 amount = bountyOwedTo[caller];
         if (amount == 0) revert NoBountyOwed();
-        bountyOwedTo[msg.sender] = 0;
+        bountyOwedTo[caller] = 0;
         totalBountyOwed -= amount;
-        emit BountyClaimed(msg.sender, amount);
-        usdc.safeTransfer(msg.sender, amount);
+        emit BountyClaimed(caller, amount);
+        usdc.safeTransfer(caller, amount);
     }
 
     /// @notice Return accumulated principal to the liquidity source.
@@ -963,9 +1301,37 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      `repay`/`applyYield` is what lets those work when the source cannot
     ///      receive, and keeps the harvester's hot loop free of external calls.
     ///      Pull-based, so the transfer and the source's bookkeeping cannot come apart.
+    ///
+    ///      **Audit round 21, finding 3: a no-op at zero, not a revert, and the reason is not
+    ///      ergonomics.** This function used to open `if (amount == 0) revert NothingToSettle();`.
+    ///      Because it is permissionless and free - MEASURED at 42,744 gas - that revert let any
+    ///      stranger decide whether a *deploy script* included a settle leg: `_phase4Calls` had to
+    ///      write the leg conditionally on `pendingPrincipal() != 0` precisely so a flat book would
+    ///      not fail for being tidy, and a queued switchover batch generated when the counter was
+    ///      non-zero died 48 hours later on `NothingToSettle` once anybody zeroed it. **The revert
+    ///      was the only reason the leg had to be conditional, and the conditionality was what the
+    ///      stranger flipped.** Returning early makes the leg unconditional, so the batch's shape no
+    ///      longer depends on mutable state and cannot be front-run into a different operation.
+    ///
+    ///      This is the shape every accrual-style permissionless poke in the wild already uses -
+    ///      Maker `Jug.drip`, Compound `CToken.accrueInterest`'s "short-circuit accumulating 0
+    ///      interest", Morpho Blue `_accrueInterest`'s `if (elapsed == 0) return;`. The safety of
+    ///      the switchover does not rest on this call having done anything: `setLiquiditySource`
+    ///      independently refuses while `pendingPrincipal != 0`, which is the dependent leg
+    ///      *asserting* the settle ran rather than assuming it (Maker's `Jug.file` requiring
+    ///      `now == rho`). Nothing is silently skipped; the assertion is downstream and already
+    ///      shipped.
+    ///
+    ///      `NothingToSettle` itself stays - `flushSocialisedLoss` raises it, and there the revert
+    ///      is correct because that caller has explicitly asked for a flush and wants to know it
+    ///      found nothing. Nothing waits on a *principal* settlement in the same way.
+    ///
+    ///      No event on the empty path either. `PrincipalSettled(0)` would be a log line saying
+    ///      money moved when none did, and an indexer counting settlements would count a stranger's
+    ///      free call as one.
     function settlePrincipal() external nonReentrant {
         uint256 amount = pendingPrincipal;
-        if (amount == 0) revert NothingToSettle();
+        if (amount == 0) return;
         address source = liquiditySource;
         if (source == address(0)) revert LiquiditySourceUnset();
 
@@ -1031,7 +1397,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // `exceedsLtv` cross-multiplies. `healthFactor` divides twice and reports
         // exactly 1e18 for a position a fraction of a bp past the threshold, so gating
         // on the view would refuse the first position that becomes liquidatable.
-        if (!LtvMath.exceedsLtv(debt, collateral, Config.LIQUIDATION_THRESHOLD_BPS)) {
+        if (!LtvMath.exceedsLtv(debt, collateral, riskParams.liquidationThresholdBps())) {
             revert PositionHealthy(LtvMath.ltvBps(debt, collateral));
         }
 
@@ -1090,9 +1456,26 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // `writeDownLoss` stay out of the bounty accounting entirely.
         //
         // Placed after `start` succeeds, so a reverting `start` cannot park against an id that
-        // does not exist - and after the supersede branch inside it has returned any escrow the
-        // lapsed auction was holding, which is what lets that escrow roll forward to this
-        // auction and this caller in the same call.
+        // does not exist.
+        //
+        // **The rest of this paragraph used to credit a supersede branch that returns the lapsed
+        // auction's escrow, and round 19 deleted it.** `start` now re-strikes in place and
+        // returns the SAME id, resolving nothing, precisely so no escrow rolls forward onto
+        // whoever paid for the re-strike - that roll-forward was measured as keeper 0, borrower
+        // 25,000,000. The placement is still correct, for a reason the old sentence did not
+        // name and which a reader could not have reconstructed from it:
+        //
+        //     `bountyEscrowOf[borrower]` is pinned at zero for an auction's entire life.
+        //
+        // The line below empties it at open, and `fundBounty` refuses while either
+        // `auctionOf(borrower)` or `workoutsOpenFor(borrower)` is set. So on a re-strike the
+        // read is zero, the `else` branch runs, and the original park and its claimant are left
+        // untouched. **Relax either of those two gates and this becomes a live bug, not a
+        // tidiness question**: a non-zero escrow at re-strike time would overwrite
+        // `parkedBountyOf[auctionId]` - claimant and amount both - while `totalBountyParked`
+        // only ever grows, leaving the total larger than the sum of the parks it is supposed to
+        // count. That is stated here because both gates are elsewhere and neither says why it
+        // cannot move.
         //
         // **Not gated on the escrow being non-zero.** A position that cannot be liquidated is
         // strictly worse than one liquidated for nothing, so this parks whatever is there,
@@ -1128,10 +1511,21 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
     /// @inheritdoc ICreditManager
     /// @dev **The other half of `liquidate`'s park, and the only thing that can spend it.**
-    ///      `earned` is the auction's judgement on its own exit: `_bid` and `expireToWorkout`
-    ///      resolved the position and pass true, `cancel` and `start`'s supersede branch resolved
-    ///      nothing and pass false. Those four are the complete set of ways an auction ends, and
-    ///      a park that outlived all of them would be USDC no address could ever reach.
+    ///      `earned` is the auction's judgement on its own exit. **This paragraph named four call
+    ///      sites when there are three, and audit round 21 caught both halves.** The complete set
+    ///      is: `LiquidationAuction._bid` (true - the lot sold), `expireToWorkout` (true - no fill
+    ///      means no surplus and no penalty share, which is the case the escrow was introduced
+    ///      for), and `_cancel` (false - nothing was resolved). **`start`'s supersede branch is
+    ///      not a call site and has not been one since round 19**, which re-strikes the same
+    ///      auction in place rather than opening a new one: see the comment there, where both the
+    ///      absent `resolveBounty` and the unchanged `liveAuctionCount` are the fix and not
+    ///      oversights. And **`expireToWorkout` reaches both values, not only true** - round 20's
+    ///      heal-to-zero-debt branch delegates to `_cancel`, so the same function can resolve
+    ///      either way depending on which exit it takes. `_cancel` is likewise reached from two
+    ///      places, `cancel` and that branch.
+    ///
+    ///      Those three are the complete set of ways an auction ends, and a park that outlived
+    ///      all of them would be USDC no address could ever reach.
     ///
     ///      **Deliberately as close to unable-to-revert as a function gets: storage only, no
     ///      external call, no `nonReentrant`, no `whenNotPaused`, no `whileAttached`.** It sits
@@ -1193,9 +1587,37 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      borrower who had just defaulted - a donation to a stranger's failure, which is not
     ///      what anyone calling this is buying. It reads the same two registers `borrow` already
     ///      reads on this pointer, so no new selector is reached and no new probe is owed.
+    ///
+    ///      **Self-funding only, since audit round 21 finding 15, and the third-party path was
+    ///      deleted rather than policed.** This wrote the escrow out of a stranger's wallet
+    ///      while `_repay`'s settlement gate is `payer == borrower && paid == debt` and says
+    ///      nothing about provenance, so the borrower simply repaid and kept the difference:
+    ///      measured at **474.999999 spent against a debt of 499.999999**, net +25.000000 to
+    ///      the borrower and -25.000000 to the funder, no liquidation and no work done. The
+    ///      self-funded path was exactly neutral, which is the control.
+    ///
+    ///      Recording the funder and refunding to them was priced first and rejected. The
+    ///      escrow is a single slot per borrower that `borrow` also writes by withholding from
+    ///      the disbursement, so provenance is not one field but a per-borrower ledger of mixed
+    ///      ownership, threaded through `_repay`'s netting, `_refundBounty`, `liquidate`'s park
+    ///      and `ParkedBounty`. That is a large change to this contract's most closely reasoned
+    ///      accounting in order to keep a path the finding shows is **never rational**: whatever
+    ///      a stranger pays in, the borrower can take by repaying. **Nothing documented above is
+    ///      lost.** Every case this function exists for - the unsatisfiable feasibility band, a
+    ///      position out of a forced close with debt and no reachable borrow, a lot the dust
+    ///      guard never charged - is a borrower arming their **own** position, and all of them
+    ///      still work.
+    ///
+    ///      **Refused on a borrower with no debt**, which is the finding's second face. There
+    ///      was no such guard while `_refundBounty` keys on `debtOf == 0`, so an escrow written
+    ///      against a debt-free position was withdrawable the moment it landed. Harmless once
+    ///      the funder is the borrower, and kept anyway: an escrow insures a debt, and one
+    ///      written where there is no debt has no meaning to give a later reader.
     function fundBounty(address borrower, uint256 amount) external nonReentrant {
         if (borrower == address(0)) revert ZeroAddress();
+        if (msg.sender != borrower) revert BountyFundingForAnother(borrower);
         if (amount == 0) revert ZeroAmount();
+        if (debtOf[borrower] == 0) revert BountyFundingWithoutDebt(borrower);
 
         address auction = liquidationAuction;
         if (auction != address(0)) {
@@ -1261,7 +1683,18 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      `CollateralVault.setCreditManager` and `setLiquiditySource` both refuse
     ///      while `totalDebt != 0`, so a default written off in narrative but not in
     ///      storage would permanently block both migration paths.
-    function writeDownLoss(address borrower, uint256 amount) external nonReentrant {
+    ///
+    /// @return socialised the part of the write-down that **no balance sheet was made whole for**:
+    ///         the pool's share, or the treasury's when the treasury is the funder, or a deferred
+    ///         `unsocialisedLoss` when the pool could not absorb it. It is returned rather than
+    ///         re-derived by the caller because it is the exact amount a **later** recovery may
+    ///         still repay without paying the same tranche twice - `fromInsurance` has already been
+    ///         handed to the source out of the fund, so crediting a recovery against that part
+    ///         would credit it twice. Audit round 21, finding 14: `LiquidationAuction.closeWorkout`
+    ///         records this figure so `workoutSettleAfterClose` can be bounded by it. The two other
+    ///         call sites ignore the return, which is why this is a return value and not a stored
+    ///         counter here: only the workout has somewhere to keep it.
+    function writeDownLoss(address borrower, uint256 amount) external nonReentrant returns (uint256 socialised) {
         if (msg.sender != liquidationAuction) revert NotLiquidationAuction();
         _settle(borrower, vault.bondCount(borrower));
 
@@ -1276,7 +1709,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         insuranceFund -= fromInsurance;
         pendingPrincipal += fromInsurance;
 
-        uint256 socialised = loss - fromInsurance;
+        socialised = loss - fromInsurance;
         emit LossWrittenDown(borrower, loss, fromInsurance, socialised);
         // The uncovered part deliberately does not touch `pendingPrincipal`. That is
         // what socialisation means: the source never gets it back.
@@ -1309,6 +1742,86 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // to mark, and the auction re-derives it anyway on the way out.
         _setImpairment(borrower, 0);
         _pushLossReserves();
+    }
+
+    /// @notice Book USDC recovered **after** its loss was already written down, back to whichever
+    ///         balance sheet actually bore that loss. LiquidationAuction only.
+    /// @dev **Audit round 21, finding 14.** `writeDownLoss` is one-way: it clears `debtOf`, so the
+    ///      next tranche of an off-chain redemption arrives at a borrower with no debt and
+    ///      `repayFor` refuses it. The only permissionless destination that remained was
+    ///      `fundInsurance`, which leaves `pendingPrincipal` and the socialised loss untouched -
+    ///      the recovered money then helps those lenders only if a *future* borrower defaults.
+    ///
+    ///      **It goes back to whoever bore the loss, and the dispatch that decided who bore it is
+    ///      reused rather than re-derived.** `_socialise` charges a pool only when that pool is
+    ///      also the liquidity source, and otherwise reports the loss as already borne by the
+    ///      source that funded the book, which "bears a default by simply never being repaid".
+    ///      So the reverse has exactly two destinations and the same test picks between them:
+    ///
+    ///      - **The pool funded it.** It absorbed the loss against `outstandingPrincipal`, so the
+    ///        recovery is a gain on an asset it has already written off. `LenderPool.recoverLoss`
+    ///        streams it. It deliberately does **not** go through `pendingPrincipal` here:
+    ///        `repayPrincipal` nets a repayment against `outstandingPrincipal`, which the
+    ///        socialisation already wrote down, so the money would be recognised only when the
+    ///        surviving book unwinds - and, measured, it breaks
+    ///        `outstandingPrincipal == pendingPrincipal + totalDebt`, because this manager would
+    ///        owe the pool money it never lent. That invariant is what caught the first version of
+    ///        this function.
+    ///      - **The treasury funded it.** It was never repaid, so repaying it is exactly right:
+    ///        `pendingPrincipal`, drained by the already-permissionless `settlePrincipal`.
+    ///
+    ///      **Not netted against `unsocialisedLoss`, and that is the sign check.** Cancelling a
+    ///      recorded-but-unplaced loss *and* delivering the cash would pay the pool twice: once by
+    ///      never taking the loss, once by receiving the money. Leaving the backlog alone is what
+    ///      makes the net effect on the funder exactly `loss - recovered`.
+    ///
+    ///      **The insurance-funded part of a write-down is deliberately out of reach here.**
+    ///      `writeDownLoss` already moved that tranche into `pendingPrincipal` out of the fund, so
+    ///      crediting it again would settle the same money twice; the auction bounds the recovery
+    ///      by the returned `socialised` figure for that reason. A redemption that comes good by
+    ///      more than that has `fundInsurance` - permissionless, already here - to refill the fund
+    ///      it spent, so no second sweep is owed.
+    ///
+    ///      Not best-effort, unlike `_socialise`. That one sits inside a liquidation exit that must
+    ///      never be blockable; this is an optional inbound payment, and a delivery that cannot be
+    ///      made should not take the money. The caller keeps their USDC and can retry.
+    ///
+    ///      **KNOWN LIMITATION, measured rather than assumed: the dispatch reads the wiring at
+    ///      RECOVERY time, not at LOSS time.** Repoint `lenderPool` and `liquiditySource` in the
+    ///      window between a forced close and the tranche that pays it, and 400.000000 lands on the
+    ///      incoming pool while the pool that actually took the loss gets nothing. That is round
+    ///      11's bearer instrument with the sign flipped - a gain pointed at whoever holds shares
+    ///      in the next era rather than a loss - and it is filed rather than guarded, for three
+    ///      reasons. The only permissionless destination this leg replaces, `fundInsurance`, has
+    ///      exactly the same era-sensitivity, so the property is not new. Refusing the repoint
+    ///      while any write-off is still recoverable would weld both pointers shut for good, since
+    ///      nothing obliges a redemption to ever arrive - the mutually-unsatisfiable shape this
+    ///      contract has been bitten by twice. And recording the bearer at close and refusing a
+    ///      mismatch strands the money instead of misdirecting it, which is better but not free.
+    ///      **Round 22 should decide; the guards both cost something and doing nothing costs
+    ///      something.** In the meantime `setLiquiditySource` and `setLenderPool` are `onlyOwner`
+    ///      and the Phase-4 switchover is a planned one-time event, so the window is operational,
+    ///      not adversarial.
+    ///
+    ///      No `_pushLossReserves`: neither branch moves a term the pool prices exits against.
+    ///      `insuranceFund` and `unsocialisedLoss` are both untouched.
+    function recoverWrittenDownLoss(address borrower, uint256 amount) external nonReentrant {
+        if (msg.sender != liquidationAuction) revert NotLiquidationAuction();
+        if (amount == 0) revert ZeroAmount();
+
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+
+        address pool = lenderPool;
+        if (pool != address(0) && pool == liquiditySource) {
+            emit WrittenDownLossRecovered(borrower, amount, pool);
+            usdc.forceApprove(pool, amount);
+            ILenderPool(pool).recoverLoss(amount);
+            usdc.forceApprove(pool, 0); // leave no standing allowance
+            return;
+        }
+
+        pendingPrincipal += amount;
+        emit WrittenDownLossRecovered(borrower, amount, liquiditySource);
     }
 
     /// @notice Re-state the reserve the lender pool holds against `borrower`, derived from auction
@@ -1637,6 +2150,17 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      `totalClaimable` and `pendingPrincipal` stay, because their claimants are
     ///      named and `claimSurplus` keeps working while detached.
     ///
+    ///      **"Named" was doing work it could not do, and audit round 21 measured the gap.**
+    ///      A claimant that is a *contract behind a moving pointer* is named and still cannot
+    ///      call: `LiquidationAuction` accrues `claimableOf[auction]` while it holds a workout
+    ///      lot, and its only call site reads its own mutable `creditManager` slot, so an
+    ///      ordinary migration left 424,999,999 USDC-wei here against a `spokenFor` of the
+    ///      same figure and moved 1 wei. `claimSurplusFor` and `claimBountyFor` are the fix,
+    ///      and they are what makes this paragraph true rather than nearly true: the pots that
+    ///      stay behind are now collectable by anybody, to their own claimant, for as long as
+    ///      this contract exists. **The ordering that used to be load-bearing and undocumented
+    ///      - sweep the auction before repointing it - is no longer load-bearing.**
+    ///
     ///      **`settlePrincipal` is the exception, and round 8 caught this docstring
     ///      claiming otherwise.** It calls `liquiditySource.repayPrincipal`, which is
     ///      `onlyCreditManager` against a single slot - and repointing that slot is
@@ -1661,7 +2185,8 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      `claimBounty` both keep working while detached so both remain reachable. Leaving
     ///      them out of `spokenFor` would sweep individually-owed money into the incoming
     ///      manager as insurance, which is precisely the failure this function exists to
-    ///      avoid, one pot along.
+    ///      avoid, one pot along. Both are reachable by a third party through the `For`
+    ///      variants above, so neither rests on its claimant still being able to call.
     ///
     ///      Delivery is measured rather than assumed, matching every other value-moving
     ///      leg in this contract.
@@ -1721,6 +2246,14 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // The counter can only fill against a pool that was the liquidity source, and this refuses
         // if that is no longer true. Belt to `_socialise`'s braces: it stops a backlog banked
         // against one funder being settled against whoever replaced it.
+        //
+        // **Audit round 21 made this unreachable, and it is kept for exactly that.** The counter
+        // only fills when the sink is the funder; both setters now refuse to move while it is
+        // non-zero, and neither can leave a pool funder without the sink. So there is no longer a
+        // sequence that reaches this line with the two pointers apart. It is not dead weight: it is
+        // the assertion that the invariant those setters carry actually held, at the one moment
+        // where being wrong about it would move somebody else's money. Deleting it would remove the
+        // only check that the pointer pair is still converged at settlement time.
         if (pool != liquiditySource) revert LossNotThisPools(liquiditySource, pool);
 
         unsocialisedLoss = 0;
@@ -1783,6 +2316,19 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      under a live loan and "who funded this" is never ambiguous. That guard is what makes
     ///      the current pointer a sound proxy for provenance here; without it this check would be
     ///      reading today's configuration to answer a question about yesterday's money.
+    ///
+    ///      **Audit round 21 finding 5: the branch above was silently wrong for a third wiring.**
+    ///      The two the argument covers are "pool funds and pool absorbs" and "treasury funds, so
+    ///      nothing to place". The third is *one pool funding while a different pool is the sink*,
+    ///      and this branch reported it as borne by a source that had recorded nothing - measured,
+    ///      the funder's `previewRedeem` was unmoved at 20,000.000000 across a fill that left a
+    ///      314.375000 hole, with `lifetimeSocialisedLoss` and `unsocialisedLoss` both zero and no
+    ///      way back. **The fix is not here.** `setLenderPool` and `setLiquiditySource` now hold the
+    ///      pointers together whenever the funder is a lender pool, so this branch can now only be
+    ///      taken by a funder that genuinely bears the loss by never being repaid - which is what
+    ///      the paragraph above always claimed it meant. Fixing it here instead would have left
+    ///      `_setImpairment` and `_pushLossReserves` still writing through `lenderPool`, marking a
+    ///      pool with no exposure, and would have read like closure.
     function _socialise(uint256 amount) private {
         address pool = lenderPool;
         if (pool != liquiditySource || pool == address(0)) {
@@ -1842,7 +2388,9 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      `liquidate` must compare with `LtvMath.exceedsLtv` rather than read this -
     ///      and must settle first, so that comparison sees the same debt this does.
     function healthFactor(address borrower) external view returns (uint256) {
-        return LtvMath.healthFactor(currentDebtOf(borrower), vault.collateralValue(borrower));
+        return LtvMath.healthFactor(
+            currentDebtOf(borrower), vault.collateralValue(borrower), riskParams.liquidationThresholdBps()
+        );
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
@@ -1945,6 +2493,21 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      `NoDebt`, an auction over a zero-debt position is always cancellable since
     ///      `exceedsLtv(0, ...)` is false, and `closeWorkout` clamps its write-off at
     ///      `currentDebtOf`.
+    ///
+    ///      **Paying to `claimableOf[borrower]` without asking who funded the escrow is correct
+    ///      only because of a property enforced elsewhere, and audit round 21 found that
+    ///      property was not enforced.** Since finding 15 there are exactly three writers of
+    ///      `bountyEscrowOf`: `borrow` withholds from the borrower's own disbursement,
+    ///      `fundBounty` now refuses any funder but the borrower, and `resolveBounty(id, false)`
+    ///      returns a park that came out of that same escrow. So:
+    ///
+    ///          every wei in `bountyEscrowOf[borrower]` was paid in by that borrower
+    ///
+    ///      which is what makes this refund - and `_repay`'s provenance-blind settlement gate -
+    ///      a return rather than a transfer. Before the fix a stranger could write this slot and
+    ///      the borrower collected it: measured at 474.999999 spent against a debt of
+    ///      499.999999. **Add a fourth writer and that sentence has to be re-checked, not
+    ///      assumed.**
     function _refundBounty(address borrower) private {
         uint256 held = bountyEscrowOf[borrower];
         if (held == 0 || debtOf[borrower] != 0) return;
@@ -1979,6 +2542,12 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      windfall for whoever arrives next, and the insurance fund is the one
     ///      destination with no individual claimant - it stays inside the protocol and
     ///      inside the solvency invariant, which a burn would not.
+    ///
+    ///      **Both branches size their slice with `_sliceOwed`, and that is the round-21
+    ///      fix.** The insurance route below had the identical per-call flooring shape as
+    ///      the accumulator route, so fixing one and not the other would have left the
+    ///      whole defect standing on the path nobody watches - the one that runs when
+    ///      nothing is staked.
     function _accrue() private {
         uint256 endAt = block.timestamp < streamEndsAt ? block.timestamp : streamEndsAt;
         uint256 last = lastAccrualAt;
@@ -1986,7 +2555,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
         uint256 bonds = vault.totalBondCount();
         if (bonds == 0) {
-            uint256 skipped = ((endAt - last) * yieldRate) / ACC_PRECISION;
+            uint256 skipped = _sliceOwed(endAt, last);
             uint256 held = undistributedYield;
             if (skipped > held) skipped = held;
             if (skipped != 0) {
@@ -2002,12 +2571,22 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             return;
         }
 
-        uint256 amount = ((endAt - last) * yieldRate) / ACC_PRECISION;
+        uint256 amount = _sliceOwed(endAt, last);
         // The rate is derived from the pot by integer division, so it can never
         // outrun it; clamp anyway rather than let rounding underflow the counter.
         uint256 pot = undistributedYield;
         if (amount > pot) amount = pot;
 
+        // Still unconditional, and now harmless. Advancing the clock past a zero slice was
+        // only ever a defect because the *next* slice was measured from here; it is now
+        // measured from `streamStartedAt`, so a caller who consumes a sub-wei window buys
+        // nothing - the wei they floored away is still owed and is paid by whoever calls
+        // next. Holding the clock back instead is the fix this line looks like it wants, and
+        // it is **inert** on any rate above one wei per second, where the `amount == 0`
+        // branch it moves is never taken at all: 5,080,000 before and 5,080,000 after. That
+        // is asserted rather than described, in
+        // `test/AccrualFloorShapes.t.sol::test_accrual_holdingTheClockBackIsInertOnARealisticEpoch`,
+        // so nobody reaches for it again on the strength of how it reads.
         lastAccrualAt = endAt;
         if (amount == 0) return;
 
@@ -2017,10 +2596,57 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         emit YieldAccrued(amount, acc, bonds);
     }
 
+    /// @dev The slice of the stream owed between `last` and `endAt`, floored **once against
+    ///      the stream's own origin** rather than once per call.
+    ///
+    ///      **This is the whole of the round-21 finding-12 fix, and the shape is borrowed
+    ///      from `LenderPool.unreleasedYield()`, which is why that contract was immune and
+    ///      this one was not.** There, the elapsed release is always measured from
+    ///      `lastYieldAccrualAt`, a mark that moves only when a stream is rated, so the
+    ///      integer division is charged once per stream no matter how often anyone reads.
+    ///      Here `lastAccrualAt` moves on *every* call, so `((endAt - last) * rate) / ACC`
+    ///      paid a floor per invocation - and `accrueYield()` is permissionless, free and
+    ///      rate-limit-free, so the number of invocations is not a protocol parameter.
+    ///
+    ///      Measured before the fix, one call per second: 5,080,000 delivered where
+    ///      5,092,592 was owed, and a pot whose wei count is below the stream's second
+    ///      count delivered **nothing at all** while the clock ran to the end.
+    ///
+    ///      The two divisions telescope: successive slices sum to
+    ///      `floor((endAt - origin) * rate / ACC)` exactly, which is what a single call
+    ///      over the same window would have paid. So the residual is bounded by one wei
+    ///      per *stream*, which is the bound `yieldRate`'s NatSpec has claimed all along.
+    ///
+    ///      Saturating in both directions rather than trusting `last >= origin >= 0`. The
+    ///      ordering does hold - `distributeYield` writes both marks on adjacent lines and
+    ///      `lastAccrualAt` only ever moves forward - but this runs inside `_settle`, which
+    ///      is on the path of every borrow, repay, deposit and withdrawal, and an underflow
+    ///      revert there would be a protocol-wide freeze bought with a wrong assumption
+    ///      about two timestamps.
+    function _sliceOwed(uint256 endAt, uint256 last) private view returns (uint256) {
+        uint256 origin = streamStartedAt;
+        if (endAt <= origin) return 0;
+
+        uint256 rate = yieldRate;
+        uint256 owedByEnd = ((endAt - origin) * rate) / ACC_PRECISION;
+        uint256 owedByLast = last > origin ? ((last - origin) * rate) / ACC_PRECISION : 0;
+        return owedByEnd > owedByLast ? owedByEnd - owedByLast : 0;
+    }
+
     /// @dev What `accYieldPerBond` would be if `_accrue` ran right now. Views must use
     ///      this, or `pendingYieldOf` and `currentDebtOf` would under-report between
     ///      interactions and a keeper would liquidate against a debt the stream has
     ///      already paid down.
+    ///
+    ///      **The `bonds == 0` early return deliberately does NOT mirror `_accrue`'s
+    ///      insurance route, and audit round 21 asked whether that asymmetry is correct.
+    ///      It is.** This function answers exactly one question - what the *accumulator*
+    ///      would read - and `_accrue`'s unstaked branch leaves `accYieldPerBond` untouched
+    ///      by construction, because there is no bond base to divide by. Returning the
+    ///      stored value is therefore the exact projection, not an approximation of it.
+    ///      The quantity that does lag between calls is `insuranceFund`, and it lags *low*:
+    ///      conservative for the pool's `insuranceCover` mirror, and only reachable while
+    ///      the vault holds no bonds at all, which is a state with no position to price.
     function _projectedAcc() private view returns (uint256) {
         uint256 endAt = block.timestamp < streamEndsAt ? block.timestamp : streamEndsAt;
         uint256 last = lastAccrualAt;
@@ -2029,7 +2655,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         uint256 bonds = vault.totalBondCount();
         if (bonds == 0) return accYieldPerBond;
 
-        uint256 amount = ((endAt - last) * yieldRate) / ACC_PRECISION;
+        uint256 amount = _sliceOwed(endAt, last);
         uint256 pot = undistributedYield;
         if (amount > pot) amount = pot;
 

@@ -7,7 +7,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Config} from "../src/Config.sol";
 import {ProtocolFeeSplitter} from "../src/ProtocolFeeSplitter.sol";
-import {LenderPool} from "../src/LenderPool.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
 import {EpochHarvester} from "../src/EpochHarvester.sol";
@@ -25,6 +24,9 @@ import {MockBond} from "./mocks/MockBond.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice A lender pool that accepts a flush but pulls less than it was offered.
 ///         Exists to prove `flushLenderYield` verifies delivery rather than assuming
@@ -73,23 +75,35 @@ contract AcceptingPool {
 
 /// @notice The weekly epoch (PRD §4.4, §6.2): claim from the farm, split 55/25/10/10,
 ///         write borrower debt down, and do it without iterating positions.
-contract EpochHarvesterTest is Test {
+contract EpochHarvesterTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8;
     uint256 internal constant FLOAT = 100_000e6;
     uint256 internal constant YIELD = 1_000e6;
     uint256 internal constant BONDS = 100;
 
-    /// @dev Borrowing power at the ceiling for the seeded lot, derived from Config so the
-    ///      ratchet moves the fixture instead of breaking it. Tests asserting a partial
-    ///      write-down need a debt larger than one epoch of borrower share
+    /// @dev Borrowing power at the ceiling for the seeded lot, derived from the live risk
+    ///      parameters so the ratchet moves the fixture instead of breaking it. Tests
+    ///      asserting a partial write-down need a debt larger than one epoch of borrower share
     ///      (YIELD x SPLIT_BORROWER_BPS = 550e6), which the ceiling comfortably is; the
     ///      literal 800e6 this replaced stopped being inside the ceiling at 25% LTV.
-    uint256 internal constant MAX_BORROW =
-        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+    /// @dev **A function rather than a `constant`, and deliberately not a value cached in
+    ///      `setUp`.** A Solidity `constant` cannot read the storage the ceiling now lives in,
+    ///      and a cache would let a test that moved the parameter partway through keep
+    ///      asserting against the figure derived before the move. Re-read on every call; see
+    ///      `RiskParamsFixture`.
+    function _maxBorrow() internal view returns (uint256) {
+        return _maxBorrow(BONDS, NAV);
+    }
 
-    /// @dev At most 1 wei of USDC is left behind by a stream's rate truncation, and a
-    ///      test that accrues twice can compound that to 2. Anything larger is a real
-    ///      accounting bug, so this stays tight rather than being widened to pass.
+    /// @dev At most 1 wei of USDC is left behind **per stream** by the rate truncation, and a
+    ///      test that runs two streams carries that to 2. Anything larger is a real accounting
+    ///      bug, so this stays tight rather than being widened to pass.
+    ///
+    ///      Per *stream*, not per accrual, and audit round 21 is why the distinction is written
+    ///      down. `CreditManager._accrue` used to floor each slice against the previous call, so
+    ///      the residual grew with the number of calls and nothing bounded it; `_sliceOwed` now
+    ///      floors once against the stream's own origin, which is what makes a fixed tolerance
+    ///      mean anything here at all.
     uint256 internal constant DUST = 2;
 
     address internal admin = makeAddr("admin");
@@ -107,6 +121,15 @@ contract EpochHarvesterTest is Test {
     CreditManager internal credit;
     EpochHarvester internal harvester;
     TreasuryLiquiditySource internal liquidity;
+    RiskParams internal riskParams;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -115,8 +138,17 @@ contract EpochHarvesterTest is Test {
         bond.setRewardPool(address(farm));
         oracle = new MockNavOracle(NAV);
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        credit = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         harvester = new EpochHarvester(usdc, ICreditManager(address(credit)), admin);
         // The adapter routes claims to the harvester, which is the Phase 3 wiring.
         adapter = new DirectCallAdapter(
@@ -131,6 +163,10 @@ contract EpochHarvesterTest is Test {
         // so suites that never run a liquidation still need a stand-in.
         MockLiquidationAuction auctionStub = new MockLiquidationAuction();
         auctionStub.setVault(address(vault));
+        // Audit round 20: the setters also check the risk authority agrees with the vault's.
+        auctionStub.setRiskParams(address(riskParams));
+        // Audit round 21: and the NAV feed, anchored on the vault's answer.
+        auctionStub.setNavOracle(address(vault.navOracle()));
         auctionStub.setCreditManager(address(credit));
         vault.setLiquidationAuction(address(auctionStub));
         // `borrow` refuses while the vault names an auction this manager does not, so
@@ -196,14 +232,12 @@ contract EpochHarvesterTest is Test {
         assertEq(usdc.balanceOf(feeWallet), toProtocol);
     }
 
-    // The end-to-end test of the lender leg reaching a *real* pool is not in this repository.
-    // `src/LenderPool.sol` here is the dormant skeleton: the finished implementation is held back
-    // from publication while one finding against it is open, so a test that deposits into the pool,
-    // flushes an epoch into it and watches the share price rise across the stream window has
-    // nothing to run against. Published instead is everything either side of this line, which
-    // exercises the harvester against stand-in pools - `AcceptingPool`, `RevertingPool` and the
-    // short-pulling pool are the three delivery outcomes it has to survive, and they are the part
-    // of that story that belongs to this contract rather than to the pool.
+    // **The end-to-end lender-leg test is not in this repository.** It constructs a real
+    // `LenderPool`, has a lender deposit into it, and asserts that a flushed epoch lands as a
+    // higher share price rather than as loose USDC. None of that is possible against the skeleton
+    // published here, which refuses deposits and cannot distribute. The delivery mechanism itself
+    // is still covered below by `AcceptingPool` and `ShortPool`, which is the part that is about
+    // this contract rather than about the pool.
 
     /// @notice The 80/20 with DexFi, proved through a real epoch rather than in isolation.
     /// @dev `ProtocolFeeSplitter` rests on one claim about this contract: that installing
@@ -239,6 +273,235 @@ contract EpochHarvesterTest is Test {
             (toProtocol * Config.PROTOCOL_FEE_DEXFI_BPS) / Config.BPS,
             "DexFi's leg is the agreed share of the fee, not of gross yield"
         );
+    }
+
+    // -- round 21: repointing the fee wallet over an accrued backlog ---------
+
+    /// @dev Three identical epochs with the splitter installed, which is the shape the agreement
+    ///      with DexFi actually ships in. Separate from `_harvestAndStream` because these tests
+    ///      care about what the harvester holds, not about what reaches a borrower.
+    function _threeEpochs() private {
+        for (uint256 i = 0; i < 3; ++i) {
+            farm.setPendingYield(address(adapter), YIELD);
+            harvester.harvest();
+            skip(Config.MIN_EPOCH_GAP);
+        }
+    }
+
+    function _splitter() private returns (ProtocolFeeSplitter) {
+        return new ProtocolFeeSplitter(IERC20(address(usdc)), makeAddr("recoupTreasury"), makeAddr("dexfiTreasury"));
+    }
+
+    /// @notice A repoint leaves the accrued fee with the wallet that earned it.
+    /// @dev **Audit round 21, finding 13.** `harvest` accrues the protocol slice into
+    ///      `pendingProtocolFee` and deliberately never pushes it; `flushProtocolFee` pays
+    ///      whatever `protocolFeeWallet` says **at flush time**; and `setProtocolFeeWallet` was
+    ///      three lines of bare `onlyOwner` with no checkpoint, no drain and - alone among the
+    ///      setters in this file - no event at all. So the whole accrual window sat behind a
+    ///      pointer only Recoup can move, and `ProtocolFeeSplitter`'s claim that "neither party
+    ///      can redirect the other's leg" bound only money already at the splitter.
+    ///
+    ///      MEASURED before the fix, and reproduced by this test's control arm: three epochs of
+    ///      1,000.000000 pay DexFi **60.000000** through the splitter, while a repoint followed
+    ///      by a flush - both of which fit in one block - paid DexFi **0** and sent 300.000000
+    ///      elsewhere. The backlog builds with no attacker and drains through no automatic path:
+    ///      100.000000 after one epoch, 1,000.000000 after ten.
+    ///
+    ///      Both arms in one test on purpose. The hazard arm alone would pass just as well if the
+    ///      checkpoint had destroyed the fee rather than parked it, and the control arm alone says
+    ///      nothing about the redirect.
+    function test_setProtocolFeeWallet_leavesTheBacklogWithTheWalletThatEarnedIt() public {
+        ProtocolFeeSplitter splitter = _splitter();
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(address(splitter));
+
+        _threeEpochs();
+        uint256 backlog = harvester.pendingProtocolFee();
+        assertEq(backlog, (3 * YIELD * Config.SPLIT_PROTOCOL_BPS) / Config.BPS, "fixture: three epochs of fee");
+
+        uint256 snapshot = vm.snapshotState();
+
+        // CONTROL: flush to the splitter as wired. This is what the agreement pays.
+        harvester.flushProtocolFee();
+        splitter.split();
+        uint256 dexfiIsOwed = usdc.balanceOf(splitter.dexfiWallet());
+        assertEq(dexfiIsOwed, (backlog * Config.PROTOCOL_FEE_DEXFI_BPS) / Config.BPS, "control: the agreed share");
+
+        vm.revertToState(snapshot);
+
+        // HAZARD: repoint, then flush, in the same block.
+        address elsewhere = makeAddr("elsewhere");
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(elsewhere);
+
+        assertEq(harvester.pendingProtocolFee(), 0, "the live counter still carries the outgoing wallet's fee");
+        assertEq(harvester.owedProtocolFee(address(splitter)), backlog, "the backlog was not checkpointed");
+        assertEq(harvester.totalOwedProtocolFee(), backlog, "the sum did not follow the mapping");
+
+        // Nothing to redirect: the live counter is empty, so the flush has nothing to pay out.
+        vm.expectRevert(EpochHarvester.NothingToFlush.selector);
+        harvester.flushProtocolFee();
+        assertEq(usdc.balanceOf(elsewhere), 0, "the incoming wallet was paid the outgoing wallet's fee");
+
+        // And the parked fee is still payable, to the splitter and only to the splitter.
+        harvester.flushProtocolFeeTo(address(splitter));
+        splitter.split();
+        assertEq(usdc.balanceOf(splitter.dexfiWallet()), dexfiIsOwed, "DexFi is short against the control");
+        assertEq(harvester.owedProtocolFee(address(splitter)), 0, "the checkpoint was not cleared by the flush");
+        assertEq(harvester.totalOwedProtocolFee(), 0, "the sum was not cleared by the flush");
+    }
+
+    /// @notice A checkpointed fee is not re-harvested as fresh yield.
+    /// @dev **The interaction the fix would have been a downgrade without.** `harvest` sizes an
+    ///      epoch as this contract's raw balance less what is already spoken for, and moving value
+    ///      out of `pendingProtocolFee` into `owedProtocolFee` removes it from that subtraction.
+    ///      Left off the line, the parked fee reads as fresh yield to the very next epoch, is
+    ///      split four ways to borrowers, lenders and insurance, and is *still* owed to the wallet
+    ///      it was parked for - so the second payment comes out of somebody else's epoch. The
+    ///      comment on that line predicted this counter before it existed.
+    function test_setProtocolFeeWallet_aCheckpointedFeeIsNotReHarvestedAsFreshYield() public {
+        ProtocolFeeSplitter splitter = _splitter();
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(address(splitter));
+
+        _threeEpochs();
+        uint256 parked = harvester.pendingProtocolFee();
+
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(feeWallet);
+        assertEq(harvester.owedProtocolFee(address(splitter)), parked, "fixture: the checkpoint must have happened");
+
+        // A fourth, identical epoch. Its fee must be one epoch's worth, not one epoch plus the
+        // backlog counted a second time.
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+
+        uint256 oneEpochFee = (YIELD * Config.SPLIT_PROTOCOL_BPS) / Config.BPS;
+        assertEq(harvester.pendingProtocolFee(), oneEpochFee, "the epoch was sized to include the parked fee");
+        // Within DUST, not exact: three completed streams have each left their one wei of rate
+        // truncation behind, which is the residual `CreditManager._sliceOwed` is bounded by.
+        assertApproxEqAbs(
+            credit.undistributedYield(),
+            (YIELD * Config.SPLIT_BORROWER_BPS) / Config.BPS,
+            DUST,
+            "borrowers were paid out of a fee parked for somebody else"
+        );
+        assertEq(harvester.owedProtocolFee(address(splitter)), parked, "and the parked fee is untouched");
+    }
+
+    /// @notice The repoint works when the outgoing wallet cannot take delivery, which is the case
+    ///         it exists for.
+    /// @dev **The sign check on the obvious fix.** Draining to the outgoing wallet before
+    ///      repointing is what MetaMorpho's `setFeeRecipient` does - but its `_accrueFee` mints
+    ///      the vault's own shares and cannot revert, while ours would be a USDC push to an
+    ///      address that may be blacklisted or a contract that reverts. Compromised, bricked or
+    ///      frozen is *why* anybody rotates a fee wallet, so a drain-first fix fails in exactly
+    ///      the case it was built for and hands the outgoing recipient a veto over its own
+    ///      replacement. It also contradicts `flushProtocolFee`'s own rationale, one function
+    ///      below, that a recipient which cannot take delivery must never block anything.
+    ///
+    ///      So: the repoint succeeds against a blacklisted outgoing wallet, the fee is parked
+    ///      rather than pushed, and it becomes payable the moment the block is lifted.
+    function test_setProtocolFeeWallet_repointsAwayFromAWalletThatCannotTakeDelivery() public {
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+        uint256 backlog = harvester.pendingProtocolFee();
+        assertGt(backlog, 0, "fixture: there must be a backlog to strand");
+
+        usdc.setBlocked(feeWallet, true);
+
+        address incoming = makeAddr("incoming");
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(incoming);
+        assertEq(harvester.protocolFeeWallet(), incoming, "a bricked outgoing wallet blocked its own replacement");
+        assertEq(harvester.owedProtocolFee(feeWallet), backlog, "the stranded fee was not parked");
+
+        // Still undeliverable while the block stands, and deliverable the moment it lifts.
+        vm.expectRevert();
+        harvester.flushProtocolFeeTo(feeWallet);
+
+        usdc.setBlocked(feeWallet, false);
+        harvester.flushProtocolFeeTo(feeWallet);
+        assertEq(usdc.balanceOf(feeWallet), backlog, "the parked fee never reached the wallet that earned it");
+    }
+
+    /// @notice The setter has no precondition a stranger can flip.
+    /// @dev **The other rejected fix, and it manufactures a different finding from the same
+    ///      round.** `require(pendingProtocolFee == 0)` on this setter reads like the tidy answer,
+    ///      and it would be a live griefing surface: `harvest()` is permissionless, so anybody
+    ///      could re-block the setter for the price of gas, indefinitely, inside the 48-hour
+    ///      timelock window a production repoint has to sit in. An unconditional checkpoint has no
+    ///      precondition to go stale, which is why it is the right shape here and in
+    ///      `setLenderPool`. This test is the guard against somebody adding that require later: a
+    ///      stranger harvests immediately before the repoint, and the repoint still lands.
+    function test_setProtocolFeeWallet_cannotBeBlockedByAStrangerHarvestingFirst() public {
+        farm.setPendingYield(address(adapter), YIELD);
+        vm.prank(caller); // permissionless, and not the owner
+        harvester.harvest();
+        assertGt(harvester.pendingProtocolFee(), 0, "fixture: the stranger must have created a backlog");
+
+        address incoming = makeAddr("incoming");
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(incoming);
+        assertEq(harvester.protocolFeeWallet(), incoming, "a stranger's harvest blocked the repoint");
+    }
+
+    /// @notice The repoint is on chain even when there is no backlog to park.
+    /// @dev It was the only setter in this contract that emitted nothing at all, on the one
+    ///      pointer a third party's revenue hangs off, so a repoint left no record that it had
+    ///      happened. The park event is conditional because a park may not have happened; this one
+    ///      is unconditional, because the repoint always has.
+    function test_setProtocolFeeWallet_emitsTheRepointAndTheParkSeparately() public {
+        ProtocolFeeSplitter splitter = _splitter();
+
+        // No backlog yet: the repoint is announced, nothing is parked.
+        vm.expectEmit(true, false, false, true, address(harvester));
+        emit EpochHarvester.ProtocolFeeWalletSet(address(splitter));
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(address(splitter));
+
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+        uint256 backlog = harvester.pendingProtocolFee();
+
+        // With a backlog, both.
+        address incoming = makeAddr("incoming");
+        vm.expectEmit(true, false, false, true, address(harvester));
+        emit EpochHarvester.ProtocolFeeParked(address(splitter), backlog, backlog);
+        vm.expectEmit(true, false, false, true, address(harvester));
+        emit EpochHarvester.ProtocolFeeWalletSet(incoming);
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(incoming);
+    }
+
+    /// @notice The parked flush is permissionless and cannot choose a destination.
+    /// @dev The two properties that make the checkpoint safe rather than merely tidy, and the same
+    ///      pair `flushLenderYieldTo` rests on. Keyed by the wallet that earned the fee, so there
+    ///      is nothing for an owner to redirect; callable by anybody, so DexFi's leg does not
+    ///      depend on Recoup's owner cooperating in paying it - which matters precisely because
+    ///      Recoup's owner is the party a redirect would have benefited.
+    function test_flushProtocolFeeTo_isPermissionlessAndPaysOnlyTheWalletThatEarnedIt() public {
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+        uint256 backlog = harvester.pendingProtocolFee();
+
+        address incoming = makeAddr("incoming");
+        vm.prank(admin);
+        harvester.setProtocolFeeWallet(incoming);
+
+        // No standing claim for anyone else, including the wallet now wired.
+        vm.expectRevert(EpochHarvester.NothingToFlush.selector);
+        harvester.flushProtocolFeeTo(incoming);
+        vm.expectRevert(EpochHarvester.ZeroAddress.selector);
+        harvester.flushProtocolFeeTo(address(0));
+
+        // And a stranger can pay the wallet that earned it.
+        vm.prank(caller);
+        harvester.flushProtocolFeeTo(feeWallet);
+        assertEq(usdc.balanceOf(feeWallet), backlog, "a stranger could not deliver the parked fee");
+
+        vm.expectRevert(EpochHarvester.NothingToFlush.selector);
+        harvester.flushProtocolFeeTo(feeWallet);
     }
 
     /// @dev Nothing may be left behind in the harvester beyond the lender share it is
@@ -360,16 +623,20 @@ contract EpochHarvesterTest is Test {
     }
 
     function test_harvest_writesDownBorrowerDebt() public {
+        // Read before the prank: the ceiling is a staticcall to `RiskParams` now, and a
+        // single-shot `vm.prank` is spent on the next call this contract makes - so deriving
+        // the amount inside the `borrow` argument would send the borrow from the test contract.
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         farm.setPendingYield(address(adapter), YIELD);
         _harvestAndStream();
         credit.settle(alice);
 
         uint256 toBorrowers = (YIELD * Config.SPLIT_BORROWER_BPS) / Config.BPS;
-        assertLt(toBorrowers, MAX_BORROW, "a partial write-down, not a full repayment");
-        assertApproxEqAbs(credit.debtOf(alice), MAX_BORROW - toBorrowers, DUST, "the loan repaid itself");
+        assertLt(toBorrowers, loan, "a partial write-down, not a full repayment");
+        assertApproxEqAbs(credit.debtOf(alice), loan - toBorrowers, DUST, "the loan repaid itself");
     }
 
     /// @dev And when the yield exceeds the debt, the remainder becomes claimable
@@ -1172,5 +1439,24 @@ contract EpochHarvesterTest is Test {
 
         assertEq(harvester.epochCount(), 2, "the epoch ran through the new adapter");
         assertEq(harvester.lastCorroboratedYield(), PIN_COST, "against the new adapter's own counter");
+    }
+
+    /// @notice Audit round 21's setter census: this pointer had no binding check at all, while its
+    ///         twin on `CollateralVault` has always required the adapter to name the right vault.
+    /// @dev An adapter bound elsewhere carries a `farmYieldDelivered` counter that has nothing to
+    ///      do with this protocol's yield, and that counter is the whole of `harvest`'s answer to
+    ///      "is this epoch real". The test above is the control: an adapter bound to the *right*
+    ///      vault still installs, including one the vault has not moved to yet.
+    function test_setCustodyAdapter_refusesAnAdapterBoundToADifferentVault() public {
+        address otherVault = makeAddr("otherVault");
+        DirectCallAdapter foreign = new DirectCallAdapter(
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, otherVault, admin, address(harvester)
+        );
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(EpochHarvester.AdapterVaultMismatch.selector, otherVault));
+        harvester.setCustodyAdapter(ICustodyAdapter(address(foreign)));
+
+        assertEq(address(harvester.custodyAdapter()), address(adapter), "the pointer did not move");
     }
 }

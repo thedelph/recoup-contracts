@@ -21,6 +21,9 @@ import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockLenderPool} from "./mocks/MockLenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice Drives the whole liquidation lifecycle in random order against a NAV that
 ///         moves under it, and checks the properties that must survive any sequence.
@@ -38,6 +41,18 @@ contract AuctionHandler is Test {
     MockUSDC public immutable usdc;
     MockBond public immutable bond;
     address public immutable keeper;
+
+    /// @notice The live risk parameters, so this handler's own predicates follow a parameter change
+    ///         instead of pinning the launch defaults.
+    /// @dev Read once from the manager in the constructor and held `immutable`, for the same reason
+    ///      `pool` below is: `targetContract(address(handler))` fuzzes every external non-view
+    ///      function, so a setter here would be a fuzz target. It is the same `RiskParams` the
+    ///      fixture deployed and passed into all three contracts, so reading it through `credit`
+    ///      cannot disagree with the authority the code under test uses - and using the live value
+    ///      is not the same as copying the implementation. `hasReachableExit` still restates each
+    ///      exit's precondition itself; only the number it compares against is read rather than
+    ///      frozen, which is the whole point of the parameters being settable.
+    IRiskParams public immutable riskParams;
 
     address[] public actors;
     uint256[] public startedAuctions;
@@ -61,6 +76,12 @@ contract AuctionHandler is Test {
     uint256 public workoutsOpened;
     uint256 public workoutsClosed;
     uint256 public recoveriesPaid;
+    /// @notice Times a tranche landed on a workout the forced close had already written off.
+    /// @dev Audit round 21, finding 14. Its own ghost rather than sharing `recoveriesPaid`,
+    ///      because the two reach different states: one pays down a live debt, the other pays a
+    ///      write-off back to the balance sheet that bore it, with no debt in front of it at all. A
+    ///      campaign that only ever reached the first would say nothing about the second.
+    uint256 public lateRecoveriesPaid;
 
     /// @notice Times a liquidation actually put a reserve into the lender pool, and times a
     ///         terminal transition actually took one out.
@@ -103,6 +124,7 @@ contract AuctionHandler is Test {
     ) {
         vault = vault_;
         credit = credit_;
+        riskParams = credit_.riskParams();
         auction = auction_;
         oracle = oracle_;
         usdc = usdc_;
@@ -214,7 +236,7 @@ contract AuctionHandler is Test {
         if (debt == 0 || bonds == 0) return;
 
         uint256 pivot =
-            (debt * Config.USDC_TO_NAV_SCALE * Config.BPS) / (Config.LIQUIDATION_THRESHOLD_BPS * bonds);
+            (debt * Config.USDC_TO_NAV_SCALE * Config.BPS) / (riskParams.liquidationThresholdBps() * bonds);
         if (pivot == 0) return;
 
         oracle.setNav(bound(offsetSeed, (pivot * 4) / 5, (pivot * 6) / 5));
@@ -318,6 +340,20 @@ contract AuctionHandler is Test {
         } catch {}
     }
 
+    /// @dev The late tranche. Permissionless, so the handler - which holds no role - drives it,
+    ///      the same way it drives `workoutSettle`.
+    function workoutSettleAfterClose(uint256 idSeed, uint256 amount) external {
+        if (startedAuctions.length == 0) return;
+        uint256 id = startedAuctions[idSeed % startedAuctions.length];
+        uint256 pay = bound(amount, 1, 2_000e6);
+        usdc.mint(address(this), pay);
+        usdc.approve(address(auction), pay);
+        try auction.workoutSettleAfterClose(id, pay) {
+            lateRecoveriesPaid++;
+        } catch {}
+        usdc.approve(address(auction), 0);
+    }
+
     function closeWorkout(uint256 idSeed) external {
         if (startedAuctions.length == 0) return;
         try auction.closeWorkout(startedAuctions[idSeed % startedAuctions.length]) {
@@ -340,6 +376,35 @@ contract AuctionHandler is Test {
     function claimBounty() external {
         vm.prank(keeper);
         try credit.claimBounty() {} catch {}
+    }
+
+    /// @dev Audit round 21, finding 4: the two legs that make a claim stranded on a manager the
+    ///      auction no longer points at reachable again. Driven here by the handler itself, an
+    ///      address with no role at all, because both are permissionless.
+    ///
+    ///      **They are one action deliberately, and the reason is worth stating rather than
+    ///      hiding.** Between the legs the auction is holding USDC that no `rewardOf` claims,
+    ///      which is exactly the excess `invariant_auctionHoldsNothingButUnclaimedRewards`
+    ///      forbids - so splitting them would trip that invariant on a state the invariant was
+    ///      never written about. That state is reachable by any external actor, here and before
+    ///      this commit alike (a plain `usdc.transfer` to the auction does it); what changed is
+    ///      that it is now drainable instead of permanent. The legs are exercised separately,
+    ///      with the intermediate balance asserted, in the impairment integration suite, which
+    ///      is one of the files held back with the pool.
+    function recoverStrandedClaim() external {
+        try credit.claimSurplusFor(address(auction)) {} catch {}
+        try auction.sweepFreeBalanceToInsurance() {} catch {}
+    }
+
+    /// @dev The third-party collectors for the other two pots. Same reason `claimBounty` above is
+    ///      here: without a drain the maps only ever grow and an error on the way out is never
+    ///      reached - and these are the drains a claimant who cannot call for themselves needs.
+    function claimRewardForKeeper() external {
+        try auction.claimRewardFor(keeper) {} catch {}
+    }
+
+    function claimBountyForKeeper() external {
+        try credit.claimBountyFor(keeper) {} catch {}
     }
 
     // ── views the invariants need ────────────────────────────────────────────
@@ -365,7 +430,7 @@ contract AuctionHandler is Test {
 
         uint256 debt = credit.currentDebtOf(borrower);
         uint256 collateral = vault.collateralValue(borrower);
-        bool liquidatable = LtvMath.exceedsLtv(debt, collateral, Config.LIQUIDATION_THRESHOLD_BPS);
+        bool liquidatable = LtvMath.exceedsLtv(debt, collateral, riskParams.liquidationThresholdBps());
 
         // cancel: needs the position to have healed.
         if (!liquidatable) return true;
@@ -382,7 +447,7 @@ contract AuctionHandler is Test {
     }
 }
 
-contract LiquidationAuctionInvariants is Test {
+contract LiquidationAuctionInvariants is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8;
     uint256 internal constant FLOAT = 1_000_000e6;
 
@@ -400,10 +465,19 @@ contract LiquidationAuctionInvariants is Test {
     MockBond internal bond;
     MockFarm internal farm;
     MockNavOracle internal oracle;
+    RiskParams internal riskParams;
 
     address internal admin = makeAddr("admin");
     address internal keeper = makeAddr("keeper");
     address internal harvester = makeAddr("harvester");
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -412,12 +486,19 @@ contract LiquidationAuctionInvariants is Test {
         bond.setRewardPool(address(farm));
         oracle = new MockNavOracle(NAV);
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, makeAddr("sink")
         );
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
-        auction = new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        credit = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        auction = new LiquidationAuction(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         pool = new MockLenderPool(IERC20(address(usdc)));
 
         vm.startPrank(admin);
@@ -500,13 +581,22 @@ contract LiquidationAuctionInvariants is Test {
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
 
-    /// @notice The auction is immutable and has no sweep, so any USDC it holds beyond
-    ///         unclaimed rewards is stranded forever. Round-1 finding #1's exact shape.
+    /// @notice The auction holds nothing at rest but the rewards it owes. Round-1 finding #1's
+    ///         exact shape.
     /// @dev **Swept in audit round 16: the first assertion is subsumed by the second** and cannot
     ///      fail while it holds. Kept, because the two failure modes want different messages and
     ///      the severe one is the under-backing, which is the one this line names. Recorded rather
     ///      than left silent: an assertion that cannot fail beside a stricter neighbour reads as
     ///      two checks and is one, and the round-15 instruction is to sweep for that shape.
+    ///
+    ///      **"Is stranded forever" was the premise of this invariant's own title and it is no
+    ///      longer true.** Audit round 21 finding 4 added `sweepFreeBalanceToInsurance`, so an
+    ///      excess is now recoverable rather than permanent. That does not weaken the assertion
+    ///      below, which is about what the protocol's own paths leave here **at rest** - and it
+    ///      never was a guarantee against an external actor, who could always break the equality
+    ///      with a bare `usdc.transfer`. What changed is only what happens next. See
+    ///      `recoverStrandedClaim` on the handler for why the two recovery legs are driven as one
+    ///      action.
     function invariant_auctionHoldsNothingButUnclaimedRewards() public view {
         assertGe(
             usdc.balanceOf(address(auction)),
@@ -762,5 +852,11 @@ contract LiquidationAuctionInvariants is Test {
         }
         handler.closeWorkout(2);
         assertEq(handler.workoutsClosed(), 1, "losses must be recognisable");
+
+        // And the redemption comes good after the close. Audit round 21, finding 14: this is the
+        // state the campaign could not reach before, because there was no call that could reach
+        // it - the money had nowhere to go but the insurance fund.
+        handler.workoutSettleAfterClose(2, 50e6);
+        assertEq(handler.lateRecoveriesPaid(), 1, "a late tranche must still be payable");
     }
 }

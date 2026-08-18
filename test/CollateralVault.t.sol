@@ -16,11 +16,14 @@ import {MockCreditManager} from "./mocks/MockCreditManager.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice Phase-1 lifecycle tests for CollateralVault + DirectCallAdapter against
 ///         the real-ABI mocks: deposit → stake → claim → unstake → withdraw → seize,
 ///         the whitelist gate, and the withdrawal LTV rule.
-contract CollateralVaultTest is Test {
+contract CollateralVaultTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp - 2026-07-24 real snapshot
 
     address internal admin = makeAddr("admin");
@@ -37,6 +40,15 @@ contract CollateralVaultTest is Test {
     MockCreditManager internal credit;
     CollateralVault internal vault;
     DirectCallAdapter internal adapter;
+    RiskParams internal riskParams;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -48,7 +60,10 @@ contract CollateralVaultTest is Test {
         auctionMock = new MockLiquidationAuction();
         auction = address(auctionMock);
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
@@ -56,6 +71,13 @@ contract CollateralVaultTest is Test {
         // has to claim this one. It is built before the vault, hence the setter.
         credit.setVault(address(vault));
         auctionMock.setVault(address(vault));
+        // Audit round 20: both setters also check the risk authority agrees with the vault's.
+        credit.setRiskParams(address(riskParams));
+        auctionMock.setRiskParams(address(riskParams));
+        // Audit round 21: and that the NAV feed does too. Read off the vault rather than off
+        // the local, because the vault's answer is the anchor the guards compare against.
+        credit.setNavOracle(address(vault.navOracle()));
+        auctionMock.setNavOracle(address(vault.navOracle()));
 
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
@@ -175,10 +197,21 @@ contract CollateralVaultTest is Test {
         vault.depositBonds(100);
         credit.setDebt(alice, 1e6);
 
-        vm.prank(alice);
+        // **Read the ceiling first, then expect, then prank.** Two separate things spend a
+        // single-shot prank. `vm.expectRevert` is a call this contract makes and consumes one -
+        // the rule this file already followed. The parameters moving into `RiskParams` storage
+        // added a second: the ceiling is now an external staticcall rather than a compile-time
+        // constant, so a read left inline, or inside the `abi.encodeWithSelector` arguments,
+        // spends the prank too. Either mistake sends `withdrawBonds` from this contract, which
+        // holds no bonds, so it reverts `InsufficientCollateral` and the test quietly checks
+        // nothing. Measured, not reasoned: it did exactly that on the first run.
+        uint256 ceiling = maxLtvBps();
         vm.expectRevert(
-            abi.encodeWithSelector(CollateralVault.WithdrawalExceedsMaxLtv.selector, type(uint256).max)
+            abi.encodeWithSelector(
+                CollateralVault.WithdrawalExceedsMaxLtv.selector, type(uint256).max, ceiling
+            )
         );
+        vm.prank(alice);
         vault.withdrawBonds(100);
     }
 
@@ -313,16 +346,18 @@ contract CollateralVaultTest is Test {
 
     // ── seize / reassign ─────────────────────────────────────────────────────
 
-    /// @dev 100 bonds at NAV is $2,515 of collateral, so the 5800 bps threshold sits
-    ///      at $1,458.70. Derived rather than hard-coded so a NAV or threshold change
-    ///      moves it instead of silently making these tests assert nothing.
-    function _liquidatableDebt(uint256 bonds) internal pure returns (uint256) {
-        return (bonds * NAV * Config.LIQUIDATION_THRESHOLD_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE) + 1;
+    /// @dev 100 bonds at NAV is $2,515 of collateral, so at the launch threshold of 5000 bps this
+    ///      sits at $1,257.50. Derived rather than hard-coded so a NAV or threshold change moves
+    ///      it instead of silently making these tests assert nothing - and `view` rather than
+    ///      `pure` since the threshold moved into storage, which is the whole reason a test may
+    ///      now change it partway through and still expect the right answer.
+    function _liquidatableDebt(uint256 bonds) internal view returns (uint256) {
+        return _debtAtThreshold(bonds, NAV) + 1;
     }
 
     /// @dev The largest debt `bonds` may carry and still sit inside the LTV ceiling.
-    function _maxDebtFor(uint256 bonds) internal pure returns (uint256) {
-        return (bonds * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+    function _maxDebtFor(uint256 bonds) internal view returns (uint256) {
+        return _maxBorrow(bonds, NAV);
     }
 
     function _unhealthy(address who, uint256 bonds) internal {
@@ -352,12 +387,13 @@ contract CollateralVaultTest is Test {
         vault.depositBonds(100);
         credit.setDebt(alice, _liquidatableDebt(100) - 2); // a whisker inside the threshold
 
-        vm.prank(auction);
+        // Read first, then expect, then prank, for the reason given in
+        // `test_withdrawBonds_cannotEmptyVaultWithDebt`.
+        uint256 trigger = liquidationThresholdBps();
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CollateralVault.PositionNotLiquidatable.selector, Config.LIQUIDATION_THRESHOLD_BPS - 1
-            )
+            abi.encodeWithSelector(CollateralVault.PositionNotLiquidatable.selector, trigger - 1)
         );
+        vm.prank(auction);
         vault.seize(alice, winner);
     }
 

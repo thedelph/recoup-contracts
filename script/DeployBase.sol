@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {CollateralVault} from "../src/CollateralVault.sol";
@@ -11,7 +12,9 @@ import {EpochHarvester} from "../src/EpochHarvester.sol";
 import {LenderPool} from "../src/LenderPool.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
 import {NAVOracle} from "../src/NAVOracle.sol";
+import {RiskParams} from "../src/RiskParams.sol";
 import {TreasuryLiquiditySource} from "../src/TreasuryLiquiditySource.sol";
+import {Config} from "../src/Config.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {ICollateralVault} from "../src/interfaces/ICollateralVault.sol";
 import {ICreditManager} from "../src/interfaces/ICreditManager.sol";
@@ -19,6 +22,7 @@ import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
 
 /// @title DeployBase
 /// @notice The deployment sequence, extracted so local, testnet and mainnet all run
@@ -63,6 +67,7 @@ abstract contract DeployBase is Script {
 
     struct Deployed {
         NAVOracle oracle;
+        RiskParams riskParams;
         CollateralVault vault;
         DirectCallAdapter adapter;
         CreditManager credit;
@@ -80,6 +85,19 @@ abstract contract DeployBase is Script {
     error ProtocolFeeWalletRequired();
     error YieldRecipientCollision(address recipient, string collidesWith);
     error OwnershipNotTransferred(address contractAddr, address actualOwner);
+    /// @dev Raised when `_ownablesOf` meets a `Deployed` member it cannot enumerate: one that is
+    ///      not a live contract (so the struct has grown a dynamic field, whose ABI encoding is an
+    ///      offset rather than a value) or one that is not `Ownable`. Loud on purpose. The
+    ///      alternative is enumerating fewer contracts than the struct holds and reporting
+    ///      success, which is the exact failure that function exists to end - and if a member is
+    ///      ever legitimately not `Ownable`, the decision to exempt it belongs in this file, in
+    ///      writing, rather than in an omission somewhere else.
+    error DeployedMemberNotOwnable(uint256 index);
+    /// @dev Raised when `_log`'s label list has fallen out of step with `Deployed`. Labels are
+    ///      presentation, but a missing label is a contract whose address the operator is never
+    ///      shown - which is what happened to `RiskParams`, the one holding the borrow ceiling and
+    ///      the liquidation trigger for the whole book.
+    error DeployedLabelsOutOfSync(uint256 labels, uint256 members);
     error WiringIncomplete(string what);
     /// @dev The mirror image of `WiringIncomplete`, and audit round 11 is why it has to exist as
     ///      its own error rather than as a missing check. A pointer that is set too early is not a
@@ -92,10 +110,33 @@ abstract contract DeployBase is Script {
     ///      charged - which is precisely the state round 11 found shipped.
     error LenderRolesDisagree(address liquiditySource, address lenderPool);
 
-    /// @dev **Audit round 19, critical 3.** Raised when the switchover is asked to move the funding
-    ///      pointer while the protocol is still open for business. The gap between the legs is what
-    ///      this guards; see `_wirePhase4` for why a pause closes it completely.
-    error SwitchoverNotPaused(string what);
+    /// @dev A switchover leg that reverts without data. Every leg in `_phase4Calls` is a call into
+    ///      a contract of ours, so in practice the callee's own named revert is re-thrown instead
+    ///      and this is the empty-returndata fallback: an out-of-gas or a call into a codeless
+    ///      address. Named so that "the switchover failed" is never silent.
+    error SwitchoverLegFailed(uint256 index, address target);
+
+    /// @dev **Deleted in audit round 20, and the deletion is the finding.** This used to be
+    ///      `SwitchoverNotPaused(string)`, raised by a `if (!d.credit.paused()) revert ...`
+    ///      immediately below `d.credit.pause()`. OpenZeppelin's `_pause()` carries
+    ///      `whenNotPaused`, so a `pause()` that *returns* has necessarily set the flag: the read
+    ///      could only ever observe what the statement above it had just written, and the only
+    ///      route to the branch was `vm.mockCall`. It had no test, because it had nothing to test.
+    ///      A post-condition must read something the statement above it did not just write; this
+    ///      one read as verification and was not. What actually holds the property is named where
+    ///      it belongs - OZ's modifier on the broadcast path, and `executeBatch`'s atomicity on
+    ///      the queued one. Do not reintroduce it.
+    ///
+    ///      **Round 21 added a `WirePhase4.SwitchoverNotPaused` and that is not this error coming
+    ///      back, so the difference is written down rather than left to a name collision.** The
+    ///      deleted one was unreachable because the line above it had just written the thing it
+    ///      read. The new one is a *precondition* on a different operation: `queue()` reads a pause
+    ///      that a separate, earlier timelock batch performed, which nothing in the same call
+    ///      stack wrote, and which round 21 measured a stranger exploiting the absence of. It has
+    ///      three tests and a neuter, and this deletion's rule - "a post-condition must read
+    ///      something the statement above it did not just write" - is the rule it satisfies rather
+    ///      than the rule it breaks. Reintroducing a `paused()` read immediately below a `pause()`
+    ///      is still wrong.
 
     /// @dev The other end of the same problem: a switchover that half-ran and left the protocol
     ///      paused is a legible failure rather than a silent outage nobody is watching for.
@@ -180,12 +221,32 @@ abstract contract DeployBase is Script {
         returns (Deployed memory d)
     {
         d.oracle = new NAVOracle(deployer);
-        d.vault = new CollateralVault(e.bond, INAVOracle(address(d.oracle)), deployer);
+        // Constructed before the three contracts that hold it, because they take it as an
+        // `immutable`. Seeded from `Config`'s declared defaults, which `RiskParams` re-checks
+        // through the same function every later write goes through - so a deployment cannot ship
+        // a risk configuration that its own setter would refuse.
+        d.riskParams = new RiskParams(
+            IRiskParams.Params({
+                maxLtvBps: uint16(Config.DEFAULT_MAX_LTV_BPS),
+                liquidationThresholdBps: uint16(Config.DEFAULT_LIQUIDATION_THRESHOLD_BPS),
+                globalBorrowCap: uint64(Config.DEFAULT_GLOBAL_BORROW_CAP),
+                perAccountBorrowCap: uint64(Config.DEFAULT_PER_ACCOUNT_BORROW_CAP)
+            }),
+            deployer
+        );
+        d.vault = new CollateralVault(
+            e.bond, INAVOracle(address(d.oracle)), IRiskParams(address(d.riskParams)), deployer
+        );
         // owner and yieldRecipient are distinct arguments and must stay visibly
         // distinct at the call site: they are unrelated roles.
         d.adapter = new DirectCallAdapter(e.bond, e.farm, e.usdc, address(d.vault), deployer, p.yieldRecipient);
-        d.credit =
-            new CreditManager(e.usdc, ICollateralVault(address(d.vault)), INAVOracle(address(d.oracle)), deployer);
+        d.credit = new CreditManager(
+            e.usdc,
+            ICollateralVault(address(d.vault)),
+            INAVOracle(address(d.oracle)),
+            IRiskParams(address(d.riskParams)),
+            deployer
+        );
         d.pool = new LenderPool(e.usdc, deployer);
         // Funds borrows until the LenderPool takes over in Phase 4. Without it,
         // `borrow` reverts `LiquiditySourceUnset` and the deployed protocol is a
@@ -193,7 +254,11 @@ abstract contract DeployBase is Script {
         d.liquidity = new TreasuryLiquiditySource(e.usdc, deployer);
         d.harvester = new EpochHarvester(e.usdc, ICreditManager(address(d.credit)), deployer);
         d.auction = new LiquidationAuction(
-            e.usdc, ICollateralVault(address(d.vault)), INAVOracle(address(d.oracle)), deployer
+            e.usdc,
+            ICollateralVault(address(d.vault)),
+            INAVOracle(address(d.oracle)),
+            IRiskParams(address(d.riskParams)),
+            deployer
         );
 
         _wire(d, p);
@@ -295,22 +360,9 @@ abstract contract DeployBase is Script {
     ///      the same class of defect as the one it fixes - the old script's mainnet target
     ///      reverted, so the wiring destined for mainnet had never executed anywhere.
     ///
-    ///      The order is load-bearing, top to bottom:
-    ///
-    ///      1. `settlePrincipal` first. `setLiquiditySource` refuses while `pendingPrincipal` is
-    ///         non-zero, and the manager's own migration notes say the principal becomes
-    ///         unreachable by every contract if the pointer moves before the money does. Guarded
-    ///         on the counter because the call reverts `NothingToSettle` at zero, and a switchover
-    ///         on a book that was already flat must not fail for being tidy.
-    ///      2. `setLiquiditySource` before `setLenderPool`, so the pool is the funder before it is
-    ///         the sink. Never the reverse: a pool named as the loss sink while the treasury still
-    ///         funds the book is exactly the shipped state round 11 found, and `_socialise` would
-    ///         refuse to charge it anyway.
-    ///      3. `harvester.setLenderPool` last, because it is the leg that starts paying. The
-    ///         lender share is only earned once the pool is carrying the credit risk, and every
-    ///         epoch harvested before this line stays accrued in `pendingLenderYield` and is
-    ///         delivered whole by the first `flushLenderYield` after it. Nothing is lost by
-    ///         waiting; something is given away by not.
+    ///      The calls themselves, and why they are in that order, live in `_phase4Calls` below -
+    ///      which is the list this executes and the list `WirePhase4.queue()` schedules, so there
+    ///      is one of it.
     ///
     ///      **Audit round 19, critical 3: the "one operation" above was never true, and the pause
     ///      is what makes it true enough.** A `forge script` broadcast emits one transaction per
@@ -341,29 +393,229 @@ abstract contract DeployBase is Script {
     ///      other `whenNotPaused` functions in the protocol, and new collateral arriving mid-
     ///      switchover is the same class of mistake even though it is not the one that was measured.
     ///
-    ///      **What this does NOT do, recorded rather than glossed.** The pause is enforced by this
-    ///      script, not by the chain. An operator who transcribes the three legs into a Safe by hand
-    ///      can omit it, and nothing on chain refuses them. The guard below catches that on the
-    ///      queued path - `run()` is executed against live state to *generate* those calls, so this
-    ///      read is a real one there - but it cannot catch an operator who never runs the script.
+    ///      **Audit round 20, finding 5: the pause is correct against the operator and is defeated
+    ///      by the timelock executor, so the legs became a list.** Round 19's residual was written
+    ///      as "an operator who transcribes the legs by hand can omit the pause". The measured route
+    ///      is worse and needs no mistake at all: the operator transcribes *every* leg faithfully,
+    ///      and still loses, because under `TimelockController` as `Governance.t.sol` and
+    ///      `RiskParameters.t.sol` both deploy it - `executors[0] = address(0)`, open execution,
+    ///      `predecessor = bytes32(0)` on every scheduled operation - **the execution order is not
+    ///      the operator's to choose**. Once matured, any stranger runs them in any order. Executing
+    ///      `setLiquiditySource` first and the pause not at all reopens exactly round 19's gap:
+    ///      500,000,000 stranded, byte-identical, `_assertPhase4Wiring` passing over it.
+    ///
+    ///      The tell was already in the tree. `RiskParams.setRiskParams`' own docstring states this
+    ///      hazard - "two scheduled operations' windows can be executed in either order once both
+    ///      have matured" - and then explicitly contrasts itself with this function. Nothing
+    ///      decayed; the two facts never met.
+    ///
+    ///      **The fix is `_phase4Calls`, and it removes the window rather than guarding it.** One
+    ///      `scheduleBatch` is one operation with one id, and `executeBatch` runs the whole array in
+    ///      order in a single transaction or reverts. There is no gap for an executor to reorder
+    ///      into, no subset that is a schedulable id, and no leg that can be left unexecuted. See
+    ///      `WirePhase4.queue()`, which is the only sanctioned way to put this operation into a
+    ///      timelock.
+    ///
+    ///      **What this does NOT do, recorded rather than glossed - and it is a narrower residual
+    ///      than round 19's.** Nothing on chain refuses eight separately scheduled operations. A
+    ///      proposer who ignores `queue()` and hand-builds eight singles in a Safe UI reopens the
+    ///      whole finding. What changed is that the correct thing to transcribe is now *one* call
+    ///      with calldata the script prints, rather than eight the operator must order themselves.
+    ///      In the pre-governance register the owner is an EOA, there is no timelock and nothing to
+    ///      batch through: there the eight legs are eight sequential transactions from one key, the
+    ///      pause is legs 1 and 2, and no third party can act between them except by paying to be
+    ///      mined in between - which the pause is what closes. Batching buys the EOA case nothing
+    ///      and costs it nothing.
+    ///
+    ///      **Audit round 21, finding 2: round 20's batch put the pause inside the room it was
+    ///      locking.** Wrapping round 19's identical list in one `scheduleBatch` removes the gap the
+    ///      pause was closing - so in that register the pause legs protect nothing - while moving
+    ///      the precondition they were guarding (`totalDebt == 0 && pendingPrincipal == 0`) to
+    ///      **forty-eight hours after the operator committed**, into a window where `borrow` is wide
+    ///      open *precisely because* the pause that would close it is leg 1 of the batch being
+    ///      blocked. MEASURED: one micro-USDC of debt - 0.000001 USDC, borrowed by a stranger who
+    ///      simply deposits collateral through the front door - makes `executeBatch` revert
+    ///      `DebtOutstanding(1)`, and `TimelockController` has no grace period, so the refused
+    ///      operation stays `Ready` (MEASURED at 365 days) as a live stranger-executable replay of
+    ///      the largest pointer move this protocol has.
+    ///
+    ///      **So the pause legs come out of the batch and are performed before the window opens.**
+    ///      They are their own operation now (`_phase4PauseCalls`, and `WirePhase4.queuePause()`
+    ///      under a timelock), executed first, and `queue()` refuses to schedule the switchover at
+    ///      all while either contract is still unpaused. The stranger's borrow is then refused at
+    ///      the door - `EnforcedPause` - instead of taking the whole batch down at execution time.
+    ///
+    ///      **Only the `pause` legs move. The `unpause` legs stay inside the batch**, and that is
+    ///      not just the obvious "or the protocol is left shut": OZ's `_unpause()` carries
+    ///      `whenPaused`, so if the pause is *not* in force when the batch executes those trailing
+    ///      legs revert `ExpectedPause` and `executeBatch`, being all-or-nothing, undoes the whole
+    ///      switchover. The precondition is therefore checked at generation time by `queue()` and
+    ///      **enforced on chain at execution time by legs that were already there**. The same holds
+    ///      for `queue()`'s other two reads without any new code: `setLiquiditySource` refuses on
+    ///      `totalDebt` and `unsocialisedLoss` itself, when it runs.
+    ///
+    ///      **The residual, and it is what "decided at a different time from when it is enforced"
+    ///      still buys.** Nothing on chain sequences the pause operation before the switchover
+    ///      operation. `queue()` will not *create* the second while the first has not landed, so
+    ///      the sanctioned path cannot produce an unguarded window - but a proposer hand-building
+    ///      both in a Safe UI can schedule them together, and then they mature together and the
+    ///      pause protects the same zero duration it did before. That is round 20's residual
+    ///      unchanged in shape and one step narrower in size: the thing an operator must not do by
+    ///      hand is now "schedule two operations at once" rather than "order eight legs". A
+    ///      `predecessor` chain would not close it either - it forces the pause to execute first,
+    ///      not earlier - which is why `WirePhase4.PREDECESSOR` stays `bytes32(0)` and says so.
+    ///
+    ///      Also two calls to transcribe now rather than one, which corrects the paragraph above:
+    ///      `queuePause()` then `queue()`, each still one call with calldata the script prints.
+    ///
+    ///      The EOA register is unchanged: this function still performs pause legs first and the
+    ///      switchover second, in one broadcast, in exactly the order it used to.
     function _wirePhase4(Deployed memory d) internal {
-        d.credit.pause();
-        d.vault.pause();
+        (address[] memory pauseTargets,, bytes[] memory pausePayloads) = _phase4PauseCalls(d);
+        _runLegs(pauseTargets, pausePayloads, 0);
 
-        // Read back rather than trusted. On the queued path this is a live read against the chain
-        // the calls are being generated for, which is the case that matters: a protocol that is
-        // already open for business must not have a funding pointer moved underneath it.
-        if (!d.credit.paused()) revert SwitchoverNotPaused("credit");
-        if (!d.vault.paused()) revert SwitchoverNotPaused("vault");
+        (address[] memory targets,, bytes[] memory payloads) = _phase4Calls(d);
+        _runLegs(targets, payloads, pauseTargets.length);
+    }
 
-        if (d.credit.pendingPrincipal() != 0) d.credit.settlePrincipal();
+    /// @dev The offset keeps `SwitchoverLegFailed`'s index numbering continuous across the two
+    ///      lists, so an operator reading a failure still counts legs the way the broadcast emits
+    ///      them rather than restarting at zero half way through.
+    function _runLegs(address[] memory targets, bytes[] memory payloads, uint256 offset) private {
+        for (uint256 i; i < targets.length; ++i) {
+            (bool ok, bytes memory ret) = targets[i].call(payloads[i]);
+            if (!ok) _bubbleRevert(offset + i, targets[i], ret);
+        }
+    }
 
-        d.credit.setLiquiditySource(address(d.pool));
-        d.credit.setLenderPool(address(d.pool));
-        d.harvester.setLenderPool(address(d.pool));
+    /// @notice The two legs that must be in force *before* the switchover window opens, as data.
+    /// @dev **Split out of `_phase4Calls` by audit round 21, finding 2.** Inside the batch these
+    ///      executed in the same transaction as the preconditions they were meant to protect, which
+    ///      is a zero-duration lock. Outside it they shut `borrow` and `depositBonds`/`depositETH`
+    ///      for the whole 48-hour maturity window, which is the only span in which anybody could
+    ///      have created the debt that blocks the switchover.
+    ///
+    ///      `CreditManager.borrow` is the only `whenNotPaused` function in that contract and the
+    ///      vault's two deposits are the only ones in the protocol, which is why two legs is the
+    ///      whole list. Pausing does not stop `liquidate`, `writeDownLoss`, `flushSocialisedLoss`
+    ///      or any `LenderPool` entry point, and it is not meant to: resolution stays open, new
+    ///      risk does not.
+    ///
+    ///      `pure`, like `_phase4Calls`, and for the same reason.
+    function _phase4PauseCalls(Deployed memory d)
+        internal
+        pure
+        returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
+    {
+        targets = new address[](2);
+        values = new uint256[](2);
+        payloads = new bytes[](2);
 
-        d.vault.unpause();
-        d.credit.unpause();
+        targets[0] = address(d.credit);
+        payloads[0] = abi.encodeCall(CreditManager.pause, ());
+
+        targets[1] = address(d.vault);
+        payloads[1] = abi.encodeCall(CollateralVault.pause, ());
+    }
+
+    /// @notice The switchover as data: every call it makes, in the order it makes them.
+    /// @dev **The single definition of "the switchover", and both ways of performing one read it.**
+    ///      `_wirePhase4` executes this list; `WirePhase4.queue()` hands the identical list to
+    ///      `TimelockController.scheduleBatch`. That is deliberate and it is the answer to a second
+    ///      round-20 item: the repo said "the three calls" in four places for an operation that is
+    ///      eight, and the five it omitted were the entire round-19 fix - so the prose was
+    ///      instructing an operator to skip it. **Nothing counts these by hand any more.** The count
+    ///      is `_phase4Calls(...).length`, printed by `queue()` and asserted against the executed
+    ///      sequence in `Deploy.t.sol`. Do not write the number down anywhere.
+    ///
+    ///      The order is load-bearing, top to bottom:
+    ///
+    ///      1. `settlePrincipal` before any pointer moves. `setLiquiditySource` refuses while
+    ///         `pendingPrincipal` is non-zero, and the manager's own migration notes say the
+    ///         principal becomes unreachable by every contract if the pointer moves before the
+    ///         money does.
+    ///      2. `setLiquiditySource` before `setLenderPool`, so the pool is the funder before it is
+    ///         the sink. Never the reverse: a pool named as the loss sink while the treasury still
+    ///         funds the book is exactly the shipped state round 11 found, and `_socialise` would
+    ///         refuse to charge it anyway.
+    ///      3. `harvester.setLenderPool` last, because it is the leg that starts paying. The
+    ///         lender share is only earned once the pool is carrying the credit risk, and every
+    ///         epoch harvested before this line stays accrued in `pendingLenderYield` and is
+    ///         delivered whole by the first `flushLenderYield` after it. Nothing is lost by
+    ///         waiting; something is given away by not.
+    ///      4. `unpause` both, last, and `_assertPhase4Wiring` is what catches a run that never
+    ///         reached them. They also carry `whenPaused`, which is what makes them the on-chain
+    ///         check that the pause `_phase4PauseCalls` performs was still in force at execution
+    ///         time - see `_wirePhase4`.
+    ///
+    ///      **There is no longer a data-dependent leg, and that is audit round 21, finding 3.**
+    ///      `settlePrincipal` used to be written into the list only when `pendingPrincipal() != 0`,
+    ///      read live at *generation* time, because the call reverted `NothingToSettle` at zero and
+    ///      a switchover on a book that was already flat must not fail for being tidy. But
+    ///      `settlePrincipal` is permissionless and free, so **a stranger chose the batch's shape**:
+    ///      MEASURED, an eight-leg batch was queued, a griefer spent 42,744 gas zeroing the counter,
+    ///      and both routes died - `executeBatch` of the queued array reverted `NothingToSettle`,
+    ///      while `executeQueued()`'s re-derivation produced a seven-leg array whose id nobody had
+    ///      ever scheduled (`TimelockUnexpectedOperationState`).
+    ///
+    ///      The root cause was the revert, not the branch. `settlePrincipal` now returns early at
+    ///      zero, so the leg is unconditional, the leg count is a constant, and **this function
+    ///      reads no mutable state at all - which the `pure` below is the compiler enforcing.**
+    ///      Correctness does not move to the settle leg having found something: `setLiquiditySource`
+    ///      independently refuses while `pendingPrincipal != 0`, and it runs immediately after the
+    ///      settle inside the same atomic `executeBatch`. That makes the batch **immune** to the
+    ///      front-run rather than defended against it.
+    ///
+    ///      Do not reintroduce a conditional leg here. A `view` on this function is the tell.
+    function _phase4Calls(Deployed memory d)
+        internal
+        pure
+        returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
+    {
+        uint256 n = 6;
+        targets = new address[](n);
+        // Every leg is non-payable, so this array is all zeros. `scheduleBatch` requires it to
+        // exist and to be the same length, which is the only reason it is returned.
+        values = new uint256[](n);
+        payloads = new bytes[](n);
+
+        uint256 i;
+        targets[i] = address(d.credit);
+        payloads[i++] = abi.encodeCall(CreditManager.settlePrincipal, ());
+
+        targets[i] = address(d.credit);
+        payloads[i++] = abi.encodeCall(CreditManager.setLiquiditySource, (address(d.pool)));
+
+        targets[i] = address(d.credit);
+        payloads[i++] = abi.encodeCall(CreditManager.setLenderPool, (address(d.pool)));
+
+        targets[i] = address(d.harvester);
+        payloads[i++] = abi.encodeCall(EpochHarvester.setLenderPool, (address(d.pool)));
+
+        targets[i] = address(d.vault);
+        payloads[i++] = abi.encodeCall(CollateralVault.unpause, ());
+
+        targets[i] = address(d.credit);
+        payloads[i++] = abi.encodeCall(CreditManager.unpause, ());
+
+        // **Weaker than it was, and said so rather than left looking the same.** While the leg
+        // count was a ternary this compared two independent expressions of one decision. Round 21
+        // removed the branch, so the only drift it can still catch is a leg *removed* without `n`
+        // being lowered - which would otherwise ship a batch ending in a call to address zero with
+        // empty calldata, and `scheduleBatch` would take it. The opposite mistake, a leg added
+        // without raising `n`, is caught by the array write itself.
+        assert(i == n);
+    }
+
+    /// @dev Re-throw the callee's own revert so a failed switchover names the failure in the terms
+    ///      the operator will recognise (`DebtOutstanding`, `EnforcedPause`, `ExpectedPause`),
+    ///      rather than flattening every leg into one anonymous failure. The typed calls this
+    ///      replaced did that for free; a list of low-level calls has to do it on purpose.
+    function _bubbleRevert(uint256 index, address target, bytes memory ret) private pure {
+        if (ret.length == 0) revert SwitchoverLegFailed(index, target);
+        assembly ("memory-safe") {
+            revert(add(ret, 0x20), mload(ret))
+        }
     }
 
     /// @dev Ownership moves last, after everything is wired.
@@ -383,6 +635,11 @@ abstract contract DeployBase is Script {
         d.harvester.transferOwnership(newOwner);
         d.auction.transferOwnership(newOwner);
         d.liquidity.transferOwnership(newOwner);
+        // Added with `RiskParams` itself, in the same edit as `_assertWiring` and
+        // `Deploy.t.sol`'s two ownership tests. `d.liquidity` was once missing from exactly these
+        // three lists at once, and CI reported the deployment healthy while the deploying key
+        // still owned the money.
+        d.riskParams.transferOwnership(newOwner);
     }
 
     // ── Post-conditions ──────────────────────────────────────────────────────
@@ -436,16 +693,28 @@ abstract contract DeployBase is Script {
     ///      in the callers rather than parameterised here, because a shared function branching on
     ///      "which phase" would have to be read twice to answer either question.
     function _assertCoreGraph(Deployed memory d, GovParams memory p) private view {
-        _requireOwner(address(d.vault), d.vault.owner(), p.owner);
-        _requireOwner(address(d.adapter), d.adapter.owner(), p.owner);
-        _requireOwner(address(d.oracle), d.oracle.owner(), p.owner);
-        _requireOwner(address(d.credit), d.credit.owner(), p.owner);
-        _requireOwner(address(d.pool), d.pool.owner(), p.owner);
-        _requireOwner(address(d.harvester), d.harvester.owner(), p.owner);
-        _requireOwner(address(d.auction), d.auction.owner(), p.owner);
-        // The one that has been missed twice, and it holds the lending float behind an uncapped
-        // `onlyOwner` withdraw.
-        _requireOwner(address(d.liquidity), d.liquidity.owner(), p.owner);
+        // **Derived from `Deployed`, never enumerated, and the third instance of one finding is
+        // why.** This block was a hand-typed list of eight, and `d.riskParams` was the ninth. That
+        // is round 10's finding exactly - `d.liquidity` was once missing from this list, from
+        // `_handOver`, and from `test/Deploy.t.sol`'s ownership test at the same time - and the
+        // comment fifty lines up in this very file describes that incident. Adding a ninth line
+        // here would not be the fix; it is what was done last time, and it is what left the list
+        // able to fall behind the struct again.
+        //
+        // The captured contract this time is worse than the last one. Measured with a control:
+        // `riskParams.transferOwnership(stranger)` left both `_assertWiring` and
+        // `_assertPhase4Wiring` passing, while the identical move on any of the other eight
+        // reverted `OwnershipNotTransferred`. Whoever holds it can ratchet every parameter to its
+        // terminus in one transaction, and the threshold half is irreversible by design - the
+        // recovered rightful owner is refused with `LiquidationThresholdLowered`, and
+        // `renounceOwnership` is disabled, so it cannot even be resolved by abdication. The repair
+        // is redeploying `RiskParams` and the three contracts holding it `immutable`.
+        //
+        // So the list comes from the struct. A tenth contract joins it by existing.
+        address[] memory ownables = _ownablesOf(d);
+        for (uint256 i; i < ownables.length; ++i) {
+            _requireOwner(ownables[i], Ownable(ownables[i]).owner(), p.owner);
+        }
 
         // The pool's own two legs, which a shipping deployment does set. Each fails quietly rather
         // than loudly: a wrong `pool.epochHarvester` is swallowed by the harvester's best-effort
@@ -466,6 +735,45 @@ abstract contract DeployBase is Script {
             revert WiringIncomplete("credit.liquidationAuction");
         }
         if (d.auction.creditManager() != address(d.credit)) revert WiringIncomplete("auction.creditManager");
+
+        // **All three risk readers must be reading the same contract.** The pointers are
+        // `immutable`, so this cannot drift after deployment - but it can be got wrong *at*
+        // deployment, by constructing one of them against a second `RiskParams`. Then the vault
+        // would refuse a withdrawal against one ceiling while the manager approved a borrow
+        // against another, and nothing else in the system would notice. This is the assertion
+        // that makes the immutability worth having: it checks the one moment at which the graph
+        // can still be built wrong.
+        if (address(d.credit.riskParams()) != address(d.riskParams)) {
+            revert WiringIncomplete("credit.riskParams");
+        }
+        if (address(d.vault.riskParams()) != address(d.riskParams)) {
+            revert WiringIncomplete("vault.riskParams");
+        }
+        if (address(d.auction.riskParams()) != address(d.riskParams)) {
+            revert WiringIncomplete("auction.riskParams");
+        }
+
+        // **And all three nav readers must be reading the same feed.** The block above was written
+        // in round 20 about the risk pointer and every word of it applies unchanged to this one -
+        // which is precisely the criticism audit round 21 made: six lines here compared the risk
+        // readers and not one compared the nav readers, on the same three contracts, over the same
+        // `immutable` shape. The two lines below it assert `oracle.keeper()` and
+        // `oracle.navConfirmer()`, so this file was already asserting things *about* the oracle
+        // while never asking whether the graph agreed on which oracle it was.
+        //
+        // As with the risk triple, these are `immutable`, so this cannot drift after deployment -
+        // it can only be got wrong *at* deployment, and this is the assertion for that moment. The
+        // contract-level guards added in the same change are what cover the migration, which has no
+        // script around it.
+        if (address(d.credit.navOracle()) != address(d.oracle)) {
+            revert WiringIncomplete("credit.navOracle");
+        }
+        if (address(d.vault.navOracle()) != address(d.oracle)) {
+            revert WiringIncomplete("vault.navOracle");
+        }
+        if (address(d.auction.navOracle()) != address(d.oracle)) {
+            revert WiringIncomplete("auction.navOracle");
+        }
 
         // **These four tested for non-zero rather than for the right address, and this file names
         // the rule it was breaking a few lines below: "ruling out wrong destinations is not the
@@ -541,10 +849,10 @@ abstract contract DeployBase is Script {
         // four times.
         _assertCoreGraph(d, p);
 
-        // All three legs, together. Half a switchover is the failure this exists to catch: the
-        // pool funding borrows without being the loss sink means depositors take the credit risk
-        // and the deferral counter never fills, and the sink without the funding is round 11 all
-        // over again.
+        // Every pointer the switchover moves, together. Half a switchover is the failure this
+        // exists to catch: the pool funding borrows without being the loss sink means depositors
+        // take the credit risk and the deferral counter never fills, and the sink without the
+        // funding is round 11 all over again.
         if (d.credit.liquiditySource() != address(d.pool)) revert WiringIncomplete("credit.liquiditySource");
         if (d.credit.lenderPool() != address(d.pool)) revert WiringIncomplete("credit.lenderPool");
         if (d.harvester.lenderPool() != address(d.pool)) revert WiringIncomplete("harvester.lenderPool");
@@ -565,12 +873,19 @@ abstract contract DeployBase is Script {
 
         // **The pause has to come back off, and nothing else was watching for that.** `_wirePhase4`
         // pauses across the gap, which means a run that dies part-way - a reverted leg, a Safe
-        // signer who stops signing, an operator who queued four of the five calls - leaves the
+        // signer who stops signing, an operator who executed every leg of `_phase4Calls` except
+        // the two `unpause`s at the end - leaves the
         // protocol unable to take a borrow or a deposit with no error anywhere saying so. Under an
         // EOA owner the fix is one transaction; under the timelock this protocol is heading for it
         // is a 48-hour wait, which is exactly the situation somebody needs to be told about rather
         // than left to discover. Asserted here because this is the check an operator runs after the
         // queued calls execute.
+        //
+        // **Round 21 moved the pause out of `_phase4Calls` and this assertion got MORE work, not
+        // less.** The pause now happens in a separate, earlier operation, so "paused and never
+        // unpaused" is no longer only a half-run batch - it is also an operator who ran
+        // `queuePause()` and then abandoned the switchover. That state has no other detector, and
+        // this is the line that names it.
         if (d.credit.paused()) revert SwitchoverLeftPaused("credit");
         if (d.vault.paused()) revert SwitchoverLeftPaused("vault");
     }
@@ -579,21 +894,88 @@ abstract contract DeployBase is Script {
         if (actual != expected) revert OwnershipNotTransferred(contractAddr, actual);
     }
 
+    /// @notice Every `Ownable` in `Deployed`, enumerated from the struct itself.
+    /// @dev **The anti-drift device, and it is the point of round 20's ownership finding.** Five
+    ///      places in this repo needed "every contract the deploy script creates": `_handOver`,
+    ///      `_assertCoreGraph`, `_log`, and three tests in `Deploy.t.sol`. Every one of them was a
+    ///      list typed out by hand, and twice now a contract has been added to some of them and
+    ///      not to others - `d.liquidity` in round 10, `d.riskParams` in round 20. Both times CI
+    ///      certified the gap, because the tests were built from the same hand-typed list as the
+    ///      thing they were checking.
+    ///
+    ///      `Deployed` holds contract references and nothing else, so its ABI encoding is exactly
+    ///      one 32 byte word per member, and enumerating the encoding enumerates the struct. There
+    ///      is no list to fall behind: a tenth contract added to `Deployed` is checked, logged and
+    ///      asserted about by existing, and if it cannot be enumerated this reverts rather than
+    ///      quietly covering one fewer contract than the struct holds.
+    ///
+    ///      **`_handOver` is deliberately still written out, and that is now safe rather than an
+    ///      omission.** It performs state changes inside the broadcast, so it reads better as an
+    ///      explicit sequence of transactions an operator can match against a block explorer. What
+    ///      made it dangerous before was that the post-condition checking it was a second copy of
+    ///      the same list, so the two could fall behind together - and they did, twice. The
+    ///      post-condition is derived now, so a `_handOver` that misses a member fails
+    ///      `OwnershipNotTransferred` in simulation, loudly, before anything is broadcast. The
+    ///      check no longer agrees with the thing it checks by construction.
+    ///
+    ///      Read a word at a time without assembly. There is no assembly anywhere in this repo and
+    ///      a deploy post-condition is the last place to introduce it; `Deployed` has single-digit
+    ///      membership and this runs in a script simulation and in tests, never on a hot path.
+    function _ownablesOf(Deployed memory d) internal view returns (address[] memory list) {
+        bytes memory encoded = abi.encode(d);
+        uint256 members = encoded.length / 32;
+        list = new address[](members);
+
+        for (uint256 i; i < members; ++i) {
+            uint256 word;
+            for (uint256 b; b < 32; ++b) {
+                word = (word << 8) | uint8(encoded[i * 32 + b]);
+            }
+            address member = address(uint160(word));
+            // A word that is not a plain address, or an address with no code, means the struct has
+            // grown a member this cannot read - a dynamic field encodes as an offset, and an
+            // offset is a small integer with nothing deployed at it.
+            if (word >> 160 != 0 || member.code.length == 0) revert DeployedMemberNotOwnable(i);
+            (bool ok, bytes memory ret) = member.staticcall(abi.encodeCall(Ownable.owner, ()));
+            if (!ok || ret.length != 32) revert DeployedMemberNotOwnable(i);
+            list[i] = member;
+        }
+    }
+
+    /// @dev Labels for `_ownablesOf`'s output, in `Deployed` declaration order. Presentation only -
+    ///      `_log` checks the length against the enumeration, so a member added without a label
+    ///      fails loudly rather than going unprinted.
+    function _deployedLabels() private pure returns (string[] memory labels) {
+        labels = new string[](9);
+        labels[0] = "NAVOracle         ";
+        labels[1] = "RiskParams        ";
+        labels[2] = "CollateralVault   ";
+        labels[3] = "DirectCallAdapter ";
+        labels[4] = "CreditManager     ";
+        labels[5] = "LenderPool        ";
+        labels[6] = "LiquiditySource   ";
+        labels[7] = "EpochHarvester    ";
+        labels[8] = "LiquidationAuction";
+    }
+
     // ── Logging ──────────────────────────────────────────────────────────────
 
-    function _log(Deployed memory d, GovParams memory p) internal pure {
+    function _log(Deployed memory d, GovParams memory p) internal view {
         console.log("owner             ", p.owner);
         console.log("yieldRecipient    ", p.yieldRecipient);
         console.log("keeper            ", p.keeper);
         console.log("protocolFeeWallet ", p.protocolFeeWallet);
-        console.log("NAVOracle         ", address(d.oracle));
-        console.log("CollateralVault   ", address(d.vault));
-        console.log("DirectCallAdapter ", address(d.adapter));
-        console.log("CreditManager     ", address(d.credit));
-        console.log("LiquiditySource   ", address(d.liquidity));
-        console.log("LenderPool        ", address(d.pool));
-        console.log("EpochHarvester    ", address(d.harvester));
-        console.log("LiquidationAuction", address(d.auction));
+
+        // Printed from the same enumeration `_assertCoreGraph` checks, rather than from a second
+        // hand-typed list. `RiskParams` was absent from the old list, so the operator was never
+        // shown the address of the contract holding the borrow ceiling and the liquidation trigger
+        // - and an address nobody prints is an address nobody verifies after a deploy.
+        address[] memory ownables = _ownablesOf(d);
+        string[] memory labels = _deployedLabels();
+        if (labels.length != ownables.length) revert DeployedLabelsOutOfSync(labels.length, ownables.length);
+        for (uint256 i; i < ownables.length; ++i) {
+            console.log(labels[i], ownables[i]);
+        }
         console.log("Post-deploy: fund the liquidity source and bootstrap the NAV oracle.");
         // Printed because the deployment is deliberately incomplete: the LenderPool above is
         // deployed and knows who its manager is, and is wired into nothing that pays it or

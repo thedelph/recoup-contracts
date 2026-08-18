@@ -119,6 +119,10 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
         revert NotImplemented(); // TODO(phase-4): CreditManager only; emit loudly
     }
 
+    function recoverLoss(uint256) external {
+        revert NotImplemented(); // TODO(phase-4): CreditManager only
+    }
+
     function queuePosition(address) external view returns (uint256, uint256) {
         revert NotImplemented(); // TODO(phase-4)
     }
@@ -137,6 +141,16 @@ contract LenderPool is ERC4626, Ownable, ReentrancyGuard {
     // never reaches it while the count is zero.
     //
     // These stay when the phase-4 pool lands; there they carry the real set.
+
+    // `exitReserve()` joined them in a later round, for a different guard with the same shape:
+    // `setLossSink` probes it to decide whether an address funds the book as a pool does. That
+    // probe fails *open*, so a skeleton that reverted would not deadlock anything - but it would
+    // answer "not a pool" about the pool, and zero is the honest answer instead. A dormant pool
+    // holds nothing back for leavers because it has no leavers and no assets to hold.
+
+    function exitReserve() external pure returns (uint256) {
+        return 0;
+    }
 
     function totalImpairment() external pure returns (uint256) {
         return 0;

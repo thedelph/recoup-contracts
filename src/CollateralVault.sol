@@ -13,6 +13,7 @@ import {ICustodyAdapter} from "./interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "./interfaces/IDexFiBond.sol";
 import {ILiquidationAuction} from "./interfaces/ILiquidationAuction.sol";
 import {INAVOracle} from "./interfaces/INAVOracle.sol";
+import {IRiskParams} from "./interfaces/IRiskParams.sol";
 
 /// @title CollateralVault (PRD §4.1)
 /// @notice Accounting home for bond collateral (fungible ERC-1155 units, id 0).
@@ -27,7 +28,10 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error AdapterNotSet();
     error ZeroAmount();
     error InsufficientCollateral(uint256 requested, uint256 available);
-    error WithdrawalExceedsMaxLtv(uint256 postLtvBps);
+    /// @dev Carries the ceiling as well as the resulting LTV. Without it a caller has to supply
+    ///      the ceiling from somewhere else, and once it is settable, "somewhere else" is a copy
+    ///      that can be stale. See the same widening on `CreditManager.ExceedsMaxLtv`.
+    error WithdrawalExceedsMaxLtv(uint256 postLtvBps, uint256 maxLtvBps);
     error NothingMinted();
     error ZeroAddress();
     error AdapterHasLivePosition(uint256 staked);
@@ -41,11 +45,38 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error CreditManagerHasUndistributedYield(uint256 undistributed);
     error AuctionHasLiveWork(uint256 outstanding);
     error LiquidationAuctionVaultMismatch(address auctionVault);
+    error CreditManagerRiskParamsMismatch(address managerRiskParams);
+    error LiquidationAuctionRiskParamsMismatch(address auctionRiskParams);
+    /// @notice The incoming manager prices collateral off a different NAV feed to this vault.
+    error CreditManagerNavOracleMismatch(address managerNavOracle);
+    /// @notice The incoming auction prices collateral off a different NAV feed to this vault.
+    error LiquidationAuctionNavOracleMismatch(address auctionNavOracle);
 
     event YieldHarvested(uint256 usdcAmount);
 
     IDexFiBond public immutable bond;
-    INAVOracle public immutable navOracle;
+
+    /// @inheritdoc ICollateralVault
+    /// @notice The live NAV feed, and the reference the other two nav readers are checked against.
+    /// @dev **Audit round 21: the sibling round 20 did not anchor.** Immutability of *this* pointer
+    ///      says nothing about the manager's or the auction's, exactly as it said nothing about
+    ///      their `riskParams` before #199 - and this pointer had less than that one did, because
+    ///      not even `DeployBase._assertCoreGraph` compared the three. `setCreditManager` and
+    ///      `setLiquidationAuction` below are what make "the protocol prices one position off one
+    ///      feed" a property rather than an intention.
+    INAVOracle public immutable override navOracle;
+
+    /// @inheritdoc ICollateralVault
+    /// @notice The live risk configuration, and the reference the other two risk readers are
+    ///         checked against.
+    /// @dev **The sentence that used to be here was wrong, and audit round 20 executed it.** It
+    ///      read "Immutable, so this vault and the manager it settles into can never disagree about
+    ///      where the liquidation line is". Immutability of *this* pointer says nothing about the
+    ///      manager's: the manager is replaceable, and an ordinary zero-debt migration to a pair
+    ///      built on a second `RiskParams` was accepted by all seven wiring calls. The claim is now
+    ///      true because `setCreditManager` and `setLiquidationAuction` below enforce it, not
+    ///      because the keyword implies it.
+    IRiskParams public immutable override riskParams;
     /// @notice Pluggable custody backend (direct-call vs Safe) - §4.1 config decision.
     ICustodyAdapter public custodyAdapter;
     address public creditManager;
@@ -59,28 +90,99 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///         notice the two have diverged.
     uint256 public totalBondCount;
 
-    constructor(IDexFiBond bond_, INAVOracle navOracle_, address initialOwner) Ownable(initialOwner) {
-        if (address(bond_) == address(0) || address(navOracle_) == address(0)) revert ZeroAddress();
+    constructor(IDexFiBond bond_, INAVOracle navOracle_, IRiskParams riskParams_, address initialOwner)
+        Ownable(initialOwner)
+    {
+        if (
+            address(bond_) == address(0) || address(navOracle_) == address(0)
+                || address(riskParams_) == address(0)
+        ) revert ZeroAddress();
         bond = bond_;
         navOracle = navOracle_;
+        riskParams = riskParams_;
     }
 
     // ── Wiring (owner, behind timelock in production) ────────────────────────
+
+    /// @dev **Audit round 19's argument, and audit round 21 found it unapplied here.** A real
+    ///      adapter's `stakedBalance()` is not a storage getter - it forwards to DexFi's farm - so
+    ///      the sentence `_outgoingAuctionWork` uses below ("the only address that fails to answer
+    ///      never held live work") does **not** transfer verbatim, and the difference is why this
+    ///      helper is written out rather than reusing that one's reasoning by reference.
+    ///
+    ///      What catching costs: an adapter that genuinely holds a position, whose farm is down,
+    ///      reads as idle and can be repointed away from. What it buys is the repoint being
+    ///      possible at all, which round 21 measured it was not - `setCustodyAdapter`,
+    ///      `depositBonds` and `custodyIsSolvent()` all reverting **permanently**, on a contract
+    ///      that cannot be replaced and is holding third-party collateral.
+    ///
+    ///      The trade is one-sided because the bonds do not move either way. `bondCount` is
+    ///      untouched by a repoint, the units stay in the farm under the outgoing adapter, and
+    ///      while that farm is down nobody can unstake them whichever address this pointer names -
+    ///      so the orphan the catch admits is a wrong pointer over collateral that was already
+    ///      immobile, not a loss of it. **That arm is reasoned, not measured.** What is measured is
+    ///      the other one: `test_control_aLiveOutgoingPositionIsStillRefused` holds a real position
+    ///      under a working farm and is still refused, so the catch did not loosen the guard.
+    ///
+    ///      The deliberate liar - an adapter that answers at install and refuses afterwards while
+    ///      holding a live position - is out of scope for the same reason `CreditManager
+    ///      .setLenderPool` gives for its own `catch`: this guard is against operator error, not
+    ///      against an owner who is choosing the addresses on both sides.
+    function _outgoingStake(ICustodyAdapter current) private view returns (uint256 staked) {
+        try current.stakedBalance() returns (uint256 n) {
+            staked = n;
+        } catch {}
+    }
 
     /// @dev A swap must not orphan a live position: reject unless the outgoing
     ///      adapter holds nothing in custody, and require the incoming adapter to be
     ///      bound to this vault. Migrating a live position requires unstaking first
     ///      (or an explicit migration path), never a bare re-point.
+    ///
+    /// @dev **Audit round 21: this contract's own docstring, one function down, calls its incoming
+    ///      probe "the weakest in the protocol" - and it says that about the auction pointer, which
+    ///      round 20 then fixed. The sentence was left standing, true and unread, about this
+    ///      setter.** Measured: an adapter answering `vault()` and nothing else installed with no
+    ///      revert, and afterwards this function, `depositBonds` and `custodyIsSolvent()` all
+    ///      reverted forever.
+    ///
+    ///      **What this probe does not check, said plainly rather than left to a count.** This
+    ///      contract calls six selectors bare on this pointer - `stake`, `unstake`, `claimYield`,
+    ///      `transferBonds`, `stakedBalance` and `mintBonds` - and four of them change state, so
+    ///      they cannot be probed by calling them. The probe below therefore covers **two of six**,
+    ///      and an adapter that answers both views and implements none of the four still installs
+    ///      and still bricks `depositBonds`. What it does close is the way back: an adapter that
+    ///      answers `stakedBalance()` at install answers it at the next repoint too, so the escape
+    ///      hatch survives the mistake even where the probe did not prevent it. That, and not the
+    ///      count, is the property worth having.
+    ///
+    ///      Bare rather than `try`/`catch` with an error of its own, following `LiquidationAuction
+    ///      .setCreditManager`'s `totalBountyParked()` probe: this path is `onlyOwner`, so failing
+    ///      loudly with no data costs nothing a named error would buy.
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
         if (address(adapter) == address(0)) revert ZeroAddress();
         ICustodyAdapter current = custodyAdapter;
         if (address(current) != address(0)) {
-            uint256 staked = current.stakedBalance();
+            // Audit round 21: this read was bare. See `_outgoingStake`.
+            uint256 staked = _outgoingStake(current);
             if (staked != 0) revert AdapterHasLivePosition(staked);
         }
         address boundVault = adapter.vault();
         if (boundVault != address(this)) revert AdapterVaultMismatch(boundVault);
+        // The second of the two views, probed for the reason given above. Its value is discarded:
+        // a fresh adapter's balance is whatever it is, and this is testing only that the call
+        // answers at all.
+        // slither-disable-next-line unused-return
+        adapter.stakedBalance();
         custodyAdapter = adapter;
+    }
+
+    /// @dev The manager-pointer twin of `_outgoingStake`. See the `totalDebt` call site in
+    ///      `setCreditManager` for why catching here is safe in a way it is not for the adapter.
+    function _outgoingDebt(address current) private view returns (uint256 outstanding) {
+        try ICreditManager(current).totalDebt() returns (uint256 n) {
+            outstanding = n;
+        } catch {}
     }
 
     /// @dev Refuses to repoint while the outgoing manager still records debt.
@@ -99,7 +201,19 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         if (creditManager_ == address(0)) revert ZeroAddress();
         address current = creditManager;
         if (current != address(0)) {
-            uint256 outstanding = ICreditManager(current).totalDebt();
+            // **Audit round 21, and the read is one statement above the two round 19 wrapped.**
+            // Bare on the address this setter is *replacing*, in the function this file calls "the
+            // escape from every other unrecoverable state in this contract". A manager answering
+            // the four selectors probed below but not this one installed cleanly and then welded
+            // the hatch shut.
+            //
+            // Here round 19's argument does transfer verbatim, unlike the adapter's above:
+            // `CreditManager.totalDebt` is a plain `uint256` public getter over storage and cannot
+            // revert, so the only address that fails to answer it was never a credit manager, and
+            // an address that was never a credit manager records no debt for this guard to
+            // protect. Catching can only make a repoint more possible, never a genuine one less
+            // refused.
+            uint256 outstanding = _outgoingDebt(current);
             if (outstanding != 0) revert CreditManagerHasDebt(outstanding);
             // Debt is not the only live state a manager owns, and it is not even the
             // one most at risk here. Yield accrues to bond *holders*, so a vault of
@@ -152,6 +266,39 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         }
         address boundVault = address(ICreditManager(creditManager_).vault());
         if (boundVault != address(this)) revert CreditManagerVaultMismatch(boundVault);
+
+        // **Audit round 20: the one cross-contract pointer with no binding check anywhere.** Every
+        // setter in this protocol cross-checks the pointer *relation* it installs and none of them
+        // looked at the risk parameters, so a manager reading a different `RiskParams` installed
+        // here without a murmur. What that buys is a position both contracts have an opinion about
+        // and no shared answer for: liquidatable under the auction's threshold, healthy under this
+        // one, so `bid` and `expireToWorkout` refuse it here while `cancel` refuses it there.
+        //
+        // Checked against *this* contract's pointer rather than between the incoming pair, because
+        // this is the only contract in the graph that cannot be replaced - there is no
+        // `setCollateralVault`, and the vault pointer is `immutable` on both the manager and the
+        // auction. Two replaceable contracts checking each other can agree while both disagree
+        // with the collateral.
+        //
+        // No probe is owed for this selector. The probe rule covers selectors called *bare and
+        // elsewhere* on a pointer this setter installs; `riskParams()` is called here and nowhere
+        // else, so the call is its own probe and an address that cannot answer it is refused
+        // rather than installed.
+        address incomingRisk = address(ICreditManager(creditManager_).riskParams());
+        if (incomingRisk != address(riskParams)) revert CreditManagerRiskParamsMismatch(incomingRisk);
+
+        // **Audit round 21, and the same argument one pointer over.** `navOracle` is the other
+        // `immutable` all three of the vault, the manager and the auction carry, and it had none of
+        // the six guards the risk pointer got. What a divergence buys here is quieter than the risk
+        // one and worth more: nothing reverts, because this manager reads its feed only for
+        // `borrow`'s staleness gate while this vault values the collateral off its own. The vault
+        // calls the price stale and the manager keeps lending against it, or the reverse freezes
+        // borrowing over a book nothing is wrong with.
+        //
+        // No probe is owed, for the same reason the line above owes none: `navOracle()` is called
+        // here and nowhere else, so the call is its own probe.
+        address incomingNav = address(ICreditManager(creditManager_).navOracle());
+        if (incomingNav != address(navOracle)) revert CreditManagerNavOracleMismatch(incomingNav);
 
         // **Detachment is one-way.** `whileAttached` stops a detached manager pricing
         // positions it no longer governs, but nothing stopped it being pointed at
@@ -232,6 +379,26 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         }
         address boundVault = address(ILiquidationAuction(liquidationAuction_).vault());
         if (boundVault != address(this)) revert LiquidationAuctionVaultMismatch(boundVault);
+
+        // Audit round 20, and the twin of the check in `setCreditManager`. This one is the direct
+        // one: `bid` calls `seize` here, which re-runs the health test against *this* contract's
+        // threshold, while the auction opened the lot against its own. An auction on a different
+        // authority is an auction whose own fill path this contract refuses.
+        //
+        // It also, incidentally, gives this contract the incoming probe its own docstring below
+        // calls the weakest in the protocol: an address answering `vault()` and nothing else no
+        // longer installs.
+        address incomingRisk = address(ILiquidationAuction(liquidationAuction_).riskParams());
+        if (incomingRisk != address(riskParams)) revert LiquidationAuctionRiskParamsMismatch(incomingRisk);
+
+        // **Audit round 21, and the loudest of the six.** `start` fixes the Dutch curve off the
+        // auction's own feed and freezes it for the auction's life, while `bid` settles a debt this
+        // contract priced off its own. Measured on the shipped fixture: an auction one order of
+        // magnitude behind sold a lot worth 943.125000 for 94.312500 and wrote off 534.437500 of
+        // principal, against a control that wrote off nothing.
+        address incomingNav = address(ILiquidationAuction(liquidationAuction_).navOracle());
+        if (incomingNav != address(navOracle)) revert LiquidationAuctionNavOracleMismatch(incomingNav);
+
         liquidationAuction = liquidationAuction_;
     }
 
@@ -315,8 +482,9 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
                 // must not price against a stale NAV (PRD §4.6).
                 if (navOracle.isStale()) revert NavStale();
                 uint256 remainingValue = LtvMath.collateralValue(held - amount, navOracle.navPerBond());
-                if (LtvMath.exceedsLtv(debt, remainingValue, Config.MAX_LTV_BPS)) {
-                    revert WithdrawalExceedsMaxLtv(LtvMath.ltvBps(debt, remainingValue));
+                uint256 ceiling = riskParams.maxLtvBps();
+                if (LtvMath.exceedsLtv(debt, remainingValue, ceiling)) {
+                    revert WithdrawalExceedsMaxLtv(LtvMath.ltvBps(debt, remainingValue), ceiling);
                 }
             }
         }
@@ -449,7 +617,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         if (cm == address(0)) return;
         uint256 debt = ICreditManager(cm).currentDebtOf(owner_);
         uint256 value = LtvMath.collateralValue(amount, navOracle.navPerBond());
-        if (!LtvMath.exceedsLtv(debt, value, Config.LIQUIDATION_THRESHOLD_BPS)) {
+        if (!LtvMath.exceedsLtv(debt, value, riskParams.liquidationThresholdBps())) {
             revert PositionNotLiquidatable(LtvMath.ltvBps(debt, value));
         }
     }

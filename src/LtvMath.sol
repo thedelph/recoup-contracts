@@ -56,10 +56,27 @@ library LtvMath {
 
     /// @notice Health factor, `Config.HEALTH_FACTOR_SCALE` fixed point.
     /// @dev `< 1e18` means liquidatable. See the caveat on `ltvBps`: this is a view.
-    function healthFactor(uint256 debtUsdc, uint256 collateralValue8dp) internal pure returns (uint256) {
+    /// @param thresholdBps The live liquidation threshold, read from `RiskParams` by the caller.
+    ///
+    ///        Taken as a parameter for the same reason `exceedsLtv` already takes `maxBps`, and
+    ///        the alternative was worse in a specific way. This library is stateless and most of
+    ///        the tree imports it, so making it `view` in order to read the threshold itself would
+    ///        spread state-reading mutability outward through every caller. Passing it in keeps the
+    ///        library pure and costs exactly one call site.
+    ///
+    ///        It also closes a divergence the constant version would have opened the moment the
+    ///        threshold became settable: `liquidate` compares against storage, so a `healthFactor`
+    ///        still inlining a compile-time constant would report a comfortable 1e18 for a position
+    ///        the protocol was already seizing. A keeper and the UI both read this, and both would
+    ///        have acted on it.
+    function healthFactor(uint256 debtUsdc, uint256 collateralValue8dp, uint256 thresholdBps)
+        internal
+        pure
+        returns (uint256)
+    {
         uint256 ltv = ltvBps(debtUsdc, collateralValue8dp);
         if (ltv == 0) return type(uint256).max;
         if (ltv == type(uint256).max) return 0;
-        return (Config.LIQUIDATION_THRESHOLD_BPS * Config.HEALTH_FACTOR_SCALE) / ltv;
+        return (thresholdBps * Config.HEALTH_FACTOR_SCALE) / ltv;
     }
 }

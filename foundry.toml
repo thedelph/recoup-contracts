@@ -17,7 +17,7 @@ exclude_lints = ["screaming-snake-case-immutable"]
 
 # These are forge's current defaults, written down rather than inherited. `fail_on_revert`
 # is the one that matters: every invariant suite here wraps its interesting actions in
-# `try` and assert a typed selector in the `catch`, which is only meaningful while a
+# `try` and asserts a typed selector in the `catch`, which is only meaningful while a
 # reverting handler call is discarded instead of failing the run. Most random sequences
 # are meaningless and must be allowed to revert. Flipping this to `true` - by a forge
 # default changing, or by someone passing the flag - breaks every suite at once, so the

@@ -60,6 +60,21 @@ contract MockLenderPool {
         outstandingPrincipal = absorbed > outstandingPrincipal ? 0 : outstandingPrincipal - absorbed;
     }
 
+    /// @notice Money coming back on a loss this pool already took. Audit round 21, finding 14.
+    /// @dev Kept in step with `socialiseLoss` above deliberately: `CreditManager` picks between
+    ///      the two destinations for a recovery with the same test `_socialise` uses on the way
+    ///      down, so a mock that could absorb a loss but not receive its recovery would make the
+    ///      pool branch of that dispatch untestable and the treasury branch look total.
+    ///      **`outstandingPrincipal` does not move**, matching the real pool: there is no loan to
+    ///      re-recognise, the money is a gain on one already written off.
+    uint256 public recoveredTotal;
+
+    function recoverLoss(uint256 amount) external {
+        if (!accepting) revert PoolRefuses();
+        recoveredTotal += amount;
+        usdc.transferFrom(msg.sender, address(this), amount);
+    }
+
     // ── ILiquiditySource ─────────────────────────────────────────────────────
 
     /// @dev Audit round 11 is why a *loss sink* mock now also has to be able to *fund a loan*.

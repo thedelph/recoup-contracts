@@ -20,10 +20,18 @@
     "MockBond": "0xb3a29C5c1f6FE1Bf7cF6BaDa743269689a6c20d5",
     "MockFarm": "0xE7A54e090c1104bfCFC8e84e7F879C13C67C3A48"
   },
+  "riskParameters": {
+    "maxLtvBps": 3500,
+    "liquidationThresholdBps": 5800,
+    "globalBorrowCapUsdc": 250000,
+    "perAccountBorrowCapUsdc": 25000,
+    "divergenceNote": "These are the values the DEPLOYED bytecode enforces, not the values Config.sol declares. This deployment is dated 2026-08-03 and predates two later changes: the capped-beta parameters agreed with DexFi on 2026-08-07 (2500 / 5000 / 25k / 5k), and the move of all four out of `internal constant` and into `RiskParams` storage. The deployed contracts have no RiskParams and cannot be retuned - the parameters are compiled in - so the divergence closes at the next redeploy and not before. Recorded as data rather than prose because it was prose for nine days and nothing could check it.",
+    "sourceOfTruth": "the chain, read from RiskParams once a deployment carries one"
+  },
   "operatorsNote": "Owner, yield recipient, keeper and NAV confirmer are four distinct addresses, and every protocol contract was verified on-chain as owned by the configured owner rather than by the deployer. Read them from the contracts if you want them. The testnet operator keys are throwaways funded from a faucet; a mainnet deployment does not reuse that pattern.",
   "state": {
     "liquiditySourceFundedUsdc": "250000000000",
-    "liquiditySourceFundedNote": "250,000 mUSDC, equal to Config.GLOBAL_BORROW_CAP",
+    "liquiditySourceFundedNote": "250,000 mUSDC. This matched Config.GLOBAL_BORROW_CAP when it was funded and stopped matching on 2026-08-07, when the capped-beta cap dropped to 25,000e6 - the note went on claiming equality for nine days, off by ten times, because nothing read it. The float is deliberately left as funded: it is a testnet float and over-funding it refuses nothing.",
     "navBootstrapped": true,
     "navBootstrapValue": "2163780721",
     "navBootstrapTx": "0x79997855e278b5558bc21d44bfd6a95bd3fadc5d79d69bde847aad4a8ea0c460",
