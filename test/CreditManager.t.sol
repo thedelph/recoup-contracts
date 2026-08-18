@@ -23,6 +23,9 @@ import {MockLenderPool} from "./mocks/MockLenderPool.sol";
 import {MockLiquidationAuction} from "./mocks/MockLiquidationAuction.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice A liquidity source that under-delivers. Exists to prove `borrow` verifies
 ///         receipt rather than trusting the source: a short delivery would otherwise
@@ -95,36 +98,60 @@ contract ReentrantLiquiditySource is ILiquiditySource {
 ///         Fixture uses the real 2026-07-24 NAV snapshot so the numbers are the ones
 ///         the protocol will actually see: 100 bonds at $25.15 is $2,515 of collateral.
 ///
-///         `MAX_BORROW` is derived from `Config` rather than written down. It was the
-///         literal 880.25e6 (35% of $2,515) until the capped-beta parameters landed on
-///         2026-08-07 and broke fourteen tests at the fixture rather than in the code
-///         under test. The ratchet agreed with DexFi moves `MAX_LTV_BPS` at least twice
-///         more, so the fixture reads the parameter instead of restating it.
-contract CreditManagerTest is Test {
+///         `_maxBorrow()` is derived from the live risk parameters rather than written
+///         down. It was the literal 880.25e6 (35% of $2,515) until the capped-beta
+///         parameters landed on 2026-08-07 and broke fourteen tests at the fixture rather
+///         than in the code under test. The ratchet agreed with DexFi moves the borrow
+///         ceiling at least twice more, so the fixture reads the parameter instead of
+///         restating it - and reads it on every call, because the parameter now lives in
+///         `RiskParams` storage and a test may move it partway through.
+contract CreditManagerTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
 
     /// @notice Tolerance for figures that came through the yield stream.
     /// @dev A stream's rate is `pot * 1e18 / duration`, so running one to completion
-    ///      delivers the pot short by at most 1 wei of USDC; two accrual steps in a
-    ///      test can compound that to 2. Anything larger is a real accounting bug, so
-    ///      this stays deliberately tight rather than being widened to make a test
-    ///      pass. Exact-value assertions are kept wherever the stream is not involved.
+    ///      delivers the pot short by at most 1 wei of USDC, and a test that crosses two
+    ///      streams can carry that to 2. Anything larger is a real accounting bug, so this
+    ///      stays deliberately tight rather than being widened to make a test pass.
+    ///      Exact-value assertions are kept wherever the stream is not involved.
+    ///
+    ///      **This used to say "two accrual steps in a test can compound that to 2", and
+    ///      audit round 21 measured that false.** It was a property of a stream accrued once
+    ///      or twice, not of the code: `_accrue` floored every slice against the previous
+    ///      call, so the residual grew with the number of calls and nothing bounded that -
+    ///      80 wei at an hourly cadence, 12,592 at one call per second, and the entire pot
+    ///      where the rate fell below one wei per second. It is a property of the code again
+    ///      only because `CreditManager._sliceOwed` now floors once per stream; the tolerance
+    ///      is meaningless without that, and `test_stream_perSecondAccrualDeliversWhatOneCallWould`
+    ///      is what keeps it honest.
     uint256 internal constant DUST = 2;
-    /// @dev Borrowing power at the ceiling: BONDS x NAV x maxLTV, in USDC 6dp.
-    uint256 internal constant MAX_BORROW =
-        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
     uint256 internal constant FLOAT = 100_000e6;
 
-    /// @dev The NAV the liquidation-boundary tests crash to, and the debt that sits
-    ///      exactly on the threshold once they do. Derived, because the property under
-    ///      test is "one unit past the threshold" and that is only true of a literal for
-    ///      as long as the threshold does not move. It was 580_000_001 against a 5,800
-    ///      bps threshold; at 5,000 the same literal is 16% past the line and the test
+    /// @dev The NAV the liquidation-boundary tests crash to. The debt that sits exactly on
+    ///      the threshold once they do is `_debtAtThreshold()` below - derived, because the
+    ///      property under test is "one unit past the threshold" and that is only true of a
+    ///      literal for as long as the threshold does not move. It was 580_000_001 against a
+    ///      5,800 bps threshold; at 5,000 the same literal is 16% past the line and the test
     ///      would have been asserting something else entirely.
     uint256 internal constant BOUNDARY_NAV = 10e8;
-    uint256 internal constant DEBT_AT_THRESHOLD =
-        ((BONDS * BOUNDARY_NAV / Config.USDC_TO_NAV_SCALE) * Config.LIQUIDATION_THRESHOLD_BPS) / Config.BPS;
+
+    /// @dev Borrowing power at the ceiling: BONDS x NAV x maxLTV, in USDC 6dp.
+    /// @dev **A function and not a `constant`, and not a variable cached in `setUp` either.**
+    ///      A Solidity `constant` cannot read storage, which is where the ceiling now lives;
+    ///      a cache would let a test that moves the parameter partway through compute its
+    ///      expected figures from a snapshot taken before the move and pass against the old
+    ///      one. That is the exact failure the settable parameters exist to make visible, so
+    ///      this re-reads on every call. See `RiskParamsFixture`.
+    function _maxBorrow() internal view returns (uint256) {
+        return _maxBorrow(BONDS, NAV);
+    }
+
+    /// @dev The debt that sits exactly on the liquidation threshold for the seeded lot once
+    ///      NAV has crashed to `BOUNDARY_NAV`. Re-read per call for the same reason.
+    function _debtAtThreshold() internal view returns (uint256) {
+        return _debtAtThreshold(BONDS, BOUNDARY_NAV);
+    }
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");
@@ -142,6 +169,15 @@ contract CreditManagerTest is Test {
     DirectCallAdapter internal adapter;
     CreditManager internal credit;
     TreasuryLiquiditySource internal liquidity;
+    RiskParams internal riskParams;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -152,17 +188,30 @@ contract CreditManagerTest is Test {
         auctionMock = new MockLiquidationAuction();
         auction = address(auctionMock);
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        credit = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         liquidity = new TreasuryLiquiditySource(usdc, admin);
 
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));
         auctionMock.setVault(address(vault));
+        // Audit round 20: the setters also check the risk authority agrees with the vault's.
+        auctionMock.setRiskParams(address(riskParams));
+        // Audit round 21: and the NAV feed, anchored on the vault's answer.
+        auctionMock.setNavOracle(address(vault.navOracle()));
         // `borrow` now refuses while the three wiring pointers disagree, so the mock
         // has to report the aligned state the fixture is in.
         auctionMock.setCreditManager(address(credit));
@@ -195,40 +244,53 @@ contract CreditManagerTest is Test {
     // ── borrow: the LTV boundary ─────────────────────────────────────────────
 
     function test_borrow_atExactMaxLtvSucceeds() public {
+        // **Read before the prank, and every test below does the same.** A single-shot
+        // `vm.prank` is spent on the next call the test contract makes, and since the ceiling
+        // moved into `RiskParams` storage the derivation is an external staticcall - so
+        // `vm.prank(alice); credit.borrow(_maxBorrow());` spends the prank on the parameter
+        // read and sends the borrow from this contract, which owns no collateral.
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
-        assertEq(credit.debtOf(alice), MAX_BORROW);
-        assertEq(credit.totalDebt(), MAX_BORROW);
+        assertEq(credit.debtOf(alice), loan);
+        assertEq(credit.totalDebt(), loan);
         // The disbursement is the loan less the prepaid liquidation bounty; the debt, and so
         // the LTV, are the full loan. That asymmetry is the whole reason the bounty is held
         // off the debt ledger, and this is the test that pins it.
-        assertEq(usdc.balanceOf(alice), MAX_BORROW - Config.LIQUIDATION_CALL_BOUNTY);
+        assertEq(usdc.balanceOf(alice), loan - Config.LIQUIDATION_CALL_BOUNTY);
         assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY);
-        assertEq(credit.currentLtvBps(alice), Config.MAX_LTV_BPS);
+        assertEq(credit.currentLtvBps(alice), maxLtvBps());
     }
 
     /// @dev One USDC unit past the limit. With the old divide-then-compare formula
     ///      this rounded down to exactly maxLTV and was allowed; cross-multiplication
     ///      is what makes it revert.
     function test_borrow_oneUnitBeyondMaxLtvReverts() public {
+        // **Two separate things spend a single-shot prank here, and the order below survives
+        // both.** `vm.expectRevert` is itself a call this contract makes, and it consumes a
+        // pending prank - that is the repo's existing rule and it has not changed. What the
+        // parameters moving into storage added is a second way to lose it: every derivation is
+        // now an external staticcall, so a read left inline, or inside the
+        // `abi.encodeWithSelector` arguments, would spend the prank before `borrow` ever ran.
+        // Reads first, then the expectation, then the prank, then the call.
+        uint256 overTheCeiling = _maxBorrow() + 1;
+        uint256 ceilingBps = maxLtvBps();
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.ExceedsMaxLtv.selector, ceilingBps, ceilingBps));
         vm.prank(alice);
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.ExceedsMaxLtv.selector, Config.MAX_LTV_BPS)
-        );
-        credit.borrow(MAX_BORROW + 1);
+        credit.borrow(overTheCeiling);
     }
 
     function test_borrow_secondBorrowCountsExistingDebt() public {
         vm.startPrank(alice);
-        credit.borrow(MAX_BORROW - 100e6);
+        credit.borrow(_maxBorrow() - 100e6);
         vm.expectRevert();
         credit.borrow(101e6);
         vm.stopPrank();
     }
 
     function testFuzz_borrowNeverExceedsMaxLtv(uint256 amount) public {
-        amount = bound(amount, 1, MAX_BORROW * 2);
+        amount = bound(amount, 1, _maxBorrow() * 2);
         vm.prank(alice);
         try credit.borrow(amount) {
             uint256 debt = credit.debtOf(alice);
@@ -236,7 +298,7 @@ contract CreditManagerTest is Test {
             // The post-state must satisfy the rule exactly, with no rounding slack.
             assertLe(
                 debt * Config.USDC_TO_NAV_SCALE * Config.BPS,
-                Config.MAX_LTV_BPS * collateral,
+                maxLtvBps() * collateral,
                 "accepted borrow left LTV above the maximum"
             );
         } catch {}
@@ -258,9 +320,10 @@ contract CreditManagerTest is Test {
     }
 
     function test_borrow_revertsWithNoCollateral() public {
+        uint256 ceilingBps = maxLtvBps();
         vm.prank(bob);
         vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.ExceedsMaxLtv.selector, type(uint256).max)
+            abi.encodeWithSelector(CreditManager.ExceedsMaxLtv.selector, type(uint256).max, ceilingBps)
         );
         credit.borrow(1e6);
     }
@@ -276,24 +339,32 @@ contract CreditManagerTest is Test {
     function test_borrow_revertsOnPerAccountCap() public {
         // Enough collateral that LTV is not the binding constraint.
         _giveCollateral(bob, 5_000);
-        uint256 over = Config.PER_ACCOUNT_BORROW_CAP + 1;
+        uint256 cap = perAccountBorrowCap();
+        uint256 over = cap + 1;
         vm.prank(bob);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.PerAccountCapExceeded.selector, over, Config.PER_ACCOUNT_BORROW_CAP
-            )
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.PerAccountCapExceeded.selector, over, cap));
         credit.borrow(over);
     }
 
-    /// @dev Proves the global cap is not merely the per-account cap in disguise: ten
-    ///      accounts each inside their own limit must still hit the protocol ceiling.
+    /// @dev Proves the global cap is not merely the per-account cap in disguise: enough
+    ///      accounts each inside their own limit must still hit the protocol ceiling. The
+    ///      count is derived from the live caps rather than written down, so a ratchet step
+    ///      moves the loop instead of breaking it.
     function test_borrow_revertsOnGlobalCap() public {
-        uint256 perAccount = Config.PER_ACCOUNT_BORROW_CAP;
-        uint256 accounts = Config.GLOBAL_BORROW_CAP / perAccount;
-        usdc.mint(address(this), Config.GLOBAL_BORROW_CAP);
-        usdc.approve(address(liquidity), Config.GLOBAL_BORROW_CAP);
-        liquidity.fund(Config.GLOBAL_BORROW_CAP);
+        uint256 perAccount = perAccountBorrowCap();
+        uint256 globalCap = globalBorrowCap();
+        uint256 accounts = globalCap / perAccount;
+        // Both premises stated rather than assumed, now that both caps are settable and the
+        // relation between them is only checked as `perAccount <= global`. An uneven division
+        // leaves the loop short of the ceiling so the refusal never fires, and a single
+        // account filling the whole book is the very state this test exists to distinguish
+        // itself from.
+        assertEq(globalCap % perAccount, 0, "the caps no longer divide evenly");
+        assertGt(accounts, 1, "one account fills the book, so nothing here is about the global cap");
+
+        usdc.mint(address(this), globalCap);
+        usdc.approve(address(liquidity), globalCap);
+        liquidity.fund(globalCap);
 
         for (uint256 i; i < accounts; ++i) {
             address borrower = address(uint160(0xB0B0 + i));
@@ -301,17 +372,13 @@ contract CreditManagerTest is Test {
             vm.prank(borrower);
             credit.borrow(perAccount);
         }
-        assertEq(credit.totalDebt(), Config.GLOBAL_BORROW_CAP);
+        assertEq(credit.totalDebt(), globalCap);
 
         address extra = makeAddr("extra");
         _giveCollateral(extra, 5_000);
         vm.prank(extra);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.GlobalCapExceeded.selector,
-                Config.GLOBAL_BORROW_CAP + 1e6,
-                Config.GLOBAL_BORROW_CAP
-            )
+            abi.encodeWithSelector(CreditManager.GlobalCapExceeded.selector, globalCap + 1e6, globalCap)
         );
         credit.borrow(1e6);
     }
@@ -419,6 +486,48 @@ contract CreditManagerTest is Test {
         assertEq(usdc.balanceOf(address(liquidity)) - before, 500e6);
         assertEq(credit.pendingPrincipal(), 0);
         assertEq(usdc.allowance(address(credit), address(liquidity)), 0, "no standing allowance");
+    }
+
+    /// @notice **Audit round 21, finding 3: a no-op at zero, not a revert.**
+    /// @dev This function used to open `if (amount == 0) revert NothingToSettle();`, and that
+    ///      revert was the only reason `DeployBase._phase4Calls` had to write the settle leg
+    ///      *conditionally* on `pendingPrincipal() != 0`. Because the call is permissionless and
+    ///      free - MEASURED at 42,744 gas - the conditionality made a stranger the author of a
+    ///      queued switchover batch's shape: zero the counter during the delay and the operation
+    ///      either reverts on a leg that is now empty or re-derives to an id nobody scheduled.
+    ///
+    ///      Three things asserted here rather than one, because "it stopped reverting" is not the
+    ///      property. It must also move nothing and emit nothing - a `PrincipalSettled(0)` would
+    ///      let an indexer count a stranger's free call as a settlement.
+    function test_settlePrincipal_isANoOpAtZeroRatherThanARevert() public {
+        assertEq(credit.pendingPrincipal(), 0, "premise: nothing owed home");
+        uint256 sourceBefore = usdc.balanceOf(address(liquidity));
+        uint256 managerBefore = usdc.balanceOf(address(credit));
+
+        vm.recordLogs();
+        vm.prank(makeAddr("anyStranger"));
+        credit.settlePrincipal();
+
+        assertEq(vm.getRecordedLogs().length, 0, "an empty settlement is not an event");
+        assertEq(usdc.balanceOf(address(liquidity)), sourceBefore, "and moves nothing");
+        assertEq(usdc.balanceOf(address(credit)), managerBefore);
+        assertEq(credit.pendingPrincipal(), 0);
+
+        // The loaded path is unchanged, which is what stops this reading as "settlement was
+        // switched off". Same call, same caller, money moves.
+        vm.startPrank(alice);
+        credit.borrow(500e6);
+        usdc.approve(address(credit), 500e6);
+        credit.repay(500e6);
+        vm.stopPrank();
+
+        // Snapshotted here, not above: the borrow itself pulled the float out of the source, so a
+        // delta measured across the whole loan would be zero and this assertion would pass over a
+        // settlement that never happened.
+        uint256 sourceBeforeSettle = usdc.balanceOf(address(liquidity));
+        vm.prank(makeAddr("anyStranger"));
+        credit.settlePrincipal();
+        assertEq(usdc.balanceOf(address(liquidity)) - sourceBeforeSettle, 500e6, "the real settlement still settles");
     }
 
     // ── yield distribution (accumulator) ─────────────────────────────────────
@@ -591,8 +700,9 @@ contract CreditManagerTest is Test {
     }
 
     function test_healthFactor_aboveOneWhileWithinMaxLtv() public {
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         // At the LTV ceiling against the liquidation threshold, HF = threshold/maxLTV.
         assertGt(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE);
     }
@@ -641,8 +751,9 @@ contract CreditManagerTest is Test {
     ///      debt went up or because collateral came out. That is why the formula lives
     ///      in LtvMath rather than being written twice.
     function test_withdrawalBoundaryMatchesBorrowBoundary() public {
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         // Already exactly at maxLTV, so releasing even one bond must fail.
         vm.prank(alice);
@@ -726,10 +837,15 @@ contract CreditManagerTest is Test {
     ///      from its own vault - so a manager bound elsewhere reverts every deposit,
     ///      withdrawal and seizure, with everyone's collateral already inside.
     function test_setCreditManager_refusedWhenBoundToAnotherVault() public {
-        CollateralVault otherVault =
-            new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        CollateralVault otherVault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         CreditManager foreign = new CreditManager(
-            usdc, ICollateralVault(address(otherVault)), INAVOracle(address(oracle)), admin
+            usdc,
+            ICollateralVault(address(otherVault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
         );
 
         vm.prank(admin);
@@ -746,14 +862,15 @@ contract CreditManagerTest is Test {
     ///      reporting against the stale figure is how a keeper queues a liquidation
     ///      that a free, permissionless `settle` would have cleared.
     function test_riskViewsPriceAgainstDebtNetOfEarnedYield() public {
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         uint256 ltvBefore = credit.currentLtvBps(alice);
         uint256 hfBefore = credit.healthFactor(alice);
 
         _distribute(400e6); // earned, but nobody has settled
 
-        assertEq(credit.debtOf(alice), MAX_BORROW, "still unsettled");
+        assertEq(credit.debtOf(alice), loan, "still unsettled");
         assertLt(credit.currentLtvBps(alice), ltvBefore, "LTV reflects the write-down");
         assertGt(credit.healthFactor(alice), hfBefore, "and so does health");
 
@@ -808,8 +925,13 @@ contract CreditManagerTest is Test {
         credit.claimSurplus();
         assertEq(credit.totalDebt(), 0);
 
-        CreditManager fresh =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager fresh = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         vm.prank(admin);
         vault.setCreditManager(address(fresh));
 
@@ -850,8 +972,13 @@ contract CreditManagerTest is Test {
         // debt-free position has nothing left for it to insure.
         assertEq(credit.bountyEscrowOf(alice), 0, "bounty refunded when yield cleared the debt");
 
-        CreditManager fresh =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager fresh = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         vm.prank(admin);
         vault.setCreditManager(address(fresh));
 
@@ -973,17 +1100,105 @@ contract CreditManagerTest is Test {
     ///      now fails on its own premise, `escrow emptied: 25000000 != 0`. No other route into it
     ///      was found. So this function has **no demonstrated trigger today**. It is kept because
     ///      the hole is arithmetic rather than incidental, and because the two caps it sits
-    ///      between are committed to become admin-settable and to ratchet - a cap that moves down
-    ///      past a live position reopens exactly this band, with no code change to notice it.
+    ///      between are **now** admin-settable and expected to ratchet - `RiskParams` shipped
+    ///      them into storage, so a cap that moves down past a live position reopens exactly this
+    ///      band, with no code change to notice it. The premise below therefore reads the live
+    ///      cap rather than a constant: it is the assertion that fails first if a move ever makes
+    ///      the band bigger than the charge it is measured against.
     ///
     ///      Permissionless for the same reason `fundInsurance` is: whoever expects to profit from
     ///      liquidating a position can arm it themselves for less than the reward.
+    /// @notice Lowering the per-account cap onto a live position does NOT reopen the un-armable
+    ///         band, and this is where that is settled rather than argued about.
+    /// @dev **The deferral this test was written for, moved out of a docstring and made to run.**
+    ///      The private planning notes asked the new setter to refuse a downward move of `PER_ACCOUNT_BORROW_CAP`
+    ///      that "drops the band onto positions already open". Building it turned up two reasons
+    ///      not to, and the second is the one that matters.
+    ///
+    ///      First, the check is not expressible. It asks whether any open position has
+    ///      `debtOf > newCap - LIQUIDATION_CALL_BOUNTY`, and this contract has no borrower
+    ///      enumeration: `debtOf` is a bare mapping and the only aggregate is `totalDebt`.
+    ///      Building one means an on-chain holder list, which the single-write yield accumulator
+    ///      exists specifically to avoid.
+    ///
+    ///      Second, and decisively: **a cap move cannot create the band.** Read `borrow` again.
+    ///      `bountyDue` is `LIQUIDATION_CALL_BOUNTY - held`, so it is zero whenever the escrow is
+    ///      already full - and any position that has ever crossed `MIN_BOUNTIED_DEBT` has a full
+    ///      escrow, because that is when the charge was taken. Below the threshold no charge is
+    ///      due at all. So the band needs a *depleted* escrow at a debt above the threshold, and
+    ///      the only thing that empties an escrow is a liquidation consuming it. Moving a cap
+    ///      empties nothing.
+    ///
+    ///      That is what this test measures: the cap drops under a live armed position, and the
+    ///      borrower is refused for the honest reason (they are over the new cap) rather than
+    ///      trapped between two errors. The premise behind that request is corrected in the session write-up.
+    function test_loweringThePerAccountCapDoesNotStrandAnArmedPosition() public {
+        uint256 loan = Config.MIN_BOUNTIED_DEBT + 100e6;
+        vm.prank(alice);
+        credit.borrow(loan);
+        assertEq(
+            credit.bountyEscrowOf(alice),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "premise: crossing the threshold arms the escrow, so no further charge can be due"
+        );
+
+        // Drop the cap to just above the live debt: the band, if a cap move could create one,
+        // would sit exactly here - within one bounty of the ceiling.
+        uint64 tightened = uint64(loan + Config.LIQUIDATION_CALL_BOUNTY / 2);
+        IRiskParams.Params memory p = riskParams.params();
+        p.perAccountBorrowCap = tightened;
+        vm.prank(admin);
+        riskParams.setRiskParams(p);
+
+        // The escrow is untouched by the cap move, so nothing further is owed and the dust guard
+        // cannot fire. The only limit left is the cap itself, which is the honest one.
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "the cap move emptied an escrow");
+
+        uint256 headroom = tightened - loan;
+        vm.prank(alice);
+        credit.borrow(headroom);
+        assertEq(credit.debtOf(alice), tightened, "the borrower could not draw their remaining headroom");
+
+        // And one unit past it is refused by the cap, by name, not by an unsatisfiable pair.
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.PerAccountCapExceeded.selector, uint256(tightened) + 1, tightened)
+        );
+        vm.prank(alice);
+        credit.borrow(1);
+    }
+
+    /// @notice The band's real precondition, pinned so the cause is not mislaid again.
+    /// @dev With a full escrow the charge is zero at every cap value, so no ordering of the two
+    ///      guards can be unsatisfiable. This is the algebra the test above demonstrates, asserted
+    ///      directly so that a change to `borrow`'s charging rule breaks it here rather than
+    ///      somewhere three sessions later.
+    function test_theUnsatisfiableBandNeedsADepletedEscrowNotACapMove() public {
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "armed at the threshold");
+
+        // Whatever the cap becomes, `bountyDue` is zero for this position, so `BorrowBelowBounty`
+        // is unreachable for it and only the cap can refuse a draw.
+        for (uint64 cap = 1_000e6; cap <= 20_000e6; cap += 6_000e6) {
+            IRiskParams.Params memory p = riskParams.params();
+            p.globalBorrowCap = cap > p.globalBorrowCap ? cap : p.globalBorrowCap;
+            p.perAccountBorrowCap = cap;
+            vm.prank(admin);
+            riskParams.setRiskParams(p);
+            assertEq(
+                credit.bountyEscrowOf(alice),
+                Config.LIQUIDATION_CALL_BOUNTY,
+                "an escrow that is already full stays full whatever the cap does"
+            );
+        }
+    }
+
     function test_fundBounty_armsAPositionNoBorrowAmountCouldArm() public {
         // The arithmetic, stated where a parameter move would break it: any position whose
         // headroom is under the charge has an empty feasible band.
         assertLt(
             Config.LIQUIDATION_CALL_BOUNTY,
-            Config.PER_ACCOUNT_BORROW_CAP,
+            perAccountBorrowCap(),
             "premise: the charge fits inside the cap at all"
         );
 
@@ -993,11 +1208,12 @@ contract CreditManagerTest is Test {
         assertEq(credit.bountyEscrowOf(alice), 0, "premise: unarmed, and legitimately so");
         assertEq(usdc.balanceOf(alice), Config.MIN_BOUNTIED_DEBT - 1, "the whole draw disbursed");
 
-        address stranger = makeAddr("stranger");
-        usdc.mint(stranger, 2 * Config.LIQUIDATION_CALL_BOUNTY);
+        // Funded by the borrower herself: since round 21 that is the only funder this accepts,
+        // and it is the funder every case in `fundBounty`'s own docstring describes.
+        usdc.mint(alice, 2 * Config.LIQUIDATION_CALL_BOUNTY);
         uint256 heldBefore = usdc.balanceOf(address(credit));
 
-        vm.startPrank(stranger);
+        vm.startPrank(alice);
         usdc.approve(address(credit), 2 * Config.LIQUIDATION_CALL_BOUNTY);
         credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
 
@@ -1013,13 +1229,102 @@ contract CreditManagerTest is Test {
         credit.fundBounty(alice, 1);
         vm.stopPrank();
 
-        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "armed by a stranger");
+        assertEq(
+            credit.bountyEscrowOf(alice),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "armed through the route no borrow amount could reach"
+        );
         assertEq(credit.totalBountyEscrowed(), Config.LIQUIDATION_CALL_BOUNTY);
         assertEq(
             usdc.balanceOf(address(credit)) - heldBefore,
             Config.LIQUIDATION_CALL_BOUNTY,
             "and the USDC actually arrived, so the escrow is funded and not just recorded"
         );
+    }
+
+    /// @notice Only the borrower may write their own escrow. Audit round 21, finding 15.
+    /// @dev **The hazard, then the refusal.** `borrow` withholds the bounty from the borrower's
+    ///      own disbursement, so `_repay`'s escrow settlement is exactly neutral - it hands back
+    ///      money the same borrower already paid. `fundBounty` wrote the same slot out of a
+    ///      stranger's wallet, and `_repay`'s gate is `payer == borrower && paid == debt` with
+    ///      nothing in it about provenance. MEASURED at `868edb4` on exactly this fixture: a
+    ///      stranger funds 25.000000 for a borrower under `MIN_BOUNTIED_DEBT`, the borrower
+    ///      simply repays, and spends **474.999999 against a debt of 499.999999** - net
+    ///      +25.000000 to the borrower, -25.000000 to the stranger, no liquidation and no work
+    ///      done. Solvency was never touched (`held == spokenFor` throughout), which is why it
+    ///      is a theft from the funder rather than from the protocol.
+    ///
+    ///      **The path was deleted rather than policed**, and the alternative was priced first:
+    ///      recording the funder means a per-borrower ledger of mixed ownership - `borrow` writes
+    ///      this slot too - threaded through `_repay`'s netting, `_refundBounty`, `liquidate`'s
+    ///      park and `ParkedBounty`, to preserve a path the finding shows is never rational.
+    ///      `test_fundBounty_armsAPositionNoBorrowAmountCouldArm` above is the evidence that
+    ///      nothing `fundBounty`'s docstring claims was lost: every case it names is a borrower
+    ///      arming their own position.
+    function test_fundBounty_refusesAnyFunderButTheBorrower() public {
+        vm.prank(alice);
+        credit.borrow(Config.MIN_BOUNTIED_DEBT - 1);
+        assertEq(credit.bountyEscrowOf(alice), 0, "premise: unarmed, and legitimately so");
+
+        address funder = makeAddr("funder");
+        usdc.mint(funder, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.startPrank(funder);
+        usdc.approve(address(credit), Config.LIQUIDATION_CALL_BOUNTY);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.BountyFundingForAnother.selector, alice));
+        credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.stopPrank();
+
+        assertEq(credit.bountyEscrowOf(alice), 0, "the escrow was written anyway");
+        assertEq(usdc.balanceOf(funder), Config.LIQUIDATION_CALL_BOUNTY, "the funder was charged anyway");
+    }
+
+    /// @notice The borrower's cash cost of clearing a debt is the debt, whoever else is around.
+    /// @dev The arithmetic half of the finding, kept as a live assertion rather than a figure in
+    ///      a comment. Before the refusal above this read 474.999999 against a debt of
+    ///      499.999999 once a stranger had paid in; the self-funded control was exactly neutral
+    ///      and still is. **Neuter check: delete the `msg.sender != borrower` line and this test
+    ///      stays green** - it is the refusal test that catches that, which is why both are here.
+    function test_repay_theSelfFundedEscrowIsExactlyNeutral() public {
+        uint256 debt = Config.MIN_BOUNTIED_DEBT - 1;
+        vm.prank(alice);
+        credit.borrow(debt);
+
+        usdc.mint(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        uint256 held = usdc.balanceOf(alice);
+        vm.startPrank(alice);
+        usdc.approve(address(credit), Config.LIQUIDATION_CALL_BOUNTY);
+        credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.stopPrank();
+
+        usdc.mint(alice, debt);
+        vm.startPrank(alice);
+        usdc.approve(address(credit), debt);
+        credit.repay(debt);
+        vm.stopPrank();
+
+        assertEq(credit.debtOf(alice), 0, "the debt did not clear");
+        assertEq(held + debt - usdc.balanceOf(alice), debt, "self-funding is not neutral");
+        assertEq(credit.bountyEscrowOf(alice), 0, "the escrow outlived the debt");
+    }
+
+    /// @notice An escrow insures a debt, so `fundBounty` refuses where there is none.
+    /// @dev The finding's second face: there was no `debtOf != 0` guard here while
+    ///      `_refundBounty` keys on `debtOf == 0`, so an escrow written against a debt-free
+    ///      position was withdrawable through `claimSurplus` the moment it landed - measured at
+    ///      25.000000 out and 25.000000 straight back. Harmless once the funder must be the
+    ///      borrower, and closed anyway: the state has no meaning to give a later reader.
+    function test_fundBounty_refusesAPositionWithNoDebt() public {
+        assertEq(credit.debtOf(alice), 0, "premise: no debt at all");
+
+        usdc.mint(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.startPrank(alice);
+        usdc.approve(address(credit), Config.LIQUIDATION_CALL_BOUNTY);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.BountyFundingWithoutDebt.selector, alice));
+        credit.fundBounty(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.stopPrank();
+
+        assertEq(credit.bountyEscrowOf(alice), 0, "an escrow with nothing to insure");
+        assertEq(credit.totalBountyEscrowed(), 0, "and the total moved with it");
     }
 
     /// @dev **The borrower's cash cost of a loan is the loan.** They receive the draw less the
@@ -1114,8 +1419,13 @@ contract CreditManagerTest is Test {
         usdc.mint(address(source), FLOAT);
 
         // Fresh manager so the liquidity source can be swapped in at zero debt.
-        CreditManager credit2 =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager credit2 = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         vm.startPrank(admin);
         vault.setCreditManager(address(credit2));
         credit2.setLiquiditySource(address(source));
@@ -1334,6 +1644,192 @@ contract CreditManagerTest is Test {
         assertLt(credit.claimableOf(jit), 2e6, "the previous cohort's yield was not capturable");
     }
 
+    // ── streaming: the per-call floor (audit round 21, finding 12) ────────────
+
+    /// @dev Walk the stream one second at a time. The point of the fixture is that the
+    ///      *number of calls* is not a protocol parameter: `accrueYield()` is permissionless
+    ///      and free of any cooldown, and every borrow, repay, deposit and withdrawal
+    ///      reaches the same code through `_settle`. A hostile caller and an ordinary busy
+    ///      market drive it identically, which is why the finding needed no attacker.
+    function _walk(uint256 secondsToWalk) private {
+        for (uint256 i = 0; i < secondsToWalk; ++i) {
+            skip(1);
+            credit.accrueYield();
+        }
+    }
+
+    /// @notice Accruing every second delivers exactly what accruing once would have.
+    /// @dev **The round-21 finding, closed.** `_accrue` used to floor
+    ///      `(elapsed x rate) / ACC_PRECISION` against the time since the *last call* while
+    ///      writing `lastAccrualAt` unconditionally, so the integer division was charged once
+    ///      per invocation instead of once per stream. MEASURED before the fix on this exact
+    ///      fixture: 5,080,000 delivered against 5,092,592 owed, 12,592 wei short over 20,000
+    ///      seconds of a 110 USDC stream. The pot is not destroyed - it stays in
+    ///      `undistributedYield` and rolls into the next stream - but it is deferred by an
+    ///      amount any stranger can choose, and it moves `currentDebtOf`, which is what
+    ///      `liquidate`, `cancel` and `_impairmentFor` price on.
+    ///
+    ///      Asserted against the one-call control rather than a literal, so the test states
+    ///      the property - call cadence does not change what a stream pays - rather than a
+    ///      number a parameter change would falsify.
+    function test_stream_perSecondAccrualDeliversWhatOneCallWould() public {
+        uint256 pot = 110e6;
+        uint256 window = 20_000;
+
+        _deliver(pot);
+        uint256 snapshot = vm.snapshotState();
+
+        _walk(window);
+        uint256 walked = pot - credit.undistributedYield();
+
+        vm.revertToState(snapshot);
+        skip(window);
+        credit.accrueYield();
+        uint256 oneCall = pot - credit.undistributedYield();
+
+        assertGt(oneCall, 0, "control delivered nothing - the fixture is not streaming");
+        assertEq(walked, oneCall, "the per-call floor is still being charged");
+    }
+
+    /// @notice A pot whose wei count is below the stream's second count still pays out.
+    /// @dev **The sharp case, and it needs no attacker.** `distributeYield` rates a pot over
+    ///      `max(elapsed, 5 days, remaining)` and its own comment names the ordinary causes of
+    ///      a long `elapsed` - a keeper outage, a run of declined epochs, the gap before the
+    ///      harvester is wired at all. `Config.MIN_EPOCH_YIELD` is 1 USDC, so a 1 USDC
+    ///      borrower share rated over 30 days is a legal epoch whose `yieldRate` is below
+    ///      `ACC_PRECISION`. Every per-second slice then floored to zero while the clock ran
+    ///      on: MEASURED before the fix this delivered **0** where 1,929 was owed, a 100%
+    ///      suppression for as long as anybody kept calling.
+    function test_stream_aSubWeiRateIsNotSuppressedByPerSecondAccrual() public {
+        skip(30 days); // the harvester is wired in `setUp`; nothing has been distributed yet
+        uint256 pot = Config.MIN_EPOCH_YIELD;
+        _deliver(pot);
+        assertLt(credit.yieldRate(), 1e18, "rate is not sub-wei-per-second; the case is not set up");
+
+        uint256 window = 5_000;
+        uint256 snapshot = vm.snapshotState();
+
+        _walk(window);
+        uint256 walked = pot - credit.undistributedYield();
+
+        vm.revertToState(snapshot);
+        skip(window);
+        credit.accrueYield();
+        uint256 oneCall = pot - credit.undistributedYield();
+
+        assertGt(oneCall, 0, "control delivered nothing - the fixture is not streaming");
+        assertEq(walked, oneCall, "a sub-wei rate is still suppressed by per-second accrual");
+    }
+
+    /// @notice The suppression reached the borrower's debt, and no longer does.
+    /// @dev `currentDebtOf` projects the stream on top of the stored figure, so a slice the
+    ///      accumulator never received is a write-down the borrower never got. MEASURED before
+    ///      the fix: 628,750,000 under per-second accrual against 628,748,071 left alone -
+    ///      1,929 wei of write-down suppressed, on the debt three liquidation paths price
+    ///      against.
+    function test_stream_perSecondAccrualDoesNotSuppressTheBorrowersWriteDown() public {
+        // `_maxBorrow()` reads `RiskParams` through an external call, and an external view in
+        // argument position spends the prank. Read first, then prank, then call.
+        uint256 loan = _maxBorrow();
+        vm.prank(alice);
+        credit.borrow(loan);
+
+        skip(30 days);
+        _deliver(Config.MIN_EPOCH_YIELD);
+        assertLt(credit.yieldRate(), 1e18, "rate is not sub-wei-per-second");
+
+        uint256 stored = credit.debtOf(alice);
+        uint256 snapshot = vm.snapshotState();
+        _walk(5_000);
+        uint256 debtWalked = credit.currentDebtOf(alice);
+
+        vm.revertToState(snapshot);
+        skip(5_000);
+        uint256 debtLeftAlone = credit.currentDebtOf(alice);
+
+        assertLt(debtLeftAlone, stored, "control: the stream wrote nothing down");
+        assertEq(debtWalked, debtLeftAlone, "per-second accrual still suppresses the write-down");
+    }
+
+    /// @notice The unstaked branch has the same floor and got the same fix.
+    /// @dev **The sibling in the same commit.** `_accrue`'s `bonds == 0` arm routes the skipped
+    ///      slice to `insuranceFund` with arithmetic that was character-for-character the shape
+    ///      the accumulator arm had. Fixing one and not the other would have left the defect
+    ///      standing on the path that runs when nothing is staked, which is the path nobody
+    ///      watches - and `_pushLossReserves` mirrors that fund into the pool's exit pricing,
+    ///      so a short insurance fund is a lender-facing number.
+    function test_stream_theUnstakedSliceIsNotShortChangedByPerSecondAccrual() public {
+        skip(30 days);
+        _deliver(Config.MIN_EPOCH_YIELD);
+        assertLt(credit.yieldRate(), 1e18, "rate is not sub-wei-per-second");
+
+        vm.prank(alice);
+        vault.withdrawBonds(BONDS);
+        assertEq(vault.totalBondCount(), 0, "the unstaked branch is not the one under test");
+
+        uint256 window = 5_000;
+        uint256 opening = credit.insuranceFund();
+        uint256 snapshot = vm.snapshotState();
+
+        _walk(window);
+        uint256 walked = credit.insuranceFund() - opening;
+
+        vm.revertToState(snapshot);
+        skip(window);
+        credit.accrueYield();
+        uint256 oneCall = credit.insuranceFund() - opening;
+
+        assertGt(oneCall, 0, "control routed nothing to insurance - the fixture is not streaming");
+        assertEq(walked, oneCall, "the unstaked slice is still floored per call");
+    }
+
+    /// @notice A re-rate moves the origin the slice is floored against, and the stream still
+    ///         cannot outrun its pot.
+    /// @dev **The sibling `distributeYield` owed the fix.** Its four-line reset gained a fifth
+    ///      field, and `_sliceOwed` is only exact because `owedByLast` is exactly zero on a
+    ///      stream's first call - which is true only while the origin IS the rating instant.
+    ///
+    ///      Leave the origin behind and the arithmetic still telescopes, which is why this is
+    ///      worth a test rather than a comment: it looks fine. What breaks is subtler and worse.
+    ///      `floor(a) - floor(b)` can exceed `floor(a - b)` by one, so a stream rated against a
+    ///      stale origin releases **one wei more than its rate owes** and the `amount > pot`
+    ///      clamp starts binding - a line whose own comment says the rate "can never outrun" the
+    ///      pot and which is clamped only "rather than let rounding underflow the counter".
+    ///      MEASURED with the origin left at zero: a 100 USDC stream run to completion leaves a
+    ///      residual of **0** against the **1** the rate actually owes. That is a documented-dead
+    ///      guard quietly becoming the thing holding the accounting up, which is a shape this
+    ///      protocol has now been bitten by twice.
+    function test_stream_aReRateMovesTheOriginAndTheStreamCannotOutrunItsPot() public {
+        uint256 pot = 100e6;
+        _deliver(pot);
+
+        // No `elapsed` has built up in this fixture, so the stream is rated over the floor.
+        uint256 duration = Config.YIELD_STREAM_DURATION;
+        assertEq(credit.streamEndsAt(), block.timestamp + duration, "unexpected stream window");
+        uint256 owedByTheRate = (duration * credit.yieldRate()) / 1e18;
+
+        // The money assertion first, deliberately: it is the one that goes red when the origin
+        // is left behind, and a mechanism assertion in front of it would mask that.
+        skip(duration);
+        credit.accrueYield();
+        assertEq(pot - credit.undistributedYield(), owedByTheRate, "the stream released more than its rate owed");
+        assertLe(credit.undistributedYield(), 1, "the residual over a full stream is above one wei");
+        assertEq(credit.streamStartedAt(), credit.streamEndsAt() - duration, "the origin is not the rating instant");
+
+        // And a fresh epoch starts from the new instant rather than paying out its history.
+        uint256 carried = credit.undistributedYield();
+        _deliver(pot);
+        assertEq(credit.streamStartedAt(), block.timestamp, "the origin did not move with the re-rate");
+        assertEq(credit.undistributedYield(), carried + pot, "the re-rate paid something out as it ran");
+
+        skip(1);
+        credit.accrueYield();
+        uint256 firstSlice = (carried + pot) - credit.undistributedYield();
+        assertApproxEqAbs(
+            firstSlice, credit.yieldRate() / 1e18, 1, "the new stream's first slice is not one second's worth"
+        );
+    }
+
     // ── liquidate: the gate ──────────────────────────────────────────────────
 
     /// @dev Wires a recording auction so `liquidate` can reach the line past its own
@@ -1406,8 +1902,13 @@ contract CreditManagerTest is Test {
     function test_borrow_refusedOnAFreshManagerWhileTheVaultAlreadyHasAnAuction() public {
         _wireAuction();
 
-        CreditManager next =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager next = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         vm.startPrank(admin);
         next.setLiquiditySource(address(liquidity));
         next.setEpochHarvester(harvester);
@@ -1444,16 +1945,17 @@ contract CreditManagerTest is Test {
 
     function test_liquidate_revertsWhileHealthy() public {
         _wireAuction();
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
-        vm.expectRevert(abi.encodeWithSelector(CreditManager.PositionHealthy.selector, Config.MAX_LTV_BPS));
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.PositionHealthy.selector, maxLtvBps()));
         credit.liquidate(alice);
     }
 
     /// @notice The whole reason `LtvMath.exceedsLtv` exists.
     /// @dev 100 bonds at BOUNDARY_NAV is exactly $1,000 of collateral, so the threshold
-    ///      sits at exactly DEBT_AT_THRESHOLD. One extra unit of debt puts the position
+    ///      sits at exactly `_debtAtThreshold()`. One extra unit of debt puts the position
     ///      genuinely past it - but `ltvBps` floors, so the view still reports the
     ///      threshold and
     ///      `healthFactor` still reports exactly 1e18 "healthy". A gate that read the
@@ -1464,11 +1966,12 @@ contract CreditManagerTest is Test {
     function test_liquidate_oneUnitPastThresholdIsLiquidatableThoughHealthFactorReadsExactlyOne() public {
         MockLiquidationAuction a = _wireAuction();
 
+        uint256 onePastTheLine = _debtAtThreshold() + 1;
         vm.prank(alice);
-        credit.borrow(DEBT_AT_THRESHOLD + 1);
+        credit.borrow(onePastTheLine);
         oracle.setNav(BOUNDARY_NAV);
 
-        assertEq(credit.currentLtvBps(alice), Config.LIQUIDATION_THRESHOLD_BPS, "the view floors to the threshold");
+        assertEq(credit.currentLtvBps(alice), liquidationThresholdBps(), "the view floors to the threshold");
         assertEq(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE, "and reports exactly healthy");
 
         credit.liquidate(alice);
@@ -1481,8 +1984,9 @@ contract CreditManagerTest is Test {
     ///      cured must survive. Settling first is what makes the gate honest.
     function test_liquidate_settlesBeforeGating() public {
         _wireAuction();
+        uint256 onePastTheLine = _debtAtThreshold() + 1;
         vm.prank(alice);
-        credit.borrow(DEBT_AT_THRESHOLD + 1);
+        credit.borrow(onePastTheLine);
         oracle.setNav(BOUNDARY_NAV);
 
         // An epoch's yield lands and streams; enough of it clears the position.
@@ -1501,8 +2005,9 @@ contract CreditManagerTest is Test {
     /// @notice PRD §4.6: staleness pauses borrowing, never liquidation.
     function test_liquidate_worksOnStaleNavAndWhilePaused() public {
         MockLiquidationAuction a = _wireAuction();
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         oracle.setNav(BOUNDARY_NAV);
         oracle.setStale(true);
         vm.prank(admin);
@@ -1519,8 +2024,9 @@ contract CreditManagerTest is Test {
     }
 
     function test_liquidate_revertsWhenAuctionUnset() public {
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         oracle.setNav(BOUNDARY_NAV);
 
         vm.expectRevert(CreditManager.LiquidationAuctionUnset.selector);
@@ -1577,8 +2083,9 @@ contract CreditManagerTest is Test {
 
     function test_writeDownLoss_drawsInsuranceFirstAndKeepsPrincipalHonest() public {
         address a = _asAuction();
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         usdc.mint(address(this), 500e6);
         usdc.approve(address(credit), 500e6);
         credit.fundInsurance(500e6);
@@ -1587,8 +2094,8 @@ contract CreditManagerTest is Test {
         vm.prank(a);
         credit.writeDownLoss(alice, 200e6);
 
-        assertEq(credit.debtOf(alice), MAX_BORROW - 200e6);
-        assertEq(credit.totalDebt(), MAX_BORROW - 200e6);
+        assertEq(credit.debtOf(alice), loan - 200e6);
+        assertEq(credit.totalDebt(), loan - 200e6);
         assertEq(credit.insuranceFund(), 300e6, "insurance absorbed it");
         assertEq(credit.pendingPrincipal() - principalBefore, 200e6, "and the source is still owed it");
         assertEq(credit.unsocialisedLoss(), 0, "nothing had to reach lenders");
@@ -1596,11 +2103,12 @@ contract CreditManagerTest is Test {
 
     function test_writeDownLoss_clampsToOutstandingDebt() public {
         address a = _asAuction();
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW * 10);
+        credit.writeDownLoss(alice, loan * 10);
         assertEq(credit.debtOf(alice), 0);
         assertEq(credit.totalDebt(), 0);
     }
@@ -1609,17 +2117,18 @@ contract CreditManagerTest is Test {
     ///         written off in narrative but not in storage bricks Phase 4 permanently.
     function test_writeDownLoss_leavesTheLiquiditySourceSwappable() public {
         address a = _asAuction();
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
-        usdc.mint(address(this), MAX_BORROW);
-        usdc.approve(address(credit), MAX_BORROW);
-        credit.fundInsurance(MAX_BORROW);
+        credit.borrow(loan);
+        usdc.mint(address(this), loan);
+        usdc.approve(address(credit), loan);
+        credit.fundInsurance(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
+        credit.writeDownLoss(alice, loan);
         // Insurance covered it, so the source is owed the principal back and both
         // migration guards stay armed until it is actually returned.
-        assertEq(credit.pendingPrincipal(), MAX_BORROW);
+        assertEq(credit.pendingPrincipal(), loan);
         credit.settlePrincipal();
 
         TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
@@ -1656,6 +2165,20 @@ contract CreditManagerTest is Test {
         vm.stopPrank();
     }
 
+    /// @dev A pool wired as the **loss sink only**, with the treasury still funding the book. That
+    ///      is the state `DeployBase` ships, and since audit round 21 it is also the only state in
+    ///      which the sink may be moved at all: `setLenderPool` refuses to leave a funder that is
+    ///      itself a lender pool, so the three outgoing clauses this file tests are reachable
+    ///      through this configuration and no longer through the converged one. Written as its own
+    ///      helper rather than inlined, because "which door is this clause still reachable at" is
+    ///      the question a reader of those tests now has to answer first.
+    function _poolIsTheSinkWhileTheTreasuryFunds() internal returns (MockLenderPool pool) {
+        pool = new MockLenderPool(usdc);
+        usdc.mint(address(pool), FLOAT);
+        vm.prank(admin);
+        credit.setLenderPool(address(pool));
+    }
+
     /// @notice **Audit round 11's executed PoC, as a regression test.** A loss banked while the
     ///         treasury funded the book must never become chargeable to pool depositors.
     /// @dev The original turned 5,000e6 into 6,250e6 with an exactly matching loss to an honest
@@ -1676,11 +2199,12 @@ contract CreditManagerTest is Test {
         address a = _asAuction();
 
         // Treasury era: the float funds the book, and no pool is wired as the sink yet.
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
+        credit.writeDownLoss(alice, loan);
 
         assertEq(credit.unsocialisedLoss(), 0, "a treasury-funded default must leave nothing to place");
 
@@ -1703,16 +2227,30 @@ contract CreditManagerTest is Test {
         address a = _asAuction();
         MockLenderPool pool = _poolFundsTheBook();
 
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         pool.setAccepting(false); // the default, stated so the test does not rest on it
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
+        credit.writeDownLoss(alice, loan);
         assertGt(credit.unsocialisedLoss(), 0, "the fixture must leave a genuine pool-funded backlog");
 
-        // `expectRevert` before `prank`: the cheatcode call consumes a pending prank, so the other
-        // order sends the call from this contract and fails on ownership instead of on the guard.
+        // `expectRevert` before `prank`, because the expected-error arguments contain a read.
+        // A pending single-shot prank is spent on the next call this contract makes, and
+        // `credit.unsocialisedLoss()` below is one - so under the other order the prank goes to
+        // the read and the guarded call arrives from this contract, failing on ownership
+        // instead of on the guard.
+        //
+        // **Both mechanisms are real, and the original comment was right.** This note briefly
+        // said the staticcall in the arguments was the whole explanation and the cheatcode was
+        // not. That was a re-diagnosis made without running anything, and running it refutes it:
+        // `test_borrow_oneUnitBeyondMaxLtvReverts` fails with the guarded call arriving from this
+        // contract even when every read is already hoisted into a local, and passes on nothing but
+        // swapping `expectRevert` ahead of `prank`. So `vm.expectRevert` does consume a pending
+        // prank, exactly as this file always said - and the staticcall is a *second*, newer way to
+        // lose it that arrived with the risk parameters moving into storage. The ordering below
+        // survives both, which is why it is the ordering to copy.
         vm.expectRevert(
             abi.encodeWithSelector(CreditManager.LossOutstanding.selector, credit.unsocialisedLoss())
         );
@@ -1733,26 +2271,57 @@ contract CreditManagerTest is Test {
     ///      Reuses `LossOutstanding` rather than inventing an error, because it is the identical
     ///      clause `setLiquiditySource` already carries and an operator reading the revert should
     ///      recognise it as the same problem with the same fix: call the flush first.
+    ///
+    ///      **Audit round 21 SUBSUMED this clause on this door, and the test says so rather than
+    ///      being quietly repointed.** The counter can only fill against a pool that is also the
+    ///      funder, and the sink may no longer be moved off a pool funder at all - so the refusal
+    ///      an operator now meets here is `LossSinkMustBeTheFunder`, one line earlier and for a
+    ///      broader reason. The round-11 property has not gone anywhere: it is asserted below at
+    ///      `setLiquiditySource`, under the original error, which is the door the migration
+    ///      actually goes through now. Both halves are in this one test on purpose, because
+    ///      splitting them would leave a reader thinking the clause was deleted.
     function test_setLenderPool_refusedWhileTheOutgoingPoolsBacklogIsUnplaced() public {
         address a = _asAuction();
         MockLenderPool pool = _poolFundsTheBook();
 
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         pool.setAccepting(false); // the default, stated so the test does not rest on it
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
+        credit.writeDownLoss(alice, loan);
         assertGt(credit.unsocialisedLoss(), 0, "the fixture must leave a genuine pool-funded backlog");
 
         MockLenderPool incoming = new MockLenderPool(usdc);
-        // `expectRevert` before `prank`: the cheatcode call consumes a pending prank, so the other
-        // order sends the call from this contract and fails on ownership instead of on the guard.
+        // `expectRevert` before `prank`, because the expected-error arguments contain a read.
+        // A pending single-shot prank is spent on the next call this contract makes, and
+        // `credit.unsocialisedLoss()` below is one - so under the other order the prank goes to
+        // the read and the guarded call arrives from this contract, failing on ownership
+        // instead of on the guard.
+        //
+        // **Both mechanisms are real, and the original comment was right.** This note briefly
+        // said the staticcall in the arguments was the whole explanation and the cheatcode was
+        // not. That was a re-diagnosis made without running anything, and running it refutes it:
+        // `test_borrow_oneUnitBeyondMaxLtvReverts` fails with the guarded call arriving from this
+        // contract even when every read is already hoisted into a local, and passes on nothing but
+        // swapping `expectRevert` ahead of `prank`. So `vm.expectRevert` does consume a pending
+        // prank, exactly as this file always said - and the staticcall is a *second*, newer way to
+        // lose it that arrived with the risk parameters moving into storage. The ordering below
+        // survives both, which is why it is the ordering to copy.
+        uint256 backlog = credit.unsocialisedLoss();
         vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.LossOutstanding.selector, credit.unsocialisedLoss())
+            abi.encodeWithSelector(
+                CreditManager.LossSinkMustBeTheFunder.selector, address(pool), address(incoming)
+            )
         );
         vm.prank(admin);
         credit.setLenderPool(address(incoming));
+
+        // And the clause this test was written for, at the door the migration now uses.
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.LossOutstanding.selector, backlog));
+        vm.prank(admin);
+        credit.setLiquiditySource(address(incoming));
     }
 
     /// @notice The guard's second clause: the outgoing pool must not still have money out on loan.
@@ -1767,19 +2336,25 @@ contract CreditManagerTest is Test {
     ///      Asserted with `unsocialisedLoss` explicitly at zero, because a test that let both
     ///      clauses be armed at once would pass on whichever fired first and prove nothing about
     ///      this one.
+    ///
+    ///      **Driven with the treasury as the funder since audit round 21, and that is not a
+    ///      fixture convenience.** The sink may no longer be moved off a pool funder at all, so on
+    ///      the converged wiring `LossSinkMustBeTheFunder` fires one line earlier and this clause
+    ///      is never reached. It still binds, and this is the configuration it binds in - the one
+    ///      `DeployBase` ships. The principal is armed on the mock directly rather than through a
+    ///      borrow, because a treasury-funded borrow puts the principal on the treasury.
     function test_setLenderPool_refusedWhileTheOutgoingPoolStillHasPrincipalOut() public {
-        MockLenderPool pool = _poolFundsTheBook();
+        MockLenderPool pool = _poolIsTheSinkWhileTheTreasuryFunds();
 
-        vm.prank(alice);
-        credit.borrow(MAX_BORROW);
-        assertEq(pool.outstandingPrincipal(), MAX_BORROW, "the outgoing pool really did fund it");
+        uint256 loan = _maxBorrow();
+        pool.lend(loan);
+        assertEq(pool.outstandingPrincipal(), loan, "the outgoing pool really is carrying principal");
         assertEq(credit.unsocialisedLoss(), 0, "the other clause must not be what bites here");
+        assertTrue(credit.liquiditySource() != address(pool), "and the round-21 clause must not either");
 
         MockLenderPool incoming = new MockLenderPool(usdc);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.PoolPrincipalOutstanding.selector, address(pool), MAX_BORROW
-            )
+            abi.encodeWithSelector(CreditManager.PoolPrincipalOutstanding.selector, address(pool), loan)
         );
         vm.prank(admin);
         credit.setLenderPool(address(incoming));
@@ -1803,14 +2378,15 @@ contract CreditManagerTest is Test {
         address a = _asAuction();
         MockLenderPool outgoing = _poolFundsTheBook();
 
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         // A default the pool will not take yet: both clauses of the guard are now armed.
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "remembered, not swallowed");
-        assertEq(outgoing.outstandingPrincipal(), MAX_BORROW, "and still recorded as lent");
+        credit.writeDownLoss(alice, loan);
+        assertEq(credit.unsocialisedLoss(), loan, "remembered, not swallowed");
+        assertEq(outgoing.outstandingPrincipal(), loan, "and still recorded as lent");
 
         // The drain the guard points an operator at, and the only one there is.
         outgoing.setAccepting(true);
@@ -1833,13 +2409,13 @@ contract CreditManagerTest is Test {
         // fresh loan and absorbs the default on it.
         incoming.setAccepting(true);
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
-        assertEq(incoming.outstandingPrincipal(), MAX_BORROW, "the incoming pool funds the book");
+        credit.borrow(loan);
+        assertEq(incoming.outstandingPrincipal(), loan, "the incoming pool funds the book");
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
-        assertEq(incoming.socialisedTotal(), MAX_BORROW, "and takes the loss on what it funded");
-        assertEq(outgoing.socialisedTotal(), MAX_BORROW, "while the outgoing one keeps only its own");
+        credit.writeDownLoss(alice, loan);
+        assertEq(incoming.socialisedTotal(), loan, "and takes the loss on what it funded");
+        assertEq(outgoing.socialisedTotal(), loan, "while the outgoing one keeps only its own");
     }
 
     /// @notice The three socialisation states, composed. A refusing pool is not an edge
@@ -1855,25 +2431,26 @@ contract CreditManagerTest is Test {
         address a = _asAuction();
         MockLenderPool pool = _poolFundsTheBook();
 
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         // Insurance is empty, so the whole loss has to reach lenders - and cannot.
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "remembered, not swallowed");
+        credit.writeDownLoss(alice, loan);
+        assertEq(credit.unsocialisedLoss(), loan, "remembered, not swallowed");
         assertEq(credit.debtOf(alice), 0, "and the liquidation still completed");
 
         // An explicit flush still fails loudly, and leaves the counter intact.
-        vm.expectRevert(abi.encodeWithSelector(CreditManager.SocialisationRejected.selector, MAX_BORROW));
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.SocialisationRejected.selector, loan));
         credit.flushSocialisedLoss();
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "a failed flush must not lose the loss");
+        assertEq(credit.unsocialisedLoss(), loan, "a failed flush must not lose the loss");
 
         // Phase 4 arrives: the same counter drains with no redeploy.
         pool.setAccepting(true);
         credit.flushSocialisedLoss();
         assertEq(credit.unsocialisedLoss(), 0);
-        assertEq(pool.socialisedTotal(), MAX_BORROW);
+        assertEq(pool.socialisedTotal(), loan);
     }
 
     /// @dev Round 10, finding 1 - the one the whole round turned on, and the reason this mock now
@@ -1904,20 +2481,17 @@ contract CreditManagerTest is Test {
         MockLenderPool pool = _poolFundsTheBook();
         pool.setAccepting(true);
         // Accepts the call, absorbs a quarter of it, and says so.
-        pool.setAbsorbCap(MAX_BORROW / 4);
+        uint256 loan = _maxBorrow();
+        pool.setAbsorbCap(loan / 4);
 
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
+        credit.writeDownLoss(alice, loan);
 
-        assertEq(pool.socialisedTotal(), MAX_BORROW / 4, "the pool took what it could");
-        assertEq(
-            credit.unsocialisedLoss(),
-            MAX_BORROW - MAX_BORROW / 4,
-            "the rest must be remembered, not erased"
-        );
+        assertEq(pool.socialisedTotal(), loan / 4, "the pool took what it could");
+        assertEq(credit.unsocialisedLoss(), loan - loan / 4, "the rest must be remembered, not erased");
         assertEq(credit.debtOf(alice), 0, "and the liquidation still completed");
     }
 
@@ -1932,18 +2506,19 @@ contract CreditManagerTest is Test {
         address a = _asAuction();
         MockLenderPool pool = _poolFundsTheBook();
 
+        uint256 loan = _maxBorrow();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(loan);
         vm.prank(a);
-        credit.writeDownLoss(alice, MAX_BORROW);
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW);
+        credit.writeDownLoss(alice, loan);
+        assertEq(credit.unsocialisedLoss(), loan);
 
         pool.setAccepting(true);
-        pool.setAbsorbCap(MAX_BORROW / 2);
+        pool.setAbsorbCap(loan / 2);
         credit.flushSocialisedLoss();
 
-        assertEq(pool.socialisedTotal(), MAX_BORROW / 2);
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW - MAX_BORROW / 2, "the flush ate the remainder");
+        assertEq(pool.socialisedTotal(), loan / 2);
+        assertEq(credit.unsocialisedLoss(), loan - loan / 2, "the flush ate the remainder");
     }
 
     function test_flushSocialisedLoss_revertsWithNothingToDo() public {
@@ -2008,12 +2583,17 @@ contract CreditManagerTest is Test {
     ///
     ///      The other two clauses are asserted at zero, so this cannot pass on whichever fires
     ///      first - the same discipline the two tests above already use.
+    ///
+    ///      **Treasury-funded since audit round 21**, for the reason given on the principal clause
+    ///      above: on the converged wiring the sink cannot be moved at all, so this clause is only
+    ///      reachable from the configuration `DeployBase` ships.
     function test_setLenderPool_refusedWhileTheOutgoingPoolStillCarriesAMark() public {
-        MockLenderPool pool = _poolFundsTheBook();
+        MockLenderPool pool = _poolIsTheSinkWhileTheTreasuryFunds();
         pool.setImpairment(alice, 1_000e6);
 
         assertEq(pool.outstandingPrincipal(), 0, "the principal clause must not be what bites here");
         assertEq(credit.unsocialisedLoss(), 0, "nor the backlog clause");
+        assertTrue(credit.liquiditySource() != address(pool), "nor the round-21 one");
         assertEq(pool.exitReserve(), 0, "and the blinded detector must read zero, which is the finding");
 
         MockLenderPool incoming = new MockLenderPool(usdc);
@@ -2038,8 +2618,13 @@ contract CreditManagerTest is Test {
     ///      **And it now calls the function its own docstring names.** Round 17 also caught this
     ///      body calling the single-borrower `refreshImpairment(alice)` while the text cited the
     ///      bounded `refreshImpairments(n)`. Both are drains, so it exercises each.
+    ///
+    ///      **Treasury-funded since audit round 21**, same reason: the escape this test proves is
+    ///      an escape from the mark clause, and the mark clause is now only reachable from the
+    ///      sink-only configuration. The escape out of the converged configuration is a different
+    ///      one and lives in `test_setLenderPool_theWholePoolMigrationIsStillReachable`.
     function test_setLenderPool_theMarkIsClearableWithoutMovingThePointer() public {
-        MockLenderPool pool = _poolFundsTheBook();
+        MockLenderPool pool = _poolIsTheSinkWhileTheTreasuryFunds();
         pool.setImpairment(alice, 1_000e6);
         pool.setImpairment(bob, 500e6);
 
@@ -2226,8 +2811,9 @@ contract CreditManagerTest is Test {
         MockLenderPool pool = _poolFundsTheBook();
         _wireAuction();
 
+        uint256 onePastTheLine = _debtAtThreshold() + 1;
         vm.prank(alice);
-        credit.borrow(DEBT_AT_THRESHOLD + 1);
+        credit.borrow(onePastTheLine);
         oracle.setNav(BOUNDARY_NAV);
 
         // Opening the liquidation writes the mark, and that write is a real one.
@@ -2308,9 +2894,20 @@ contract CreditManagerTest is Test {
 ///      pointer - so it cleared every check the setter made and bricked repayment anyway.
 contract TwoThirdsOfAnAuction {
     address public immutable vault;
+    /// @dev **Audit round 20 added a fourth incoming check ahead of the three probes**, so a stub
+    ///      that disagreed about the risk authority would be refused before the probe under test
+    ///      could fire - and this file would then be asserting round 20's guard three times over
+    ///      while round 17's went untested. Taken from the vault so it is right by construction.
+    address public immutable riskParams;
+    /// @dev **Audit round 21 added a fifth incoming check**, the sibling of the risk one above.
+    ///      Agreed on purpose, for exactly the same reason: the probe under test has to be the one
+    ///      that fires. Taken from the vault so it is right by construction.
+    address public immutable navOracle;
 
     constructor(address vault_) {
         vault = vault_;
+        riskParams = address(ICollateralVault(vault_).riskParams());
+        navOracle = address(ICollateralVault(vault_).navOracle());
     }
 
     function recognisedRecoveryOf(address) external pure returns (uint256) {
@@ -2329,9 +2926,18 @@ contract TwoThirdsOfAnAuction {
 /// @notice Answers the first and third probes and not the middle one.
 contract NoAuctionOf {
     address public immutable vault;
+    /// @dev See `TwoThirdsOfAnAuction`: agreed on purpose, so the probe under test is the one that
+    ///      fires rather than round 20's risk check.
+    address public immutable riskParams;
+    /// @dev **Audit round 21 added a fifth incoming check**, the sibling of the risk one above.
+    ///      Agreed on purpose, for exactly the same reason: the probe under test has to be the one
+    ///      that fires. Taken from the vault so it is right by construction.
+    address public immutable navOracle;
 
     constructor(address vault_) {
         vault = vault_;
+        riskParams = address(ICollateralVault(vault_).riskParams());
+        navOracle = address(ICollateralVault(vault_).navOracle());
     }
 
     function workoutsOpenFor(address) external pure returns (uint256) {
@@ -2360,8 +2966,17 @@ contract UncountablePool {
 ///      *partial* implementation passing a *partial* check.
 contract HalfAnAuction {
     address public immutable vault;
+    /// @dev See `TwoThirdsOfAnAuction`: agreed on purpose, so the probe under test is the one that
+    ///      fires rather than round 20's risk check.
+    address public immutable riskParams;
+    /// @dev **Audit round 21 added a fifth incoming check**, the sibling of the risk one above.
+    ///      Agreed on purpose, for exactly the same reason: the probe under test has to be the one
+    ///      that fires. Taken from the vault so it is right by construction.
+    address public immutable navOracle;
 
     constructor(address vault_) {
         vault = vault_;
+        riskParams = address(ICollateralVault(vault_).riskParams());
+        navOracle = address(ICollateralVault(vault_).navOracle());
     }
 }

@@ -34,6 +34,28 @@ contract MockLiquidationAuction {
         vault = vault_;
     }
 
+    /// @notice The risk configuration this auction claims to read.
+    /// @dev **Audit round 20**, and settable for exactly the reason `vault` is. `CollateralVault
+    ///      .setLiquidationAuction` and `CreditManager.setLiquidationAuction` both refuse an
+    ///      auction answering a different authority to the vault's, so a fixture points this at the
+    ///      vault's own `RiskParams` - and a fixture proving the guard bites points it elsewhere.
+    address public riskParams;
+
+    function setRiskParams(address riskParams_) external {
+        riskParams = riskParams_;
+    }
+
+    /// @notice The NAV feed this auction claims to price from.
+    /// @dev **Audit round 21**, and settable for exactly the reason `riskParams` is.
+    ///      `CollateralVault.setLiquidationAuction` and `CreditManager.setLiquidationAuction` both
+    ///      refuse an auction pricing off a different feed to the vault's, so a fixture points this
+    ///      at the vault's own oracle - and a fixture proving the guard bites points it elsewhere.
+    address public navOracle;
+
+    function setNavOracle(address navOracle_) external {
+        navOracle = navOracle_;
+    }
+
     function setCreditManager(address creditManager_) external {
         creditManager = creditManager_;
     }

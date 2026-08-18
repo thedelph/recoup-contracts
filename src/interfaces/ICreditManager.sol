@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {ICollateralVault} from "./ICollateralVault.sol";
+import {INAVOracle} from "./INAVOracle.sol";
+import {IRiskParams} from "./IRiskParams.sol";
 
 /// @title ICreditManager
 /// @notice Debt accounting: borrow, optional manual repay, yield-driven write-down,
@@ -37,10 +39,11 @@ interface ICreditManager {
     ///         any loss reaches lenders. Permissionless; pulls against an allowance.
     function fundInsurance(uint256 amount) external;
 
-    /// @notice Top a position's prepaid liquidation bounty back up to the full charge, so
-    ///         somebody is paid for liquidating it. Permissionless; pulls against an
-    ///         allowance. Exists because arming a position through `borrow` is not always
-    ///         reachable - see the implementation.
+    /// @notice Top your own position's prepaid liquidation bounty back up to the full charge,
+    ///         so somebody is paid for liquidating it. Pulls against an allowance. Exists
+    ///         because arming a position through `borrow` is not always reachable - see the
+    ///         implementation. **`msg.sender` must be `borrower`**, and the position must
+    ///         carry debt.
     function fundBounty(address borrower, uint256 amount) external;
 
     /// @notice Spread an epoch's borrower share across every bond, in one write.
@@ -68,6 +71,11 @@ interface ICreditManager {
     /// @notice Claim yield accrued beyond debt (and post-liquidation surplus).
     function claimSurplus() external;
 
+    /// @notice Collect a named account's surplus, paid to that account. Permissionless, and
+    ///         the destination is not chooseable. Exists because `claimSurplus` strands any
+    ///         claimant that is a contract behind a moving pointer - see the implementation.
+    function claimSurplusFor(address account) external;
+
     /// @notice Start a Dutch auction for an unhealthy position. Callable by anyone
     ///         once the position is past the liquidation threshold; the caller earns a
     ///         share of the penalty if the lot sells for more than the debt.
@@ -79,7 +87,15 @@ interface ICreditManager {
 
     /// @notice Recognise unrecoverable debt: insurance first, then socialised to
     ///         lenders. LiquidationAuction only.
-    function writeDownLoss(address borrower, uint256 amount) external;
+    /// @return socialised The part the insurance fund did **not** make the liquidity source whole
+    ///         for, and therefore the exact amount a later recovery may still repay without paying
+    ///         the same tranche twice. `LiquidationAuction.closeWorkout` keeps it.
+    function writeDownLoss(address borrower, uint256 amount) external returns (uint256 socialised);
+
+    /// @notice Book USDC recovered after its loss was written down, back to whichever balance
+    ///         sheet bore it - the pool that absorbed it, or the source that was never repaid.
+    ///         LiquidationAuction only.
+    function recoverWrittenDownLoss(address borrower, uint256 amount) external;
 
     /// @return Sum of the bounties currently parked against live auctions.
     /// @dev Also the marker `LiquidationAuction.setCreditManager` checks a candidate manager
@@ -133,6 +149,25 @@ interface ICreditManager {
     ///         this, and the vault settles before every bond-count change, so a
     ///         mismatched pointer reverts every deposit, withdrawal and seizure.
     function vault() external view returns (ICollateralVault);
+
+    /// @notice The risk configuration this manager reads.
+    /// @dev **Audit round 20.** Exposed for the same reason `vault()` is: so a setter installing
+    ///      this manager can refuse one that answers a different authority to the vault's. Before
+    ///      this reached the interface no setter could have expressed the check - the member was on
+    ///      all three implementations and on none of their interfaces.
+    function riskParams() external view returns (IRiskParams);
+
+    /// @notice The NAV feed this manager reads.
+    /// @dev **Audit round 21.** Exposed for the same reason `riskParams()` is: so a setter
+    ///      installing this manager can refuse one that prices off a different feed to the vault's.
+    ///      Before this reached the interface no setter could have expressed the check - the member
+    ///      was on all three implementations and on none of their interfaces.
+    ///
+    ///      This manager reads its own feed for exactly one thing, `borrow`'s `isStale()` gate, and
+    ///      that is what makes the divergence silent: vault stale and manager fresh keeps lending
+    ///      against a price `NAV_STALENESS` has already disowned, and manager stale with the vault
+    ///      fresh freezes borrowing on a book nothing is wrong with. Both measured.
+    function navOracle() external view returns (INAVOracle);
 
     /// @return ltvBps debt / collateralValue in bps. Zero when there is no debt,
     ///         whatever the collateral; type(uint256).max when there is debt against

@@ -17,10 +17,13 @@ import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 import {Config} from "../src/Config.sol";
 import {MockBond} from "./mocks/MockBond.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice Proves the six skeletons deploy and wire together, and that the few
 ///         implemented views behave. Business-logic tests arrive with each phase.
-contract SkeletonsTest is Test {
+contract SkeletonsTest is RiskParamsFixture {
     address internal admin = makeAddr("admin");
 
     MockUSDC internal usdc;
@@ -31,17 +34,40 @@ contract SkeletonsTest is Test {
     LenderPool internal pool;
     EpochHarvester internal harvester;
     LiquidationAuction internal auction;
+    RiskParams internal riskParams;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
         bond = new MockBond();
         oracle = new NAVOracle(admin);
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        credit = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         pool = new LenderPool(usdc, admin);
         harvester = new EpochHarvester(usdc, ICreditManager(address(credit)), admin);
-        auction =
-            new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        auction = new LiquidationAuction(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
 
         vm.startPrank(admin);
         vault.setCreditManager(address(credit));
@@ -101,6 +127,23 @@ contract SkeletonsTest is Test {
         // `queuePosition` still reverts.
         vm.expectRevert(LenderPool.NotImplemented.selector);
         pool.queuePosition(address(this));
+
+        // `recoverLoss` is the newest of those stubs. It is declared so the published skeleton
+        // carries the whole of the interface's function set, and it reverts for the same reason
+        // the rest do. Listed here so that a member added to `ILenderPool` and left without a
+        // body on this side shows up as a deliberate entry rather than as a silently missing one.
+        vm.expectRevert(LenderPool.NotImplemented.selector);
+        pool.recoverLoss(1);
+
+        // Deliberately *not* in this list: `exitReserve()`, `totalImpairment()` and
+        // `impairedBorrowerCount()`. `CreditManager` probes all three when wiring - two of the
+        // probes refuse a pool that cannot answer, and the third would read a reverting address as
+        // "not a pool" about the pool itself - so the skeleton answers them rather than reverting.
+        // Zero is the truth for a dormant pool with nothing lent, no marks against it and no
+        // leavers to hold anything back from, not a placeholder standing in for missing work.
+        assertEq(pool.exitReserve(), 0, "a dormant pool holds nothing back for leavers");
+        assertEq(pool.totalImpairment(), 0);
+        assertEq(pool.impairedBorrowerCount(), 0);
     }
 
     function test_borrowRefusesUntilLiquiditySourceIsWired() public {
@@ -142,6 +185,12 @@ contract SkeletonsTest is Test {
     ///      So this pins the topic against a **string literal**, not against the declaration. The
     ///      literal is the published ABI: changing the event's shape has to break this test on
     ///      purpose, which is the moment to think about who is already matching on the old topic.
+    ///
+    ///      **One line per event the interface declares, and being exhaustive is the property.** An
+    ///      event added to `ILenderPool` without a line here leaves this test green while it stops
+    ///      covering the ABI, which is the same silence the drift lived in. `LossRecovered` is the
+    ///      entry audit round 21 added, and it is here because the round that added the event is
+    ///      the only round that will remember to.
     function test_lenderPoolEventTopicsMatchThePublishedAbi() public pure {
         assertEq(
             ILenderPool.YieldDistributed.selector,
@@ -156,6 +205,11 @@ contract SkeletonsTest is Test {
         assertEq(ILenderPool.ImpairmentReleased.selector, keccak256("ImpairmentReleased(address,uint256,uint256)"));
         assertEq(ILenderPool.LossReservesSet.selector, keccak256("LossReservesSet(uint256,uint256,uint256)"));
         assertEq(ILenderPool.LossSocialised.selector, keccak256("LossSocialised(uint256)"));
+        assertEq(
+            ILenderPool.LossRecovered.selector,
+            keccak256("LossRecovered(uint256,uint256)"),
+            "two parameters: amount, lifetimeRecovered - not the arity of its counterpart LossSocialised"
+        );
         assertEq(ILenderPool.WithdrawalQueued.selector, keccak256("WithdrawalQueued(address,uint256,uint256)"));
         assertEq(
             ILenderPool.QueuedWithdrawalServiced.selector,

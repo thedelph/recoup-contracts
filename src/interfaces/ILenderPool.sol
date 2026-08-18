@@ -53,6 +53,14 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      insurance netting and the exposure clamp both sit between them and the answer.
     event LossReservesSet(uint256 unplacedLoss, uint256 insuranceCover, uint256 exitReserve);
     event LossSocialised(uint256 amount);
+    /// @notice Money recovered on a loss this pool has already absorbed, routed into the yield
+    ///         stream rather than landing in the share price in its own block.
+    /// @dev The exact counterpart of `LossSocialised`, and separate from `PrincipalSurplusStreamed`
+    ///      on purpose: a surplus repayment reverses a write-down through the principal leg and
+    ///      moves `outstandingPrincipal`, while this arrives on a loan that has already been
+    ///      written off entirely and moves nothing but the pot. An indexer that could not tell them
+    ///      apart would report a live loan where there is none.
+    event LossRecovered(uint256 amount, uint256 lifetimeRecovered);
     event WithdrawalQueued(address indexed lender, uint256 indexed queueIndex, uint256 assets);
     event QueuedWithdrawalServiced(address indexed lender, uint256 indexed queueIndex, uint256 assets);
     /// @notice A queued request was withdrawn by its owner, who took the escrowed shares back.
@@ -141,6 +149,15 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      placed and the remainder existed on no ledger at all. Any implementation must report
     ///      what it took, and every caller must retain the difference.
     function socialiseLoss(uint256 amount) external returns (uint256 absorbed);
+
+    /// @notice Book money recovered on a loss this pool already took, as yield. CreditManager only.
+    /// @dev **Audit round 21, finding 14.** `socialiseLoss` is not reversible through
+    ///      `repayPrincipal`: that leg nets against `outstandingPrincipal`, which the socialisation
+    ///      has already written down, so a recovery arriving that way is recognised only when the
+    ///      surviving book unwinds. It arrives here instead, where it is what it actually is - a
+    ///      gain on an asset the pool has already written off - and is streamed for the same
+    ///      reason every other inbound gain is.
+    function recoverLoss(uint256 amount) external;
 
     /// @return index position in the FIFO queue (0 = next), remaining assets still owed
     function queuePosition(address lender) external view returns (uint256 index, uint256 remaining);

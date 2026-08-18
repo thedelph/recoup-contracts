@@ -20,6 +20,9 @@ import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockLenderPool} from "./mocks/MockLenderPool.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice Dutch auction lifecycle against the real-ABI mocks (PRD §4.5, §6.3).
 ///
@@ -27,51 +30,73 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///         collateral. Positions are put underwater by crashing NAV rather than by
 ///         writing debt directly, which is the only way it can actually happen on chain.
 ///
-///         `MAX_BORROW` is derived from `Config` rather than written down. It used to be
-///         the literal 880.25e6, which was 35% of $2,515 - correct until the capped-beta
+///         `_maxBorrowAtCeiling()` is derived from the live risk parameters rather than written
+///         down. It used to be the literal 880.25e6, which was 35% of $2,515 - correct until the capped-beta
 ///         parameters landed on 2026-08-07, at which point 53 of the 61 tests in this
 ///         file failed at the fixture rather than in the code under test. The ratchet
-///         agreed with DexFi moves `MAX_LTV_BPS` at least twice more, so the same break
+///         agreed with DexFi moves the LTV ceiling at least twice more, so the same break
 ///         is scheduled to happen again unless the fixture reads the parameter.
-contract LiquidationAuctionTest is Test {
+///
+///         It reads it through `RiskParamsFixture`, and it is a **function** rather than a
+///         constant because the four negotiated parameters now live in `RiskParams` storage and a
+///         Solidity `constant` cannot read a storage slot. Nothing here is cached in a variable set
+///         in `setUp` either: a test that moves a parameter partway through has to see the new
+///         derived figure, and a cache would keep passing against the stale one.
+contract LiquidationAuctionTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
     uint256 internal constant FLOAT = 100_000e6;
 
+    // ── the derived scenario figures ─────────────────────────────────────────
+    //
+    // Six `internal constant`s until the risk parameters became storage. Same derivations, same
+    // relationships between them; see the contract docstring for why they are `view` functions.
+
     /// @dev Borrowing power at the ceiling: BONDS x NAV x maxLTV, in USDC 6dp.
-    uint256 internal constant MAX_BORROW =
-        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+    function _maxBorrowAtCeiling() internal view returns (uint256) {
+        return _maxBorrow(BONDS, NAV);
+    }
 
     /// @dev The NAV at which a position borrowed to the ceiling sits exactly on the
     ///      liquidation threshold. Everything below is liquidatable, everything above is
     ///      not, so the two scenario NAVs are chosen either side of it by construction.
-    uint256 internal constant NAV_AT_THRESHOLD =
-        (MAX_BORROW * Config.BPS * Config.USDC_TO_NAV_SCALE) / (Config.LIQUIDATION_THRESHOLD_BPS * BONDS);
+    function _thresholdNav() internal view returns (uint256) {
+        return _navAtThreshold(_maxBorrowAtCeiling(), BONDS);
+    }
 
     /// @dev The NAV at which the whole lot is worth exactly the debt, so a fill at 100%
     ///      of NAV covers the loan and not a cent more.
-    uint256 internal constant NAV_AT_DEBT_PARITY = (MAX_BORROW * Config.USDC_TO_NAV_SCALE) / BONDS;
+    function _debtParityNav() internal view returns (uint256) {
+        return _navAtDebtParity(_maxBorrowAtCeiling(), BONDS);
+    }
 
     /// @dev Liquidatable but still solvent: past the threshold, yet worth more than the
     ///      debt, so a mid-auction fill leaves the borrower a surplus. Sits midway
     ///      between the two bounds above so it can never drift to the wrong side of
     ///      either when the parameters move.
-    uint256 internal constant SOFT_NAV = (NAV_AT_THRESHOLD + NAV_AT_DEBT_PARITY) / 2;
+    function _softNav() internal view returns (uint256) {
+        return (_thresholdNav() + _debtParityNav()) / 2;
+    }
 
     /// @dev The other side: even a fill at 100% of NAV cannot cover the loan, so the
     ///      insurance fund and then the lenders take the difference. Half of debt parity
     ///      is comfortably clear of the boundary rather than a cent under it.
-    uint256 internal constant CRASHED_NAV = NAV_AT_DEBT_PARITY / 2;
+    function _crashedNav() internal view returns (uint256) {
+        return _debtParityNav() / 2;
+    }
 
     /// @dev The NAV at which the auction's *floor* price lands half a penalty above the
     ///      debt, i.e. inside the band where a fill leaves some surplus but less than a
     ///      full penalty. Solved from the floor rather than picked, because it depends on
     ///      three parameters at once - the LTV ceiling, the auction floor and the penalty
     ///      - and a hand-picked NAV silently leaves the band when any of them moves.
-    uint256 internal constant NAV_FOR_PARTIAL_PENALTY = (
-        (MAX_BORROW + (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / (2 * Config.BPS))
-            * Config.BPS * Config.USDC_TO_NAV_SCALE
-    ) / (BONDS * Config.AUCTION_FLOOR_BPS);
+    function _navForPartialPenalty() internal view returns (uint256) {
+        uint256 debt = _maxBorrowAtCeiling();
+        return (
+            (debt + (debt * Config.LIQUIDATION_PENALTY_BPS) / (2 * Config.BPS)) * Config.BPS
+                * Config.USDC_TO_NAV_SCALE
+        ) / (BONDS * Config.AUCTION_FLOOR_BPS);
+    }
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");
@@ -89,6 +114,15 @@ contract LiquidationAuctionTest is Test {
     CreditManager internal credit;
     LiquidationAuction internal auction;
     TreasuryLiquiditySource internal liquidity;
+    RiskParams internal riskParams;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -97,12 +131,19 @@ contract LiquidationAuctionTest is Test {
         bond.setRewardPool(address(farm));
         oracle = new MockNavOracle(NAV);
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
-        auction = new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        credit = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        auction = new LiquidationAuction(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         liquidity = new TreasuryLiquiditySource(usdc, admin);
 
         vm.startPrank(admin);
@@ -133,20 +174,25 @@ contract LiquidationAuctionTest is Test {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// @dev Borrow at the ceiling, then crash NAV until the position is genuinely past
-    ///      the liquidation threshold. `CRASHED_NAV` is half of debt parity, so the lot
+    ///      the liquidation threshold. `_crashedNav()` is half of debt parity, so the lot
     ///      is worth half the loan and the LTV is well over 10,000 bps.
     function _openAuction() internal returns (uint256 id) {
-        return _openAuctionAt(CRASHED_NAV);
+        return _openAuctionAt(_crashedNav());
     }
 
-    /// @dev `SOFT_NAV` is the interesting case: past the liquidation threshold, but the
+    /// @dev `_softNav()` is the interesting case: past the liquidation threshold, but the
     ///      lot is still worth more than the debt, so a mid-auction fill leaves a
-    ///      surplus. `CRASHED_NAV` is the other side - even a 100%-of-NAV fill cannot
-    ///      cover the loan. Both are derived either side of `NAV_AT_DEBT_PARITY`, so
+    ///      surplus. `_crashedNav()` is the other side - even a 100%-of-NAV fill cannot
+    ///      cover the loan. Both are derived either side of `_debtParityNav()`, so
     ///      neither can end up on the wrong side of its own premise.
     function _openAuctionAt(uint256 nav) internal returns (uint256 id) {
+        // **Read before the prank, never from inside the argument list.** The derivation is an
+        // external view call now that the risk parameters are storage, and `vm.prank` applies to
+        // the *next* call including a static one - so leaving it in argument position would spend
+        // the prank on the parameter read and run `borrow` as this contract.
+        uint256 debt = _maxBorrowAtCeiling();
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(debt);
         oracle.setNav(nav);
         vm.prank(keeper);
         credit.liquidate(alice);
@@ -195,10 +241,10 @@ contract LiquidationAuctionTest is Test {
         assertEq(startedAt, uint96(block.timestamp));
         assertFalse(settled);
         assertEq(bondCount, BONDS);
-        assertEq(startNav, CRASHED_NAV);
-        assertEq(debt, MAX_BORROW);
-        assertEq(startPrice, _lotPrice(BONDS, CRASHED_NAV, Config.AUCTION_START_PREMIUM_BPS));
-        assertEq(startPrice, 314.375e6, "100 bonds at CRASHED_NAV, at 100% of NAV");
+        assertEq(startNav, _crashedNav());
+        assertEq(debt, _maxBorrowAtCeiling());
+        assertEq(startPrice, _lotPrice(BONDS, _crashedNav(), Config.AUCTION_START_PREMIUM_BPS));
+        assertEq(startPrice, 314.375e6, "100 bonds at the crashed NAV, at 100% of NAV");
         assertTrue(auction.isLiquidating(alice));
     }
 
@@ -231,9 +277,10 @@ contract LiquidationAuctionTest is Test {
     ///      without this the protocol would open auctions over empty lots and a bidder
     ///      could pay the full price for nothing.
     function test_start_refusesAnEmptyLot() public {
+        uint256 debt = _maxBorrowAtCeiling(); // read before the prank - see `_openAuctionAt`
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
-        oracle.setNav(CRASHED_NAV);
+        credit.borrow(debt);
+        oracle.setNav(_crashedNav());
 
         // Seize the lot out from under the position, leaving debt against no bonds.
         vm.prank(address(auction));
@@ -259,7 +306,7 @@ contract LiquidationAuctionTest is Test {
         uint256 expected = Config.AUCTION_START_PREMIUM_BPS
             - (Config.AUCTION_START_PREMIUM_BPS - Config.AUCTION_FLOOR_BPS) / 2;
         assertEq(auction.currentPremiumBps(id), expected);
-        assertEq(auction.currentPrice(id), _lotPrice(BONDS, CRASHED_NAV, expected));
+        assertEq(auction.currentPrice(id), _lotPrice(BONDS, _crashedNav(), expected));
     }
 
     function test_currentPrice_reachesTheFloorExactlyAtDurationAndStaysThere() public {
@@ -304,10 +351,10 @@ contract LiquidationAuctionTest is Test {
         uint256 id = _openAuction();
         uint256 priced = auction.currentPrice(id);
 
-        oracle.setNav(CRASHED_NAV * 3);
+        oracle.setNav(_crashedNav() * 3);
         assertEq(auction.currentPrice(id), priced, "a recovery must not reprice a live auction upward");
 
-        oracle.setNav(CRASHED_NAV / 4);
+        oracle.setNav(_crashedNav() / 4);
         assertEq(auction.currentPrice(id), priced, "and a further crash must not reprice it downward");
     }
 
@@ -324,7 +371,7 @@ contract LiquidationAuctionTest is Test {
         uint256 id = _openAuction();
         vm.prank(alice);
         vault.depositBonds(50);
-        assertEq(auction.currentPrice(id), 471.5625e6, "150 bonds at CRASHED_NAV");
+        assertEq(auction.currentPrice(id), 471.5625e6, "150 bonds at the crashed NAV");
     }
 
     function test_currentPrice_revertsForUnknownAndClosedAuctions() public {
@@ -355,10 +402,10 @@ contract LiquidationAuctionTest is Test {
         uint256 id = _openAuction();
 
         address friend = makeAddr("friend");
-        usdc.mint(friend, MAX_BORROW);
+        usdc.mint(friend, _maxBorrowAtCeiling());
         vm.startPrank(friend);
-        usdc.approve(address(credit), MAX_BORROW);
-        credit.repayFor(alice, MAX_BORROW);
+        usdc.approve(address(credit), _maxBorrowAtCeiling());
+        credit.repayFor(alice, _maxBorrowAtCeiling());
         vm.stopPrank();
 
         auction.cancel(id);
@@ -375,17 +422,31 @@ contract LiquidationAuctionTest is Test {
     ///
     ///      The damage is that `workoutsOpenFor` blocks that borrower from ever borrowing again and
     ///      `openWorkoutCount` blocks four separate wiring setters, until some third party pays gas
-    ///      to close a workout over nothing. `cancel` is the correct exit and remains available,
-    ///      which is what the second half asserts: the fix refuses the wrong door without closing
-    ///      the right one.
+    ///      to close a workout over nothing. `cancel` is the correct exit and remains available.
+    ///
+    ///      **Audit round 20 moved this test from the door to the damage, and the move is the
+    ///      point.** Round 12 refused the wrong door with `NothingToAuction`. That was correct
+    ///      about the harm and, it turned out, wrong about the remedy: refusing left the caller
+    ///      holding a lapsed auction with only one legal move left, and nothing on chain naming
+    ///      it. `expireToWorkout` now dispatches a healed position - and an empty position is a
+    ///      healed one, since `exceedsLtv` reads zero debt as healthy - into the `cancel` body
+    ///      instead. **Every consequence round 12 enumerated is still asserted below**, because
+    ///      the dispatch happens before `reassign` and before the workout is registered: no
+    ///      workout is opened, `workoutsOpenFor` stays at zero, the four setters stay free, and
+    ///      the caller earns nothing. What changed is that the wrong door is now the right one.
+    ///
+    ///      `NothingToAuction` is not dead: it still guards a *liquidatable* position with an
+    ///      empty lot, which is the hole `hasReachableExit` in the invariant suite names and
+    ///      argues is unreachable because `withdrawBonds` refuses to empty a position carrying
+    ///      debt. It is no longer reachable from *this* fixture, which is the change.
     function test_expireToWorkout_refusesAPositionWithNoCollateral() public {
         uint256 id = _openAuction();
 
         address friend = makeAddr("friend");
-        usdc.mint(friend, MAX_BORROW);
+        usdc.mint(friend, _maxBorrowAtCeiling());
         vm.startPrank(friend);
-        usdc.approve(address(credit), MAX_BORROW);
-        credit.repayFor(alice, MAX_BORROW);
+        usdc.approve(address(credit), _maxBorrowAtCeiling());
+        credit.repayFor(alice, _maxBorrowAtCeiling());
         vm.stopPrank();
 
         vm.prank(alice);
@@ -393,10 +454,97 @@ contract LiquidationAuctionTest is Test {
         assertEq(vault.bondCount(alice), 0, "the fixture must leave the position empty");
 
         skip(Config.AUCTION_DURATION + 1);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NothingToAuction.selector, alice));
+        address volunteer = makeAddr("volunteer");
+        uint256 volunteerBefore = usdc.balanceOf(volunteer);
+        vm.prank(volunteer);
         auction.expireToWorkout(id);
 
+        // The round-12 damage, restated as the damage rather than as the door.
         assertEq(auction.openWorkoutCount(), 0, "a workout was opened over nothing");
+        assertEq(auction.workoutsOpenFor(alice), 0, "and the borrower must not be blocked by one");
+
+        // And the auction really is resolved, on the one exit that is legal here.
+        assertEq(auction.auctionOf(alice), 0, "the auction must not still be registered");
+        assertEq(auction.liveAuctionCount(), 0, "nor still be counted live");
+        assertFalse(auction.isLiquidating(alice));
+
+        // Nobody was paid for it. Audit round 18: a cancel resolves nothing, so it earns nothing.
+        assertEq(usdc.balanceOf(volunteer), volunteerBefore, "a cancel must never pay its caller");
+        assertEq(auction.rewardOf(volunteer), 0, "nor accrue them a claim");
+    }
+
+    /// @notice Once the auction's clock has run out, `expireToWorkout` always resolves it - on
+    ///         either side of the liquidatable predicate, and past the re-strike deadline.
+    /// @dev **Audit round 20, and this is the property the round-19 bound was assumed to have.**
+    ///      `Config.AUCTION_RESET_WINDOW` bounds the re-strike, not the mark. Past it `start`
+    ///      refuses with `AuctionResetWindowClosed`, so `expireToWorkout` is the only legal move
+    ///      left - and it used to revert on exactly the positions that had healed, through
+    ///      `reassign`'s `_requireLiquidatable`. `cancel` was the remedy, and `CreditManager.borrow`
+    ///      has said since round 13 that it "is unrewarded and optional, so nothing makes it
+    ///      happen": the mark, the borrowing block, the four welded setters and the locked
+    ///      collateral all stood until a volunteer turned up, with no clock on any of them.
+    ///
+    ///      `hasReachableExit` in `LiquidationAuction.invariants.t.sol` restates the spec as
+    ///      "expireToWorkout: needs only that the clock has run out". That line was the spec and
+    ///      not the code, which is why the invariant stayed green over the defect. It is the code
+    ///      now, and this is the test that says so directly rather than through a fuzz campaign.
+    ///
+    ///      Both branches are asserted in one test on purpose: the value is the *totality*, and a
+    ///      test that only exercised the healed side would pass over an implementation that had
+    ///      simply stopped opening workouts.
+    function test_expireToWorkout_isTotalOnceTheClockHasRunOut() public {
+        // ── the healed branch: resolves as a cancel, opens no workout, pays nobody ──
+        uint256 healedId = _openAuctionAt(_softNav());
+        vm.warp(auction.firstOpenedAt(healedId) + Config.AUCTION_RESET_WINDOW + 1);
+
+        // The re-strike really is closed, so this is the state with one legal move in it.
+        vm.prank(keeper);
+        vm.expectRevert();
+        credit.liquidate(alice);
+
+        // Permissionless and capital-free: the yield stream reaches the same place.
+        address friend = makeAddr("friend");
+        // Three quarters, so the heal clears the *borrow* ceiling too and the re-arm below is
+        // a real observation rather than a second refusal wearing a different error.
+        uint256 cure = (credit.currentDebtOf(alice) * 3) / 4;
+        usdc.mint(friend, cure);
+        vm.startPrank(friend);
+        usdc.approve(address(credit), cure);
+        credit.repayFor(alice, cure);
+        vm.stopPrank();
+        assertGt(credit.currentDebtOf(alice), 0, "premise: the heal must leave a live loan");
+        assertGt(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE, "premise: and the position must be healthy");
+
+        address volunteer = makeAddr("volunteer");
+        uint256 volunteerBefore = usdc.balanceOf(volunteer);
+        vm.prank(volunteer);
+        auction.expireToWorkout(healedId);
+
+        assertEq(auction.auctionOf(alice), 0, "the healed branch must clear the auction pointer");
+        assertEq(auction.liveAuctionCount(), 0, "and the live register with it");
+        assertEq(auction.openWorkoutCount(), 0, "a healed position must not open a workout");
+        assertEq(auction.workoutsOpenFor(alice), 0, "nor be marked as having one");
+        assertEq(usdc.balanceOf(volunteer), volunteerBefore, "round 18: a cancel pays its caller nothing");
+        assertEq(auction.rewardOf(volunteer), 0, "nor accrues them a claim");
+
+        // The borrower is armed again rather than permanently barred.
+        vm.prank(alice);
+        credit.borrow(1);
+
+        // ── the still-forfeit branch: unchanged, and still earns the caller the escrow ──
+        oracle.setNav(_crashedNav());
+        vm.prank(keeper);
+        credit.liquidate(alice);
+        uint256 forfeitId = auction.auctionOf(alice);
+        skip(Config.AUCTION_DURATION + 1);
+
+        address keeper2 = makeAddr("keeper2");
+        vm.prank(keeper2);
+        auction.expireToWorkout(forfeitId);
+
+        assertEq(auction.openWorkoutCount(), 1, "a forfeit position must still open a workout");
+        assertEq(auction.workoutsOpenFor(alice), 1, "and still block the borrower through it");
+        assertEq(auction.auctionOf(alice), 0, "the auction pointer clears on this branch too");
     }
 
     function test_cancel_revertsWhileStillLiquidatable() public {
@@ -413,7 +561,7 @@ contract LiquidationAuctionTest is Test {
         oracle.setNav(NAV);
         auction.cancel(first);
 
-        oracle.setNav(CRASHED_NAV);
+        oracle.setNav(_crashedNav());
         vm.prank(keeper);
         credit.liquidate(alice);
 
@@ -427,12 +575,12 @@ contract LiquidationAuctionTest is Test {
     /// @notice PRD §6.3, literally: a keeper buys at 82% of NAV, the debt is repaid,
     ///         the surplus goes to the borrower and the bonds go to the winner.
     function test_bid_repaysDebtSurplusToBorrowerBondsToWinner() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(_elapsedForPremium(8_200));
         assertEq(auction.currentPremiumBps(id), 8_200);
 
         uint256 price = auction.currentPrice(id);
-        assertEq(price, 773.3625e6, "100 bonds at SOFT_NAV, 82% of NAV");
+        assertEq(price, 773.3625e6, "100 bonds at the soft NAV, 82% of NAV");
 
         _fundBidder(bidder, price);
         uint256 floatBefore = usdc.balanceOf(address(liquidity));
@@ -449,16 +597,16 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.debtOf(alice), 0);
         assertEq(credit.totalDebt(), 0);
         assertEq(credit.unsocialisedLoss(), 0);
-        assertEq(credit.pendingPrincipal(), MAX_BORROW);
+        assertEq(credit.pendingPrincipal(), _maxBorrowAtCeiling());
 
         // Penalty is 500 bps of the debt, split down the middle.
-        uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
+        uint256 penalty = (_maxBorrowAtCeiling() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
         assertEq(penalty, 31.4375e6);
         assertEq(auction.rewardOf(keeper), penalty / 2, "the trigger, not the bidder");
         assertEq(credit.insuranceFund(), penalty - penalty / 2);
 
         // And the borrower keeps what is left, claimable rather than pushed.
-        assertEq(credit.claimableOf(alice), price - MAX_BORROW - penalty);
+        assertEq(credit.claimableOf(alice), price - _maxBorrowAtCeiling() - penalty);
         assertEq(credit.claimableOf(alice), 113.175e6);
 
         // Every wei accounted for, and the auction keeps only the unclaimed reward.
@@ -467,7 +615,7 @@ contract LiquidationAuctionTest is Test {
 
         // Principal finds its way home through the existing permissionless path.
         credit.settlePrincipal();
-        assertEq(usdc.balanceOf(address(liquidity)), floatBefore + MAX_BORROW);
+        assertEq(usdc.balanceOf(address(liquidity)), floatBefore + _maxBorrowAtCeiling());
 
         vm.prank(alice);
         credit.claimSurplus();
@@ -475,7 +623,7 @@ contract LiquidationAuctionTest is Test {
         // bounty is not coming back - it went to the keeper who opened the auction.
         assertEq(
             usdc.balanceOf(alice),
-            MAX_BORROW - Config.LIQUIDATION_CALL_BOUNTY + 113.175e6,
+            _maxBorrowAtCeiling() - Config.LIQUIDATION_CALL_BOUNTY + 113.175e6,
             "the loan plus the surplus"
         );
 
@@ -512,16 +660,16 @@ contract LiquidationAuctionTest is Test {
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id);
         assertEq(price, 213.775e6, "68% of $314.375");
-        assertLt(price, MAX_BORROW, "the whole point: the lot is worth less than the loan");
+        assertLt(price, _maxBorrowAtCeiling(), "the whole point: the lot is worth less than the loan");
 
         _fundBidder(bidder, price);
-        uint256 shortfall = MAX_BORROW - price;
+        uint256 shortfall = _maxBorrowAtCeiling() - price;
 
         // The old assertion was `unsocialisedLoss == shortfall - 100e6`: the residual was banked
         // as a claim to be placed on lenders later. Audit round 11 found that wrong here, because
         // there are no lenders in this fixture - the treasury float funded this loan and no lender
         // pool is wired at all. The residual was already borne by the treasury, which lent
-        // `MAX_BORROW` and will only ever see the 100 of insurance plus what the lot fetched, so
+        // `_maxBorrowAtCeiling()` and will only ever see the 100 of insurance plus what the lot fetched, so
         // recording it a second time as a placeable claim counted the same loss twice. The second
         // copy was a bearer instrument: `flushSocialisedLoss` is permissionless, so it could be
         // pointed at whoever held pool shares in a later era, and an executed PoC did exactly
@@ -571,7 +719,7 @@ contract LiquidationAuctionTest is Test {
 
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id);
-        assertLt(price, MAX_BORROW, "a fill short of the debt");
+        assertLt(price, _maxBorrowAtCeiling(), "a fill short of the debt");
 
         _fundBidder(bidder, price);
         vm.prank(bidder);
@@ -612,13 +760,14 @@ contract LiquidationAuctionTest is Test {
     ///      permissionless and the attacker chooses the ordering, which is exactly why a
     ///      claw-back hook on `cancel` would not have been sufficient.
     function test_cancel_returnsTheEscrowSoOpeningAnAuctionIsNotAPayday() public {
+        uint256 debt = _maxBorrowAtCeiling(); // read before the prank - see `_openAuctionAt`
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(debt);
         assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "premise: armed");
 
         // Just past the threshold, which is where every real liquidation begins and the only
         // band in which a dust cure is cheap enough for the strip to pay for itself.
-        oracle.setNav((NAV_AT_THRESHOLD * 999) / 1000);
+        oracle.setNav((_thresholdNav() * 999) / 1000);
 
         address griefer = makeAddr("griefer");
         uint256 dust = 1e6;
@@ -647,7 +796,7 @@ contract LiquidationAuctionTest is Test {
         // The control the round-eighteen bundle insisted on: the honest keeper who resolves the
         // position afterwards is paid in full, so the zero above is the guard doing its job and
         // not a fixture in which nobody is ever paid.
-        oracle.setNav(CRASHED_NAV);
+        oracle.setNav(_crashedNav());
         vm.prank(keeper);
         credit.liquidate(alice);
         uint256 second = auction.auctionOf(alice);
@@ -680,7 +829,7 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.bountyEscrowOf(alice), 0, "under the dust threshold, so never charged");
         assertEq(usdc.balanceOf(alice), dustLoan, "and the whole draw was disbursed");
 
-        oracle.setNav(CRASHED_NAV);
+        oracle.setNav(_crashedNav());
         address second = makeAddr("secondCaller");
         vm.expectEmit(true, false, false, false, address(credit));
         emit CreditManager.BountyDepleted(alice);
@@ -694,15 +843,15 @@ contract LiquidationAuctionTest is Test {
     /// @dev Near the floor `price < debt + penalty` is routine, not exotic. An unclamped
     ///      subtraction would panic in exactly the band where Dutch auctions fill.
     function test_bid_clampsThePenaltyToTheSurplusThatExists() public {
-        // NAV_FOR_PARTIAL_PENALTY puts the *floor* price only just above the debt: less
+        // _navForPartialPenalty() puts the *floor* price only just above the debt: less
         // full penalty of surplus, but more than none. The decay curve cannot reach
         // that band at a higher NAV, because it stops at the floor by design.
-        uint256 id = _openAuctionAt(NAV_FOR_PARTIAL_PENALTY);
+        uint256 id = _openAuctionAt(_navForPartialPenalty());
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id);
-        assertGt(price, MAX_BORROW);
-        uint256 surplus = price - MAX_BORROW;
-        assertLt(surplus, (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS, "a partial penalty");
+        assertGt(price, _maxBorrowAtCeiling());
+        uint256 surplus = price - _maxBorrowAtCeiling();
+        assertLt(surplus, (_maxBorrowAtCeiling() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS, "a partial penalty");
 
         _fundBidder(bidder, price);
         vm.prank(bidder);
@@ -718,7 +867,7 @@ contract LiquidationAuctionTest is Test {
     /// @dev Debt before penalty. The other order manufactures a shortfall the insurance
     ///      fund then covers, which is paying the liquidation caller out of insurance.
     function test_bid_appliesDebtBeforePenalty() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id); // 1,020 vs 880.25 of debt
 
@@ -737,7 +886,7 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_bid_penaltySplitSumsExactlyEvenOnAnOddPenalty() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(_elapsedForPremium(8_200));
         uint256 price = auction.currentPrice(id);
 
@@ -745,7 +894,7 @@ contract LiquidationAuctionTest is Test {
         vm.prank(bidder);
         auction.bid(id);
 
-        uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
+        uint256 penalty = (_maxBorrowAtCeiling() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
         assertEq(auction.rewardOf(keeper) + credit.insuranceFund(), penalty, "no wei invented or lost");
         assertGe(credit.insuranceFund(), auction.rewardOf(keeper), "the odd wei goes to the protocol");
     }
@@ -753,7 +902,7 @@ contract LiquidationAuctionTest is Test {
     // ── bid: adverse conditions ──────────────────────────────────────────────
 
     function test_bid_revertsForAWinnerThatCannotReceiveErc1155() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         RejectingBidder rejecting = new RejectingBidder();
         usdc.mint(address(rejecting), 2_000e6);
 
@@ -766,7 +915,7 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_bid_succeedsForAContractWinnerThatCan() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         ContractBidder accepting = new ContractBidder();
         usdc.mint(address(accepting), 2_000e6);
 
@@ -778,7 +927,7 @@ contract LiquidationAuctionTest is Test {
     ///         code. Everything the attacker can reach must already be closed, and the
     ///         settlement figures must be read after them, not before.
     function test_bid_isNotReentrableThroughTheWinnersCallback() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(_elapsedForPremium(8_200));
         uint256 price = auction.currentPrice(id);
 
@@ -799,7 +948,7 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_bid_revertsWhenTheBidderIsBlacklisted() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         _fundBidder(bidder, 2_000e6);
         usdc.setBlocked(bidder, true);
 
@@ -813,7 +962,7 @@ contract LiquidationAuctionTest is Test {
     ///         bidder can still fill after the adapter's entry is revoked. That is a
     ///         real escape hatch and must be a test, not a discovery during an incident.
     function test_bid_stillFillsToAWhitelistedWinnerAfterTheAdapterIsRevoked() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         bond.setWhitelisted(address(adapter), false);
         bond.setWhitelisted(bidder, true);
 
@@ -824,7 +973,7 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_bid_revertsAfterTheAuctionIsCancelled() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         oracle.setNav(NAV);
         auction.cancel(id);
 
@@ -852,7 +1001,7 @@ contract LiquidationAuctionTest is Test {
     ///         this test actually cares about are unchanged: the stale fill is refused, and a fresh
     ///         price is reachable.
     function test_bid_lapsesAfterTheWindowAndLiquidateReStrikesIt() public {
-        uint256 first = _openAuctionAt(SOFT_NAV);
+        uint256 first = _openAuctionAt(_softNav());
         // Inside `Config.AUCTION_RESET_WINDOW`, because a re-strike past that is refused outright -
         // asserted in its own test rather than smuggled in here.
         skip(Config.AUCTION_DURATION + 1 hours);
@@ -892,7 +1041,7 @@ contract LiquidationAuctionTest is Test {
         // Holds nothing at any point, which is the whole shape of the finding: the freeze cost the
         // attacker gas and no capital at all.
         address griefer = makeAddr("reStrikeGriefer");
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         uint256 opened = auction.firstOpenedAt(id);
         assertEq(opened, block.timestamp, "premise: the open stamps the clock");
 
@@ -934,7 +1083,7 @@ contract LiquidationAuctionTest is Test {
     ///      `keeper`. Substituting the *borrower* for the second one was the whole finding: a keeper
     ///      opens the auction and does the work, the borrower waits one second past the lapse,
     ///      re-strikes, and the 25 USDC lands on them instead. Measured on a genuine default with a
-    ///      short fill - keeper 0, borrower 25,000,000, borrower's total out equal to `MAX_BORROW`.
+    ///      short fill - keeper 0, borrower 25,000,000, borrower's total out equal to `_maxBorrowAtCeiling()`.
     ///      The keeper's only defence was one second wide: `expireToWorkout` is legal from
     ///      `>= finishesAt` and the re-strike from `> finishesAt`, and nobody is paid to use it.
     ///
@@ -948,9 +1097,10 @@ contract LiquidationAuctionTest is Test {
     ///      are what made it look safe.
     function test_liquidate_reStrikingLeavesTheParkedBountyWithTheCallerWhoOpenedIt() public {
         address firstCaller = makeAddr("firstCaller");
+        uint256 debt = _maxBorrowAtCeiling(); // read before the prank - see `_openAuctionAt`
         vm.prank(alice);
-        credit.borrow(MAX_BORROW);
-        oracle.setNav(SOFT_NAV);
+        credit.borrow(debt);
+        oracle.setNav(_softNav());
 
         vm.prank(firstCaller);
         credit.liquidate(alice);
@@ -986,7 +1136,7 @@ contract LiquidationAuctionTest is Test {
     /// @notice The floor is reachable at the last instant of the window, not an
     ///         asymptote - the lapse check is strictly-after for exactly this reason.
     function test_bid_fillsAtExactlyTheFloorOnTheFinalInstant() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION);
         assertEq(auction.currentPremiumBps(id), Config.AUCTION_FLOOR_BPS);
 
@@ -1024,9 +1174,9 @@ contract LiquidationAuctionTest is Test {
     ///      opened. Composed with the cancel that clears the stale auction afterwards,
     ///      because a refusal with no way to clear the auction is a permanent strand.
     function test_bid_revertsOnceATopUpHasCuredThePositionAndCancelClearsIt() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         vm.prank(alice);
-        vault.depositBonds(50); // 150 bonds at SOFT_NAV is 4,444 bps: healthy again
+        vault.depositBonds(50); // 150 bonds at _softNav() is 4,444 bps: healthy again
 
         _fundBidder(bidder, 5_000e6);
         uint256 price = auction.currentPrice(id);
@@ -1040,7 +1190,7 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_bid_revertsAboveTheCallersCap() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         uint256 price = auction.currentPrice(id);
 
         _fundBidder(bidder, 5_000e6);
@@ -1050,7 +1200,7 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_bid_pullsExactlyTheCurrentPriceAndNoMore() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(_elapsedForPremium(8_200));
         uint256 price = auction.currentPrice(id);
 
@@ -1064,7 +1214,7 @@ contract LiquidationAuctionTest is Test {
     /// @notice Anyone can donate bonds to this contract, because it is an
     ///         `ERC1155Holder`. Nothing may be sized from a balance.
     function test_bid_ignoresDonatedBondsAndUsdc() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         address donor = makeAddr("donor");
         bond.mint(donor, 500);
         bond.setWhitelisted(donor, true);
@@ -1125,10 +1275,10 @@ contract LiquidationAuctionTest is Test {
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
-        assertEq(credit.debtOf(alice), MAX_BORROW, "still owed");
+        assertEq(credit.debtOf(alice), _maxBorrowAtCeiling(), "still owed");
         assertEq(credit.unsocialisedLoss(), 0, "and nothing guessed at lenders' expense");
-        (,,,, uint256 debtAtExpiry,,) = auction.workouts(id);
-        assertEq(debtAtExpiry, MAX_BORROW);
+        (,,,, uint256 debtAtExpiry,,,) = auction.workouts(id);
+        assertEq(debtAtExpiry, _maxBorrowAtCeiling());
     }
 
     function test_expireToWorkout_revertsBeforeTheDurationElapses() public {
@@ -1206,16 +1356,16 @@ contract LiquidationAuctionTest is Test {
         // It is asserted from the outside because the mock cannot testify to it: `socialiseLoss`
         // increments a counter and then reverts, and the revert rolls the increment back with
         // everything else, so a refusal is invisible in the mock's own storage by construction.
-        vm.expectCall(address(pool), abi.encodeCall(MockLenderPool.socialiseLoss, (MAX_BORROW)));
+        vm.expectCall(address(pool), abi.encodeCall(MockLenderPool.socialiseLoss, (_maxBorrowAtCeiling())));
         auction.closeWorkout(id);
 
         assertEq(credit.debtOf(alice), 0);
-        assertEq(credit.unsocialisedLoss(), MAX_BORROW, "remembered, not lost");
+        assertEq(credit.unsocialisedLoss(), _maxBorrowAtCeiling(), "remembered, not lost");
         assertEq(auction.openWorkoutCount(), 0);
     }
 
     function test_workoutSettle_repaysAndPaysTheSameSplitAsAFill() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
@@ -1228,31 +1378,31 @@ contract LiquidationAuctionTest is Test {
         auction.workoutSettle(id, recovery);
         vm.stopPrank();
 
-        uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
+        uint256 penalty = (_maxBorrowAtCeiling() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
         assertEq(credit.debtOf(alice), 0);
         assertEq(auction.rewardOf(keeper), penalty / 2, "the same split a fill would have paid");
         assertEq(credit.insuranceFund(), penalty - penalty / 2);
-        assertEq(credit.claimableOf(alice), recovery - MAX_BORROW - penalty);
+        assertEq(credit.claimableOf(alice), recovery - _maxBorrowAtCeiling() - penalty);
         assertEq(usdc.balanceOf(address(auction)), auction.totalUnclaimedRewards());
     }
 
     /// @dev A manual redemption may pay in stages. Writing the gap down on the first
     ///      tranche would socialise a loss the second tranche covers.
     function test_workoutSettle_acceptsPartialTranchesWithoutSocialisingEarly() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
         address operator = makeAddr("operator");
-        usdc.mint(operator, MAX_BORROW);
+        usdc.mint(operator, _maxBorrowAtCeiling());
         vm.startPrank(operator);
-        usdc.approve(address(auction), MAX_BORROW);
+        usdc.approve(address(auction), _maxBorrowAtCeiling());
 
         auction.workoutSettle(id, 400e6);
         assertGt(credit.debtOf(alice), 0, "still owed after the first tranche");
         assertEq(credit.unsocialisedLoss(), 0, "and nothing written off prematurely");
 
-        auction.workoutSettle(id, MAX_BORROW - 400e6);
+        auction.workoutSettle(id, _maxBorrowAtCeiling() - 400e6);
         vm.stopPrank();
 
         assertEq(credit.debtOf(alice), 0);
@@ -1267,7 +1417,7 @@ contract LiquidationAuctionTest is Test {
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
-        (, uint96 openedAt,,,,,) = auction.workouts(id);
+        (, uint96 openedAt,,,,,,) = auction.workouts(id);
         vm.expectRevert(
             abi.encodeWithSelector(
                 LiquidationAuction.WorkoutStillRunning.selector, openedAt + Config.WORKOUT_MAX_DURATION
@@ -1287,15 +1437,16 @@ contract LiquidationAuctionTest is Test {
         auction.expireToWorkout(id);
         skip(Config.WORKOUT_MAX_DURATION);
 
-        // The old assertion was `unsocialisedLoss == MAX_BORROW - 300e6`, labelled "and the rest
+        // The old assertion was `unsocialisedLoss == _maxBorrowAtCeiling() - 300e6`, labelled "and the rest
         // is lenders'". The residual is the point of this test and the figure is untouched, but
         // whose it is was wrong: the treasury float funded this loan and no lender pool is wired,
         // so round 11 stopped recording a loss the funder is already carrying as a claim on
         // somebody else. The recognition still happens on schedule, permissionlessly, for the
         // exact amount insurance could not reach - it is now reported against the source that
         // bears it instead of being banked against a pool that lent nothing.
+        uint256 residual = _maxBorrowAtCeiling() - 300e6; // read before the cheatcode, not inside it
         vm.expectEmit(true, false, false, true, address(credit));
-        emit CreditManager.LossBorneByTheSource(address(liquidity), MAX_BORROW - 300e6);
+        emit CreditManager.LossBorneByTheSource(address(liquidity), residual);
 
         auction.closeWorkout(id); // permissionless
 
@@ -1303,6 +1454,189 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.insuranceFund(), 0, "insurance absorbed what it could");
         assertEq(credit.unsocialisedLoss(), 0, "the residual is the funder's, not a claim to place");
         assertEq(auction.openWorkoutCount(), 0);
+    }
+
+    // ── Audit round 21, finding 14: the forced close and the late tranche ─────
+
+    /// @notice The control. A tranche that lands INSIDE the window pays the debt down.
+    function test_H_control_recoveryInsideTheWindowPaysTheDebtDown() public {
+        uint256 id = _openAuction();
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+
+        assertEq(credit.currentDebtOf(alice), 628.750000e6, "premise: the debt at expiry");
+
+        address operator = makeAddr("operator");
+        usdc.mint(operator, 400e6);
+        vm.startPrank(operator);
+        usdc.approve(address(auction), 400e6);
+        auction.workoutSettle(id, 400e6);
+        vm.stopPrank();
+
+        emit log_named_uint("MEASURED debt after a 400.000000 tranche inside the window", credit.currentDebtOf(alice));
+        assertEq(credit.currentDebtOf(alice), 228.750000e6, "628.750000 -> 228.750000");
+    }
+
+    /// @notice The hazard. The same tranche one day later, after a stranger forced the close.
+    /// @dev DexFi's redemption is off-chain and quoted at "48h+", so a tranche genuinely can be a
+    ///      day late. `closeWorkout` is permissionless the instant the window passes, so a stranger
+    ///      - not the operator, not the borrower, nobody with any stake - picks the moment.
+    function test_H_hazard_theForcedCloseDestroysTheLateTranche() public {
+        uint256 id = _openAuction();
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+        assertEq(credit.currentDebtOf(alice), 628.750000e6, "premise: the debt at expiry");
+
+        skip(Config.WORKOUT_MAX_DURATION);
+
+        // Nothing has arrived at this contract to be swept before the write-off, which is what
+        // makes the "settle what has already arrived" fix inert on this trace.
+        assertEq(
+            usdc.balanceOf(address(auction)) - auction.totalUnclaimedRewards(),
+            0,
+            "premise: no unapplied recovery is sitting here at the moment of the close"
+        );
+
+        uint256 writtenOff = credit.currentDebtOf(alice);
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+
+        emit log_named_uint("MEASURED written off by the forced close (USDC 6dp)", writtenOff);
+        assertEq(writtenOff, 628.750000e6, "628.750000 written off in full");
+        assertEq(credit.debtOf(alice), 0, "and the debt is gone");
+        assertEq(liquidity.outstandingPrincipal(), 628.750000e6, "the funder is still out the whole loan");
+
+        // The tranche arrives the next day. `workoutSettle` and `repayFor` both refuse it.
+        skip(1 days);
+        address operator = makeAddr("operator");
+        usdc.mint(operator, 400e6);
+        vm.startPrank(operator);
+        usdc.approve(address(auction), 400e6);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.WorkoutNotOpen.selector, id));
+        auction.workoutSettle(id, 400e6);
+
+        usdc.approve(address(credit), 400e6);
+        vm.expectRevert(CreditManager.NoDebt.selector);
+        credit.repayFor(alice, 400e6);
+        vm.stopPrank();
+
+        // The fix, in the same trace: the tranche now lands, and it lands on the balance sheet
+        // that funded the loan rather than on the insurance fund.
+        vm.startPrank(operator);
+        auction.workoutSettleAfterClose(id, 400e6);
+        vm.stopPrank();
+
+        assertEq(credit.pendingPrincipal(), 400e6, "booked as principal owed home");
+        assertEq(credit.insuranceFund(), 0, "and NOT as a donation that only a future default reaches");
+
+        credit.settlePrincipal(); // permissionless, already here
+        emit log_named_uint("MEASURED recovered to the funder after the forced close", 400e6);
+        assertEq(liquidity.outstandingPrincipal(), 228.750000e6, "628.750000 -> 228.750000, one day late");
+    }
+
+    /// @notice The sign check on the fix this finding's first candidate prescribed, run as a
+    ///         measurement rather than argued.
+    /// @dev The obvious structural fix is "settle what has already arrived at the moment of the
+    ///      close, so the write-off is only ever of what genuinely did not arrive". It is a
+    ///      reasonable-sounding change and on this trace it moves **nothing**: an off-chain
+    ///      redemption quoted at "48h+" has not arrived at all when the fourteenth day passes, so
+    ///      the free balance a sweep would find is zero and the figure written off is identical.
+    ///      Asserted as `assertEq(sweptFirst, shipped)` because eight prescribed fixes in a row on
+    ///      this project have failed a sign check and the eighth failed by being inert.
+    ///
+    ///      It is not a bad change - it closes a different, smaller trace, where a relayer
+    ///      `transfer`s USDC here instead of calling `workoutSettle`. It is simply not this one,
+    ///      and it would have read like closure.
+    function test_H_signCheck_sweepingWhatHasArrivedAtTheCloseMovesNothing() public {
+        uint256 id = _openAuction();
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+        skip(Config.WORKOUT_MAX_DURATION);
+
+        // What the prescribed variant would have found to settle before writing off.
+        uint256 sweepable = usdc.balanceOf(address(auction)) - auction.totalUnclaimedRewards();
+        uint256 shipped = credit.currentDebtOf(alice);
+        uint256 sweptFirst = shipped > sweepable ? shipped - sweepable : 0;
+
+        emit log_named_uint("MEASURED unapplied balance a pre-close sweep would find", sweepable);
+        assertEq(sweepable, 0, "there is nothing here: the redemption has not arrived");
+        assertEq(sweptFirst, shipped, "the prescribed fix writes off exactly what the shipped one does");
+
+        auction.closeWorkout(id);
+        assertEq(credit.debtOf(alice), 0);
+    }
+
+    /// @notice Bounded by what the close wrote off **and nobody was made whole for**.
+    /// @dev The insurance fund has already handed its part to the liquidity source through
+    ///      `pendingPrincipal`, so crediting a recovery against that part would settle the same
+    ///      tranche twice. `fundInsurance` is the permissionless destination for anything above the
+    ///      bound, and it is already here.
+    function test_H_fix_isBoundedByThePartNobodyWasMadeWholeFor() public {
+        uint256 id = _openAuction();
+        usdc.mint(address(this), 300e6);
+        usdc.approve(address(credit), 300e6);
+        credit.fundInsurance(300e6);
+
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+        skip(Config.WORKOUT_MAX_DURATION);
+        auction.closeWorkout(id);
+
+        (,,,,,,, uint256 writtenDown) = auction.workouts(id);
+        emit log_named_uint("MEASURED recoverable after a close that insurance part-covered", writtenDown);
+        assertEq(writtenDown, 328.750000e6, "628.750000 written off, 300.000000 of it already paid home");
+        assertEq(credit.pendingPrincipal(), 300e6, "insurance's part is already on its way to the funder");
+
+        address operator = makeAddr("operator");
+        usdc.mint(operator, 400e6);
+        vm.startPrank(operator);
+        usdc.approve(address(auction), 400e6);
+        auction.workoutSettleAfterClose(id, 400e6); // asks for more than the bound
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(operator), 400e6 - 328.750000e6, "the pull is clamped, not the caller refused");
+        assertEq(credit.pendingPrincipal(), 300e6 + 328.750000e6, "and the funder is whole for the whole loan");
+
+        (,,,,,,, uint256 left) = auction.workouts(id);
+        assertEq(left, 0, "nothing left to recover");
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NothingLeftToRecover.selector, id));
+        auction.workoutSettleAfterClose(id, 1e6);
+    }
+
+    /// @notice A workout that closed cleanly wrote nothing off, so there is nothing to repay.
+    /// @dev The second trap round 21 named: once the residual is zero the close is legal
+    ///      immediately, with no fourteen-day wait. That path must not open a route for money to
+    ///      arrive at a loan that was repaid in full - `_distribute`'s waterfall would send it to
+    ///      the borrower, and this function has no waterfall at all.
+    function test_H_fix_refusedOnAWorkoutThatClosedClean() public {
+        uint256 id = _openAuctionAt(_softNav());
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+
+        address operator = makeAddr("operator");
+        usdc.mint(operator, 1_350e6);
+        vm.startPrank(operator);
+        usdc.approve(address(auction), 1_350e6);
+        auction.workoutSettle(id, 1_350e6); // clears the debt in full
+        vm.stopPrank();
+
+        auction.closeWorkout(id); // legal immediately, and rightly so
+        (,,,,,,, uint256 writtenDown) = auction.workouts(id);
+        assertEq(writtenDown, 0, "nothing was written off, so nothing can be repaid");
+
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NothingLeftToRecover.selector, id));
+        auction.workoutSettleAfterClose(id, 1e6);
+    }
+
+    /// @notice And it refuses a workout that is still open, which `workoutSettle` is for.
+    function test_H_fix_refusesAWorkoutThatIsStillOpen() public {
+        uint256 id = _openAuction();
+        skip(Config.AUCTION_DURATION);
+        auction.expireToWorkout(id);
+
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.WorkoutNotClosed.selector, id));
+        auction.workoutSettleAfterClose(id, 1e6);
     }
 
     /// @notice Arming a position is refused once its liquidation has started.
@@ -1318,9 +1652,11 @@ contract LiquidationAuctionTest is Test {
         uint256 id = _openAuction();
         assertEq(credit.bountyEscrowOf(alice), 0, "premise: parked against the auction");
 
-        address stranger = makeAddr("stranger");
-        usdc.mint(stranger, Config.LIQUIDATION_CALL_BOUNTY);
-        vm.startPrank(stranger);
+        // The borrower's own top-up, which is the only funder `fundBounty` accepts since audit
+        // round 21 - so this test still exercises the liveness gate rather than stopping on the
+        // provenance gate in front of it. See `test_fundBounty_refusesAnyFunderButTheBorrower`.
+        usdc.mint(alice, Config.LIQUIDATION_CALL_BOUNTY);
+        vm.startPrank(alice);
         usdc.approve(address(credit), Config.LIQUIDATION_CALL_BOUNTY);
 
         vm.expectRevert(
@@ -1336,7 +1672,7 @@ contract LiquidationAuctionTest is Test {
         assertEq(auction.auctionOf(alice), 0, "premise: the first register is clear");
         assertGt(auction.workoutsOpenFor(alice), 0, "and the second one is not");
 
-        vm.startPrank(stranger);
+        vm.startPrank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(CreditManager.BountyFundingWhileLiquidating.selector, alice)
         );
@@ -1375,7 +1711,7 @@ contract LiquidationAuctionTest is Test {
 
         skip(Config.AUCTION_DURATION);
         uint256 price = auction.currentPrice(id);
-        assertLt(price, MAX_BORROW, "premise: the fill cannot cover the debt");
+        assertLt(price, _maxBorrowAtCeiling(), "premise: the fill cannot cover the debt");
         _fundBidder(bidder, price);
         vm.prank(bidder);
         auction.bid(id);
@@ -1395,11 +1731,12 @@ contract LiquidationAuctionTest is Test {
         vm.stopPrank();
 
         oracle.setNav(NAV);
+        uint256 bobsDebt = _maxBorrowAtCeiling(); // read before the prank - see `_openAuctionAt`
         vm.prank(bob);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(bobsDebt);
         assertEq(credit.bountyEscrowOf(bob), Config.LIQUIDATION_CALL_BOUNTY, "premise: armed");
 
-        oracle.setNav(CRASHED_NAV);
+        oracle.setNav(_crashedNav());
         vm.prank(keeper);
         credit.liquidate(bob);
         assertEq(credit.bountyEscrowOf(bob), 0, "and emptied the moment the auction opened");
@@ -1458,9 +1795,9 @@ contract LiquidationAuctionTest is Test {
         vm.startPrank(bob);
         bond.setApprovalForAll(address(vault), true);
         vault.depositBonds(BONDS);
-        credit.borrow((BONDS * CRASHED_NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE));
+        credit.borrow(_maxBorrow(BONDS, _crashedNav()));
         vm.stopPrank();
-        oracle.setNav(CRASHED_NAV / 4); // and then it quarters, to 10,000 bps
+        oracle.setNav(_crashedNav() / 4); // and then it quarters, to 10,000 bps
         vm.prank(keeper);
         credit.liquidate(bob);
         uint256 second = auction.auctionOf(bob);
@@ -1536,15 +1873,15 @@ contract LiquidationAuctionTest is Test {
     ///      cost of gas - taking the liquidation caller's reward and the insurance
     ///      fund's share with it. The base is now fixed at expiry.
     function test_workoutSettle_penaltyIsFixedAtExpiryNotAtSettlement() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
         // Borrower front-runs the relay and clears the debt themselves.
-        usdc.mint(alice, MAX_BORROW);
+        usdc.mint(alice, _maxBorrowAtCeiling());
         vm.startPrank(alice);
-        usdc.approve(address(credit), MAX_BORROW);
-        credit.repay(MAX_BORROW);
+        usdc.approve(address(credit), _maxBorrowAtCeiling());
+        credit.repay(_maxBorrowAtCeiling());
         vm.stopPrank();
         assertEq(credit.debtOf(alice), 0);
 
@@ -1555,7 +1892,7 @@ contract LiquidationAuctionTest is Test {
         auction.workoutSettle(id, 1_350e6);
         vm.stopPrank();
 
-        uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
+        uint256 penalty = (_maxBorrowAtCeiling() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
         assertEq(auction.rewardOf(keeper), penalty / 2, "the caller still earns their share");
         assertEq(credit.insuranceFund(), penalty - penalty / 2, "and insurance still gets its own");
     }
@@ -1563,7 +1900,7 @@ contract LiquidationAuctionTest is Test {
     /// @dev Tranching must not shrink the total penalty either - the unpaid balance
     ///      carries across calls rather than being recomputed from a shrinking debt.
     function test_workoutSettle_tranchingCollectsTheSamePenaltyAsOneTranche() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
@@ -1571,11 +1908,11 @@ contract LiquidationAuctionTest is Test {
         usdc.mint(operator, 1_350e6);
         vm.startPrank(operator);
         usdc.approve(address(auction), 1_350e6);
-        auction.workoutSettle(id, MAX_BORROW); // clears the debt exactly, no surplus
-        auction.workoutSettle(id, 1_350e6 - MAX_BORROW); // the surplus tranche
+        auction.workoutSettle(id, _maxBorrowAtCeiling()); // clears the debt exactly, no surplus
+        auction.workoutSettle(id, 1_350e6 - _maxBorrowAtCeiling()); // the surplus tranche
         vm.stopPrank();
 
-        uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
+        uint256 penalty = (_maxBorrowAtCeiling() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
         assertEq(auction.rewardOf(keeper) + credit.insuranceFund(), penalty, "split, not skipped");
     }
 
@@ -1645,8 +1982,9 @@ contract LiquidationAuctionTest is Test {
     function test_setLiquidationAuction_aPointerThatCannotAnswerIsNotAWeld() public {
         // A stub with the one selector the incoming probes demand, and nothing else.
         StubAuction stub = new StubAuction(address(vault));
-        LiquidationAuction next =
-            new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        LiquidationAuction next = new LiquidationAuction(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
 
         vm.startPrank(admin);
         vault.setLiquidationAuction(address(stub));
@@ -1663,10 +2001,11 @@ contract LiquidationAuctionTest is Test {
     }
 
     function test_setLiquidationAuction_refusesWhileWorkIsInFlight() public {
-        LiquidationAuction next =
-            new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        LiquidationAuction next = new LiquidationAuction(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
 
-        _openAuctionAt(SOFT_NAV);
+        _openAuctionAt(_softNav());
         assertEq(auction.liveAuctionCount(), 1);
 
         vm.startPrank(admin);
@@ -1726,10 +2065,11 @@ contract LiquidationAuctionTest is Test {
     ///      argument rests on those predicates being exact complements, which holds only
     ///      while both pointers name the same manager.
     function test_setCreditManager_refusesWhileWorkIsInFlight() public {
-        CreditManager next =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager next = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
 
-        _openAuctionAt(SOFT_NAV);
+        _openAuctionAt(_softNav());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionHasLiveWork.selector, uint256(1)));
         auction.setCreditManager(address(next));
@@ -1737,10 +2077,16 @@ contract LiquidationAuctionTest is Test {
         // And it refuses a manager bound to a different vault, the way its siblings do.
         oracle.setNav(NAV);
         auction.cancel(auction.auctionOf(alice));
-        CollateralVault otherVault =
-            new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
-        CreditManager foreign =
-            new CreditManager(usdc, ICollateralVault(address(otherVault)), INAVOracle(address(oracle)), admin);
+        CollateralVault otherVault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        CreditManager foreign = new CreditManager(
+            usdc,
+            ICollateralVault(address(otherVault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         vm.prank(admin);
         vm.expectRevert(
             abi.encodeWithSelector(LiquidationAuction.CreditManagerVaultMismatch.selector, address(otherVault))
@@ -1762,10 +2108,11 @@ contract LiquidationAuctionTest is Test {
     ///      sole precondition - with an auction ticket still ticking. A third party
     ///      could therefore arrange for an ordinary migration to open the hole.
     function test_setCreditManager_refusedWhileAnAuctionIsLive() public {
-        CreditManager next =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager next = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
 
-        _openAuctionAt(SOFT_NAV);
+        _openAuctionAt(_softNav());
         assertEq(auction.liveAuctionCount(), 1);
 
         // Anyone can clear the debt, which used to be the only thing checked.
@@ -1797,8 +2144,9 @@ contract LiquidationAuctionTest is Test {
     ///      admitted a manager this vault had never used. This is the check
     ///      `EpochHarvester.setCreditManager` has had since round 6.
     function test_setCreditManager_refusesAManagerTheVaultDoesNotUse() public {
-        CreditManager sibling =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager sibling = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
 
         // Same vault, so the round-6b check passes - but the vault does not use it.
         vm.prank(admin);
@@ -1818,7 +2166,7 @@ contract LiquidationAuctionTest is Test {
 
     /// @notice A lapsed auction stops quoting a price nobody can fill.
     function test_currentPrice_refusesOnceLapsed() public {
-        uint256 id = _openAuctionAt(SOFT_NAV);
+        uint256 id = _openAuctionAt(_softNav());
         skip(Config.AUCTION_DURATION + 1);
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionLapsed.selector, id));
         auction.currentPrice(id);
@@ -1845,8 +2193,9 @@ contract LiquidationAuctionTest is Test {
         vm.stopPrank();
         assertGt(credit.undistributedYield(), 0, "an epoch is in flight");
 
-        CreditManager next =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager next = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
 
         // Refused while still attached: this is a migration path, not a withdrawal.
         vm.prank(admin);
@@ -1901,8 +2250,9 @@ contract LiquidationAuctionTest is Test {
         assertEq(credit.totalBountyParked(), 0, "and the park emptied when the fill resolved it");
         assertEq(credit.totalBountyOwed(), Config.LIQUIDATION_CALL_BOUNTY, "and owed to the keeper");
 
-        CreditManager next =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager next = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         vm.prank(admin);
         vault.setCreditManager(address(next));
 
@@ -1955,8 +2305,9 @@ contract LiquidationAuctionTest is Test {
         credit.accrueYield();
         assertGt(credit.accYieldPerBond(), 0, "the incumbent has history");
 
-        CreditManager next =
-            new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        CreditManager next = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         vm.prank(admin);
         vault.setCreditManager(address(next));
 
@@ -1975,6 +2326,58 @@ contract LiquidationAuctionTest is Test {
         vm.expectRevert(LiquidationAuction.RenounceDisabled.selector);
         auction.renounceOwnership();
     }
+
+    /// @notice `claimSurplus`'s `_refundBounty` is a live path, not a spare.
+    /// @dev **The comment on that line used to say "unreachable today" and audit round 21
+    ///      measured the route.** The argument it made was that every route a debt has to zero
+    ///      already refunds - `_repay` at the end, `_settle` in the branch where yield clears the
+    ///      last of the debt - so a borrower can never be sitting on an escrow with no debt. It
+    ///      is wrong in one direction: all of those hooks key on a debt *reduction*, and
+    ///      `resolveBounty(id, false)` writes the escrow with no debt reduction anywhere near it.
+    ///
+    ///      A stranger cures a liquidated position with the permissionless `repayFor` - the
+    ///      escrow is already parked against the auction, so `_repay`'s refund is a no-op - and
+    ///      then `cancel` returns the park to a borrower whose `debtOf` is already zero.
+    ///      `settle` cannot reach it and `repay` reverts `NoDebt`. This line is the only door
+    ///      left. It is also the one exit deliberately kept open through a migration, which is
+    ///      why it matters that it is real.
+    ///
+    ///      Written as a test because the state is reachable, which is the thing the old comment
+    ///      denied. It said a test "would have to fake it"; nothing here is faked.
+    function test_claimSurplusRefundsAnEscrowNoOtherHookCanReach() public {
+        uint256 id = _openAuction();
+        assertEq(credit.bountyEscrowOf(alice), 0, "premise: parked against the auction");
+        assertEq(credit.totalBountyParked(), Config.LIQUIDATION_CALL_BOUNTY, "premise: and it is parked");
+
+        address rescuer = makeAddr("rescuer");
+        uint256 debt = credit.currentDebtOf(alice);
+        usdc.mint(rescuer, debt);
+        vm.startPrank(rescuer);
+        usdc.approve(address(credit), debt);
+        credit.repayFor(alice, debt);
+        vm.stopPrank();
+        assertEq(credit.debtOf(alice), 0, "premise: debt-free");
+        assertEq(credit.bountyEscrowOf(alice), 0, "premise: and _repay's refund had nothing to do");
+
+        auction.cancel(id);
+        assertEq(
+            credit.bountyEscrowOf(alice),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "resolveBounty(false) did not credit a debt-free borrower"
+        );
+
+        credit.settle(alice);
+        assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "settle refunded after all");
+        vm.prank(alice);
+        vm.expectRevert(CreditManager.NoDebt.selector);
+        credit.repay(1);
+
+        uint256 before = usdc.balanceOf(alice);
+        vm.prank(alice);
+        credit.claimSurplus();
+        assertEq(credit.bountyEscrowOf(alice), 0, "claimSurplus's _refundBounty did not run");
+        assertGe(usdc.balanceOf(alice) - before, Config.LIQUIDATION_CALL_BOUNTY, "and it did not pay");
+    }
 }
 
 /// @notice An address that satisfies every *incoming* wiring probe and answers nothing else.
@@ -1985,8 +2388,22 @@ contract LiquidationAuctionTest is Test {
 ///      `liveAuctionCount` here would make the test pass against the defect it exists to catch.
 contract StubAuction {
     address public immutable vault;
+    /// @dev **Audit round 20 gave this contract a second incoming check, and it goes here rather
+    ///      than being left out.** With the risk pointer unanswered the stub no longer installs at
+    ///      all, and the round-19 defect this stub exists to catch - a pointer that installs and
+    ///      then welds both setters shut - would become unreachable, which reads as the test
+    ///      passing when it is really no longer looking. Taken from the vault so it agrees by
+    ///      construction. `liveAuctionCount` still must not appear here: that is the selector the
+    ///      finding is about.
+    address public immutable riskParams;
+    /// @dev **Audit round 21 added a fifth incoming check**, the sibling of the risk one above.
+    ///      Agreed on purpose, for exactly the same reason: the probe under test has to be the one
+    ///      that fires. Taken from the vault so it is right by construction.
+    address public immutable navOracle;
 
     constructor(address vault_) {
         vault = vault_;
+        riskParams = address(ICollateralVault(vault_).riskParams());
+        navOracle = address(ICollateralVault(vault_).navOracle());
     }
 }

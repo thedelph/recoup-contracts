@@ -16,6 +16,9 @@ import {ICustodyAdapter} from "../../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
+import {RiskParams} from "../../src/RiskParams.sol";
+import {IRiskParams} from "../../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "../helpers/RiskParamsFixture.sol";
 
 /// @notice PRD §12's Phase 3 exit criterion and §6.3's acceptance criterion: the full
 ///         liquidation lifecycle, including the expiry to workout path, against live
@@ -27,25 +30,33 @@ import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
 ///         adapter whitelisted.** That single fact is what makes the no-escrow design
 ///         work, and it is the difference between needing one address whitelisted by
 ///         DexFi and needing two.
-contract LiquidationForkTest is Test {
+contract LiquidationForkTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp, 2026-07-24 snapshot
     uint256 internal constant BONDS = 100;
     uint256 internal constant FLOAT = 50_000e6;
+
     /// @dev Borrowing power at the ceiling, derived rather than written down.
     ///
     ///      **This was the literal `880.25e6`, 35% of $2,515, and it stayed 35% after the ceiling
     ///      moved to 25% on 2026-08-07.** That change derived the same figure across 67 unit tests
-    ///      and missed the fork suite, so these tests had been reverting `ExceedsMaxLtv(3500)`
+    ///      and missed the fork suite, so these tests had been reverting `ExceedsMaxLtv`
     ///      since - unnoticed, because fork tests skip unless `RUN_FORK_TESTS=true` and CI does not
-    ///      set it. The ratchet moves `MAX_LTV_BPS` at least twice more, so this must not be a
+    ///      set it. The ratchet moves the LTV ceiling at least twice more, so this must not be a
     ///      number.
-    uint256 internal constant MAX_BORROW =
-        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+    ///
+    ///      It is no longer a `constant` either: the ceiling is storage on `RiskParams` now, and a
+    ///      Solidity constant cannot read a storage slot. A `view` call re-read on every use is the
+    ///      only shape that stays correct when a parameter moves partway through a test - caching it
+    ///      in `setUp` would compile and quietly pin the value again.
+    function _scenarioMaxBorrow() internal view returns (uint256) {
+        return _maxBorrow(BONDS, NAV);
+    }
 
     /// @dev The NAV at which a position borrowed at the ceiling sits exactly on the liquidation
     ///      threshold. Derived because it depends on two parameters that both move.
-    uint256 internal constant NAV_AT_THRESHOLD = (MAX_BORROW * Config.USDC_TO_NAV_SCALE * Config.BPS)
-        / (BONDS * Config.LIQUIDATION_THRESHOLD_BPS);
+    function _scenarioNavAtThreshold() internal view returns (uint256) {
+        return _navAtThreshold(_scenarioMaxBorrow(), BONDS);
+    }
 
     /// @dev Comfortably past the threshold, and deliberately still worth more than the loan so a
     ///      mid-auction fill leaves a real surplus to split.
@@ -55,7 +66,13 @@ contract LiquidationForkTest is Test {
     ///      it at 4,191 bps - healthy - so `liquidate` reverted `PositionHealthy` and three fork
     ///      tests failed at the fixture rather than in the code under test. Second literal in this
     ///      file pinned to a parameter that has already moved once and will move again.
-    uint256 internal constant CRASHED_NAV = (NAV_AT_THRESHOLD * 9) / 10;
+    ///
+    ///      A tenth below the threshold NAV, so the position lands at the threshold divided by 0.9
+    ///      whatever the threshold happens to be. That relation is the reason this is safe to state
+    ///      without naming a bps figure at all.
+    function _crashedNav() internal view returns (uint256) {
+        return (_scenarioNavAtThreshold() * 9) / 10;
+    }
 
     IDexFiBond internal bond = IDexFiBond(Config.DEXFI_BOND_NFT);
     IDexFiFarm internal farm = IDexFiFarm(Config.DEXFI_FARM);
@@ -74,8 +91,20 @@ contract LiquidationForkTest is Test {
     LiquidationAuction internal auction;
     NAVOracle internal oracle;
     TreasuryLiquiditySource internal liquidity;
+    RiskParams internal riskParams;
 
     bool internal run;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    /// @dev `address(0)` skips the inherited fixture-decay detector, matching how every test in
+    ///      this file self-skips without `RUN_FORK_TESTS`: the detector needs a live setter owner
+    ///      and there is no deployed `RiskParams` at all until the fork is selected.
+    function _riskParamsOwner() internal view override returns (address) {
+        return address(0);
+    }
 
     function setUp() public {
         run = vm.envOr("RUN_FORK_TESTS", false);
@@ -90,10 +119,23 @@ contract LiquidationForkTest is Test {
         vm.etch(winner, "");
 
         oracle = new NAVOracle(admin);
-        vault = new CollateralVault(bond, INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(bond, INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin);
         adapter = new DirectCallAdapter(bond, farm, usdc, address(vault), admin, harvester);
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
-        auction = new LiquidationAuction(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        credit = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
+        auction = new LiquidationAuction(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         liquidity = new TreasuryLiquiditySource(usdc, admin);
 
         vm.startPrank(admin);
@@ -132,12 +174,13 @@ contract LiquidationForkTest is Test {
 
     /// @dev Drop the price far enough to put a max-LTV position past the liquidation
     ///      threshold. One post is capped at roughly a tenth per day and LTV has to travel from
-    ///      `MAX_LTV_BPS` to past `LIQUIDATION_THRESHOLD_BPS`, so this has to go through the second
+    ///      the LTV ceiling to past the liquidation threshold, so this has to go through the second
     ///      key - the same path `test_largeNavMoveNeedsTheSecondKey` pins in the Phase-2 fork
     ///      suite, used here in anger.
     ///
     ///      This comment named 3,500 and 5,800 until the fork suite was repaired; both figures had
-    ///      been wrong since 2026-08-07. Naming the constants instead is the point.
+    ///      been wrong since 2026-08-07. Naming the parameters instead is the point - and they are
+    ///      settable storage now, so a figure written here could not even be checked at build time.
     function _crashNavTo(uint256 nav) internal {
         vm.prank(keeper);
         oracle.postNav(nav);
@@ -150,7 +193,7 @@ contract LiquidationForkTest is Test {
     function _openPosition() internal {
         vm.startPrank(alice);
         vault.depositBonds(BONDS);
-        credit.borrow(MAX_BORROW);
+        credit.borrow(_scenarioMaxBorrow());
         vm.stopPrank();
     }
 
@@ -161,9 +204,10 @@ contract LiquidationForkTest is Test {
         vm.skip(!run);
         _openPosition();
 
-        // $15.00 a bond: past the threshold at 5,868 bps, but still worth more than the
-        // loan, so a mid-auction fill leaves a real surplus to split.
-        _crashNavTo(CRASHED_NAV);
+        // A tenth under the NAV that puts the position exactly on the threshold, so it lands at
+        // the threshold divided by 0.9 - past it whatever the threshold is - while still being
+        // worth more than the loan, so a mid-auction fill leaves a real surplus to split.
+        _crashNavTo(_crashedNav());
 
         vm.prank(keeper);
         credit.liquidate(alice);
@@ -182,7 +226,7 @@ contract LiquidationForkTest is Test {
 
         // Recomputed from the crash NAV rather than written down, and rounded up the way the
         // auction rounds. `1_230e6` was 82% of $1,500 and true only while the crash was $15.00.
-        uint256 numerator = BONDS * CRASHED_NAV * 8_200;
+        uint256 numerator = BONDS * _crashedNav() * 8_200;
         uint256 denominator = Config.BPS * Config.USDC_TO_NAV_SCALE;
         uint256 expectedPrice = (numerator + denominator - 1) / denominator;
         uint256 price = auction.currentPrice(id);
@@ -207,12 +251,12 @@ contract LiquidationForkTest is Test {
         assertEq(credit.unsocialisedLoss(), 0);
 
         // Penalty split 50/50, surplus to the borrower, claimable rather than pushed.
-        uint256 penalty = (MAX_BORROW * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
+        uint256 penalty = (_scenarioMaxBorrow() * Config.LIQUIDATION_PENALTY_BPS) / Config.BPS;
         assertEq(auction.rewardOf(keeper), penalty / 2, "the trigger, not the bidder");
         assertEq(credit.insuranceFund(), penalty - penalty / 2);
         // Real streamed USDC arrived during the warps and paid part of the loan down,
         // so the borrower's surplus is at least the arithmetic figure, never less.
-        assertGe(credit.claimableOf(alice), price - MAX_BORROW - penalty, "surplus to the borrower");
+        assertGe(credit.claimableOf(alice), price - _scenarioMaxBorrow() - penalty, "surplus to the borrower");
 
         // Every wei accounted for: the auction keeps only the unclaimed reward.
         assertEq(usdc.balanceOf(address(auction)), auction.totalUnclaimedRewards());
@@ -231,7 +275,7 @@ contract LiquidationForkTest is Test {
     function test_expiryToWorkoutOnLiveState() public {
         vm.skip(!run);
         _openPosition();
-        _crashNavTo(CRASHED_NAV);
+        _crashNavTo(_crashedNav());
 
         vm.prank(keeper);
         credit.liquidate(alice);
@@ -258,7 +302,14 @@ contract LiquidationForkTest is Test {
         // DexFi's quote, not a protocol parameter - nothing on chain uses it or can
         // enforce it, which is exactly why the workout is a manual process with a
         // forced-recognition deadline rather than a formula.
-        uint256 recovery = (BONDS * 15e8 * 9_000) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
+        //
+        // The NAV it redeems against is the crashed one the position defaulted at. This read
+        // `15e8`, the third survivor of the pre-2026-08-07 literals: `CRASHED_NAV` stopped being
+        // $15.00 when the ceiling and the threshold moved, and this copy did not follow. It kept
+        // passing because $1,350 of recovery covered a loan that had shrunk to $628.75, which is
+        // the failure mode that matters - a literal that no longer describes anything, sitting one
+        // parameter move away from quietly clearing a debt it should not have covered.
+        uint256 recovery = (BONDS * _crashedNav() * 9_000) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
         deal(Config.USDC_BASE, address(this), recovery);
         usdc.approve(address(auction), recovery);
         auction.workoutSettle(id, recovery);
@@ -277,7 +328,7 @@ contract LiquidationForkTest is Test {
     function test_liquidationSurvivesAStaleFeedThatStopsBorrowing() public {
         vm.skip(!run);
         _openPosition();
-        _crashNavTo(CRASHED_NAV);
+        _crashNavTo(_crashedNav());
 
         vm.warp(block.timestamp + Config.NAV_STALENESS + 1);
         assertTrue(oracle.isStale());

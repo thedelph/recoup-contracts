@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {CollateralVault} from "../src/CollateralVault.sol";
-import {Config} from "../src/Config.sol";
 import {LtvMath} from "../src/LtvMath.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
@@ -17,6 +16,9 @@ import {MockCreditManager} from "./mocks/MockCreditManager.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice Randomised call sequences against the vault + adapter. The fuzzer
 ///         plays several actors (depositors, the auction, the owner, a yield
@@ -178,11 +180,14 @@ contract VaultHandler is Test {
         }
     }
 
+    /// @dev The threshold is read off the vault's own `RiskParams` on every call rather than
+    ///      inlined, so this mirror cannot disagree with the contract it is predicting - not even
+    ///      for one handler frame after a parameter move.
     function _liquidatable(address who, uint256 held) internal view returns (bool) {
         return LtvMath.exceedsLtv(
             credit.currentDebtOf(who),
             LtvMath.collateralValue(held, vault.navOracle().navPerBond()),
-            Config.LIQUIDATION_THRESHOLD_BPS
+            vault.riskParams().liquidationThresholdBps()
         );
     }
 
@@ -202,26 +207,42 @@ contract VaultHandler is Test {
     }
 }
 
-contract CollateralVaultInvariants is Test {
+contract CollateralVaultInvariants is RiskParamsFixture {
+    uint256 internal constant NAV = 25.15e8;
+
     VaultHandler internal handler;
     CollateralVault internal vault;
     DirectCallAdapter internal adapter;
     MockBond internal bond;
     MockFarm internal farm;
     MockUSDC internal usdc;
+    RiskParams internal riskParams;
+    address internal riskParamsOwner;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return riskParamsOwner;
+    }
 
     function setUp() public {
         address admin = makeAddr("admin");
+        riskParamsOwner = admin;
         MockLiquidationAuction auctionMock = new MockLiquidationAuction();
         address auction = address(auctionMock);
         usdc = new MockUSDC();
         bond = new MockBond();
         farm = new MockFarm(bond, usdc);
         bond.setRewardPool(address(farm));
-        MockNavOracle oracle = new MockNavOracle(25.15e8);
+        MockNavOracle oracle = new MockNavOracle(NAV);
         MockCreditManager credit = new MockCreditManager();
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)),
             IDexFiFarm(address(farm)),
@@ -232,6 +253,13 @@ contract CollateralVaultInvariants is Test {
         );
         credit.setVault(address(vault)); // setCreditManager checks the binding back
         auctionMock.setVault(address(vault));
+        // Audit round 20: both setters also check the risk authority agrees with the vault's.
+        credit.setRiskParams(address(riskParams));
+        auctionMock.setRiskParams(address(riskParams));
+        // Audit round 21: and that the NAV feed does too. Read off the vault rather than off
+        // the local, because the vault's answer is the anchor the guards compare against.
+        credit.setNavOracle(address(vault.navOracle()));
+        auctionMock.setNavOracle(address(vault.navOracle()));
         vm.startPrank(admin);
         vault.setCustodyAdapter(ICustodyAdapter(address(adapter)));
         vault.setCreditManager(address(credit));
@@ -314,9 +342,16 @@ contract CollateralVaultInvariants is Test {
     ///      these behaviours occur in *every* random 500-call sequence, and fail on the
     ///      first unlucky one.
     ///
-    ///      NAV is fixed at 25.15e8 in this fixture and there is no `moveNav` action, so
+    ///      NAV is fixed at `NAV` in this fixture and there is no `moveNav` action, so
     ///      liquidatability comes only from `setDebt`. That is why the debt figures below
-    ///      are hand-derived from the bond counts rather than picked round.
+    ///      are derived from the bond counts rather than picked round - and, since the LTV
+    ///      ceiling and the liquidation threshold became settable storage, derived through
+    ///      the fixture rather than written out. A literal here would sit on whichever side
+    ///      of the line the launch values happened to put it, and this test asserts *which
+    ///      branch was taken*: a stale figure would not fail, it would silently stop
+    ///      exercising the guard it was chosen to exercise. It already had: the percentages
+    ///      this comment used to quote were the pre-2026-08-07 parameters, and the step
+    ///      described as sitting inside the ceiling was over it.
     function test_handlerCanReachEveryStateTheInvariantsCheck() public {
         // actor0 stakes 1,000 bonds - $25,150 of collateral at 25.15e8.
         handler.deposit(0, 1_000);
@@ -326,10 +361,10 @@ contract CollateralVaultInvariants is Test {
         handler.withdraw(0, 100);
         assertEq(handler.withdrawsDone(), 1, "withdrawals must be possible");
 
-        // 900 bonds left, $22,635. At $7,000 the position sits at 30.9% LTV, inside the
-        // 35% ceiling - but releasing 300 more would leave 600 bonds ($15,090) and put it
-        // at 46.4%, so the withdrawal rule must refuse it.
-        handler.setDebt(0, 7_000e6);
+        // 900 bonds left. Debt set to exactly what 900 bonds may carry, so the position is
+        // inside the ceiling where it stands and releasing 300 more - leaving 600 bonds to
+        // carry the same debt - must be refused, whatever the ceiling currently is.
+        handler.setDebt(0, _maxBorrow(900, NAV));
         handler.withdraw(0, 300);
         assertEq(handler.withdrawsRefusedByLtv(), 1, "the LTV withdrawal guard was never exercised");
         assertEq(handler.withdrawsDone(), 1, "a withdrawal that breaches max LTV was allowed");
@@ -340,16 +375,15 @@ contract CollateralVaultInvariants is Test {
         handler.harvest();
         assertEq(handler.harvestsWithYield(), 1, "harvested yield must be reachable");
 
-        // Past the 58% liquidation threshold on 900 bonds ($22,635 x 0.58 = $13,128).
-        handler.setDebt(0, 15_000e6);
+        // The smallest debt past the liquidation threshold on 900 bonds.
+        handler.setDebt(0, _debtAtThreshold(900, NAV) + 1);
         handler.seize(0);
         assertEq(handler.seizesDone(), 1, "seizure must be reachable");
         assertEq(handler.ghostSeizedToWinners(), 900, "the whole position must move to the winner");
 
-        // The workout path, on a second actor, so the seized one is not reused. 1,000
-        // bonds is $25,150 and $20,000 of debt is 79.5% - comfortably liquidatable.
+        // The workout path, on a second actor, so the seized one is not reused.
         handler.deposit(1, 1_000);
-        handler.setDebt(1, 20_000e6);
+        handler.setDebt(1, _debtAtThreshold(1_000, NAV) + 1);
         handler.reassign(1);
         assertEq(handler.reassignsDone(), 1, "the workout reassignment must be reachable");
         assertEq(vault.bondCount(handler.auction()), 1_000, "the claim must land on the auction");

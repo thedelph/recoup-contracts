@@ -6,22 +6,29 @@ pragma solidity ^0.8.24;
 ///         PRD rule: no magic numbers anywhere else - all bps values use the 10_000
 ///         denominator (`BPS`). Values from PRD §5 (risk) and §4.4 (yield split).
 /// @dev    Every member here is an `internal constant`, inlined into each consumer at
-///         compile time. There is no parameter storage and no setter anywhere in the
-///         protocol, so changing any value below means redeploying the contracts that
-///         read it.
+///         compile time. Changing one means redeploying the contracts that read it.
 ///
-///         That is deliberate while nothing is live, and it is **not** the intended
-///         mainnet shape. PRD §4 and §9 call for the risk parameters to sit in
-///         admin-tunable storage behind a timelock of `ADMIN_TIMELOCK`; moving
-///         `MAX_LTV_BPS`, `LIQUIDATION_THRESHOLD_BPS` and the two borrow caps into
-///         bounded setters is a pre-mainnet task and has not been done.
+///         **The exception, and it is the important one: the four negotiated risk
+///         parameters are no longer read by any contract at runtime.** They live in
+///         `RiskParams` as bounded storage behind the owner, per PRD §4 and §9, and
+///         what remains here are the `DEFAULT_*` values the deploy script seeds that
+///         contract with. Changing one below changes what a *fresh deployment* starts
+///         at; it does nothing to a chain that is already live, where the live values
+///         are whatever `RiskParams.params()` returns.
 ///
-///         Whoever does it: those four cannot be set independently. The auction floor
-///         has to keep covering debt plus the liquidation penalty after a worst-case
-///         NAV move, which ties `LIQUIDATION_THRESHOLD_BPS` to `AUCTION_FLOOR_BPS` by
-///         the relation derived below and asserted in `test/Config.t.sol`. A setter
-///         that moves one without checking the other can silently put the floor under
-///         the debt it is supposed to cover.
+///         They are still declared here, under names that say what they are, for a
+///         reason that is not inertia: the webapp mirrors this file, and the check that
+///         holds the mirror to it parses these declarations. What that check guarantees
+///         has narrowed - from "the UI matches the protocol" to "the UI matches the
+///         launch defaults" - and that narrowing is a known gap, tracked with the
+///         webapp's chain-read work, rather than a passing check that has quietly
+///         stopped meaning anything.
+///
+///         The relations between those four are enforced in `RiskParams.checkRiskParams`
+///         and no longer only in `test/Config.t.sol`. The one worth knowing about here:
+///         the auction floor has to keep covering debt plus the liquidation penalty
+///         after a worst-case NAV move, which ties the liquidation threshold to
+///         `AUCTION_FLOOR_BPS` below.
 library Config {
     uint256 internal constant BPS = 10_000;
 
@@ -34,38 +41,119 @@ library Config {
     /// survivable. The expansion back towards the PRD figures is scheduled against
     /// observable data rather than renegotiated - four clean epochs with the insurance
     /// fund at INSURANCE_FUND_TARGET_BPS of debt raises the global cap, four more
-    /// raises MAX_LTV_BPS. Changing any of them is a redeploy until the bounded setters
-    /// described in the header exist.
-    uint256 internal constant MAX_LTV_BPS = 2_500;
-    uint256 internal constant LIQUIDATION_THRESHOLD_BPS = 5_000;
-    uint256 internal constant GLOBAL_BORROW_CAP = 25_000e6; // USDC, 6 decimals
-    uint256 internal constant PER_ACCOUNT_BORROW_CAP = 5_000e6;
+    /// raises the borrow ceiling.
+    ///
+    /// **These are seeds, not the live values.** They are what `DeployBase` constructs
+    /// `RiskParams` with, and nothing else reads them. `RiskParams` re-checks them
+    /// through the same function every later write goes through, so a set that its own
+    /// setter would refuse cannot be deployed. The `DEFAULT_` prefix is the point of the
+    /// name: reading one of these and believing it describes a live chain is the mistake
+    /// the prefix exists to prevent.
+    uint256 internal constant DEFAULT_MAX_LTV_BPS = 2_500;
+    uint256 internal constant DEFAULT_LIQUIDATION_THRESHOLD_BPS = 5_000;
+    uint256 internal constant DEFAULT_GLOBAL_BORROW_CAP = 25_000e6; // USDC, 6 decimals
+    uint256 internal constant DEFAULT_PER_ACCOUNT_BORROW_CAP = 5_000e6;
     uint256 internal constant RESERVE_RATIO_BPS = 1_500; // LenderPool hot float target
 
-    /// @notice Ceiling on total deposits into the LenderPool.
-    /// @dev Set equal to `GLOBAL_BORROW_CAP` deliberately, and it is a yield figure rather than a
-    ///      risk one. A lender's return is 25% of the yield on collateral worth four times the
-    ///      debt, so at the LTV ceiling a fully deployed pool earns the bond fund's own yield rate.
-    ///      Idle USDC earns nothing and dilutes that rate for everyone in the pool, so a pool
-    ///      materially larger than the debt it can fund pays everyone less for no extra safety.
-    ///      Moves with the global cap on each ratchet step.
-    uint256 internal constant LENDER_POOL_DEPOSIT_CAP = GLOBAL_BORROW_CAP;
+    /// @notice Seed for the ceiling on total deposits into the LenderPool.
+    /// @dev A yield figure rather than a risk one. A lender's return is 25% of the yield on
+    ///      collateral worth four times the debt, so at the LTV ceiling a fully deployed pool
+    ///      earns the bond fund's own yield rate. Idle USDC earns nothing and dilutes that rate
+    ///      for everyone in the pool, so a pool materially larger than the debt it can fund pays
+    ///      everyone less for no extra safety.
+    ///
+    ///      **It used to be `= GLOBAL_BORROW_CAP`, and that alias had to go.** A Solidity constant
+    ///      cannot be defined in terms of storage, so the moment the global cap became settable
+    ///      this would have silently frozen at 25k through every ratchet step - in an ERC-4626
+    ///      `maxDeposit` override, which the standard forbids from reverting, on a contract with
+    ///      no sweep and no owner rescue. It was also an alias tying a lender-return decision to a
+    ///      credit-risk decision by `=`, with nothing in the tree saying so. The pool now owns this
+    ///      as its own settable `depositCap`. The ratchet still moves both together; it now does so
+    ///      by naming both, which is one extra call in a proposal that already takes 48 hours.
+    uint256 internal constant DEFAULT_LENDER_POOL_DEPOSIT_CAP = 25_000e6;
+
+    /// @notice The absolute ceiling the settable global borrow cap may never exceed.
+    /// @dev Lives here rather than only in `RiskParams` because three contracts need it as a
+    ///      compile-time constant. `RiskParams` enforces it as a bound; `LenderPool.impair` and
+    ///      `LiquidationAuction._bid` use it as an overflow clamp on a measured balance delta.
+    ///
+    ///      Both of those clamps *must* stay constant rather than reading the live cap. Neither
+    ///      function may revert - `impair` is reached by the auction's exits of last resort, and
+    ///      an exit that can fail while holding somebody else's collateral is not an exit - so
+    ///      neither can afford an external call. It is a guard against arithmetic that should be
+    ///      impossible, not a policy limit.
+    ///
+    ///      **The two clamps clamp two different kinds of quantity, and only one of them is a
+    ///      debt.** Round 20 found both sites carrying the same justification - "no borrower can
+    ///      owe more than the live cap, the live cap can never exceed this, so the clamp cannot
+    ///      bite" - and it does not cover both:
+    ///
+    ///      - `LenderPool.impair` clamps a *mark*: an expected shortfall on one borrower, which
+    ///        `CreditManager._impairmentFor` computes as `debt - recovered`. A shortfall cannot
+    ///        exceed the debt it is a shortfall of, so the debt argument covers this one exactly
+    ///        and the clamp is genuinely unreachable.
+    ///      - `LiquidationAuction._bid` clamps `credited`: the USDC actually received for a
+    ///        winning bid. **That is a price, not a debt.** Nothing bounds what a bidder pays by
+    ///        what the borrower owes - a fill above the debt is the ordinary outcome, which is why
+    ///        there is a surplus path at all. The first strike does bound it, at one remove: a
+    ///        liquidation requires the position to be at or past the threshold, and the lot opens
+    ///        at `AUCTION_START_PREMIUM_BPS` of NAV and only decays, so the price is at most the
+    ///        collateral value at strike, at most `BPS / threshold` times the debt, at most twice
+    ///        it. A *re-strike* does not: it re-reads the lot and the NAV without re-checking that
+    ///        the position is still liquidatable, so a borrower who has deposited collateral or
+    ///        whose NAV has recovered can be re-struck at a price bounded by neither.
+    ///
+    ///      So the clamp at `_bid` can bite, and it is still correct - for a reason nothing in the
+    ///      tree stated. `recognisedRecoveryOf` is only ever consumed as `debt > recovered ? debt
+    ///      - recovered : 0`, and this ceiling is at least any debt the protocol can carry, so
+    ///      every value at or above the debt produces the same answer: no mark. The clamp is
+    ///      chosen so that biting is *harmless*, not so that biting is *impossible*, and those are
+    ///      different guarantees with different failure modes if the consumer ever changes.
+    ///      **A wrong reason licenses a wrong edit**, which is why this is written down rather
+    ///      than left as a conclusion that happened to survive.
+    ///
+    ///      It is the PRD's original launch figure, which is also the far end of the ratchet
+    ///      agreed with DexFi. Going beyond it is a redeploy, deliberately.
+    uint256 internal constant GLOBAL_BORROW_CAP_MAX = 250_000e6;
     uint256 internal constant INSURANCE_FUND_TARGET_BPS = 500; // ≥5% of outstanding debt per cap raise
     uint256 internal constant UNDERWRITING_APR_BPS = 2_500; // UI/modelling only, never marketed
 
     // ── Liquidation auction (PRD §4.5) ───────────────────────────────────────
     uint256 internal constant AUCTION_START_PREMIUM_BPS = 10_000; // 100% of NAV
-    // Floor must cover debt + liquidation penalty at the worst LTV that can first
-    // trigger a liquidation - i.e. after one immediate NAV_MAX_DEVIATION_BPS drop:
-    //   THRESHOLD/(1-maxDev) x (1+penalty) = 5000/0.9 x 1.05 = 5833 bps.
-    // Set above that with margin; relation asserted in Config.t.sol.
-    // The margin used to be 33 bps against a 5800 threshold. Dropping the threshold to
-    // 5000 widened it to 967 bps without touching this value, so the floor is now far
-    // clear of its bound rather than sitting just above it. That headroom is offered to
-    // DexFi as a raise (80-85%) conditional on their liquidation backstop being
-    // pre-funded, because a high floor with nothing standing behind it pushes lots that
-    // cannot clear into the workout queue, which is the one path that truly redeems
-    // bonds out of their fund. Left at 6800 until they name a level.
+    // Floor must cover debt + liquidation penalty at the worst LTV that can first trigger a
+    // liquidation - one immediate maximum *unconfirmed* NAV drop applied to a position sitting
+    // exactly on the threshold. The requirement, never a literal:
+    //
+    //   maxDrop  = NAV_MAX_DEVIATION_BPS * NAV_DEVIATION_MAX_ELAPSED / NAV_DEVIATION_WINDOW
+    //   required = THRESHOLD * (BPS + LIQUIDATION_PENALTY_BPS) / (BPS - maxDrop)
+    //
+    // Enforced at runtime by `RiskParams.checkRiskParams` relation (C), which evaluates it
+    // cross-multiplied and division-free, and exposes it as `minimumAuctionFloorFor(threshold)`
+    // so a floor change can be modelled before it is agreed. It binds in BOTH directions now the
+    // threshold can move: a *reduction* here lowers the ceiling on how high the threshold may be
+    // ratcheted.
+    //
+    // **Read the margin at the ratchet's terminus, not at today's threshold.** The threshold is
+    // the one input designed to move - `RiskParams`' hard ceiling is 5800 and that endpoint is
+    // the commitment made to DexFi - so `AUCTION_FLOOR_BPS - required(today)` is a fact with a
+    // shelf life, and quoting it here is how one margin came to have three different values in
+    // three files. Both ends are asserted in
+    // `RiskParameters.t.sol:test_relationCsMarginIsPinnedAtBothEndsOfTheRatchet`, which is where
+    // the numbers belong: a change to this constant, to the penalty or to any of the three NAV
+    // deviation constants fails a test instead of staling a comment. At the terminus the room is
+    // tens of basis points, not hundreds.
+    //
+    // **Commercially urgent, and the reason this paragraph is here rather than in a doc.**
+    // This floor is under live negotiation with DexFi and has been offered to them as a *raise*
+    // (80-85%), conditional on their liquidation backstop being pre-funded - a high floor with
+    // nothing standing behind it pushes lots that cannot clear into the workout queue, which is
+    // the one path that truly redeems bonds out of their fund. A raise is safe here; the danger
+    // is the counter-offer. **A reduction of a few tens of basis points puts the agreed 5800
+    // endpoint permanently out of reach through `checkRiskParams`**, and no ratchet step could
+    // then reach it: this is a compile-time constant, so recovering the endpoint would mean
+    // redeploying `RiskParams` and the three contracts that hold it `immutable`. Run
+    // `minimumAuctionFloorFor(5800)` against any number they name before agreeing to it. Left at
+    // 6800 until they name a level.
     uint256 internal constant AUCTION_FLOOR_BPS = 6_800; // 68% of NAV
     uint256 internal constant AUCTION_DURATION = 6 hours;
 
@@ -85,6 +173,18 @@ library Config {
     ///      on a lapsed auction is the permissionless `expireToWorkout`, which arms
     ///      `WORKOUT_MAX_DURATION` and its forced close. The mark can therefore stand for at most
     ///      this window plus that one, rather than for as long as somebody keeps paying gas.
+    ///
+    ///      **That sentence was false when it was written, and audit round 20 is what made it
+    ///      true.** This window bounds the *re-strike*; the mark is keyed on
+    ///      `auctionOf[borrower] != 0`, which a lapse does not clear. A position that HEALED under
+    ///      a lapsed auction - by a permissionless `repayFor`, by the borrower depositing
+    ///      collateral to save it, by the yield stream alone, or by a `liquidationThresholdBps`
+    ///      raise - failed `expireToWorkout` on `reassign`'s liquidatable check, so the "only legal
+    ///      move" was not legal and nothing here bounded anything. Measured at all four routes:
+    ///      the mark unchanged at +365 days, `openWorkoutCount` 0, `refreshImpairments` reporting
+    ///      0. `expireToWorkout` now dispatches that case into the `cancel` body, which releases
+    ///      the mark on the spot - so the bound above holds on the still-forfeit branch and is
+    ///      beaten on the healed one.
     ///
     ///      **48 hours is eight full auction cycles, and the derivation matters because the first
     ///      draft of this got it wrong in the expensive direction.** It was written as 14 days, to
@@ -181,8 +281,17 @@ library Config {
     // Not read by any contract yet, and deliberately so: `EpochHarvester.flushProtocolFee` pays
     // the whole fee out with a plain `safeTransfer` to `protocolFeeWallet`, so the split is done
     // by an immutable splitter installed at that address rather than by changing the core. Both
-    // destinations and both shares fixed at its construction, so neither party can redirect it
-    // afterwards. Blocked on DexFi naming their receiving address.
+    // destinations and both shares fixed at its construction, so neither party can redirect what
+    // has arrived there. Blocked on DexFi naming their receiving address.
+    //
+    // **That guarantee used to be written one word wider - "neither party can redirect it" - and
+    // audit rounds 13 and 21 both found the same gap under it.** The splitter is immutable; the
+    // hop in front of it was not. The fee accrues in `EpochHarvester.pendingProtocolFee` until
+    // somebody calls `flushProtocolFee`, and `setProtocolFeeWallet` used to repoint the
+    // destination over that backlog with no checkpoint and no event: MEASURED at three
+    // 1,000.000000 epochs, DexFi's 60.000000 became 0. Closed in round 21 by checkpointing the
+    // backlog into `EpochHarvester.owedProtocolFee[outgoing]`, which anybody can then deliver.
+    // The claim is true again, and it is true of two contracts rather than one.
     uint256 internal constant PROTOCOL_FEE_RECOUP_BPS = 8_000;
     uint256 internal constant PROTOCOL_FEE_DEXFI_BPS = 2_000;
 

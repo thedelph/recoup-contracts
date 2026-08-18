@@ -16,8 +16,28 @@ import {Config} from "./Config.sol";
 ///      A splitter is not the only way to honour the agreement - the alternative is
 ///      Chris sending DexFi a share every month - but a monthly transfer is a promise
 ///      and this is not. Both destinations are immutable and both shares are compiled
-///      in, so once deployed neither party can redirect the other's leg, and neither
-///      needs to trust the other to remember.
+///      in, so **money that has arrived here cannot be redirected by either party**.
+///
+///      **Read that sentence narrowly, because the wider version of it was written here
+///      first and audit round 21 refuted it by measurement.** It used to say "once
+///      deployed neither party can redirect the other's leg, and neither needs to trust
+///      the other to remember". The first half binds only the balance already at this
+///      address; the second half was simply false. The fee accrues in
+///      `EpochHarvester.pendingProtocolFee` and stays there until somebody calls
+///      `flushProtocolFee` - deliberately, so a blacklisted wallet cannot stop an epoch -
+///      and until that call lands, the money is behind `setProtocolFeeWallet`. MEASURED
+///      over three 1,000.000000 epochs: with this splitter installed DexFi is paid
+///      60.000000; a repoint followed by a flush, both fitting in one block, paid DexFi
+///      **0** and sent 300.000000 elsewhere.
+///
+///      That gap is closed on the harvester rather than here, and it had to be: this
+///      contract has no owner, no setter and no view of the counter, which is the whole
+///      of its value. `EpochHarvester.setProtocolFeeWallet` now checkpoints the accrued
+///      backlog into `owedProtocolFee[outgoing]`, and anybody may call
+///      `flushProtocolFeeTo(thisSplitter)` to bring it here afterwards. So the honest
+///      statement of the guarantee is in two parts: **what has arrived cannot be
+///      redirected, and what has accrued cannot be redirected either - but only because
+///      the harvester remembers, not because this contract can.**
 ///
 ///      There is deliberately **no owner, no setter, no pause and no rescue**. An owner
 ///      is exactly the thing that would make the guarantee above untrue, and a contract

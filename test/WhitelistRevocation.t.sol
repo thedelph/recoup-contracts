@@ -14,12 +14,15 @@ import {MockBond} from "./mocks/MockBond.sol";
 import {MockFarm} from "./mocks/MockFarm.sol";
 import {MockNavOracle} from "./mocks/MockNavOracle.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {RiskParams} from "../src/RiskParams.sol";
+import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 
 /// @notice What happens to live positions if DexFi revokes the adapter's transfer
 ///         whitelist entry after we are running. The whitelist is owner-managed and
 ///         revocable at any time (PRD §7 standing risk), so the blast radius needs to
 ///         be a known quantity rather than a discovery.
-contract WhitelistRevocationTest is Test {
+contract WhitelistRevocationTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8;
 
     address internal admin = makeAddr("admin");
@@ -33,6 +36,15 @@ contract WhitelistRevocationTest is Test {
     MockNavOracle internal oracle;
     CollateralVault internal vault;
     DirectCallAdapter internal adapter;
+    RiskParams internal riskParams;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    function _riskParamsOwner() internal view override returns (address) {
+        return admin;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -41,7 +53,10 @@ contract WhitelistRevocationTest is Test {
         bond.setRewardPool(address(farm));
         oracle = new MockNavOracle(NAV);
 
-        vault = new CollateralVault(IDexFiBond(address(bond)), INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
         adapter = new DirectCallAdapter(
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );

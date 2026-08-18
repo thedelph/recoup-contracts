@@ -10,6 +10,13 @@ The current security posture, including what is knowingly **not** mitigated, is 
 
 Each round is a 12-agent Solidity audit pass. Rounds are appended, newest first.
 
+**This file stops at round nine and the protocol is on round twenty-one.** That is a gap in the
+write-up, not in the work: the fixes from rounds ten onwards are in the code published here, and
+the README's security posture section is kept current against the whole count. The reason the
+later rounds are not written up here is that most of them are about the lender pool, which is
+held back - describing an attack in detail against a contract nobody can read is worse than
+saying plainly that the round happened. When the pool is published these rounds follow it.
+
 ---
 
 ## Round nine - referral registry (August 2026)

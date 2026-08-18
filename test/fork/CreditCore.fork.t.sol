@@ -16,6 +16,9 @@ import {ICustodyAdapter} from "../../src/interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
+import {RiskParams} from "../../src/RiskParams.sol";
+import {IRiskParams} from "../../src/interfaces/IRiskParams.sol";
+import {RiskParamsFixture} from "../helpers/RiskParamsFixture.sol";
 
 /// @notice PRD §12's Phase 2 exit criterion: borrow, repay and yield-application on a
 ///         mainnet fork. Run with:
@@ -27,24 +30,28 @@ import {INAVOracle} from "../../src/interfaces/INAVOracle.sol";
 ///         snapshot because DexFi publishes no on-chain NAV - that gap is exactly what
 ///         the keeper exists to close, and why its figure must be independently
 ///         reconciled rather than read from DexFi.
-contract CreditCoreForkTest is Test {
+contract CreditCoreForkTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
+    uint256 internal constant FLOAT = 50_000e6;
 
     /// @dev Borrowing power at the ceiling, derived rather than written down.
     ///
     ///      **This was the literal `880.25e6` - 35% of $2,515 - and it went on being 35% after the
     ///      ceiling moved to 25% on 2026-08-07.** That change derived the same figure in 53 unit
     ///      tests and 14 CreditManager tests, and missed the fork suite entirely, so these four
-    ///      tests had been reverting `ExceedsMaxLtv(3500)` ever since while the README went on
+    ///      tests had been reverting `ExceedsMaxLtv` ever since while the README went on
     ///      claiming ten green fork tests. Fork tests are skipped unless `RUN_FORK_TESTS=true` and
     ///      CI does not set it, so nothing said otherwise.
     ///
-    ///      The ratchet is expected to move `MAX_LTV_BPS` at least twice more, which is exactly why
-    ///      this must not be a number.
-    uint256 internal constant MAX_BORROW =
-        (BONDS * NAV * Config.MAX_LTV_BPS) / (Config.BPS * Config.USDC_TO_NAV_SCALE);
-    uint256 internal constant FLOAT = 50_000e6;
+    ///      The ratchet is expected to move the LTV ceiling at least twice more, which is exactly
+    ///      why this must not be a number - and, since that ceiling became storage on `RiskParams`,
+    ///      why it can no longer even be a `constant`: a Solidity constant cannot read a storage
+    ///      slot. It is a `view` call through the fixture instead, re-read every time, so a test
+    ///      that moves the parameter partway through still computes against the live figure.
+    function _scenarioMaxBorrow() internal view returns (uint256) {
+        return _maxBorrow(BONDS, NAV);
+    }
 
     IDexFiBond internal bond = IDexFiBond(Config.DEXFI_BOND_NFT);
     IDexFiFarm internal farm = IDexFiFarm(Config.DEXFI_FARM);
@@ -61,8 +68,20 @@ contract CreditCoreForkTest is Test {
     CreditManager internal credit;
     NAVOracle internal oracle;
     TreasuryLiquiditySource internal liquidity;
+    RiskParams internal riskParams;
 
     bool internal run;
+
+    function _riskParams() internal view override returns (IRiskParams) {
+        return IRiskParams(address(riskParams));
+    }
+
+    /// @dev `address(0)` skips the inherited fixture-decay detector, matching how every test in
+    ///      this file self-skips without `RUN_FORK_TESTS`: the detector needs a live setter owner
+    ///      and there is no deployed `RiskParams` at all until the fork is selected.
+    function _riskParamsOwner() internal view override returns (address) {
+        return address(0);
+    }
 
     function setUp() public {
         run = vm.envOr("RUN_FORK_TESTS", false);
@@ -76,9 +95,16 @@ contract CreditCoreForkTest is Test {
         vm.etch(harvester, "");
 
         oracle = new NAVOracle(admin);
-        vault = new CollateralVault(bond, INAVOracle(address(oracle)), admin);
+        riskParams = _deployRiskParams(admin);
+        vault = new CollateralVault(bond, INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin);
         adapter = new DirectCallAdapter(bond, farm, usdc, address(vault), admin, harvester);
-        credit = new CreditManager(usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), admin);
+        credit = new CreditManager(
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(oracle)),
+            IRiskParams(address(riskParams)),
+            admin
+        );
         liquidity = new TreasuryLiquiditySource(usdc, admin);
 
         vm.startPrank(admin);
@@ -88,6 +114,10 @@ contract CreditCoreForkTest is Test {
         // so suites that never run a liquidation still need a stand-in.
         MockLiquidationAuction auctionStub = new MockLiquidationAuction();
         auctionStub.setVault(address(vault));
+        // Audit round 20: the setters also check the risk authority agrees with the vault's.
+        auctionStub.setRiskParams(address(riskParams));
+        // Audit round 21: and the NAV feed, anchored on the vault's answer.
+        auctionStub.setNavOracle(address(vault.navOracle()));
         auctionStub.setCreditManager(address(credit));
         vault.setLiquidationAuction(address(auctionStub));
         // Both sides. An auction the vault names while the manager does not is a
@@ -130,12 +160,30 @@ contract CreditCoreForkTest is Test {
         assertEq(adapter.stakedBalance(), BONDS, "staked in the live farm");
         assertTrue(vault.custodyIsSolvent());
 
-        // 2. Borrow against them, at the ceiling `Config` sets today.
-        uint256 maxBorrow = MAX_BORROW;
+        // 2. Borrow against them, at the ceiling `RiskParams` holds today.
+        uint256 maxBorrow = _scenarioMaxBorrow();
         vm.prank(alice);
         credit.borrow(maxBorrow);
-        assertEq(usdc.balanceOf(alice), maxBorrow, "USDC received same block");
-        assertEq(credit.currentLtvBps(alice), Config.MAX_LTV_BPS, "sits exactly at maxLTV");
+        // **The disbursement is the loan less the prepaid liquidation bounty, and the debt is the
+        // full loan.** That asymmetry is the point of holding the bounty off the debt ledger.
+        //
+        // This line asserted the borrower received `maxBorrow` and had been **failing since the
+        // caller bounty landed**, on `origin/main`, with exactly this arithmetic: 603,750,000
+        // against an expected 628,750,000, a difference of the 25 USDC charge. Nothing noticed,
+        // because CI never sets `RUN_FORK_TESTS` and the fork suite self-skips without it - so
+        // `forge test` has reported ten green fork tests while one of them could not run and would
+        // not have passed. Verified as pre-existing by running this same test on a pristine
+        // `origin/main` worktree before touching it, rather than assuming this change was innocent.
+        assertEq(
+            usdc.balanceOf(alice),
+            maxBorrow - Config.LIQUIDATION_CALL_BOUNTY,
+            "USDC received same block, less the prepaid bounty"
+        );
+        assertEq(credit.debtOf(alice), maxBorrow, "the debt is the full loan, bounty or no bounty");
+        assertEq(
+            credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "the charge is escrowed, not spent"
+        );
+        assertEq(credit.currentLtvBps(alice), maxLtvBps(), "sits exactly at maxLTV");
         assertGt(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE, "healthy at maxLTV");
 
         // 3. Let real rewards stream, then harvest them out of the live farm.
@@ -167,7 +215,7 @@ contract CreditCoreForkTest is Test {
         credit.settle(alice);
         // At most 1 wei of USDC is left behind by the stream rate's truncation.
         assertApproxEqAbs(credit.debtOf(alice), debtBefore - harvested, 1, "debt fell by the yield");
-        assertLt(credit.currentLtvBps(alice), Config.MAX_LTV_BPS, "self-repaid, LTV improved");
+        assertLt(credit.currentLtvBps(alice), maxLtvBps(), "self-repaid, LTV improved");
 
         // 5. Repay the remainder and exit with the bonds.
         uint256 remaining = credit.debtOf(alice);

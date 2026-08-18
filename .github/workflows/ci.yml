@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# One job, and it runs the unit and invariant suites only.
+#
+# The fork suite is deliberately not here. Its three files read `BASE_RPC_URL` through
+# `vm.envOr` and skip themselves when it is unset, so they cost nothing by being absent -
+# and wiring a mainnet RPC secret into a public repository's Actions is a larger decision
+# than a test job. Run them locally with `BASE_RPC_URL` set; the README says how.
+#
+# Allow several minutes. The invariant suites dominate: `foundry.toml` sets 256 runs at
+# depth 500, and that is the setting that makes them worth having.
+jobs:
+  test:
+    name: forge test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `forge-std` and `openzeppelin-contracts` are git submodules. Without this the
+          # checkout succeeds, every import fails, and the failure reads like a broken
+          # remapping rather than a missing checkout flag.
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Show versions
+        run: forge --version
+
+      - name: Build
+        run: forge build
+
+      - name: Test
+        run: forge test -vv

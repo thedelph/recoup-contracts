@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.24;
 
-
+import {INAVOracle} from "./INAVOracle.sol";
+import {IRiskParams} from "./IRiskParams.sol";
 
 /// @title ICollateralVault
 /// @notice Holds bond collateral (fungible ERC-1155 units, id 0), tracks per-owner
@@ -60,6 +61,41 @@ interface ICollateralVault {
     ///      only sound while the vault settles into it before every bond-count change
     ///      - which stops the instant this pointer moves elsewhere.
     function creditManager() external view returns (address);
+
+    /// @notice The risk configuration this vault reads, and the reference every other risk reader
+    ///         is checked against.
+    /// @dev **Audit round 20.** All three risk readers hold this as an `immutable`, and until this
+    ///      member reached the interfaces no wiring setter could look at it - so an ordinary
+    ///      zero-debt manager+auction migration installed a second `RiskParams` with no refusal at
+    ///      any of the seven calls, and a position between the two thresholds then had `bid`,
+    ///      `expireToWorkout` and `cancel` all refuse it at once.
+    ///
+    ///      **This one is the reference because this contract cannot be replaced.** There is no
+    ///      `setCollateralVault` anywhere; the vault pointer is `immutable` on both the manager and
+    ///      the auction. So the manager and the auction are checked against the vault's answer, and
+    ///      never against each other - a symmetric check between two replaceable contracts can
+    ///      agree with itself while both disagree with the collateral.
+    function riskParams() external view returns (IRiskParams);
+
+    /// @notice The NAV feed this vault prices collateral from, and the reference every other nav
+    ///         reader is checked against.
+    /// @dev **Audit round 21, and the exact sibling of `riskParams` above.** Round 20 anchored the
+    ///      risk pointer at six wiring sites and left this one - the identical `immutable` triple,
+    ///      one constructor argument over - with no constructor check, no setter check, nothing on
+    ///      any interface and not one line in `DeployBase._assertCoreGraph`. It was therefore
+    ///      *weaker* than `riskParams` had been before round 20, which at least had the script
+    ///      assertion.
+    ///
+    ///      Divergence here produces no revert anywhere, because each contract reads its own feed
+    ///      for a different, non-overlapping job: the vault values collateral and decides
+    ///      liquidatability, the manager gates `borrow` on staleness, the auction prices the whole
+    ///      Dutch curve. Measured on the shipped fixture, a lot worth 943.125000 sold for
+    ///      94.312500 and 534.437500 of principal was written off against a control of zero.
+    ///
+    ///      This one is the reference for the same reason `riskParams` is: there is no
+    ///      `setCollateralVault` anywhere, so the vault is the only contract in the graph that
+    ///      cannot be replaced.
+    function navOracle() external view returns (INAVOracle);
 
     /// @notice Sum of every `bondCount`. The denominator for pro-rata yield, and the
     ///         figure custody solvency is checked against.

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.24;
 
+import {INAVOracle} from "./INAVOracle.sol";
+import {IRiskParams} from "./IRiskParams.sol";
+
 /// @title ILiquidationAuction
 /// @notice Dutch auction of a liquidated position's whole bond lot (PRD §4.5).
 ///         Linear decay from startPremium×NAV to floor over the auction duration;
@@ -36,6 +39,10 @@ interface ILiquidationAuction {
 
     /// @notice After expiry unfilled: move bonds to the workout queue for DexFi
     ///         manual redemption; shortfall → insurance fund → socialised loss.
+    /// @dev Total once the auction's clock has run out, and audit round 20 is why. If the position
+    ///      healed during the window there is nothing to seize, so this resolves the auction the
+    ///      way `cancel` does - same body, same zero payment - instead of reverting on the vault's
+    ///      liquidatable check and leaving a caller who has no other legal move.
     function expireToWorkout(uint256 auctionId) external;
 
     /// @return price current Dutch price in USDC for the whole lot
@@ -80,4 +87,20 @@ interface ILiquidationAuction {
     ///         new debt during a migration window, when the three wiring pointers do
     ///         not yet agree and so nothing can open an auction to liquidate it.
     function creditManager() external view returns (address);
+
+    /// @notice The risk configuration this auction reads.
+    /// @dev **Audit round 20.** `cancel` decides whether a position has healed and `bid` reaches
+    ///      the vault's own `seize` check; the completeness of the three exits rests on those two
+    ///      predicates being exact complements, which they only are while both contracts read one
+    ///      authority. Exposed so the setters that install this auction can require exactly that.
+    function riskParams() external view returns (IRiskParams);
+
+    /// @notice The NAV feed this auction prices from.
+    /// @dev **Audit round 21.** `start` fixes the whole Dutch curve off this feed and the curve is
+    ///      then frozen for the auction's life, while the debt it settles, the health gate it
+    ///      passed and the write-down it triggers are all computed off the vault's. An auction on a
+    ///      second feed therefore sells the collateral at a price nothing else in the protocol
+    ///      agrees with, and no comparison anywhere notices. Exposed so the setters that install
+    ///      this auction can require the feeds to be the same one.
+    function navOracle() external view returns (INAVOracle);
 }

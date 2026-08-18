@@ -32,6 +32,9 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     error CreditManagerNotLive(address liveManager);
+    /// @notice The incoming custody adapter is bound to a different vault to the one this
+    ///         harvester's credit manager settles into.
+    error AdapterVaultMismatch(address adapterVault);
     error NotImplemented();
     error EpochGapNotElapsed(uint256 nextAllowedAt);
     error ZeroAddress();
@@ -52,6 +55,18 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     event ParkedLenderYieldFlushed(address indexed pool, uint256 amount);
     event ProtocolFeeAccrued(uint256 indexed epoch, uint256 amount, uint256 totalPending);
     event ProtocolFeeFlushed(address indexed wallet, uint256 amount);
+    /// @notice The fee wallet was repointed, so the fee accrued under the outgoing one was
+    ///         checkpointed against it rather than following the pointer.
+    /// @param totalParked The sum across all wallets, which `harvest` nets off `claimed`.
+    event ProtocolFeeParked(address indexed wallet, uint256 amount, uint256 totalParked);
+    /// @notice A checkpointed fee was finally delivered to the wallet it belongs to.
+    event ParkedProtocolFeeFlushed(address indexed wallet, uint256 amount);
+    /// @notice The fee wallet was repointed.
+    /// @dev **This event did not exist until audit round 21.** It was the only setter on this
+    ///      contract that emitted nothing at all, on the one pointer a third party's revenue
+    ///      hangs off, so the repoint that redirected DexFi's accrued leg left no on-chain
+    ///      record whatsoever - not even the fact that it had happened.
+    event ProtocolFeeWalletSet(address indexed wallet);
     event CreditManagerSet(address indexed creditManager);
     /// @param seededCorroboration The incoming adapter's `farmYieldDelivered` at the swap, which
     ///        becomes the new high-water mark. Emitted rather than left implicit because a wrong
@@ -128,6 +143,51 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     ///      `harvest` let one frozen wallet stop every epoch, borrowers included.
     uint256 public pendingProtocolFee;
 
+    /// @notice Protocol fee that accrued while a given wallet was wired, checkpointed there when
+    ///         the pointer moved. Payable to that wallet forever.
+    /// @dev **Audit round 21: the fee leg was the lender leg's un-fixed twin.** `setLenderPool`
+    ///      has parked an outgoing pool's accrued share since round 11 - see `owedToPool` - and
+    ///      the reasoning transplants exactly, with one difference that makes it sharper rather
+    ///      than weaker. On the lender leg the party being redirected is a pool this protocol
+    ///      deploys. Here it is **DexFi**, a commercial counterparty entitled to
+    ///      `PROTOCOL_FEE_DEXFI_BPS` of the fee under an agreement whose only on-chain
+    ///      enforcement is the immutable `ProtocolFeeSplitter`. That splitter's own NatSpec
+    ///      claimed "once deployed neither party can redirect the other's leg"; it binds only
+    ///      money already *at* the splitter, and `setProtocolFeeWallet` reached over it.
+    ///      MEASURED over three 1,000.000000 epochs: with the splitter installed DexFi is paid
+    ///      60.000000, and a repoint-then-flush in a single block paid DexFi **0** and sent
+    ///      300.000000 elsewhere. The backlog needs no attacker to build - it is linear in
+    ///      epochs, 100.000000 after one and 1,000.000000 after ten, and nothing drains it
+    ///      automatically because `flushProtocolFee` is a separate call by design.
+    ///
+    ///      **The obvious fix - drain to the outgoing wallet before repointing - is wrong here,
+    ///      and this is the half the external precedent gets to skip.** MetaMorpho's
+    ///      `setFeeRecipient` accrues to the old recipient first, but its `_accrueFee` mints the
+    ///      vault's own shares and cannot revert; ours would be a USDC push to an address that
+    ///      may be blacklisted, or a contract that reverts - which is precisely why anyone
+    ///      rotates a fee wallet. Draining first hands the outgoing recipient a veto over its own
+    ///      replacement, and contradicts `flushProtocolFee`'s own stated rationale that a
+    ///      recipient which cannot take delivery must never block anything. So the ordering is
+    ///      kept and the push is dropped: credit, and let them pull.
+    ///
+    ///      **The other naive fix, `require(pendingProtocolFee == 0)` on the setter, is worse
+    ///      than wrong - it manufactures a different finding from the same round.** `harvest()`
+    ///      is permissionless, so anyone could re-block the setter for gas inside the 48-hour
+    ///      timelock window and the repoint would never execute. An unconditional checkpoint has
+    ///      no precondition for a stranger to flip.
+    mapping(address => uint256) public owedProtocolFee;
+
+    /// @notice Sum of `owedProtocolFee`. The fourth category of USDC sitting here that is not
+    ///         this epoch's yield, alongside `pendingLenderYield`, `pendingProtocolFee` and
+    ///         `totalOwedToPools`.
+    /// @dev A mapping cannot be summed, and `harvest` sizes an epoch from this contract's raw
+    ///      balance less what is already spoken for. `harvest`'s own comment predicted this
+    ///      counter before it existed - "any future balance this contract holds on someone
+    ///      else's behalf belongs on this line too" - and leaving it off would have made the
+    ///      checkpoint worse than the bug it fixes: the parked fee would read as fresh yield to
+    ///      the next epoch, be split four ways, and still be owed.
+    uint256 public totalOwedProtocolFee;
+
     /// @notice The custody adapter's `farmYieldDelivered` as of the last epoch this contract
     ///         accepted. An epoch is corroborated by the *increase* on this mark, never by the
     ///         absolute figure.
@@ -175,8 +235,39 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     ///      not answer `farmYieldDelivered()` reverts here, at wiring time and under the owner's
     ///      hand, rather than inside the permissionless `harvest` where a revert freezes every
     ///      borrower's write-down.
+    ///
+    /// @dev **Audit round 21's census: this was the one adapter pointer in the protocol with no
+    ///      binding check at all**, while `CollateralVault.setCustodyAdapter` - the twin, on the
+    ///      same interface - has required `adapter.vault() == address(this)` since it was written.
+    ///      What the omission bought is an adapter belonging to a different vault, whose
+    ///      `farmYieldDelivered` counter has nothing to do with the yield this protocol earned:
+    ///      `harvest` sizes the epoch from this contract's own USDC balance but decides whether the
+    ///      epoch is *real* from that counter, so a foreign counter either freezes the stream
+    ///      permanently at zero or corroborates epochs funded by a donation - which is the exact
+    ///      defence round 11 built the counter to be.
+    ///
+    ///      **Read against the vault this harvester's own manager settles into**, because this
+    ///      contract holds no vault pointer of its own and `creditManager` is a constructor
+    ///      argument that can never be zero. `setCreditManager` below already requires that manager
+    ///      to be the vault's live one, so the reference is the same vault the collateral is in.
+    ///
+    ///      **What this does not check, stated rather than implied by the count.** It is the weak
+    ///      form: same vault, not *the vault's live adapter*. The strong form - `ICollateralVault
+    ///      (liveVault).custodyAdapter() == adapter`, the shape `setCreditManager` below uses for
+    ///      its own pointer - was considered and rejected on measured ground: it refuses seeding
+    ///      this pointer onto an adapter the vault has not moved to yet, and
+    ///      `test_setCustodyAdapter_reSeedsTheCorroborationWatermark` does exactly that and would
+    ///      go red. It would also add an ordering constraint to a wiring sequence the deploy script
+    ///      and the Phase-4 batch both drive.
+    ///
+    ///      So an operator can still point this at the *previous* adapter after a vault-side
+    ///      migration. That residual is a frozen yield stream, recoverable by calling this setter
+    ///      again with the right address, and it is left open knowingly.
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
         if (address(adapter) == address(0)) revert ZeroAddress();
+        address boundVault = adapter.vault();
+        address liveVault = address(creditManager.vault());
+        if (boundVault != liveVault) revert AdapterVaultMismatch(boundVault);
         custodyAdapter = adapter;
         lastCorroboratedYield = adapter.farmYieldDelivered();
         emit CustodyAdapterSet(address(adapter), lastCorroboratedYield);
@@ -254,9 +345,45 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         emit CreditManagerSet(address(creditManager_));
     }
 
+    /// @notice Repoint the wallet the protocol fee is paid to.
+    /// @dev **Checkpoints the accrued backlog against the outgoing wallet first, and does not
+    ///      try to pay it.** The full argument, the measurement and both rejected alternatives
+    ///      are on `owedProtocolFee`; the short version is that this setter used to hand a
+    ///      third party's accrued revenue to whoever the owner named next, and that the two
+    ///      obvious guards - drain first, or refuse while a backlog stands - would each have
+    ///      recreated a deadlock this contract has already been bitten by twice.
+    ///
+    ///      Note what is deliberately *not* copied from `setLenderPool`. That sibling calls
+    ///      `_tryDeliverLenderYield(outgoing)` before reading the residue, because its delivery
+    ///      is an approve-and-call a pool may take partially, so "what is left standing" is the
+    ///      only honest measure of what could not be delivered. Here delivery is a plain
+    ///      `safeTransfer` that either moves everything or reverts, so there is no partial case
+    ///      to measure - and attempting it inside a `try` would need a low-level call whose only
+    ///      effect would be to sometimes pay a wallet that `flushProtocolFee` already lets
+    ///      anybody pay, permissionlessly, in the block before this one. Fewer moving parts, no
+    ///      external call, and therefore no `nonReentrant` needed either.
+    ///
+    ///      **No precondition, deliberately.** The only branch below decides whether a park
+    ///      *happened*, not whether the repoint is allowed: the pointer moves on every call, in
+    ///      every state, and there is nothing here a stranger can flip to make it revert.
+    ///      Repointing a wallet to itself is a no-op that still emits. And the park is not a
+    ///      state anyone can be stuck in - `flushProtocolFeeTo` is permissionless and takes its
+    ///      destination from the mapping key, so the checkpoint can always be discharged by
+    ///      whoever wants it discharged.
     function setProtocolFeeWallet(address wallet) external onlyOwner {
         if (wallet == address(0)) revert ZeroAddress();
+
+        address outgoing = protocolFeeWallet;
+        uint256 backlog = pendingProtocolFee;
+        if (outgoing != address(0) && outgoing != wallet && backlog != 0) {
+            pendingProtocolFee = 0;
+            owedProtocolFee[outgoing] += backlog;
+            totalOwedProtocolFee += backlog;
+            emit ProtocolFeeParked(outgoing, backlog, totalOwedProtocolFee);
+        }
+
         protocolFeeWallet = wallet;
+        emit ProtocolFeeWalletSet(wallet);
     }
 
     // ── IEpochHarvester ──────────────────────────────────────────────────────
@@ -310,8 +437,15 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // every subsequent epoch, gets split four ways, and is then still owed to the pool it was
         // parked for - so the second payment comes out of somebody else's epoch. Any future
         // balance this contract holds on someone else's behalf belongs on this line too.
-        uint256 claimed =
-            usdc.balanceOf(address(this)) - pendingLenderYield - pendingProtocolFee - totalOwedToPools;
+        //
+        // **`totalOwedProtocolFee` is that future balance, and it arrived in audit round 21.**
+        // The fee leg gained the same per-wallet checkpoint the lender leg has had since round
+        // 11, which moves value out of `pendingProtocolFee` and therefore out of this
+        // subtraction. Without this term the fix would have been a downgrade: a checkpointed
+        // backlog would read as fresh yield to the very next epoch, get split four ways, and
+        // still be owed to the wallet it was parked for.
+        uint256 claimed = usdc.balanceOf(address(this)) - pendingLenderYield - pendingProtocolFee
+            - totalOwedToPools - totalOwedProtocolFee;
 
         // Split per PRD §4.4, computed before the cooldown decision because the
         // borrower share is what decides whether this epoch did anything.
@@ -565,6 +699,36 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
 
         pendingProtocolFee = 0;
         emit ProtocolFeeFlushed(wallet, amount);
+        usdc.safeTransfer(wallet, amount);
+    }
+
+    /// @notice Deliver a fee checkpointed for a wallet this harvester no longer points at.
+    /// @dev Permissionless, and takes the wallet as an argument - the pair of properties that
+    ///      make the checkpoint safe, exactly as they do for `flushLenderYieldTo`.
+    ///      `owedProtocolFee` is keyed by the wallet that earned the fee, so this can only ever
+    ///      move money to that address: there is no destination to choose and therefore nothing
+    ///      for an owner to redirect. And because anybody may call it, DexFi's leg does not
+    ///      depend on Recoup's owner cooperating in paying it - which is the entire point, since
+    ///      Recoup's owner is the party the redirect would have benefited.
+    ///
+    ///      Deliberately separate from `flushProtocolFee` rather than folded into it, for the
+    ///      reason its lender-leg twin gives: that function pays the *currently wired* wallet out
+    ///      of the live counter, and conflating the two would put a stranger's balance inside the
+    ///      path the live fee uses. Reverts loudly on a no-op, because a caller who asked for a
+    ///      delivery wants to know it did not land.
+    ///
+    ///      A plain `safeTransfer` like its sibling, not the measured approve-and-call the lender
+    ///      legs use. Nothing here is pulled, so there is no short-delivery case to measure; a
+    ///      transfer that fails reverts and takes the counters with it, which is the correct
+    ///      outcome for a caller who asked for exactly this payment.
+    function flushProtocolFeeTo(address wallet) external nonReentrant {
+        if (wallet == address(0)) revert ZeroAddress();
+        uint256 amount = owedProtocolFee[wallet];
+        if (amount == 0) revert NothingToFlush();
+
+        owedProtocolFee[wallet] = 0;
+        totalOwedProtocolFee -= amount;
+        emit ParkedProtocolFeeFlushed(wallet, amount);
         usdc.safeTransfer(wallet, amount);
     }
 

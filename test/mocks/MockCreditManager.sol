@@ -17,6 +17,29 @@ contract MockCreditManager {
         vault = vault_;
     }
 
+    /// @notice The risk configuration this manager claims to read.
+    /// @dev **Audit round 20**, and settable for exactly the reason `vault` is. Every wiring setter
+    ///      that installs a risk reader now refuses one answering a different authority to the
+    ///      vault's, so a fixture has to point this at the vault's own `RiskParams` before wiring -
+    ///      and a fixture proving the guard bites points it somewhere else, which is the whole
+    ///      value of it being settable rather than derived.
+    address public riskParams;
+
+    function setRiskParams(address riskParams_) external {
+        riskParams = riskParams_;
+    }
+
+    /// @notice The NAV feed this manager claims to read.
+    /// @dev **Audit round 21**, and settable for exactly the reason `riskParams` is, one pointer
+    ///      over. `CollateralVault.setCreditManager` now refuses a manager pricing off a different
+    ///      feed to the vault's, so a fixture points this at the vault's own oracle before wiring -
+    ///      and a fixture proving the guard bites points it elsewhere.
+    address public navOracle;
+
+    function setNavOracle(address navOracle_) external {
+        navOracle = navOracle_;
+    }
+
     // This mock used to carry a `liquidationAuction` pointer and an `unsocialisedLoss` counter,
     // both added so `LenderPool`'s round-10 exit gate could read them: the gate asked its manager
     // which auction was authoritative and whether a loss had already been recognised. The gate was
