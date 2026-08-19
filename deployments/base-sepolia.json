@@ -35,16 +35,22 @@
   "state": {
     "liquiditySourceFundedUsdc": "250000000000",
     "liquiditySourceFundedNote": "250,000 mUSDC. That is TEN TIMES the current DEFAULT_GLOBAL_BORROW_CAP of 25,000e6, which is fine because over-funding a testnet float refuses nothing. Deliberately not described as equal to the cap: that claim was in this file and wrong by ten times for nine days.",
-    "navBootstrapped": false,
-    "navBootstrapNote": "NOT YET BOOTSTRAPPED. bootstrapNav is onlyOwner and one-shot, and the owner is not the deploying address, so it is a separate step and has not been taken. Until it runs, navPerBond and lastUpdated are 0, isStale() is true, and borrow reverts NavStale() (selector 0x979a5876, confirmed by simulation). Seed at the keeper's own figure, not DexFi's displayed price: bootstrapping at theirs would put the keeper's first post outside the deviation budget on day one."
+    "navBootstrapped": true,
+    "navBootstrapNote": "Bootstrapped 2026-08-19T12:33:24Z at 2182440000, i.e. $21.8244, which is the keeper's own independently computed figure and NOT DexFi's displayed $24.81. Seeding at theirs would have put the keeper's first post about 12% out and parked it for the confirmer on day one, which is the same reasoning the 2026-08-03 deploy used. bootstrapNav is onlyOwner and the owner is not the deploying address, so it was a separate step. It is one-shot and reverts AlreadyBootstrapped, so it cannot be corrected without redeploying the oracle and repointing everything at it.",
+    "navBootstrapValue": "2182440000"
   },
   "seededPosition": {
-    "status": "PARTIAL - collateral deposited, borrow blocked on the NAV bootstrap",
+    "status": "COMPLETE",
     "bonds": 1000,
-    "plannedDebtUsdc": "4000000000",
-    "sizingNote": "Sized against the NEW parameters. 1000 bonds at a NAV near 21.86 is about 21,860 of collateral; the 2500 bps ceiling allows about 5,465 USDC and perAccountBorrowCap cuts that to 5,000. A 4,000 USDC borrow lands near 1,830 bps LTV, comfortably inside both. The old 6,000 USDC position at 2,772 bps is not reachable under these parameters.",
-    "disbursementNote": "borrow(4000000000) books 4,000,000,000 of debt and disburses 3,975,000,000: 25 USDC tops up the prepaid liquidation bounty escrow, which bountyEscrowOf then reports rather than reverting. That read reverted on the 2026-08-03 bytecode, so the webapp's three-state escrow sentinel collapses to two states on this deployment.",
-    "readback": "CollateralVault.bondCount(borrower) = 1000 and totalBondCount = 1000, read from chain after the deposit. collateralValue reads 0 because the NAV oracle is not bootstrapped yet, not because the collateral is missing. The 1000 bonds sit in the MockFarm, which is the designed deposit path: vault to adapter to farm, staked."
+    "debtUsdc": "4000000000",
+    "disbursedUsdc": "3975000000",
+    "bountyEscrowUsdc": "25000000",
+    "collateralValueNav8dp": "2182440000000",
+    "ltvBps": 1832,
+    "healthFactor": "2729257641921397379",
+    "sizingNote": "Sized against the parameters agreed with DexFi on 2026-08-07 and enforced on chain since the 2026-08-19 redeploy. 1000 bonds at $21.8244 is $21,824.40 of collateral; the 2500 bps ceiling allows $5,456.10 and perAccountBorrowCap cuts that to $5,000. $4,000 lands at 1832 bps. The old deployment's 6,000 USDC position at 2772 bps is not reachable under these parameters.",
+    "disbursementNote": "borrow(4000000000) booked 4,000,000,000 of debt and disbursed 3,975,000,000, with 25 USDC topping up the prepaid liquidation bounty escrow. bountyEscrowOf now returns 25000000 rather than reverting, which it did on the 2026-08-03 bytecode, so the webapp's three-state escrow sentinel has two reachable states on this deployment rather than three.",
+    "parametersAreBindingNote": "Readback is not the same as enforcement, so both were checked. healthFactor 2.729 equals collateral x 0.50 / debt, which is the 5000 bps threshold and not the old 5800 (that would give 3.165). And borrow(1100000000) on top reverts PerAccountCapExceeded with 5,100,000,000 requested against a 5,000,000,000 cap."
   },
   "previousDeployment": {
     "deployedAt": "2026-08-03",
