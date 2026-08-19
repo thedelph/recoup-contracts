@@ -121,18 +121,19 @@ contract SkeletonsTest is RiskParamsFixture {
         vm.expectRevert(EpochHarvester.NotImplemented.selector);
         harvester.harvestRange(0, 1);
 
-        // The LenderPool's protocol flows are the remaining phase-4 stubs *in this repository*.
-        // The pool is finished in the private tree; it is held back from publication while one
-        // finding against it is open, so what ships here is still the dormant skeleton and
-        // `queuePosition` still reverts.
-        vm.expectRevert(LenderPool.NotImplemented.selector);
-        pool.queuePosition(address(this));
+        // `LenderPool` used to be the remaining phase-4 stub *in this repository*, held back from
+        // publication while findings were open against it. It was published on 2026-08-19, when the
+        // Base Sepolia redeploy put it on chain and Basescan verification made the source public
+        // anyway. So these two are no longer stubs, and the assertions are inverted: they prove the
+        // published contract answers, which is what a reader of this file wants to know.
+        (uint256 queueIndex, uint256 owed) = pool.queuePosition(address(this));
+        assertEq(queueIndex, 0, "an address that has never queued is not in the queue");
+        assertEq(owed, 0, "and is owed nothing");
 
-        // `recoverLoss` is the newest of those stubs. It is declared so the published skeleton
-        // carries the whole of the interface's function set, and it reverts for the same reason
-        // the rest do. Listed here so that a member added to `ILenderPool` and left without a
-        // body on this side shows up as a deliberate entry rather than as a silently missing one.
-        vm.expectRevert(LenderPool.NotImplemented.selector);
+        // `recoverLoss` is `onlyCreditManager`. Reverting for this caller is the guard doing its
+        // job rather than a missing body, and naming the selector is what keeps those two apart: a
+        // member added to `ILenderPool` and left unimplemented would revert with something else.
+        vm.expectRevert(LenderPool.NotCreditManager.selector);
         pool.recoverLoss(1);
 
         // Deliberately *not* in this list: `exitReserve()`, `totalImpairment()` and

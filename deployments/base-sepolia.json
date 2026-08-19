@@ -1,41 +1,70 @@
 {
   "network": "base-sepolia",
   "chainId": 84532,
-  "deployedAt": "2026-08-03",
+  "deployedAt": "2026-08-19",
   "verified": true,
   "note": "Mock DexFi stack. Real DexFi bonds exist only on Base mainnet, so MockUSDC/MockBond/MockFarm stand in and mirror the verified ABIs including the whitelist gate. The adapter is self-whitelisted here; on mainnet that is DexFi's call and is the one integration ask (PRD 14 ask #5).",
   "contracts": {
-    "NAVOracle": "0x3b70678BDb3de6E5D8E3B9031513F385Fc021214",
-    "CollateralVault": "0x1f4a33B40B135E424b3d57db649f258d4F2be35C",
-    "DirectCallAdapter": "0xe21d7Eb94e25fe3E3721917afdED6f9CD75E6224",
-    "CreditManager": "0xE4AE37d44548C66c180DF418f6DaDdAe3b74082C",
-    "TreasuryLiquiditySource": "0x38DD1afee26bfecA4033C102b4b0DCf3E38797c7",
-    "LenderPool": "0xc74f4EB1385cD0da3243689DE6B52Cd8B9e2C1ec",
-    "EpochHarvester": "0x2A93A7B4a8D35C9ccEfab4e3e05BAfC28f8f1ADD",
-    "LiquidationAuction": "0x5C2A9aA4425BC7c4bCCB6Ee88B5b3374f9D6A1Fa",
+    "NAVOracle": "0x2adf6efe82c7a38214be2a2d8d06d2e98ee4eafa",
+    "RiskParams": "0xb2592dc47250b2546273a64c3736bc4c01cea49e",
+    "CollateralVault": "0xf5a1d8584ab196ecfd5662d61d5e0e0b8d6b757c",
+    "DirectCallAdapter": "0x0064474674ebf4f110b6a082e9f9a6640b4225ea",
+    "CreditManager": "0x060b722b47aa2d5ca672411a2bdae9e67a6a6b58",
+    "TreasuryLiquiditySource": "0x1f1ade78b31c4038473f91da515e5540e727044b",
+    "LenderPool": "0x4ab96c8528b51f333371e66b177c1830be92c0f6",
+    "EpochHarvester": "0x37c186f327aea3fd5d33038ee5122243595f5764",
+    "LiquidationAuction": "0x6fbb14fc068511e02606ed88944f330d45117fb4",
     "ReferralRegistry": "0x30B9B1D7A40aa7D14613cb1742EFaaB155dC84a0"
   },
   "mocks": {
-    "MockUSDC": "0xFa5148Df05ebbAd57cEdB0AbC16fB01dadcDD525",
-    "MockBond": "0xb3a29C5c1f6FE1Bf7cF6BaDa743269689a6c20d5",
-    "MockFarm": "0xE7A54e090c1104bfCFC8e84e7F879C13C67C3A48"
+    "MockUSDC": "0x10543e8956f4b5d1fb677ccf2299a055b29165b8",
+    "MockBond": "0x5e471466f21f7ad57990f58aee2e0e817c8fbfa6",
+    "MockFarm": "0x203276cb4d823643448619f02d7f42dbabe8f11f"
   },
+  "mocksNote": "Fresh mocks. DeployTestnet builds its own MockUSDC/MockBond/MockFarm, so nothing carries over from 2026-08-03: the old seeded position lives on the old bond and the old vault.",
+  "referralRegistryNote": "Deliberately NOT redeployed and carried over unchanged. script/DeployBase.sol:39 states it must not be added to the deploy script, and nothing under contracts/src/ couples it to CreditManager. Bindings are address-scoped and non-portable, so redeploying would orphan every existing one.",
   "riskParameters": {
-    "maxLtvBps": 3500,
-    "liquidationThresholdBps": 5800,
-    "globalBorrowCapUsdc": 250000,
-    "perAccountBorrowCapUsdc": 25000,
-    "divergenceNote": "These are the values the DEPLOYED bytecode enforces, not the values Config.sol declares. This deployment is dated 2026-08-03 and predates two later changes: the capped-beta parameters agreed with DexFi on 2026-08-07 (2500 / 5000 / 25k / 5k), and the move of all four out of `internal constant` and into `RiskParams` storage. The deployed contracts have no RiskParams and cannot be retuned - the parameters are compiled in - so the divergence closes at the next redeploy and not before. Recorded as data rather than prose because it was prose for nine days and nothing could check it.",
-    "sourceOfTruth": "the chain, read from RiskParams once a deployment carries one"
+    "maxLtvBps": 2500,
+    "liquidationThresholdBps": 5000,
+    "globalBorrowCapUsdc": 25000,
+    "perAccountBorrowCapUsdc": 5000,
+    "sourceOfTruth": "the chain, read from RiskParams at 0xb2592dc47250b2546273a64c3736bc4c01cea49e",
+    "closedNote": "The divergence recorded here from 2026-08-03 to 2026-08-19 is CLOSED. These four values were read back from RiskParams on chain after the redeploy and match Config.sol's declared defaults exactly. They are storage now, not bytecode constants, so a governance retune moves them without a redeploy and this record has to be updated when that happens."
   },
   "operatorsNote": "Owner, yield recipient, keeper and NAV confirmer are four distinct addresses, and every protocol contract was verified on-chain as owned by the configured owner rather than by the deployer. Read them from the contracts if you want them. The testnet operator keys are throwaways funded from a faucet; a mainnet deployment does not reuse that pattern.",
   "state": {
     "liquiditySourceFundedUsdc": "250000000000",
-    "liquiditySourceFundedNote": "250,000 mUSDC. This matched Config.GLOBAL_BORROW_CAP when it was funded and stopped matching on 2026-08-07, when the capped-beta cap dropped to 25,000e6 - the note went on claiming equality for nine days, off by ten times, because nothing read it. The float is deliberately left as funded: it is a testnet float and over-funding it refuses nothing.",
-    "navBootstrapped": true,
-    "navBootstrapValue": "2163780721",
-    "navBootstrapTx": "0x79997855e278b5558bc21d44bfd6a95bd3fadc5d79d69bde847aad4a8ea0c460",
-    "navBootstrapNote": "Seeded at the keeper's own independently reconstructed figure ($21.63780721), not DexFi's displayed $24.80. Bootstrapping at theirs would have put the keeper's first post outside the deviation budget on day one. bootstrapNav is one-shot (reverts AlreadyBootstrapped), so this cannot be corrected without redeploying the oracle and repointing everything at it.",
-    "navBudgetNote": "The deviation budget is prorated by time since the last accepted price, so it reads 0 bps immediately after a bootstrap and any post parks for the confirmer. It accrues at NAV_MAX_DEVIATION_BPS (1000) * elapsed / NAV_DEVIATION_WINDOW (24h), so ~9 minutes covers 6 bps and a daily run has the full budget. Not a fault."
-  }
+    "liquiditySourceFundedNote": "250,000 mUSDC. That is TEN TIMES the current DEFAULT_GLOBAL_BORROW_CAP of 25,000e6, which is fine because over-funding a testnet float refuses nothing. Deliberately not described as equal to the cap: that claim was in this file and wrong by ten times for nine days.",
+    "navBootstrapped": false,
+    "navBootstrapNote": "NOT YET BOOTSTRAPPED. bootstrapNav is onlyOwner and one-shot, and the owner is not the deploying address, so it is a separate step and has not been taken. Until it runs, navPerBond and lastUpdated are 0, isStale() is true, and borrow reverts NavStale() (selector 0x979a5876, confirmed by simulation). Seed at the keeper's own figure, not DexFi's displayed price: bootstrapping at theirs would put the keeper's first post outside the deviation budget on day one."
+  },
+  "seededPosition": {
+    "status": "PARTIAL - collateral deposited, borrow blocked on the NAV bootstrap",
+    "bonds": 1000,
+    "plannedDebtUsdc": "4000000000",
+    "sizingNote": "Sized against the NEW parameters. 1000 bonds at a NAV near 21.86 is about 21,860 of collateral; the 2500 bps ceiling allows about 5,465 USDC and perAccountBorrowCap cuts that to 5,000. A 4,000 USDC borrow lands near 1,830 bps LTV, comfortably inside both. The old 6,000 USDC position at 2,772 bps is not reachable under these parameters.",
+    "disbursementNote": "borrow(4000000000) books 4,000,000,000 of debt and disburses 3,975,000,000: 25 USDC tops up the prepaid liquidation bounty escrow, which bountyEscrowOf then reports rather than reverting. That read reverted on the 2026-08-03 bytecode, so the webapp's three-state escrow sentinel collapses to two states on this deployment.",
+    "readback": "CollateralVault.bondCount(borrower) = 1000 and totalBondCount = 1000, read from chain after the deposit. collateralValue reads 0 because the NAV oracle is not bootstrapped yet, not because the collateral is missing. The 1000 bonds sit in the MockFarm, which is the designed deposit path: vault to adapter to farm, staked."
+  },
+  "previousDeployment": {
+    "deployedAt": "2026-08-03",
+    "note": "Replaced by the 2026-08-19 redeploy, which closed the risk-parameter divergence. Those contracts are still on chain and still hold the old seeded position, but nothing points at them. They enforce MAX_LTV 3500 / threshold 5800 / global cap 250,000 / per-account 25,000 in bytecode and have no RiskParams, which is why they could not be retuned.",
+    "contracts": {
+      "NAVOracle": "0x3b70678BDb3de6E5D8E3B9031513F385Fc021214",
+      "CollateralVault": "0x1f4a33B40B135E424b3d57db649f258d4F2be35C",
+      "DirectCallAdapter": "0xe21d7Eb94e25fe3E3721917afdED6f9CD75E6224",
+      "CreditManager": "0xE4AE37d44548C66c180DF418f6DaDdAe3b74082C",
+      "TreasuryLiquiditySource": "0x38DD1afee26bfecA4033C102b4b0DCf3E38797c7",
+      "LenderPool": "0xc74f4EB1385cD0da3243689DE6B52Cd8B9e2C1ec",
+      "EpochHarvester": "0x2A93A7B4a8D35C9ccEfab4e3e05BAfC28f8f1ADD",
+      "LiquidationAuction": "0x5C2A9aA4425BC7c4bCCB6Ee88B5b3374f9D6A1Fa",
+      "ReferralRegistry": "0x30B9B1D7A40aa7D14613cb1742EFaaB155dC84a0"
+    },
+    "mocks": {
+      "MockUSDC": "0xFa5148Df05ebbAd57cEdB0AbC16fB01dadcDD525",
+      "MockBond": "0xb3a29C5c1f6FE1Bf7cF6BaDa743269689a6c20d5",
+      "MockFarm": "0xE7A54e090c1104bfCFC8e84e7F879C13C67C3A48"
+    }
+  },
+  "gasNote": "23,932,089 gas across 40 transactions, 0.00014361 ETH at 0.006 gwei. The fork rehearsal predicted 23,932,125, which is 36 gas out."
 }

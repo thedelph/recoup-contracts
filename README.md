@@ -4,7 +4,7 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **deployed to Base Sepolia** (2026-08-03), nothing on mainnet. The collateral layer, the
+Status: **deployed to Base Sepolia** (redeployed 2026-08-19), nothing on mainnet. The collateral layer, the
 credit core, the epoch harvester and the liquidation auction are implemented, and the whole loan
 lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling through to
 the workout path - is fork-tested against the live DexFi contracts. Lending reaches the credit core
@@ -80,17 +80,23 @@ bond and farm contracts exist only on Base mainnet; the mocks mirror their verif
 the transfer whitelist. The live DexFi contracts are exercised by the mainnet fork tests below,
 which are the real integration proof.
 
-**One thing to know before you verify those addresses.** The four risk parameters in
-[`src/Config.sol`](src/Config.sol) changed on 2026-08-07 to the capped-beta values agreed with
-DexFi - max LTV 3500 -> 2500 bps, liquidation threshold 5800 -> 5000, and both borrow caps down.
-Those parameters are `internal constant`, inlined at compile time, and the Sepolia contracts were
-deployed on 2026-08-03, so **the deployed bytecode still enforces the old values**. Source and
-chain genuinely disagree here, and the source is the intended one. **The half of that which was
-queued has since landed**: the four parameters now live in bounded, timelocked storage in
-[`src/RiskParams.sol`](src/RiskParams.sol) rather than as compile-time constants, so the next
-change to them is a transaction rather than a redeploy. What is left is the redeploy itself, which
-is what puts a `RiskParams` on chain at all. Until then the deployed contracts have no `RiskParams`
-to read, cannot be retuned, and the divergence stands.
+**The risk parameters on chain now match the source, and did not until 2026-08-19.** The four
+values in [`src/Config.sol`](src/Config.sol) changed on 2026-08-07 to the capped-beta figures
+agreed with DexFi - max LTV 3500 -> 2500 bps, liquidation threshold 5800 -> 5000, and both borrow
+caps down. They were `internal constant`, inlined at compile time, and the Sepolia contracts then
+deployed predated that change, so for twelve days the deployed bytecode enforced the old values
+while the source declared the new ones. That window is recorded rather than quietly removed:
+anyone who checked those addresses during it saw the old numbers, and was seeing them correctly.
+
+The redeploy on 2026-08-19 closed it. The four parameters now live in bounded, timelocked storage
+in [`src/RiskParams.sol`](src/RiskParams.sol) rather than as compile-time constants, so the next
+change to them is a transaction rather than a redeploy. Read them back rather than taking this on
+trust: `RiskParams` on Base Sepolia returns **2500 / 5000 / 25000000000 / 5000000000**.
+
+**One thing that is not finished.** `bootstrapNav` is one-shot and `onlyOwner`, and it has not been
+called on the new oracle, so `navPerBond` is 0, `isStale()` is true and `borrow` reverts
+`NavStale()`. Collateral has been deposited against the new deployment and the borrow has not. If
+you exercise these contracts on that chain, expect that rather than a defect.
 
 **Reviewing this repo?** [REVIEW.md](REVIEW.md) is a reading guide: where bonds can and cannot go,
 who controls what, what revoking the whitelist would do, and which tests to run first.
@@ -142,9 +148,34 @@ LiquidationAuction: implemented. A Dutch auction over the whole position, decayi
 to the winner, and an unfilled auction moves the *claim* to a workout queue while the units stay
 staked and earning. Three exits, and the guards exist to prove no state closes all of them.
 
-LenderPool: skeleton here, finished in private and withheld over one open finding (see above).
+LenderPool: implemented. ERC-4626 over USDC, lending only to CreditManager, a FIFO withdrawal
+queue that escrows shares rather than burning them, and exits priced on a reserve so a leaver
+cannot outrun a loss they already carry. **Two findings were open against it on 2026-08-19 and are named below.** Check `AUDITS.md` and the
+commit history rather than this line for their current state; work on the second was in flight when
+this was written.
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
+
+**`LenderPool` was withheld from this repo until 2026-08-19, and here is why it is not any more.**
+It was held back because findings are open against it and publishing the mechanism without the fix
+seemed the wrong trade while nothing carrying the code was deployed. The 2026-08-19 Base Sepolia
+redeploy put it on chain and Basescan verification published the full source, so withholding it here
+stopped protecting anything and started making this README wrong. It is published, with the findings open at that date stated rather
+than left to be discovered:
+
+- **A loss-making position has no mark until somebody volunteers to liquidate it** (round 17). The
+  window is narrowed to one transaction-ordering slot and the residual is irreducible without an
+  oracle for expected recovery.
+- **A parked withdrawal request reserves, at an un-impaired price, a claim it is forbidden to be
+  paid** (round 21). Measured at 6.66x over-reservation on a request that is free and revocable, and
+  `available()` can reach zero, which halts borrowing protocol-wide. Four candidate fixes were built
+  and each was refuted; what is left is impaired pricing plus serve-while-marked, which are one
+  change.
+
+**No lender capital is exposed and none can be.** The pool is deployed but not wired as
+`CreditManager`'s liquidity source and holds nothing, so it cannot lend and therefore cannot take a
+loss. Its asset on that chain is a mock USDC anyone can mint. The public lender launch is gated on
+an external audit, which has not happened.
 
 Design notes that matter for review:
 
