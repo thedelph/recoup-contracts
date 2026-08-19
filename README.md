@@ -148,9 +148,34 @@ LiquidationAuction: implemented. A Dutch auction over the whole position, decayi
 to the winner, and an unfilled auction moves the *claim* to a workout queue while the units stay
 staked and earning. Three exits, and the guards exist to prove no state closes all of them.
 
-LenderPool: skeleton here, finished in private and withheld over one open finding (see above).
+LenderPool: implemented. ERC-4626 over USDC, lending only to CreditManager, a FIFO withdrawal
+queue that escrows shares rather than burning them, and exits priced on a reserve so a leaver
+cannot outrun a loss they already carry. **Two findings were open against it on 2026-08-19 and are named below.** Check `AUDITS.md` and the
+commit history rather than this line for their current state; work on the second was in flight when
+this was written.
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
+
+**`LenderPool` was withheld from this repo until 2026-08-19, and here is why it is not any more.**
+It was held back because findings are open against it and publishing the mechanism without the fix
+seemed the wrong trade while nothing carrying the code was deployed. The 2026-08-19 Base Sepolia
+redeploy put it on chain and Basescan verification published the full source, so withholding it here
+stopped protecting anything and started making this README wrong. It is published, with the findings open at that date stated rather
+than left to be discovered:
+
+- **A loss-making position has no mark until somebody volunteers to liquidate it** (round 17). The
+  window is narrowed to one transaction-ordering slot and the residual is irreducible without an
+  oracle for expected recovery.
+- **A parked withdrawal request reserves, at an un-impaired price, a claim it is forbidden to be
+  paid** (round 21). Measured at 6.66x over-reservation on a request that is free and revocable, and
+  `available()` can reach zero, which halts borrowing protocol-wide. Four candidate fixes were built
+  and each was refuted; what is left is impaired pricing plus serve-while-marked, which are one
+  change.
+
+**No lender capital is exposed and none can be.** The pool is deployed but not wired as
+`CreditManager`'s liquidity source and holds nothing, so it cannot lend and therefore cannot take a
+loss. Its asset on that chain is a mock USDC anyone can mint. The public lender launch is gated on
+an external audit, which has not happened.
 
 Design notes that matter for review:
 
