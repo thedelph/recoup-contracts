@@ -93,10 +93,16 @@ in [`src/RiskParams.sol`](src/RiskParams.sol) rather than as compile-time consta
 change to them is a transaction rather than a redeploy. Read them back rather than taking this on
 trust: `RiskParams` on Base Sepolia returns **2500 / 5000 / 25000000000 / 5000000000**.
 
-**One thing that is not finished.** `bootstrapNav` is one-shot and `onlyOwner`, and it has not been
-called on the new oracle, so `navPerBond` is 0, `isStale()` is true and `borrow` reverts
-`NavStale()`. Collateral has been deposited against the new deployment and the borrow has not. If
-you exercise these contracts on that chain, expect that rather than a defect.
+**And the parameters bind rather than merely read back**, which is worth checking separately,
+because a storage read proves less than it looks like it does. `healthFactor` on the seeded position
+is 2.729, which is collateral x **0.50** / debt: the 5000 bps threshold is live, where the old 5800
+would give 3.165. Borrowing past the wallet cap reverts `PerAccountCapExceeded` with 5,100,000,000
+requested against a 5,000,000,000 cap.
+
+The deployment is complete as of 2026-08-19. The oracle is bootstrapped at $21.8244 and there is a
+seeded position of 1000 bonds against $4,000 of debt at 1832 bps. Note that `borrow` disburses less
+than it books, $3,975 against $4,000 of debt, because 25 USDC tops up a prepaid liquidation bounty
+escrow that `bountyEscrowOf` then reports.
 
 **Reviewing this repo?** [REVIEW.md](REVIEW.md) is a reading guide: where bonds can and cannot go,
 who controls what, what revoking the whitelist would do, and which tests to run first.
