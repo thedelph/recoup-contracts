@@ -4,7 +4,7 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **deployed to Base Sepolia** (2026-08-03), nothing on mainnet. The collateral layer, the
+Status: **deployed to Base Sepolia** (redeployed 2026-08-19), nothing on mainnet. The collateral layer, the
 credit core, the epoch harvester and the liquidation auction are implemented, and the whole loan
 lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling through to
 the workout path - is fork-tested against the live DexFi contracts. Lending reaches the credit core
@@ -80,17 +80,23 @@ bond and farm contracts exist only on Base mainnet; the mocks mirror their verif
 the transfer whitelist. The live DexFi contracts are exercised by the mainnet fork tests below,
 which are the real integration proof.
 
-**One thing to know before you verify those addresses.** The four risk parameters in
-[`src/Config.sol`](src/Config.sol) changed on 2026-08-07 to the capped-beta values agreed with
-DexFi - max LTV 3500 -> 2500 bps, liquidation threshold 5800 -> 5000, and both borrow caps down.
-Those parameters are `internal constant`, inlined at compile time, and the Sepolia contracts were
-deployed on 2026-08-03, so **the deployed bytecode still enforces the old values**. Source and
-chain genuinely disagree here, and the source is the intended one. **The half of that which was
-queued has since landed**: the four parameters now live in bounded, timelocked storage in
-[`src/RiskParams.sol`](src/RiskParams.sol) rather than as compile-time constants, so the next
-change to them is a transaction rather than a redeploy. What is left is the redeploy itself, which
-is what puts a `RiskParams` on chain at all. Until then the deployed contracts have no `RiskParams`
-to read, cannot be retuned, and the divergence stands.
+**The risk parameters on chain now match the source, and did not until 2026-08-19.** The four
+values in [`src/Config.sol`](src/Config.sol) changed on 2026-08-07 to the capped-beta figures
+agreed with DexFi - max LTV 3500 -> 2500 bps, liquidation threshold 5800 -> 5000, and both borrow
+caps down. They were `internal constant`, inlined at compile time, and the Sepolia contracts then
+deployed predated that change, so for twelve days the deployed bytecode enforced the old values
+while the source declared the new ones. That window is recorded rather than quietly removed:
+anyone who checked those addresses during it saw the old numbers, and was seeing them correctly.
+
+The redeploy on 2026-08-19 closed it. The four parameters now live in bounded, timelocked storage
+in [`src/RiskParams.sol`](src/RiskParams.sol) rather than as compile-time constants, so the next
+change to them is a transaction rather than a redeploy. Read them back rather than taking this on
+trust: `RiskParams` on Base Sepolia returns **2500 / 5000 / 25000000000 / 5000000000**.
+
+**One thing that is not finished.** `bootstrapNav` is one-shot and `onlyOwner`, and it has not been
+called on the new oracle, so `navPerBond` is 0, `isStale()` is true and `borrow` reverts
+`NavStale()`. Collateral has been deposited against the new deployment and the borrow has not. If
+you exercise these contracts on that chain, expect that rather than a defect.
 
 **Reviewing this repo?** [REVIEW.md](REVIEW.md) is a reading guide: where bonds can and cannot go,
 who controls what, what revoking the whitelist would do, and which tests to run first.
