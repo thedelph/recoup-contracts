@@ -125,9 +125,10 @@ any price. The contract at `0x30B9B1D7A40aa7D14613cb1742EFaaB155dC84a0` predates
 carried across the 2026-08-19 redeploy rather than rebuilt, so the guard is not in its bytecode.
 Measured 2026-08-20: 1,489 bytes of deployed runtime code against 1,554 that `forge build --sizes`
 reports for this source, and `registerFor(code, NON_BINDABLE)` from a stranger succeeds against that
-address where `test_registerFor_cannotMintTheReservedSentinel` pins this source reverting
-`CodeNotBindable`. Two controls on the same address still revert, `ZeroAddress()` and `CodeTaken`,
-so it is one missing check rather than a different contract.
+address, for 51,706 gas, where `test_registerFor_cannotMintTheReservedSentinel` pins this source
+reverting `CodeNotBindable`. Two controls on the same address still revert - `ZeroAddress()` for a
+zero owner, and `CodeTaken` naming the incumbent for a reserved code - so the deployed contract does
+run its other guards, and this is one missing check rather than a different contract.
 
 The scope, stated rather than left to be inferred: Base Sepolia is a testnet, the registry holds no
 value, no protocol contract reads it, the referral programme has not launched, and the codes on that
