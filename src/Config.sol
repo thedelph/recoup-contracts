@@ -262,7 +262,7 @@ library Config {
     ///      with no on-chain enforcement, so the honest bound is generous. It exists
     ///      because the alternative is bad debt sitting on the books indefinitely at
     ///      governance's discretion, which is the "loss recognition lags the auction
-    ///      window" deferral recorded in the private security notes.
+    ///      window" deferral, recorded open rather than closed.
     uint256 internal constant WORKOUT_MAX_DURATION = 14 days;
 
     // ── Yield split (PRD §4.4) - must sum to BPS, enforced in tests ─────────

@@ -139,7 +139,7 @@ contract SkeletonsTest is RiskParamsFixture {
         // Deliberately *not* in this list: `exitReserve()`, `totalImpairment()` and
         // `impairedBorrowerCount()`. `CreditManager` probes all three when wiring - two of the
         // probes refuse a pool that cannot answer, and the third would read a reverting address as
-        // "not a pool" about the pool itself - so the skeleton answers them rather than reverting.
+        // "not a pool" about the pool itself - so the pool answers them rather than reverting.
         // Zero is the truth for a dormant pool with nothing lent, no marks against it and no
         // leavers to hold anything back from, not a placeholder standing in for missing work.
         assertEq(pool.exitReserve(), 0, "a dormant pool holds nothing back for leavers");
@@ -168,13 +168,14 @@ contract SkeletonsTest is RiskParamsFixture {
     // signature would have shown up as a payment that silently never happened rather than as a
     // build failure. The declaration is the fix.
     //
-    // Two of the three tests that make the declaration observable are not in this repository,
-    // because both need the finished pool: one type-checks the implicit conversion that only
-    // compiles while `LenderPool is ILenderPool`, and one reads a `YieldDistributed` log off a
-    // pool that actually distributed something. The skeleton published here is deliberately not
-    // `is ILenderPool` and cannot distribute. What survives the omission is the test below, which
-    // is the one that pins the published ABI itself - it reads only the interface, so it holds the
-    // topics an indexer would build against whether or not the implementation ships with it.
+    // Two of the three tests that make the declaration observable are not in this repository
+    // yet: one type-checks the implicit conversion that only compiles while
+    // `LenderPool is ILenderPool`, and one reads a `YieldDistributed` log off a pool that actually
+    // distributed something. Both went when the pool was held back from publication. The pool was
+    // published on 2026-08-19 and does declare `is ILenderPool`, so what is left is a port that has
+    // not happened. What survives the omission is the test below, which is the one that pins the
+    // published ABI itself - it reads only the interface, so it holds the topics an indexer would
+    // build against whether or not the implementation ships with it.
 
     /// @dev **The assertion the drift needed and did not have.** `ILenderPool` published
     ///      `YieldDistributed(uint256)` while the contract emitted three parameters. A different

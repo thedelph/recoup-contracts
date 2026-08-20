@@ -1275,9 +1275,9 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///         run longer than `Config.WORKOUT_MAX_DURATION`.
     /// @dev Permissionless in both cases, and the forced branch is the one that matters.
     ///      Without it, recognising bad debt would depend on governance choosing to,
-    ///      which is exactly the "loss recognition lags the auction window" deferral in
-    ///      the security notes. With it, a workout that DexFi never honours becomes a
-    ///      recognised loss on a schedule nobody has to be trusted to keep.
+    ///      which is exactly the "loss recognition lags the auction window" deferral,
+    ///      recorded open rather than closed. With it, a workout that DexFi never
+    ///      honours becomes a recognised loss on a schedule nobody has to be trusted to keep.
     ///
     ///      **The bound stays and it is no longer destructive.** Audit round 21, finding 14
     ///      measured what the bound cost: DexFi's redemption is off-chain and quoted at "48h+", a

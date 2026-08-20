@@ -4,20 +4,22 @@ Smart contracts for [Recoup](https://recoup.fi) - self-repaying loans on Base, c
 DexFi Treasury Bonds. Deposit bonds (or ETH that becomes bonds), borrow USDC, and the weekly bond
 yield pays the debt down automatically. Debt only ever decreases.
 
-Status: **deployed to Base Sepolia** (redeployed 2026-08-19), nothing on mainnet. The collateral layer, the
-credit core, the epoch harvester and the liquidation auction are implemented, and the whole loan
-lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling through to
-the workout path - is fork-tested against the live DexFi contracts. Lending reaches the credit core
-through an interfaced seam, and the pool behind that seam is a skeleton here for the reason in the
-next paragraph. No third-party money is accepted before an external audit; the exact shape of
-that gate, and what it deliberately does not cover, is spelled out further down.
+Status: **deployed to Base Sepolia** (redeployed 2026-08-19), nothing on mainnet. The collateral
+layer, the credit core, the epoch harvester and the liquidation auction are implemented, and the
+whole loan lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling
+through to the workout path - is fork-tested against the live DexFi contracts. Lending reaches the
+credit core through an interfaced seam, and the pool behind that seam is published here with two
+findings open against it, which the next paragraphs state rather than leave to be found. No
+third-party money is accepted before an external audit; the exact shape of that gate, and what it
+deliberately does not cover, is spelled out further down.
 
-**`LenderPool` is finished, and I am holding it back on purpose.** The real one - the ERC-4626
-vault, the withdrawal queue, the yield stream and the impairment pricing - is written, tested and
-audited in my private tree. It is not in this repository because one finding against it is open. A
-loss-making position carries no impairment until somebody calls `liquidate`, so in the gap between a
-loan going bad and that call, the pool prices every exit at the full pre-loss price and a lender who
-leaves first is paid out of the lenders who stay.
+**`LenderPool` is here, and two findings are open against it.** The real one - the ERC-4626 vault,
+the withdrawal queue, the yield stream and the impairment pricing - is `src/LenderPool.sol`. It was
+withheld from this repository until 2026-08-19; the section under the architecture diagram says why
+it is not any more. The first of the two open findings: a loss-making position carries no impairment
+until somebody calls `liquidate`, so in the gap between a loan going bad and that call, the pool
+prices every exit at the full pre-loss price and a lender who leaves first is paid out of the
+lenders who stay.
 
 That gap used to be unbounded, because the protocol paid the caller nothing when the sale fell short
 of the debt and nobody was obliged to volunteer. It is not unbounded now. `liquidate` carries a
@@ -70,9 +72,9 @@ exclusive lock into a periodic one with a cheaper renewal for the parker than an
 is left is one change - price the queue against the impairment and serve it while marked - and it
 needed an anchor on the NAV oracle that only landed in round twenty-one.
 
-**Publishing a pool with either of those open is worse than publishing none, so the skeleton stays
-until they are closed.** The `ILenderPool` interface here is the real one and is what the finished
-contract implements.
+**Publishing a pool with either of those open looked worse than publishing none, and that stopped
+being the trade on 2026-08-19.** The section under the architecture diagram sets out what changed.
+The `ILenderPool` interface here is the real one and `src/LenderPool.sol` is what implements it.
 
 Testnet addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json), all
 verified on Basescan. The testnet deployment runs against a **mock** DexFi stack, because the real
@@ -113,6 +115,25 @@ owner, no pause and no way to move either fact once written. It holds no value a
 contract reads it. It is deliberately absent from the main deploy script, because the supported
 fix for a core defect before launch is redeploying the set, and a registry inside that set would
 take a new address each time and orphan every existing binding.
+
+**That argument is about whether the address can stay put across a redeploy. It says nothing about
+whether the bytecode at it is current, and on Base Sepolia it is not.** The source here carries
+audit round twelve's fix: `registerFor` refuses to write the `NON_BINDABLE` tombstone on somebody
+else's behalf (`src/ReferralRegistry.sol:154`), because without that check one call bricks any
+advertised-but-unclaimed code forever - write-once mappings, no owner, no transfer, no recovery at
+any price. The contract at `0x30B9B1D7A40aa7D14613cb1742EFaaB155dC84a0` predates the fix and was
+carried across the 2026-08-19 redeploy rather than rebuilt, so the guard is not in its bytecode.
+Measured 2026-08-20: 1,489 bytes of deployed runtime code against 1,554 that `forge build --sizes`
+reports for this source, and `registerFor(code, NON_BINDABLE)` from a stranger succeeds against that
+address, for 51,706 gas, where `test_registerFor_cannotMintTheReservedSentinel` pins this source
+reverting `CodeNotBindable`. Two controls on the same address still revert - `ZeroAddress()` for a
+zero owner, and `CodeTaken` naming the incumbent for a reserved code - so the deployed contract does
+run its other guards, and this is one missing check rather than a different contract.
+
+The scope, stated rather than left to be inferred: Base Sepolia is a testnet, the registry holds no
+value, no protocol contract reads it, the referral programme has not launched, and the codes on that
+chain are re-registrable after a redeploy. Nothing is at risk. The redeploy is authorised and
+pending, and this paragraph is what should be checked against the chain rather than trusted.
 
 `ProtocolFeeSplitter` is the other standalone one, and it is also not in the deploy script yet
 because it needs a second address that does not exist. It forwards Recoup's protocol fee to two
@@ -156,9 +177,9 @@ staked and earning. Three exits, and the guards exist to prove no state closes a
 
 LenderPool: implemented. ERC-4626 over USDC, lending only to CreditManager, a FIFO withdrawal
 queue that escrows shares rather than burning them, and exits priced on a reserve so a leaver
-cannot outrun a loss they already carry. **Two findings were open against it on 2026-08-19 and are named below.** Check `AUDITS.md` and the
-commit history rather than this line for their current state; work on the second was in flight when
-this was written.
+cannot outrun a loss they already carry. **Two findings were open against it on 2026-08-19 and are
+named below.** Check `AUDITS.md` and the commit history rather than this line for their current
+state; work on the second was in flight when this was written.
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
 
@@ -166,8 +187,8 @@ All parameters live in src/Config.sol - no magic numbers anywhere else.
 It was held back because findings are open against it and publishing the mechanism without the fix
 seemed the wrong trade while nothing carrying the code was deployed. The 2026-08-19 Base Sepolia
 redeploy put it on chain and Basescan verification published the full source, so withholding it here
-stopped protecting anything and started making this README wrong. It is published, with the findings open at that date stated rather
-than left to be discovered:
+stopped protecting anything and started making this README wrong. It is published, with the findings
+open at that date stated rather than left to be discovered:
 
 - **A loss-making position has no mark until somebody volunteers to liquidate it** (round 17). The
   window is narrowed to one transaction-ordering slot and the residual is irreducible without an
@@ -207,10 +228,14 @@ forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: th
                 # run mid-flight rather than fail it
 ```
 
-That reports **569 passed, 0 failed, 13 skipped across 27 suites** on this tree. The count is
-quoted with the tree it was measured on rather than as a standing claim, because it is a derived
-number and nothing here checks it for you: the skips are the fork tests below, which need
-`RUN_FORK_TESTS=true`. CI runs the same command on every push and pull request.
+That reports **0 failed**, and the only skips are the mainnet fork tests below, which need
+`RUN_FORK_TESTS=true`. CI runs the same command on every push and pull request, so the green tick
+on `main` is the standing claim rather than anything written here.
+
+**The pass count is deliberately not quoted.** It used to be, and it was wrong by 135 tests and
+three suites within a day of being written, because it is a derived number that nothing in this
+repository re-checks against the prose. `forge test` prints the current one on the tree you are
+holding, which is the only copy worth trusting.
 
 ### Mainnet fork tests
 
@@ -285,11 +310,13 @@ what it does not is a tested quantity rather than an assurance:
 
 Every phase gets a 12-agent Solidity audit pass before it merges, and **every fix round is
 re-audited**, because the rate at which fix rounds produce their own defects has stayed stubbornly
-high: **twenty-one rounds so far, and twelve of the last thirteen found defects in the round
-before them.**
+high: **twenty-two rounds so far, and twelve of rounds nine to twenty-one found defects in the
+round immediately before them.**
 Findings are fixed with regression tests. The round-by-round record in [AUDITS.md](AUDITS.md) is
 written up as far as round nine. The rounds after it are not written up there yet: their fixes are
-in the code published here, and several of them are about the lender pool, which is not.
+in the code published here, and the reason for the gap used to be that most of those rounds are
+about the lender pool, which was not. That reason went away on 2026-08-19 and the write-up is now
+simply behind.
 
 Four habits came out of that and now apply by default:
 

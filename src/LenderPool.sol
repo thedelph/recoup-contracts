@@ -1440,8 +1440,8 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev **A per-entry price floor was added here in round 13 and deleted in round 14. Read this
     ///      before adding one back, because the obvious design is the one that failed.**
     ///
-    ///      The problem it was written for is real and is recorded open in the private security
-    ///      notes: `serviceQueue` is permissionless and prices escrowed shares at the live exit
+    ///      The problem it was written for is real and is recorded as an open finding:
+    ///      `serviceQueue` is permissionless and prices escrowed shares at the live exit
     ///      price, so a stranger chooses the instant somebody else's shares are valued, and can
     ///      open a mark themselves with the equally permissionless `liquidate`. Five agents traced
     ///      that in round 12.

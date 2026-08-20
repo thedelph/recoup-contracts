@@ -232,12 +232,12 @@ contract EpochHarvesterTest is RiskParamsFixture {
         assertEq(usdc.balanceOf(feeWallet), toProtocol);
     }
 
-    // **The end-to-end lender-leg test is not in this repository.** It constructs a real
+    // **The end-to-end lender-leg test is not in this repository yet.** It constructs a real
     // `LenderPool`, has a lender deposit into it, and asserts that a flushed epoch lands as a
-    // higher share price rather than as loose USDC. None of that is possible against the skeleton
-    // published here, which refuses deposits and cannot distribute. The delivery mechanism itself
-    // is still covered below by `AcceptingPool` and `ShortPool`, which is the part that is about
-    // this contract rather than about the pool.
+    // higher share price rather than as loose USDC. It went when the pool was held back from
+    // publication; the pool was published on 2026-08-19 and this case has not been ported back.
+    // The delivery mechanism itself is still covered below by `AcceptingPool` and `ShortPool`,
+    // which is the part that is about this contract rather than about the pool.
 
     /// @notice The 80/20 with DexFi, proved through a real epoch rather than in isolation.
     /// @dev `ProtocolFeeSplitter` rests on one claim about this contract: that installing

@@ -26,7 +26,7 @@ pragma solidity ^0.8.24;
 ///      routed anywhere; the price simply stopped being stale.
 ///
 ///      **Do not read that as "the swap is safe now."** Round 11 left further open items against
-///      this seam, recorded in the private security notes rather than here. The swap still waits.
+///      this seam, tracked as open findings rather than here. The swap still waits.
 ///
 ///      **Token movement is pull-based in both directions, and each receiver verifies
 ///      its own receipt:**
