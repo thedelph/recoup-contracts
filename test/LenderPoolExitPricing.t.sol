@@ -189,17 +189,30 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
     ///      would have missed. There was no earlier assertion here to compare against - the
     ///      unbounded doors have no bound to blind - so "the old one was blind" is stated by
     ///      executing it rather than by citing it.
+    ///
+    ///      **Driven on `maxRedeem` rather than on the whole balance since audit round 22 finding
+    ///      2, and the substitution is the finding.** This used to redeem `balanceOf(leaver)` -
+    ///      3,000,000,000,000 shares, the entire stake - in one call for 500.000000, which is the
+    ///      hole that finding closes. `maxRedeem` is now a real cap and reports 1,000,000,000,000
+    ///      here, **the same figure before and after the `liquidate`**, because the liquidity cap is
+    ///      converted on the un-impaired book and a mark does not move it. So the only thing that
+    ///      changes between the two quotes is still the price, which is what this test is about,
+    ///      and the front-run is still a six-fold move. The assertion that the leaver is left with
+    ///      nothing has gone with it: a third of the stake now stays, which is the point.
     function test_aBoundedRedeemRefusesTheFrontRunTheUnboundedDoorAccepts() public {
         _borrowAndBreach();
 
-        uint256 shares = pool.balanceOf(leaver);
+        uint256 held = pool.balanceOf(leaver);
+        uint256 shares = pool.maxRedeem(leaver);
         uint256 quoted = pool.previewRedeem(shares);
-        assertEq(quoted, DEPOSIT, "the quote should be the whole stake before any mark");
+        assertGt(shares, 0, "fixture: the exit door must be open before the mark");
+        assertLt(shares, held, "fixture: the cap must bind, or this says nothing about the cap");
 
         // The front-run: permissionless, zero capital, and it is the protocol working as designed.
         vm.prank(stranger);
         credit.liquidate(alice);
 
+        assertEq(pool.maxRedeem(leaver), shares, "the mark moved the share cap, so the price is not isolated");
         uint256 nowPaid = pool.previewRedeem(shares);
         assertLt(nowPaid, quoted / 5, "the mark should have moved the price by more than 5x");
 
@@ -207,14 +220,15 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         vm.prank(leaver);
         vm.expectRevert(abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, nowPaid, quoted));
         pool.redeem(shares, leaver, leaver, quoted);
-        assertEq(pool.balanceOf(leaver), shares, "the refused exit moved shares");
+        assertEq(pool.balanceOf(leaver), held, "the refused exit moved shares");
 
-        // The unbounded door, same block, same shares: it pays the marked price and takes the lot.
+        // The unbounded door, same block, same shares: it pays the marked price and takes what the
+        // cap allows.
         uint256 before = usdc.balanceOf(leaver);
         vm.prank(leaver);
         pool.redeem(shares, leaver, leaver);
         assertEq(usdc.balanceOf(leaver) - before, nowPaid, "the unbounded door did not pay the mark");
-        assertEq(pool.balanceOf(leaver), 0, "the unbounded door left a stake behind");
+        assertEq(pool.balanceOf(leaver), held - shares, "the unbounded door took more than its cap");
 
         // And the loss the leaver just crystallised: none of it.
         _realiseAtTheFloor(auction.auctionOf(alice));
@@ -226,15 +240,23 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         _borrowAndBreach();
 
         // Derived from the deposit rather than written down, and chosen to be reachable on both
-        // sides of the mark: before it the leaver's cap is the idle balance, after it the cap is
-        // this exact figure. So the only thing that changes between the two quotes is the price.
-        uint256 assets = DEPOSIT / 6;
+        // sides of the mark, so the only thing that changes between the two quotes is the price.
+        //
+        // **`DEPOSIT / 6` until audit round 22 finding 2, and that divisor was the old cap.** Before
+        // the mark the leaver's cap was the whole idle balance, 1,000.000000; after it, the cap was
+        // exactly `DEPOSIT / 6` - which is to say the leaver could still take 500.000000 of cash,
+        // but only by burning practically the whole 3,000.000000 stake to do it. `maxWithdraw` is
+        // now derived from `maxRedeem` and reports 166.666666 under the mark, so the figure has to
+        // sit below that to stay reachable on both sides. The 5x price move this test is about is
+        // unchanged; what moved is how much of it one call may take.
+        uint256 assets = DEPOSIT / 20;
         uint256 quotedShares = pool.previewWithdraw(assets);
         assertLe(assets, pool.maxWithdraw(leaver), "the fixture cannot reach this withdrawal");
 
         vm.prank(stranger);
         credit.liquidate(alice);
 
+        assertLe(assets, pool.maxWithdraw(leaver), "the mark closed the door, so the price is not isolated");
         uint256 nowShares = pool.previewWithdraw(assets);
         assertGt(nowShares, quotedShares * 5, "the mark should have moved the share cost by 5x");
 
@@ -299,14 +321,23 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         }
     }
 
-    // ── 2. The two max doors are one cliff, not two different ones ───────────
+    // ── 2. The two max doors are one door, and the cliff is gone ─────────────
 
     /// @notice `withdraw(maxWithdraw)` and `redeem(maxRedeem)` pay the same money and burn the same
     ///         position. Round 20 attributed the loss to `maxRedeem` alone; it is neither view's.
     /// @dev The measured figures on this fixture, for whoever reads the finding next:
     ///      `totalAssets` 6,000.000000, `exitReserve` 5,000.000000, `exitAssets` 1,000.000000,
-    ///      leaver holding 3,000,000,000,000 of 6,000,000,000,000 shares. WITHDRAW burns
-    ///      2,999,999,997,501 for 500.000000; REDEEM burns 3,000,000,000,000 for 500.000000.
+    ///      leaver holding 3,000,000,000,000 of 6,000,000,000,000 shares. Round 20 measured WITHDRAW
+    ///      burning 2,999,999,997,501 for 500.000000 and REDEEM burning 3,000,000,000,000 for the
+    ///      same 500.000000 - one cliff on two doors, which is what this test was named for.
+    ///
+    ///      **Audit round 22 finding 2 removed the cliff, and the last two assertions are inverted
+    ///      rather than deleted.** Both doors now burn 1,000,000,000,000 for 166.666666 and leave
+    ///      2,000,000,000,000 standing: two thirds of the stake, not two thousandths of a percent.
+    ///      The claim this file was written to make survives unchanged - the two doors are still one
+    ///      door, and the loss was never `maxRedeem`'s alone - and what changed is the size of what
+    ///      one call can take. Inverted here because a test that asserts a defect has to be turned
+    ///      round when the defect goes, or it becomes a test that forbids the fix.
     function test_theTwoMaxDoorsAreTheSameCliff() public {
         _borrowAndBreach();
         vm.prank(stranger);
@@ -333,12 +364,16 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
 
         assertEq(paidByWithdraw, paidByRedeem, "the two doors paid different money");
         assertApproxEqAbs(burnedByWithdraw, burnedByRedeem, 10_000, "the two doors burned different positions");
-        // Both consume essentially the whole stake, and that is the harm: it is on both doors, not
-        // on one of them. Stated as "what is left is under a hundred-thousandth of what was held",
-        // because a basis-point comparison rounds the difference away and reads as a pass either
-        // way. Measured: 2,499 shares left of 3,000,000,000,000 on the withdraw door, 0 on redeem.
-        assertLt(held - burnedByWithdraw, held / 100_000, "withdraw left a meaningful stake");
-        assertLt(held - burnedByRedeem, held / 100_000, "redeem left a meaningful stake");
+        // **INVERTED by audit round 22 finding 2.** These two used to read
+        // `assertLt(held - burned, held / 100_000)` - "what is left is under a hundred-thousandth of
+        // what was held" - because both doors consumed essentially the whole stake and that was the
+        // harm. Neither does now: MEASURED 2,000,000,004,833 shares left of 3,000,000,000,000 on the
+        // withdraw door and 2,000,000,000,000 on redeem, against a pre-fix 2,499 and 0. Asserted as
+        // "more than half the stake survives one call" rather than against the exact residue,
+        // because the exact residue is a function of the fixture's cash-to-book ratio and the claim
+        // is that a whole-loan mark can no longer empty the position.
+        assertGt(held - burnedByWithdraw, held / 2, "withdraw consumed the stake for the idle cash");
+        assertGt(held - burnedByRedeem, held / 2, "redeem consumed the stake for the idle cash");
     }
 
     /// @notice `previewRedeem(maxRedeem(o))` is `maxWithdraw(o)`, across the whole range of a mark.
@@ -346,6 +381,13 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
     ///      Both are also held under the liquidity cap they are derived from, which is the property
     ///      `maxRedeem` actually owes: it may not report shares whose execution takes more cash
     ///      than the pool has spare.
+    ///
+    ///      **Tightened from two wei to exact by audit round 22 finding 2.** `maxWithdraw` *is*
+    ///      `previewRedeem(maxRedeem(owner))` now, which is what OpenZeppelin 5.6.1's base
+    ///      `ERC4626` does and what this contract broke by overriding the two independently. The
+    ///      two-wei tolerance was the right assertion against a pair that only nearly agreed; an
+    ///      equality is the right one against a pair where one is defined as the other, and it is
+    ///      what keeps the reported maximum an executable bound rather than a quote.
     function testFuzz_theTwoMaxDoorsAgreeOnWhatAMarkCosts(uint96 markRaw) public {
         uint256 debt = _borrowAndBreach();
         vm.prank(address(credit));
@@ -355,7 +397,7 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         uint256 maxW = pool.maxWithdraw(leaver);
         uint256 spare = pool.unreservedIdle();
 
-        assertApproxEqAbs(paidByRedeem, maxW, 2, "the two max doors disagree on the assets");
+        assertEq(paidByRedeem, maxW, "the two max doors disagree on the assets");
         assertLe(paidByRedeem, spare + 1, "maxRedeem reports more than the pool can pay");
         assertLe(maxW, spare, "maxWithdraw reports more than the pool can pay");
         assertLe(pool.maxRedeem(leaver), pool.balanceOf(leaver), "maxRedeem reports more than is held");

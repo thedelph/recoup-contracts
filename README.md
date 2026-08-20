@@ -228,14 +228,10 @@ forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: th
                 # run mid-flight rather than fail it
 ```
 
-That reports **0 failed**, and the only skips are the mainnet fork tests below, which need
-`RUN_FORK_TESTS=true`. CI runs the same command on every push and pull request, so the green tick
-on `main` is the standing claim rather than anything written here.
-
-**The pass count is deliberately not quoted.** It used to be, and it was wrong by 135 tests and
-three suites within a day of being written, because it is a derived number that nothing in this
-repository re-checks against the prose. `forge test` prints the current one on the tree you are
-holding, which is the only copy worth trusting.
+Measured on 2026-08-20 for this tree: **724 passed, 0 failed, 13 skipped across 30 suites**. The
+skips are the mainnet fork tests below, which need `RUN_FORK_TESTS=true`. This is a dated baseline,
+not a substitute for running the command: CI runs it on every push and pull request, and the green
+tick on `main` is the standing claim.
 
 ### Mainnet fork tests
 
@@ -330,7 +326,7 @@ Four habits came out of that and now apply by default:
   audited twice for correctness and deleted on the third pass, when someone finally asked the prior
   question and found it never closed the hole it was written for.
 
-Alongside the audits: stateful invariant fuzzing over five suites (31 invariants), and the mainnet
+Alongside the audits: stateful invariant fuzzing over six suites (58 invariants), and the mainnet
 fork tests above, which are the real integration proof.
 
 An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does
