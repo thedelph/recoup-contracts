@@ -420,12 +420,13 @@ contract DeployTest is Test, DeployBase {
     ///      guards are mutually unsatisfiable, which is the failure this repository has shipped
     ///      twice. So this runs the whole sequence in one transaction rather than in three.
     ///
-    ///      **The second half of it is not in this repository.** The version in the private tree
-    ///      then spends real money through the wiring - a lender funds the pool, the pool funds a
-    ///      borrow, and the lender leg finally has somewhere to deliver - and none of that is
-    ///      possible against the skeleton published here, which refuses deposits and cannot lend.
-    ///      What survives is the switchover itself and its post-condition, which is the part that
-    ///      is about the deploy script rather than about the pool.
+    ///      **The second half of it is not in this repository yet.** It spends real money through
+    ///      the wiring - a lender funds the pool, the pool funds a borrow, and the lender leg
+    ///      finally has somewhere to deliver. It was dropped when `LenderPool` was held back from
+    ///      publication, and the pool was published on 2026-08-19, so what is left is a port that
+    ///      has not happened rather than something this repository cannot run. What survives is
+    ///      the switchover itself and its post-condition, which is the part that is about the
+    ///      deploy script rather than about the pool.
     function test_deploy_phase4SwitchoverWiresEveryLegTogether() public {
         (Deployed memory d, address borrower) = _liveProtocol();
 
@@ -521,13 +522,13 @@ contract DeployTest is Test, DeployBase {
     ///      into a Safe does, and it is the only assertion in this file that the funding leg alone
     ///      leaves a consistent protocol behind it.
     ///
-    ///      **The half that drives a default through it is not in this repository.** In the private
-    ///      tree a lender funds the pool, the borrow is drawn on the funding leg alone, the NAV is
-    ///      crashed and the position written down, and the loss is then measured arriving at the
-    ///      pool that funded it. None of that runs against the skeleton published here, which
-    ///      refuses deposits, cannot lend and keeps no socialised-loss book. What survives is the
-    ///      pointer property itself - that the funding leg carries the sink with it - which is the
-    ///      part an operator transcribing legs into a Safe depends on.
+    ///      **The half that drives a default through it is not in this repository yet.** A lender
+    ///      funds the pool, the borrow is drawn on the funding leg alone, the NAV is crashed and
+    ///      the position written down, and the loss is then measured arriving at the pool that
+    ///      funded it. That half was dropped when `LenderPool` was held back, and the pool was
+    ///      published on 2026-08-19, so it is an unported test rather than an impossible one. What
+    ///      survives is the pointer property itself - that the funding leg carries the sink with
+    ///      it - which is the part an operator transcribing legs into a Safe depends on.
     function test_deploy_phase4FundingLegCarriesTheLossSinkSoThereIsNoGap() public {
         (Deployed memory d,) = _liveProtocol();
 
@@ -543,16 +544,15 @@ contract DeployTest is Test, DeployBase {
         assertEq(d.credit.totalDebt(), 0, "and the manager agrees there is no debt left");
     }
 
-    // **`test_deploy_phase4PauseShutsTheOnlyDoorIntoTheGap` is not in this repository.** It is the
-    // other direction of the same property: with the switchover paused, the borrow that stranded
-    // the principal reverts; the protocol comes back open; and the identical borrow is then charged
-    // correctly to a pool that is funder and sink together. Every one of those steps needs a pool
-    // that takes deposits, lends and keeps a socialised-loss book, and the skeleton published here
-    // does none of them - a borrow drawn after the switchover reverts `NotImplemented()` inside the
-    // pool rather than landing on it. What that test says about the deploy script alone, that the
-    // switchover pauses and hands the protocol back open, is asserted immediately below and again
-    // in the timelock tests, where the pause legs are scheduled and executed as their own
-    // operation.
+    // **`test_deploy_phase4PauseShutsTheOnlyDoorIntoTheGap` is not in this repository yet.** It is
+    // the other direction of the same property: with the switchover paused, the borrow that
+    // stranded the principal reverts; the protocol comes back open; and the identical borrow is
+    // then charged correctly to a pool that is funder and sink together. Every one of those steps
+    // needs a pool that takes deposits, lends and keeps a socialised-loss book, which is why it
+    // went when `LenderPool` was held back. The pool was published on 2026-08-19 and this case has
+    // not been ported back. What it says about the deploy script alone, that the switchover pauses
+    // and hands the protocol back open, is asserted immediately below and again in the timelock
+    // tests, where the pause legs are scheduled and executed as their own operation.
     //
     // `_crashNav` and `_defaultToWriteDown`, and the crashed-NAV constant they price against, went
     // with it: they exist only to drive those pool-funded defaults.
@@ -635,11 +635,11 @@ contract DeployTest is Test, DeployBase {
         _pauseForSwitchover(d, timelock, proposer);
     }
 
-    // **`_fundALender` is not in this repository.** Every test below called it to put a real
-    // lender behind the pool before the switchover ran, and the skeleton published here refuses
-    // deposits - the fixture would revert rather than fund anything. None of what survives needs
-    // it: the book is funded by the treasury right up until the switchover moves the pointer, and
-    // nothing here borrows afterwards.
+    // **`_fundALender` is not in this repository yet.** Every test below called it to put a real
+    // lender behind the pool before the switchover ran, and it went with the tests that needed it
+    // when `LenderPool` was held back. The pool was published on 2026-08-19 and the helper has not
+    // been ported back. None of what survives needs it: the book is funded by the treasury right
+    // up until the switchover moves the pointer, and nothing here borrows afterwards.
 
     /// @notice **The reorder is still real; the harm it used to reach is not.** Round 19's pause is
     ///         correct against the operator and is defeated by the timelock executor: legs queued
@@ -658,12 +658,13 @@ contract DeployTest is Test, DeployBase {
     ///      and sink together. The default is charged in full. Kept for exactly that: it is the
     ///      assertion that reordering no longer reaches the harm, on the one path that used to.
     ///
-    ///      **The measurement of that charge is not in this repository.** The private tree draws
-    ///      the borrow on the reordered funding leg, crashes the NAV, writes the position down and
-    ///      asserts the whole loss arriving at the pool. The skeleton here cannot lend, so what
-    ///      survives is the half that is about the deploy script and the timelock: legs queued one
-    ///      operation each can be executed in any order by anybody, and the funding leg run alone
-    ///      still leaves both pointers consistent.
+    ///      **The measurement of that charge is not in this repository yet.** It draws the borrow
+    ///      on the reordered funding leg, crashes the NAV, writes the position down and asserts the
+    ///      whole loss arriving at the pool. It went when `LenderPool` was held back from
+    ///      publication and has not been ported back since the pool was published, so what survives
+    ///      is the half that is about the deploy script and the timelock: legs queued one operation
+    ///      each can be executed in any order by anybody, and the funding leg run alone still
+    ///      leaves both pointers consistent.
     function test_deploy_phase4LegsQueuedSeparatelyCanBeReorderedButTheGapIsGone() public {
         (Deployed memory d,) = _liveProtocol();
         TimelockController timelock = _timelock();
@@ -697,8 +698,9 @@ contract DeployTest is Test, DeployBase {
         assertFalse(d.credit.paused(), "and nothing is paused: the round-19 fix never ran");
 
         // The borrow, the crash and the written-down default that used to be measured here belong
-        // to the pool, and the pool is not in this repository. What can still be said on this side
-        // of the seam is that the reordered leg left nothing inconsistent behind it.
+        // to the pool, and went with it when it was held back. The pool is published now and that
+        // half has not been ported back. What can still be said on this side of the seam is that
+        // the reordered leg left nothing inconsistent behind it.
         assertEq(d.credit.unsocialisedLoss(), 0, "and nothing may be left deferred");
 
         // The rest land, in any order the executor likes.
@@ -724,11 +726,12 @@ contract DeployTest is Test, DeployBase {
     ///      scheduled - `TimelockController` refuses them as `Unset`. That is why this removes the
     ///      window rather than guarding it: there is no guard to defeat.
     ///
-    ///      **The last clause of the notice above is not in this repository.** Charging the
-    ///      identical default to the lenders needs a pool that takes deposits and lends, and the
-    ///      skeleton published here does neither. The three refusals are the fix and they are all
-    ///      here; what is missing is the closing measurement that the batch reaches the same end
-    ///      state the hazard test above reached by accident.
+    ///      **The last clause of the notice above is not in this repository yet.** Charging the
+    ///      identical default to the lenders needs a pool that takes deposits and lends, which is
+    ///      why that clause went when `LenderPool` was held back; the pool is published now and it
+    ///      has not been ported back. The three refusals are the fix and they are all here; what is
+    ///      missing is the closing measurement that the batch reaches the same end state the hazard
+    ///      test above reached by accident.
     function test_deploy_phase4BatchLeavesNoWindowForAnExecutorToReorder() public {
         (Deployed memory d,) = _liveProtocol();
         TimelockController timelock = _timelock();
@@ -898,11 +901,11 @@ contract DeployTest is Test, DeployBase {
     ///      The refusal is attributable because everything else is identical: same fixture, same
     ///      collateral, same amount, same block. What changed is *when* the pause happened.
     ///
-    ///      **The retry after the switchover is not in this repository.** The private tree makes
-    ///      the same borrow again once the batch has landed, so the test cannot pass against a
-    ///      protocol left shut - which is the failure mode the pause legs would otherwise
-    ///      introduce. Against the skeleton published here that borrow would draw on a pool that
-    ///      cannot lend, so the reopening is asserted on the two pause flags directly instead.
+    ///      **The retry after the switchover is not in this repository yet.** It makes the same
+    ///      borrow again once the batch has landed, so the test cannot pass against a protocol left
+    ///      shut - which is the failure mode the pause legs would otherwise introduce. It went when
+    ///      `LenderPool` was held back and has not been ported back since the pool was published,
+    ///      so the reopening is asserted on the two pause flags directly instead.
     function test_deploy_phase4TheMicroUsdcGriefIsRefusedAtTheDoor() public {
         (Deployed memory d,) = _liveProtocol();
         TimelockController timelock = _timelock();

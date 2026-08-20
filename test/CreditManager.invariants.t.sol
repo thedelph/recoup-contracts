@@ -161,8 +161,8 @@ contract CreditHandler is Test {
     ///      A guard that binds at an event has to be asserted at that event.
     ///      The pool's own invariant suite already does exactly this at the deposit, for the same
     ///      reason, and the shape is copied from there including the live read of the ceiling.
-    ///      That suite is one of the files held back with the pool, so it is not in this
-    ///      repository to compare against.
+    ///      That suite went with the pool when it was held back and has not been ported back
+    ///      since the pool was published, so it is not here to compare against.
     function borrow(uint256 actorSeed, uint256 amount) external watched {
         address a = _actor(actorSeed);
         amount = bound(amount, 1, riskParams.perAccountBorrowCap());

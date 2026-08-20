@@ -238,7 +238,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
             // exist. **That strand is real, and `CreditManager.migrateReserves` is the
             // fix for it** - a migration path on the manager, not a guard here. The
             // one-way-detachment note below is what makes that sweep safe: nobody is
-            // coming back for the outgoing manager. Recorded in the private security notes.
+            // coming back for the outgoing manager.
         }
         // **The twin of `setLiquidationAuction`'s guard, and the one round 6b missed.**
         // `expireToWorkout` takes its authorisation from *this* pointer, via

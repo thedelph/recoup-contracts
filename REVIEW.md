@@ -183,8 +183,8 @@ opening none from 20 of 20 to 0 of 20.
 [AUDITS.md](AUDITS.md) has the round-by-round record, and the README explains the habits that came
 out of it. The short version: every phase gets a multi-agent Solidity review before it merges, and
 every fix round is itself re-audited, because the rate at which fix rounds produce their own
-defects has stayed high: twenty-one rounds so far, and twelve of the last thirteen found something
-in the round before them.
+defects has stayed high: twenty-two rounds so far, and twelve of rounds nine to twenty-one found
+something in the round immediately before them.
 
 No external audit has been commissioned yet. The README says plainly where that sits relative to
 third-party funds, and what is knowingly not mitigated in the meantime.

@@ -390,7 +390,7 @@ contract AuctionHandler is Test {
     ///      this commit alike (a plain `usdc.transfer` to the auction does it); what changed is
     ///      that it is now drainable instead of permanent. The legs are exercised separately,
     ///      with the intermediate balance asserted, in the impairment integration suite, which
-    ///      is one of the files held back with the pool.
+    ///      went with the pool when it was held back and is not yet ported back.
     function recoverStrandedClaim() external {
         try credit.claimSurplusFor(address(auction)) {} catch {}
         try auction.sweepFreeBalanceToInsurance() {} catch {}
@@ -516,10 +516,10 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         // cannot be charged for a default. A pool wired as sink only would reach `impair` and never
         // reach a realised loss, which is the vacuity this is meant to end rather than relocate.
         //
-        // **`MockLenderPool` rather than the real one, and only in this repository.** The private
-        // tree runs this suite against `LenderPool` itself; that contract is held back from
-        // publication while one finding against it is open, so what stands in here is the mock the
-        // rest of this repo already uses. Say plainly what the substitution costs: the mock's
+        // **`MockLenderPool` rather than the real one.** This suite is meant to run against
+        // `LenderPool` itself. It was pointed at the mock the rest of this repo already uses while
+        // the pool was held back from publication, and the pool was published on 2026-08-19
+        // without this being pointed back. Say plainly what the substitution costs: the mock's
         // `exitReserve` is a plain clamp to `outstandingPrincipal` rather than the real pool's
         // insurance netting, so the exit-price assertions below are weaker here than they are
         // there. What is unchanged is the thing round 16 was about - `credit.setLenderPool` is
