@@ -332,8 +332,8 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev Deliberately *not* a valuation. It moves when a lender puts money in or takes money
     ///      out, and when capital is destroyed - never on yield or on a donation - so it is a
     ///      running total of principal still admitted rather than an alias for `totalAssets()`.
-    ///      Floored at zero on the way down: once the pool has earned, a withdrawal can exceed what
-    ///      was put in.
+    ///      Each share holder carries loss-adjusted principal units, so an exit removes the
+    ///      principal attached to the shares it burns rather than treating yield as principal.
     ///
     ///      **`socialiseLoss` reduces it, and audit round 12 is why.** This used to say it never
     ///      moved "on yield, loss or donation", and the loss clause was a permanent brick: capital
@@ -347,10 +347,44 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      admitting principal. Both directions still refuse to make it a valuation.
     uint256 public netDeposits;
 
+    /// @notice Principal-accounting units held by each share holder.
+    /// @dev Units are distinct from vault shares. Vault shares price the economic claim, while
+    ///      these units remember how much admitted principal that claim carries. A realised loss
+    ///      reduces `netDeposits` without reducing the units, so every unit that existed when the
+    ///      loss landed is marked down by the same ratio. A later deposit mints units at that lower
+    ///      ratio and therefore does not inherit the earlier loss.
+    ///
+    ///      Units are a scalar balance on a fungible ERC-20. If differently priced lots merge in
+    ///      one account and are later split, their basis is averaged; exact lot identity cannot be
+    ///      reconstructed from one balance. Two integer boundaries can also loosen the cap by at
+    ///      most one asset unit each: double-ceiling after a loss, and a no-loss dust-share split
+    ///      whose rounded unit is then burned by a zero-asset redemption. All three residuals have
+    ///      deterministic tests and keep the broader finding only partly closed.
+    mapping(address account => uint256 units) private _principalUnits;
+
+    /// @dev Generation tags let a total loss invalidate old zero-basis units in O(1). Old vault
+    ///      shares remain transferable, but they carry no principal after `netDeposits` reaches
+    ///      zero. A later deposit starts the next generation at par.
+    mapping(address account => uint256 generation) private _principalUnitGeneration;
+    uint256 private _principalGeneration = 1;
+
+    /// @notice Total principal-accounting units in the current generation.
+    /// @dev Repeated near-total losses and recapitalisations can make this quotient grow quickly.
+    ///      The deposit cap makes ordinary values small, but no O(1) rescaling policy is claimed.
+    uint256 public totalPrincipalUnits;
+
+    /// @dev Queue cancellation and service must move the units recorded for that request, not the
+    ///      blended ratio of every lender whose shares share this contract as escrow. These fields
+    ///      stage one exact internal transfer or burn through `_update`.
+    bool private _hasExactPrincipalUnitMove;
+    uint256 private _exactPrincipalUnitsToMove;
+
     struct WithdrawalRequest {
         address owner;
         address receiver;
         uint256 shares;
+        uint256 principalUnits;
+        uint256 principalGeneration;
     }
 
     /// @dev Append-only. `queueHead` walks forward; serviced entries are left in place with zero
@@ -427,6 +461,24 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         }
         emit DepositCapSet(depositCap, cap);
         depositCap = cap;
+    }
+
+    /// @notice Principal-accounting units carried by `account` in the current loss generation.
+    function principalUnits(address account) public view returns (uint256) {
+        if (_principalUnitGeneration[account] != _principalGeneration) return 0;
+        return _principalUnits[account];
+    }
+
+    /// @notice The loss-adjusted, fungibly averaged principal carried by `account`'s shares.
+    /// @dev Rounded up so a partial exit cannot leave deposit-cap debt behind. Across all holders,
+    ///      the total rounding surplus is strictly less than one asset unit per holder. This is an
+    ///      accounting basis, not recoverable per-deposit lot provenance after balances merge.
+    function principalBasis(address account) public view returns (uint256) {
+        uint256 units = principalUnits(account);
+        uint256 totalUnits = totalPrincipalUnits;
+        if (units == 0 || totalUnits == 0) return 0;
+        if (units == totalUnits) return netDeposits;
+        return Math.mulDiv(netDeposits, units, totalUnits, Math.Rounding.Ceil);
     }
 
     /// @notice Shares carry three more decimals than USDC.
@@ -841,8 +893,8 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      did not move it either, which was false from round 12 onwards and is exactly the
     ///      sentence a reader would have used to clear round 21's finding 8 without measuring.
     ///
-    ///      An exit debits the counter its **pro-rata share of principal**, not the assets it is
-    ///      paid - see `_withdraw`. Debiting the assets mixed yield into a principal counter and
+    ///      An exit debits the counter through the holder's own principal units in `_update`, not
+    ///      through the assets it is paid. Debiting assets mixed yield into a principal counter and
     ///      ratcheted it down against a clamp that could not net it back up.
     function maxDeposit(address) public view override(ERC4626, IERC4626) returns (uint256) {
         uint256 taken = netDeposits;
@@ -888,21 +940,97 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      What is genuinely missing is a *bound*, not a different number here: a stranger's
     ///      `liquidate` can move the price between quote and execution. See the four-argument
     ///      `withdraw` and `redeem` below, which is where that got fixed.
+    ///
+    ///      **Derived from `maxRedeem` since audit round 22 finding 2, and the paragraph above is
+    ///      what that finding is about.** Taking a second minimum here, against an asset figure,
+    ///      was fine while the reserve was a fraction of the book and catastrophic at the one point
+    ///      that is not an edge case. `exitReserve()` clamps to `outstandingPrincipal`, so once
+    ///      `totalImpairment >= outstandingPrincipal` the reserve *is* the whole loan,
+    ///      `exitAssets()` collapses onto the idle cash, and the two terms above - the exit value of
+    ///      the caller's shares, and `unreservedIdle()` - become the same number. `previewWithdraw`
+    ///      then charges nearly the whole position for that cash. That state is not exotic:
+    ///      `CreditManager._impairmentFor` marks `currentDebtOf`, and
+    ///      `outstandingPrincipal == pendingPrincipal + totalDebt`, so a single-borrower book -
+    ///      which is the shape of the Base Sepolia deployment and of launch - reaches it through one
+    ///      permissionless `liquidate`.
+    ///
+    ///      MEASURED on the real graph in `Impairment.integration.t.sol`, nothing pranked as the
+    ///      manager: `maxWithdraw` read 19,371.250000 with and without the `liquidate`, but the
+    ///      share cost went from 19,371,250,000,000 to 19,999,999,999,968 out of twenty trillion,
+    ///      leaving a supply of **32**. The auction then filled with `lifetimeSocialisedLoss` at
+    ///      zero - the protocol realised no loss at all - and the lender's residue was worth
+    ///      19.496124 against the control's 628.749999: a **609.253876** hole with nobody on the
+    ///      other side of it, because what the residue stopped owning went to the virtual shares,
+    ///      which nobody can ever redeem.
+    ///
+    ///      **The fix is a bound on the shares an exit may burn, not a different price.**
+    ///      `previewWithdraw`, `previewRedeem`, `_exitToShares`, `_exitToAssets`, `exitAssets` and
+    ///      `exitReserve` are untouched: a leaver is paid exactly what they were paid before. What
+    ///      changed is that the liquidity cap is converted to shares on the **un-impaired** book,
+    ///      so it caps the burn at the fraction of the supply the idle cash actually represents,
+    ///      and the asset figure is then derived from it at the exit price.
+    ///
+    ///      **Raising `_decimalsOffset()` does not do this**, and that function's own NatSpec names
+    ///      it as the inflation defence, so it is the first thing a reader will reach for. The
+    ///      void's cut is `1 / (D(L-M)/(D-M) + 1)` in the deposit `D`, the loan `L` and the mark
+    ///      `M`; `10 ** offset` cancels out of it. Inert, algebraically, at any offset.
+    ///
+    ///      **Two precedents this is not, because the next round will reach for both.**
+    ///      Round 10's gate returned a flat **zero** from here while any loss could land, and read
+    ///      the manager and the auction to decide - three unguarded external calls on the only exit.
+    ///      This reads storage only, cannot revert, and never returns zero for a lender with shares
+    ///      while any cash is unspoken-for. Round 14 deleted a per-entry stored `minAssets` field on
+    ///      the shared FIFO loop, where one lender's parameter decided another lender's turn; see
+    ///      `requestWithdrawal` for all four of its failure modes and for the rule it ends on -
+    ///      "change what the queue *pays*, not who it is allowed to walk past". This is per-caller,
+    ///      computed at read time, on the caller's own door, and it is not the queue.
+    ///
+    ///      **What it costs on the un-marked path, stated rather than claimed away.** Deriving this
+    ///      composes two floors where the old expression had one. On an exact `10 ** offset` share
+    ///      price, or whenever the caller's own balance is the binding term, the figure is
+    ///      identical. On an inexact price with the idle cash binding it is exactly **one wei
+    ///      lower** and never higher - measured at 8,304.579169 against 8,304.579170. That is the
+    ///      conservative side of a disagreement the pair already had rather than a new one: this
+    ///      used to report the whole idle balance while `maxRedeem` reported the share count that
+    ///      pays one wei less than it, so the asset figure was not executable through the share
+    ///      door. Rounding the conversion up instead restores the exact figure here and lets
+    ///      `maxRedeem` report a payout larger than the cash the pool holds once the share price is
+    ///      high enough, which a socialised loss reaches; a maximum that cannot be executed is the
+    ///      worse defect, so the floor stays.
     function maxWithdraw(address owner) public view override(ERC4626, IERC4626) returns (uint256) {
-        uint256 owned = _exitToAssets(balanceOf(owner), Math.Rounding.Floor);
-        uint256 idle = unreservedIdle();
-        return owned < idle ? owned : idle;
+        return previewRedeem(maxRedeem(owner));
     }
 
     /// @inheritdoc ERC4626
-    /// @dev The share-denominated twin of `maxWithdraw`, and it reports the same money: the
-    ///      liquidity cap is an asset quantity, so it is converted at the price this door pays at.
-    ///      Read `maxWithdraw`'s note for what the pair costs under a mark and for the measurement
-    ///      that says the two agree. ERC-4626 forbids this from reverting and it makes no external
-    ///      call, so it cannot.
+    /// @dev The share-denominated twin of `maxWithdraw`, and now the primary of the pair: the
+    ///      liquidity cap is an asset quantity and this is where it becomes a share count, so this
+    ///      is the function the bound lives on and `maxWithdraw` is derived from it. Read
+    ///      `maxWithdraw`'s note for what the pair costs under a mark, for what the old shape cost,
+    ///      and for the two precedents this is not. ERC-4626 forbids this from reverting and it
+    ///      makes no external call, so it cannot.
+    ///
+    ///      **`convertToShares` rather than `_exitToShares`, and that one word is the fix.** The
+    ///      cap being converted is a quantity of *cash sitting in this contract*, so the question it
+    ///      answers is "what fraction of the book is that cash", which is a question about the
+    ///      un-impaired book. Asking it at the exit price makes the answer grow as the mark grows,
+    ///      until at a whole-loan mark it is the entire supply - which is the finding. It is the
+    ///      same argument `unreservedIdle` and `available` give for holding back the un-impaired
+    ///      claim, arriving on the third of the three functions that share it.
+    ///
+    ///      **Inert while nothing is reserved, by construction rather than by rounding**:
+    ///      `exitReserve() == 0` implies `exitAssets() == totalAssets()`, and then `convertToShares`
+    ///      and `_exitToShares(_, Floor)` are the same expression.
+    ///
+    ///      **This restores an ERC-4626 identity this contract had broken.** OpenZeppelin is pinned
+    ///      at 5.6.1, where the base `maxWithdraw(owner)` *is* `previewRedeem(maxRedeem(owner))` and
+    ///      `withdraw`/`redeem` enforce their maximum with `ERC4626ExceededMaxWithdraw` /
+    ///      `ERC4626ExceededMaxRedeem`. Overriding the two independently broke it; the audit
+    ///      measured the shipped pair agreeing only to within two wei. Exact is what makes the
+    ///      reported maximum an executable bound rather than a quote, and
+    ///      `testFuzz_R22F2_theMaxViewsConformAcrossTheMarkRange` asserts it as an equality.
     function maxRedeem(address owner) public view override(ERC4626, IERC4626) returns (uint256) {
         uint256 shares = balanceOf(owner);
-        uint256 idleShares = _exitToShares(unreservedIdle(), Math.Rounding.Floor);
+        uint256 idleShares = convertToShares(unreservedIdle());
         return shares < idleShares ? shares : idleShares;
     }
 
@@ -1218,45 +1346,111 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         if (isEpoch) lastYieldDistributeAt = block.timestamp;
     }
 
-    /// @dev The two hooks every ERC-4626 entry and exit funnels through, so `netDeposits` cannot be
-    ///      missed by a path that forgets to update it. `serviceQueue` is the one exit that does not
-    ///      come through `_withdraw` - it burns escrowed shares directly - and it decrements there.
+    /// @dev Every ERC-4626 entry funnels through here. The asset amount credits `netDeposits`, while
+    ///      the receiver gets principal units at the pre-deposit ratio. If a loss has reduced
+    ///      `netDeposits`, issuing more units for the same assets keeps new capital from inheriting
+    ///      that old loss. Before a socialised loss the active unit ratio remains one, so this
+    ///      issuance gives assets and units the same number. That ratio is not proof that the cap
+    ///      followed assets out: a dust transfer and zero-asset redemption can burn one unit and
+    ///      one `netDeposits` asset-wei together while no asset leaves the pool.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
-        netDeposits += assets;
+        // **A deposit that mints nothing is a donation the depositor did not mean to make**, and
+        // audit round 22 finding 2 is why the guard is here rather than filed as dust. Once the
+        // share price is high enough for `previewDeposit` to round to zero, this path took the USDC
+        // and minted nothing for it: a total loss for the depositor and a windfall for everyone
+        // already in. That price is reachable by donation alone - `totalAssets()` reads a raw
+        // `balanceOf`, which is the same donation `maxDeposit`'s NatSpec is written around - and the
+        // exit that finding names walks the pool straight into it from the other direction.
+        //
+        // On the hook rather than on `deposit`, because `mint` funnels through here too and a
+        // zero-share mint is the same refusal. There is no legitimate caller of either.
+        if (shares == 0) revert ZeroAmount();
+
+        uint256 totalUnits = totalPrincipalUnits;
+        uint256 units = totalUnits == 0
+            ? assets
+            : Math.mulDiv(assets, totalUnits, netDeposits, Math.Rounding.Ceil);
+
         super._deposit(caller, receiver, assets, shares);
+
+        // Credit after the asset transfer and share mint. If a hook-bearing settlement token ever
+        // reenters the unguarded ERC-20 transfer path during `safeTransferFrom`, it can move only
+        // the receiver's old shares and old units, not units for shares that do not exist yet.
+        netDeposits += assets;
+        totalPrincipalUnits = totalUnits + units;
+        _creditPrincipalUnits(receiver, units);
     }
 
     function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
         internal
         override
     {
-        // **Debited pro-rata on the shares burnt, not on the assets paid, and audit round 21 is
-        // why.** `_deposit` credits this counter in principal; paying out `assets` debits it in
-        // principal *plus* that lender's share of every epoch of yield since. The clamp below
-        // floors the difference at zero rather than letting it net out, so the drift is a one-way
-        // ratchet: measured, two epochs of a rotating lender walked the counter from 20,000.000000
-        // to 10,555.555557 while the pool still held 30,555.555557, handing back 9,444.444443 of
-        // cap headroom that nobody had vacated. `totalSupply()` here still includes `shares` -
-        // `super._withdraw` is what burns them.
-        _reduceNetDeposits(_principalPortion(shares, totalSupply()));
+        // `_update` moves and debits the owner's own principal units when the shares are burned.
+        // Keeping the debit on the token hook also covers the queue's direct burn.
         super._withdraw(caller, receiver, owner, assets, shares);
     }
 
-    /// @dev The share of `netDeposits` that leaves with `shares` out of `supply`. Floored, so the
-    ///      counter is never debited more principal than the exit is actually entitled to carry.
-    ///      `mulDiv` rather than a plain multiply: the product is unreachable at any cap real USDC
-    ///      could fund, but `depositCap` is an owner-set figure and this pool is immutable, so the
-    ///      one place a bad cap could brick is not the place to rely on an arithmetic bound.
-    function _principalPortion(uint256 shares, uint256 supply) private view returns (uint256) {
-        if (supply == 0) return netDeposits;
-        return Math.mulDiv(netDeposits, shares, supply, Math.Rounding.Floor);
+    function _creditPrincipalUnits(address account, uint256 units) private {
+        if (units == 0) return;
+
+        if (_principalUnitGeneration[account] != _principalGeneration) {
+            _principalUnitGeneration[account] = _principalGeneration;
+            _principalUnits[account] = units;
+        } else {
+            _principalUnits[account] += units;
+        }
     }
 
-    /// @dev Clamped rather than subtracted. Once the pool has earned, a lender can take out more
-    ///      than they put in, and the counter must floor at zero rather than underflow.
+    function _stageExactPrincipalUnitMove(uint256 units) private {
+        assert(!_hasExactPrincipalUnitMove);
+        _hasExactPrincipalUnitMove = true;
+        _exactPrincipalUnitsToMove = units;
+    }
+
+    function _transferWithExactPrincipalUnits(address from, address to, uint256 value, uint256 units) private {
+        _stageExactPrincipalUnitMove(units);
+        _transfer(from, to, value);
+        assert(!_hasExactPrincipalUnitMove);
+    }
+
+    function _burnWithExactPrincipalUnits(address from, uint256 value, uint256 units) private {
+        _stageExactPrincipalUnitMove(units);
+        _burn(from, value);
+        assert(!_hasExactPrincipalUnitMove);
+    }
+
+    /// @dev Removes `units` from the current generation and debits their marked-down principal.
+    ///      Ceiling is deliberate: flooring a partial path is the direction that lets residual
+    ///      principal accumulate against the deposit cap. Because unit issuance also rounds up, a
+    ///      post-loss entry and exit can loosen the cap by one asset unit. A separate no-loss
+    ///      boundary exists when a dust share ceil-moves one unit and then redeems for zero assets:
+    ///      this burn still removes that unit's one-asset-wei basis. The candidate records both
+    ///      bounded residuals rather than reversing into the cap-brick direction. A full-unit burn
+    ///      is exact against the remaining aggregate.
+    function _burnPrincipalUnits(uint256 units) private {
+        uint256 totalUnits = totalPrincipalUnits;
+        uint256 basis = units == totalUnits
+            ? netDeposits
+            : Math.mulDiv(netDeposits, units, totalUnits, Math.Rounding.Ceil);
+
+        totalPrincipalUnits = totalUnits - units;
+        _reduceNetDeposits(basis);
+    }
+
+    /// @dev Clamped rather than subtracted. When the counter reaches zero, all surviving units have
+    ///      zero basis and a generation change invalidates them without iterating over holders.
     function _reduceNetDeposits(uint256 assets) private {
+        if (assets == 0) return;
+
         uint256 taken = netDeposits;
-        netDeposits = assets > taken ? 0 : taken - assets;
+        if (taken == 0) return;
+        if (assets >= taken) {
+            netDeposits = 0;
+            totalPrincipalUnits = 0;
+            ++_principalGeneration;
+        } else {
+            netDeposits = taken - assets;
+        }
     }
 
     /// @dev Freezes the stream if the last share has just been burned.
@@ -1275,6 +1469,38 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      Hooked on `_update` rather than on `withdraw`/`redeem` because `serviceQueue` burns
     ///      escrowed shares too, and that path would otherwise slip past.
     function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0)) {
+            uint256 fromBalance = balanceOf(from);
+
+            // Preserve ERC-20's standard insufficient-balance error. A successful update can never
+            // return from this branch.
+            if (value > fromBalance) {
+                super._update(from, to, value);
+                return;
+            }
+
+            uint256 heldUnits = principalUnits(from);
+            uint256 movedUnits;
+            if (_hasExactPrincipalUnitMove) {
+                movedUnits = _exactPrincipalUnitsToMove;
+                _hasExactPrincipalUnitMove = false;
+                _exactPrincipalUnitsToMove = 0;
+            } else if (heldUnits != 0) {
+                movedUnits = value == fromBalance
+                    ? heldUnits
+                    : Math.mulDiv(heldUnits, value, fromBalance, Math.Rounding.Ceil);
+            }
+
+            if (movedUnits != 0) {
+                _principalUnits[from] = heldUnits - movedUnits;
+                if (to == address(0)) {
+                    _burnPrincipalUnits(movedUnits);
+                } else {
+                    _creditPrincipalUnits(to, movedUnits);
+                }
+            }
+        }
+
         super._update(from, to, value);
 
         // **Audit round 12: this tested the threshold round 11 had already proved wrong.** The
@@ -1323,11 +1549,12 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         outstandingPrincipal -= absorbed;
         lifetimeSocialisedLoss += absorbed;
         // **Capital destroyed has to stop counting against the deposit cap, and audit round 12
-        // found it did not.** `netDeposits` rises on a deposit and falls only by assets actually
-        // withdrawn - and a socialised loss never leaves as a withdrawal, so it consumed cap
-        // headroom permanently. This contract is immutable with no sweep and no rescue, so enough
-        // losses would close it to deposits for good, which is the same permanent brick round 11
-        // found through a donation and this reaches through ordinary operation.
+        // found it did not.** `netDeposits` rises on a deposit and falls when admitted principal
+        // leaves with burned shares, but a socialised loss burns no shares at all. Without this
+        // write it consumed cap headroom permanently. This contract is immutable with no sweep and
+        // no rescue, so enough losses would close it to deposits for good, which is the same
+        // permanent brick round 11 found through a donation and this reaches through ordinary
+        // operation.
         //
         // Reducing here does not turn the counter into a valuation: a loss removes principal the
         // pool is holding, which is exactly what it measures. Yield and donations still move it by
@@ -1495,11 +1722,21 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
 
         // Moves the shares rather than burning them, so `totalSupply` is untouched and the share
         // price does not jump at the moment somebody asks to leave.
+        uint256 escrowUnitsBefore = principalUnits(address(this));
         _transfer(msg.sender, address(this), shares);
+        uint256 requestUnits = principalUnits(address(this)) - escrowUnitsBefore;
         queuedShares += shares;
 
         uint256 index = _queue.length;
-        _queue.push(WithdrawalRequest({owner: msg.sender, receiver: receiver, shares: shares}));
+        _queue.push(
+            WithdrawalRequest({
+                owner: msg.sender,
+                receiver: receiver,
+                shares: shares,
+                principalUnits: requestUnits,
+                principalGeneration: _principalGeneration
+            })
+        );
         _requestIndexPlusOne[msg.sender] = index + 1;
 
         emit WithdrawalQueued(msg.sender, index, _exitToAssets(shares, Math.Rounding.Floor));
@@ -1514,9 +1751,12 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         if (indexPlusOne == 0) revert NothingQueued();
 
         uint256 index = indexPlusOne - 1;
-        uint256 shares = _queue[index].shares;
+        WithdrawalRequest storage request = _queue[index];
+        uint256 shares = request.shares;
+        uint256 requestUnits = request.principalGeneration == _principalGeneration ? request.principalUnits : 0;
 
-        _queue[index].shares = 0;
+        request.shares = 0;
+        request.principalUnits = 0;
         queuedShares -= shares;
         delete _requestIndexPlusOne[msg.sender];
 
@@ -1525,7 +1765,7 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         // it keeps `queuePosition`'s scan short in the ordinary case.
         _advanceHeadPastEmpties();
 
-        _transfer(address(this), msg.sender, shares);
+        _transferWithExactPrincipalUnits(address(this), msg.sender, shares, requestUnits);
         emit WithdrawalRequestCancelled(msg.sender, index, shares);
     }
 
@@ -1669,10 +1909,13 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
                 // the *un-impaired* valuation, which is what "this can never be worth an asset-wei"
                 // actually means. Genuine dust still releases, because dust is worth nothing at
                 // either price.
+                uint256 dustRequestUnits =
+                    request.principalGeneration == _principalGeneration ? request.principalUnits : 0;
                 request.shares = 0;
+                request.principalUnits = 0;
                 queuedShares -= shares;
                 delete _requestIndexPlusOne[request.owner];
-                _transfer(address(this), request.owner, shares);
+                _transferWithExactPrincipalUnits(address(this), request.owner, shares, dustRequestUnits);
 
                 emit QueuedWithdrawalReleasedAsDust(request.owner, index, shares);
                 index++;
@@ -1710,10 +1953,22 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
             // replaces was unrecoverable and stranger-timed, while the stall moves no money,
             // destroys no claim, and has an exit the affected lender controls -
             // `cancelWithdrawalRequest` is always available and unguarded, and after it `withdraw`
-            // and `redeem` are open at the impaired price up to `unreservedIdle()`. So it converts
-            // a markdown crystallised at a stranger's chosen instant into one the lender chooses
-            // themselves, which is the premise the whole industry norm rests on and the premise
-            // audit round 15 proved we lacked.
+            // and `redeem` are open at the impaired price. So it converts a markdown crystallised
+            // at a stranger's chosen instant into one the lender chooses themselves, which is the
+            // premise the whole industry norm rests on and the premise audit round 15 proved we
+            // lacked.
+            //
+            // **"Up to `unreservedIdle()`" is what that used to say, and audit round 22 finding 2
+            // narrowed it. Re-quantified here rather than left as a sentence that has stopped being
+            // true.** That door now opens up to
+            // `previewRedeem(min(balanceOf(owner), convertToShares(unreservedIdle())))`. For a
+            // lender whose stake is smaller than the idle cash's share of the book it is unchanged,
+            // because their own balance is the binding term either way. For a lender larger than
+            // that it is strictly narrower, and it narrows exactly as the mark deepens: MEASURED on
+            // `Impairment.integration.t.sol`'s single-lender fixture under a whole-debt mark, the
+            // escape goes from 19,371.250000 to **18,762.266328**, or 3.1% tighter. The money is
+            // not lost - it is the difference between crystallising a temporary markdown and
+            // keeping the claim - but the escape is smaller than this comment used to promise.
             //
             // It compounds with the `unreservedIdle()` over-reservation, which is a separate open
             // finding: during a mark the queue is suspended and an unqueued lender's `maxWithdraw`
@@ -1791,11 +2046,18 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
                 if (assetsOut == 0) break;
             }
 
+            uint256 requestUnits =
+                request.principalGeneration == _principalGeneration ? request.principalUnits : 0;
+            uint256 unitsToBurn = sharesToBurn == shares
+                ? requestUnits
+                : Math.mulDiv(requestUnits, sharesToBurn, shares, Math.Rounding.Ceil);
+
             request.shares = shares - sharesToBurn;
+            request.principalUnits = requestUnits - unitsToBurn;
             queuedShares -= sharesToBurn;
             idle -= assetsOut;
 
-            _burn(address(this), sharesToBurn);
+            _burnWithExactPrincipalUnits(address(this), sharesToBurn, unitsToBurn);
             serviced++;
             examined++;
 
@@ -1810,16 +2072,8 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
             claimable[request.receiver] += assetsOut;
             totalClaimable += assetsOut;
 
-            // The one exit that does not run through `_withdraw`, so the deposit-cap counter is
-            // decremented here instead. Done at the set-aside rather than at `claim`, because this
-            // is the moment the shares are burned and the capital stops being the pool's.
-            //
-            // **Same pro-rata rule as `_withdraw`, and this is a second writer, not the same one.**
-            // `_withdraw` is not `virtual` and `_reduceNetDeposits` is `private`, so round 21 could
-            // not validate the rule by subclassing - and had it been subclassable, the natural fix
-            // would have closed the ERC-4626 door and left this one open while reading like
-            // closure. The burn above has already happened, so the supply is reconstructed.
-            _reduceNetDeposits(_principalPortion(sharesToBurn, totalSupply() + sharesToBurn));
+            // `_burn` has already moved the escrow's principal units through `_update`, so the
+            // deposit-cap debit has one funnel for both ERC-4626 exits and queue service.
 
             if (request.shares == 0) {
                 delete _requestIndexPlusOne[request.owner];
@@ -1892,5 +2146,12 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     function queueEntry(uint256 index) external view returns (address owner, address receiver, uint256 shares) {
         WithdrawalRequest storage request = _queue[index];
         return (request.owner, request.receiver, request.shares);
+    }
+
+    /// @notice Principal units still attached to a queue entry in the current loss generation.
+    function queueEntryPrincipalUnits(uint256 index) external view returns (uint256) {
+        WithdrawalRequest storage request = _queue[index];
+        if (request.principalGeneration != _principalGeneration) return 0;
+        return request.principalUnits;
     }
 }

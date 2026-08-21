@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -10,6 +11,46 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Config} from "../src/Config.sol";
 import {LenderPool} from "../src/LenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+
+/// @dev Test token that moves a depositor's existing pool shares from inside the asset transfer.
+///      Real USDC does not currently expose this hook, but the production token is upgradeable and
+///      the pool's entry-point guard does not cover inherited ERC-20 transfers.
+contract ShareTransferHookUSDC is ERC20 {
+    LenderPool private _pool;
+    address private _shareOwner;
+    address private _shareReceiver;
+    uint256 private _shares;
+    bool private _armed;
+
+    bool public hookRan;
+
+    constructor() ERC20("Share Transfer Hook USDC", "hUSDC") {}
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function arm(LenderPool pool_, address shareOwner_, address shareReceiver_, uint256 shares_) external {
+        _pool = pool_;
+        _shareOwner = shareOwner_;
+        _shareReceiver = shareReceiver_;
+        _shares = shares_;
+        _armed = true;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (_armed && from == _shareOwner && to == address(_pool)) {
+            _armed = false;
+            hookRan = true;
+            _pool.transferFrom(_shareOwner, _shareReceiver, _shares);
+        }
+        super._update(from, to, value);
+    }
+}
 
 /// @notice The Phase 4 lender pool (PRD §4.2, §6.4).
 ///
@@ -646,7 +687,7 @@ contract LenderPoolTest is Test {
     ///      loss with her, so Bob is not left holding it. Under the old gate she was simply
     ///      blocked; under this she may go, at an honest price.
     function test_impairment_aLeaverCannotOutrunTheExpectedLoss() public {
-        uint256 aliceShares = _deposit(alice, DEPOSIT);
+        _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(4_000e6);
 
@@ -939,9 +980,7 @@ contract LenderPoolTest is Test {
         pool.redeem(shares, alice, alice);
 
         assertGt(paid, DEPOSIT, "fixture: the exit must actually carry yield out with it");
-        assertApproxEqAbs(
-            pool.netDeposits(), DEPOSIT, 2, "the leaver must debit principal, not principal plus yield"
-        );
+        assertEq(pool.netDeposits(), DEPOSIT, "the leaver must debit their exact remaining principal");
         assertEq(pool.maxDeposit(bob), pool.depositCap() - DEPOSIT, "and the cap must free exactly one seat");
     }
 
@@ -962,7 +1001,7 @@ contract LenderPoolTest is Test {
         pool.serviceQueue(4);
 
         assertEq(pool.balanceOf(address(pool)), 0, "fixture: the queue entry must have been paid in full");
-        assertApproxEqAbs(pool.netDeposits(), DEPOSIT, 2, "the queue door must debit principal too");
+        assertEq(pool.netDeposits(), DEPOSIT, "the queue door must debit the exact same principal");
     }
 
     /// @notice The measured headline: a rotating lender must not be able to walk the counter to
@@ -1005,11 +1044,348 @@ contract LenderPoolTest is Test {
         emit log_named_uint("totalAssets", pool.totalAssets());
         emit log_named_uint("maxDeposit ", pool.maxDeposit(bob));
 
-        assertGe(pool.netDeposits(), anchor, "the anchor lender's principal must still count against the cap");
-        assertLe(
-            pool.maxDeposit(bob),
-            pool.depositCap() - anchor,
-            "the cap must not re-open headroom that nobody vacated"
+        assertEq(pool.netDeposits(), anchor, "only the anchor lender's principal must remain");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - anchor, "the cap must free exactly the vacated seats");
+    }
+
+    /// @notice A lender entering above par and leaving immediately cannot consume cap headroom.
+    /// @dev Audit round 22 finding 3. A global share-ratio debit records less principal than this
+    ///      lender supplied because their shares were minted after yield raised the price. Their own
+    ///      principal units remain exact, so the round trip leaves both the anchor and headroom
+    ///      unchanged.
+    function test_R22F3_aboveParRoundTripPreservesPrincipalAndHeadroom() public {
+        _deposit(alice, DEPOSIT);
+        _distributeYield(2_000e6);
+        skip(Config.YIELD_STREAM_DURATION + 1);
+
+        uint256 assets = 15_000e6;
+        usdc.mint(bob, assets - DEPOSIT);
+        uint256 netBefore = pool.netDeposits();
+        uint256 headroomBefore = pool.maxDeposit(bob);
+
+        vm.prank(bob);
+        uint256 shares = pool.deposit(assets, bob);
+        assertEq(pool.principalBasis(bob), assets, "the entrant must carry exactly what they supplied");
+
+        vm.prank(bob);
+        pool.redeem(shares, bob, bob);
+
+        assertEq(pool.balanceOf(bob), 0, "the entrant must have completed the round trip");
+        assertEq(pool.principalUnits(bob), 0, "no principal units may outlive the shares");
+        assertEq(pool.netDeposits(), netBefore, "a round trip must not move admitted principal");
+        assertEq(pool.maxDeposit(bob), headroomBefore, "a round trip must not consume cap headroom");
+    }
+
+    /// @notice The original 114-cycle cap ratchet no longer moves admitted principal.
+    /// @dev One asset-wei per cycle is the audit's measured total cost. The above-par fixture keeps
+    ///      every entry on the share-ratio boundary that made the old global debit drift upward.
+    function test_R22F3_original114CycleRatchetNoLongerMovesTheCap() public {
+        _deposit(alice, DEPOSIT);
+        _distributeYield(2_000e6);
+        skip(Config.YIELD_STREAM_DURATION + 1);
+
+        uint256 netBefore = pool.netDeposits();
+        uint256 headroomBefore = pool.maxDeposit(bob);
+
+        for (uint256 i = 0; i < 114; i++) {
+            vm.prank(bob);
+            uint256 shares = pool.deposit(1, bob);
+            vm.prank(bob);
+            pool.redeem(shares, bob, bob);
+        }
+
+        assertEq(pool.balanceOf(bob), 0, "the rotating account must finish every cycle empty");
+        assertEq(pool.netDeposits(), netBefore, "114 cycles must not move admitted principal");
+        assertEq(pool.maxDeposit(bob), headroomBefore, "114 cycles must not consume cap headroom");
+    }
+
+    /// @notice Replacement capital does not inherit a loss and survives an older lender's exit.
+    /// @dev A raw per-holder basis is insufficient here. The old lender's recorded deposit predates
+    ///      the loss, so debiting that raw amount would clamp `netDeposits` to zero and erase the new
+    ///      lender's replacement capital from the cap. Principal units mark the old cohort down and
+    ///      issue the replacement cohort at the post-loss ratio.
+    function test_R22F3_replacementCapitalSurvivesTheLossCohortsExit() public {
+        _deposit(alice, DEPOSIT);
+        _lend(1_000e6);
+
+        vm.prank(creditManager);
+        assertEq(pool.socialiseLoss(1_000e6), 1_000e6, "fixture: the loss must land");
+
+        _deposit(bob, 1_000e6);
+        assertEq(pool.netDeposits(), DEPOSIT, "replacement capital must refill only the realised loss");
+
+        uint256 aliceShares = pool.balanceOf(alice);
+        vm.prank(alice);
+        pool.redeem(aliceShares, alice, alice);
+
+        assertEq(pool.principalUnits(alice), 0, "the old cohort must leave no units behind");
+        assertEq(pool.netDeposits(), 1_000e6, "the replacement lender's principal must remain admitted");
+        assertEq(pool.principalBasis(bob), 1_000e6, "the replacement lender must keep their full basis");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - 1_000e6, "the cap must still count the replacement");
+    }
+
+    /// @notice A total loss invalidates old units and the next deposit starts at par.
+    function test_R22F3_totalLossStartsAFreshPrincipalGeneration() public {
+        _deposit(alice, DEPOSIT);
+        usdc.mint(address(pool), 2_000e6);
+        _lend(DEPOSIT);
+
+        vm.prank(creditManager);
+        assertEq(pool.socialiseLoss(DEPOSIT), DEPOSIT, "fixture: the whole admitted principal must be lost");
+
+        assertEq(pool.netDeposits(), 0, "a total loss must clear admitted principal");
+        assertEq(pool.totalPrincipalUnits(), 0, "a total loss must clear the active unit generation");
+        assertEq(pool.principalUnits(alice), 0, "old shares must carry no basis after a total loss");
+
+        usdc.mint(alice, 1_000e6);
+        _deposit(alice, 1_000e6);
+
+        assertEq(pool.netDeposits(), 1_000e6, "new principal must start at par");
+        assertEq(pool.totalPrincipalUnits(), 1_000e6, "only the new generation may count");
+        assertEq(pool.principalUnits(alice), 1_000e6, "stale units must be replaced rather than merged");
+        assertEq(pool.principalBasis(alice), 1_000e6, "the new generation must reconstruct the new principal");
+    }
+
+    /// @notice Principal units follow shares and merge additively at the receiver.
+    function test_R22F3_principalUnitsMoveAndMergeOnTransfer() public {
+        _deposit(alice, DEPOSIT);
+        _deposit(bob, 1_000e6);
+
+        uint256 aliceUnitsBefore = pool.principalUnits(alice);
+        uint256 bobUnitsBefore = pool.principalUnits(bob);
+        uint256 totalUnitsBefore = pool.totalPrincipalUnits();
+        uint256 movedUnits = Math.mulDiv(aliceUnitsBefore, 1, pool.balanceOf(alice), Math.Rounding.Ceil);
+
+        vm.prank(alice);
+        pool.transfer(bob, 1);
+
+        assertEq(pool.principalUnits(alice), aliceUnitsBefore - movedUnits, "the sender must lose the rounded units");
+        assertEq(pool.principalUnits(bob), bobUnitsBefore + movedUnits, "the receiver must merge the rounded units");
+        assertEq(pool.totalPrincipalUnits(), totalUnitsBefore, "a transfer must conserve principal units");
+    }
+
+    /// @notice A token callback cannot move basis for shares that have not been minted yet.
+    function test_R22F3_depositCreditsPrincipalAfterTheAssetTransferHook() public {
+        ShareTransferHookUSDC hookedUsdc = new ShareTransferHookUSDC();
+        LenderPool fresh = new LenderPool(IERC20(address(hookedUsdc)), admin);
+
+        hookedUsdc.mint(alice, 2 * DEPOSIT);
+        vm.startPrank(alice);
+        hookedUsdc.approve(address(fresh), type(uint256).max);
+        fresh.deposit(DEPOSIT, alice);
+        fresh.approve(address(hookedUsdc), type(uint256).max);
+        vm.stopPrank();
+
+        uint256 sharesMoved = fresh.balanceOf(alice) / 2;
+        hookedUsdc.arm(fresh, alice, bob, sharesMoved);
+
+        vm.prank(alice);
+        fresh.deposit(DEPOSIT, alice);
+
+        assertTrue(hookedUsdc.hookRan(), "fixture: the asset-transfer hook must have run");
+        assertEq(fresh.principalUnits(bob), DEPOSIT / 2, "the callback may move only half the old basis");
+        assertEq(
+            fresh.principalUnits(alice), DEPOSIT + DEPOSIT / 2, "the new deposit must remain with its minted shares"
+        );
+        assertEq(fresh.totalPrincipalUnits(), 2 * DEPOSIT, "the callback must not create or destroy units");
+        assertEq(fresh.netDeposits(), 2 * DEPOSIT, "the callback must not move admitted principal");
+    }
+
+    /// @notice Queue escrow moves, returns and finally burns the same principal units.
+    function test_R22F3_queueEscrowUsesTheTokenHookForPrincipal() public {
+        uint256 shares = _deposit(alice, DEPOSIT);
+        uint256 queued = shares / 2;
+        uint256 queuedUnits = Math.mulDiv(DEPOSIT, queued, shares, Math.Rounding.Ceil);
+
+        vm.prank(alice);
+        pool.requestWithdrawal(queued, alice);
+        assertEq(pool.principalUnits(address(pool)), queuedUnits, "escrow must receive the queued units");
+        assertEq(pool.principalUnits(alice), DEPOSIT - queuedUnits, "the lender must release the queued units");
+
+        vm.prank(alice);
+        pool.cancelWithdrawalRequest();
+        assertEq(pool.principalUnits(address(pool)), 0, "cancellation must empty the escrow basis");
+        assertEq(pool.principalUnits(alice), DEPOSIT, "cancellation must restore the lender's basis");
+
+        vm.prank(alice);
+        pool.requestWithdrawal(shares, alice);
+        pool.serviceQueue(10);
+
+        assertEq(pool.principalUnits(address(pool)), 0, "the queue burn must consume the escrow units");
+        assertEq(pool.totalPrincipalUnits(), 0, "a full exit must consume every principal unit");
+        assertEq(pool.netDeposits(), 0, "a full exit must release all deposit-cap principal");
+    }
+
+    /// @notice Shared escrow preserves each request's basis even when share prices differ.
+    /// @dev Alice enters at par and Bob enters after yield doubles the price, so their units per
+    ///      share differ. A partial fill, cancellation and later full fill must each use the units
+    ///      recorded for that request rather than the pool's blended escrow ratio.
+    function test_R22F3_queuePreservesHeterogeneousPrincipalProvenance() public {
+        uint256 aliceShares = _deposit(alice, DEPOSIT);
+        _distributeYield(DEPOSIT);
+        skip(Config.YIELD_STREAM_DURATION + 1);
+        uint256 bobShares = _deposit(bob, DEPOSIT);
+
+        _lend(25_000e6);
+
+        vm.prank(alice);
+        pool.requestWithdrawal(aliceShares, alice);
+        vm.prank(bob);
+        pool.requestWithdrawal(bobShares, bob);
+
+        assertEq(pool.queueEntryPrincipalUnits(0), DEPOSIT, "Alice's request must record her basis");
+        assertEq(pool.queueEntryPrincipalUnits(1), DEPOSIT, "Bob's request must record his basis");
+
+        pool.serviceQueue(1);
+        (,, uint256 aliceSharesRemaining) = pool.queueEntry(0);
+        uint256 aliceUnitsRemaining = pool.queueEntryPrincipalUnits(0);
+        uint256 aliceSharesBurned = aliceShares - aliceSharesRemaining;
+        uint256 aliceUnitsBurned = Math.mulDiv(DEPOSIT, aliceSharesBurned, aliceShares, Math.Rounding.Ceil);
+        assertEq(
+            aliceUnitsRemaining,
+            DEPOSIT - aliceUnitsBurned,
+            "the partial fill must burn the request's ceiling-rounded unit slice"
+        );
+        assertLt(aliceUnitsRemaining, DEPOSIT, "fixture: Alice must be partially serviced");
+        assertGt(aliceUnitsRemaining, 0, "fixture: Alice must retain a live remainder");
+
+        vm.prank(alice);
+        pool.cancelWithdrawalRequest();
+        assertEq(pool.principalUnits(alice), aliceUnitsRemaining, "cancellation must return Alice's exact remainder");
+        assertEq(pool.principalUnits(address(pool)), DEPOSIT, "only Bob's exact request may remain in escrow");
+        assertEq(pool.queueEntryPrincipalUnits(1), DEPOSIT, "Alice's cancellation must not dilute Bob's basis");
+
+        _repay(25_000e6);
+        pool.serviceQueue(1);
+
+        assertEq(pool.principalUnits(address(pool)), 0, "servicing Bob must empty the escrow basis");
+        assertEq(pool.principalUnits(bob), 0, "Bob's full exit must consume his exact basis");
+        assertEq(pool.totalPrincipalUnits(), aliceUnitsRemaining, "only Alice's cancelled remainder may stay active");
+        assertEq(pool.netDeposits(), aliceUnitsRemaining, "the cap must count only Alice's remaining principal");
+    }
+
+    /// @notice Stale queue requests cannot take units from a post-loss generation.
+    function test_R22F3_staleQueueRequestsCannotTakeFreshPrincipalUnits() public {
+        uint256 aliceShares = _deposit(alice, DEPOSIT);
+        uint256 bobShares = _deposit(bob, DEPOSIT);
+        usdc.mint(address(pool), 4_000e6);
+        _lend(2 * DEPOSIT);
+
+        vm.prank(alice);
+        pool.requestWithdrawal(aliceShares, alice);
+        vm.prank(bob);
+        pool.requestWithdrawal(bobShares, bob);
+
+        vm.prank(creditManager);
+        assertEq(pool.socialiseLoss(2 * DEPOSIT), 2 * DEPOSIT, "fixture: the total loss must land");
+
+        uint256 freshAssets = 1_000e6;
+        uint256 carolShares = _deposit(carol, freshAssets);
+        vm.prank(carol);
+        pool.requestWithdrawal(carolShares, carol);
+
+        assertEq(pool.principalUnits(address(pool)), freshAssets, "only the fresh request may carry active units");
+        assertEq(pool.queueEntryPrincipalUnits(0), 0, "Alice's old request must be stale");
+        assertEq(pool.queueEntryPrincipalUnits(1), 0, "Bob's old request must be stale");
+        assertEq(pool.queueEntryPrincipalUnits(2), freshAssets, "Carol's request must own every fresh unit");
+
+        vm.prank(alice);
+        pool.cancelWithdrawalRequest();
+        vm.prank(bob);
+        pool.cancelWithdrawalRequest();
+
+        assertEq(pool.principalUnits(address(pool)), freshAssets, "stale cancellations must not take Carol's units");
+        assertEq(pool.queueEntryPrincipalUnits(2), freshAssets, "Carol's request provenance must survive");
+
+        vm.prank(carol);
+        pool.cancelWithdrawalRequest();
+        assertEq(pool.principalUnits(address(pool)), 0, "the fresh cancellation must empty active escrow units");
+        assertEq(pool.principalUnits(carol), freshAssets, "Carol must recover her fresh-generation basis");
+    }
+
+    /// @notice Known residual: a dust share split can loosen the cap without a realised loss.
+    /// @dev At par, the three-decimal virtual offset gives a ten-asset-wei deposit 10,000 share-wei
+    ///      and ten principal units. Transferring one share-wei ceil-moves one whole unit. That dust
+    ///      share then redeems for zero assets because the exit conversion floors, but its unit burn
+    ///      still removes one asset-wei from `netDeposits`. Ten executed cycles drive the counter
+    ///      from ten to zero while all ten assets remain. The error is gas-bound at one USDC
+    ///      micro-unit per completed boundary; it is not the original nonlinear 114-cycle ratchet.
+    function test_R22F3_knownResidual_noLossDustTransferThenZeroAssetRedeemErodesLinearly() public {
+        uint256 aliceShares = _deposit(alice, 10);
+        assertEq(aliceShares, 10_000, "fixture: the virtual offset must mint one thousand shares per asset-wei");
+
+        uint256 assetsBefore = usdc.balanceOf(address(pool));
+        uint256 headroomBefore = pool.maxDeposit(bob);
+
+        for (uint256 i = 0; i < 10; i++) {
+            vm.prank(alice);
+            pool.transfer(bob, 1);
+
+            assertEq(pool.principalUnits(bob), 1, "each dust split must ceil-move one principal unit");
+            assertEq(pool.previewRedeem(1), 0, "each one-share position must redeem for zero assets");
+
+            vm.prank(bob);
+            uint256 assetsOut = pool.redeem(1, bob, bob);
+
+            uint256 remaining = 9 - i;
+            assertEq(assetsOut, 0, "each boundary must pay no assets");
+            assertEq(usdc.balanceOf(address(pool)), assetsBefore, "no asset may leave the pool");
+            assertEq(pool.totalPrincipalUnits(), remaining, "each zero-asset exit must burn exactly one unit");
+            assertEq(pool.netDeposits(), remaining, "each zero-asset exit must loosen the cap by one asset-wei");
+            assertEq(pool.maxDeposit(bob), headroomBefore + i + 1, "cap erosion must be linear across boundaries");
+        }
+    }
+
+    /// @notice Known residual: after a loss, quotient rounding can loosen the cap by one asset-wei.
+    /// @dev The candidate remains a partial remediation until this boundary has transferable
+    ///      fractional provenance. The error is one USDC micro-unit per completed round trip, not
+    ///      the original nonlinear ratchet that closed the whole cap in 114 cycles.
+    function test_R22F3_knownResidual_postLossDustRoundTripErodesOneAssetWei() public {
+        uint256 aliceShares = _deposit(alice, 10);
+        assertGt(aliceShares, 0, "fixture: Alice must receive shares");
+        _lend(1);
+
+        vm.prank(creditManager);
+        assertEq(pool.socialiseLoss(1), 1, "fixture: the one-wei loss must land");
+        assertEq(pool.netDeposits(), 9, "fixture: nine admitted asset-wei must remain");
+
+        uint256 bobShares = _deposit(bob, 1);
+        vm.prank(bob);
+        pool.redeem(bobShares, bob, bob);
+
+        assertEq(pool.netDeposits(), 8, "known residual: the round trip loosens the cap by one asset-wei");
+    }
+
+    /// @notice Known residual: merging differently priced lots makes their basis fungibly average.
+    /// @dev Exact lot provenance cannot survive an additive ERC-20 merge and a later split in one
+    ///      scalar balance. This path requires the caller to keep the blended anchor position; it
+    ///      does not reproduce the original near-free fresh-account round trip.
+    function test_R22F3_knownResidual_mergeAndSplitAveragesPrincipalBasis() public {
+        uint256 aliceShares = _deposit(alice, DEPOSIT);
+        _distributeYield(2_000e6);
+        skip(Config.YIELD_STREAM_DURATION + 1);
+
+        uint256 bobAssets = 15_000e6;
+        usdc.mint(bob, bobAssets - DEPOSIT);
+        uint256 bobShares = _deposit(bob, bobAssets);
+
+        vm.prank(bob);
+        pool.transfer(alice, bobShares);
+        vm.prank(alice);
+        pool.transfer(bob, bobShares);
+
+        uint256 bobBasisAfterBlend = pool.principalBasis(bob);
+        assertLt(bobBasisAfterBlend, bobAssets, "fixture: the split must average Bob's basis downward");
+
+        vm.prank(bob);
+        pool.redeem(bobShares, bob, bob);
+
+        assertEq(pool.balanceOf(alice), aliceShares, "the anchor shares must remain invested");
+        assertGt(pool.netDeposits(), DEPOSIT, "known residual: averaged basis remains on the anchor position");
+        assertEq(
+            pool.netDeposits(),
+            DEPOSIT + bobAssets - bobBasisAfterBlend,
+            "the residual must equal the basis moved onto the anchor"
         );
     }
 
@@ -2519,6 +2895,257 @@ contract LenderPoolTest is Test {
             "the clamp moved available()"
         );
         assertGt(owed, idle, "fixture: the clamp must actually bind, or this proves nothing");
+    }
+
+    // ── audit round 22 finding 2: the exit that empties the book ─────────────
+
+    /// @dev The un-impaired worth of every share that somebody actually holds. The virtual shares
+    ///      are excluded on purpose: what leaks into them is exactly the money this finding is
+    ///      about, because nobody can ever redeem them.
+    function _bookValueOfRealShares() internal view returns (uint256) {
+        return pool.convertToAssets(pool.totalSupply());
+    }
+
+    /// @dev Mark `amount` against a borrower who is not a lender, so the mark moves the exit price
+    ///      and nothing else. The manager is a bare EOA in this suite, which is why this is one
+    ///      prank rather than a whole liquidation - the end-to-end version of this hazard, driven
+    ///      by a real permissionless `liquidate` with nothing pranked, is
+    ///      `test_R22F2_aWholeDebtMarkCannotEmptyTheBookOnTheWayOut` in `Impairment.integration.t.sol`.
+    function _mark(uint256 amount) internal {
+        vm.prank(creditManager);
+        pool.impair(makeAddr("markedBorrower"), amount);
+    }
+
+    /// @notice The cliff. Destruction must be flat across the whole range of the mark, endpoint
+    ///         included.
+    /// @dev **`totalImpairment == outstandingPrincipal` is the ordinary single-borrower state, not
+    ///      an edge case**, so a test that sweeps the interior and stops short of the endpoint would
+    ///      miss the only point that matters.
+    ///
+    ///      MEASURED on the tree before the fix, the whole 64-step profile on a 10,000.000000 pool
+    ///      with 5,000.000000 lent: 0 wei at a zero mark, 1 wei for steps 1 to 42, 2 wei to step 50,
+    ///      then 3, 4, 5, 6, 8, 10, 16, 31 - and **2,501.250625 at the endpoint**. So it is a cliff
+    ///      rather than a slope: everything below the last step is rounding, and the last step is a
+    ///      quarter of the book. After the fix the endpoint destroys **1 wei** and every step
+    ///      passes at a tolerance of two.
+    ///
+    ///      Destruction is measured as book value that stops belonging to anybody: what the exit
+    ///      pays out, plus what the residue is worth on the un-impaired book, against what the whole
+    ///      real supply was worth before. Measuring the *payout* instead would pass against a fix
+    ///      that merely moved the hole onto whoever stayed.
+    function test_R22F2_thereIsNoCliffAnywhereInTheMarkRange() public {
+        _deposit(alice, DEPOSIT);
+        _lend(5_000e6);
+        uint256 principal = pool.outstandingPrincipal();
+
+        uint256 steps = 64;
+        for (uint256 i = 0; i < steps; i++) {
+            uint256 mark = (principal * i) / (steps - 1);
+            uint256 clean = vm.snapshotState();
+
+            if (mark != 0) _mark(mark);
+            uint256 valueBefore = _bookValueOfRealShares();
+
+            uint256 quoted = pool.maxWithdraw(alice);
+            vm.prank(alice);
+            pool.withdraw(quoted, alice, alice);
+
+            uint256 conserved = quoted + _bookValueOfRealShares();
+            if (i == steps - 1) {
+                emit log_named_uint("R22F2 mark == principal, destroyed", valueBefore - conserved);
+            }
+            assertGe(
+                conserved + 2,
+                valueBefore,
+                "a mark somewhere in this range destroys book value that nobody realised"
+            );
+
+            vm.revertToState(clean);
+        }
+    }
+
+    /// @notice The grind. Iterating the bounded exit does not get there either.
+    /// @dev **The obvious objection to bounding the exit is that a griefer just calls it in a
+    ///      loop.** The decay is harmonic rather than geometric - `1/C(n+1) = 1/C(n) + 1/P`, so
+    ///      `S(n) = S * P / (P + n * C)` - which is a reciprocal, not an exponential, and it does
+    ///      not reach the virtual-share scale from any starting book a real pool could have.
+    ///      Derived, then MEASURED here at a thousand iterations rather than asserted from the
+    ///      algebra, because a derivation that happens to be geometric would look identical in
+    ///      prose. Report what the log says, not what this paragraph says.
+    function test_R22F2_iteratingTheBoundedExitDoesNotGrindTheSupplyDown() public {
+        _deposit(alice, DEPOSIT);
+        _lend(5_000e6);
+        _mark(pool.outstandingPrincipal());
+
+        uint256 valueBefore = _bookValueOfRealShares();
+        uint256 supplyBefore = pool.totalSupply();
+        uint256 cashBefore = usdc.balanceOf(address(pool));
+        uint256 principal = pool.outstandingPrincipal();
+        uint256 rounds = 1_000;
+        uint256 paid;
+        uint256 iterations;
+
+        for (uint256 i = 0; i < rounds; i++) {
+            uint256 quoted = pool.maxWithdraw(alice);
+            if (quoted == 0) break;
+            vm.prank(alice);
+            pool.withdraw(quoted, alice, alice);
+            paid += quoted;
+            iterations++;
+        }
+
+        emit log_named_uint("R22F2 grind iterations      ", iterations);
+        emit log_named_uint("R22F2 grind supply before   ", supplyBefore);
+        emit log_named_uint("R22F2 grind supply after    ", pool.totalSupply());
+        emit log_named_uint("R22F2 grind total paid out  ", paid);
+        emit log_named_uint("R22F2 grind destroyed       ", valueBefore - (paid + _bookValueOfRealShares()));
+
+        assertEq(iterations, rounds, "the grind stopped early, so a thousand iterations were not measured");
+
+        // **The decay law itself, not just a floor under it.** Harmonic gives
+        // `S(n) = S * P / (P + n * C)`; geometric would give `S * (P / (P + C)) ** n`, which at
+        // these numbers is zero long before iteration 1,000. Asserting the closed form is what
+        // tells the two apart - a floor alone would be satisfied by either if the floor were
+        // generous enough.
+        assertApproxEqRel(
+            pool.totalSupply(),
+            Math.mulDiv(supplyBefore, principal, principal + rounds * cashBefore),
+            1e15, // 0.1%
+            "the supply did not decay harmonically, so the derivation behind this bound is wrong"
+        );
+
+        // 10,000 wei is `MIN_SUPPLY_FOR_YIELD` at a decimals offset of three.
+        assertGt(pool.totalSupply(), (10 ** 3) * Config.BPS, "a thousand exits ground the supply past the yield floor");
+        assertGe(
+            paid + _bookValueOfRealShares() + 2 * rounds,
+            valueBefore,
+            "the grind destroys more than two wei per iteration, so the decay is not harmonic"
+        );
+    }
+
+    /// @notice ERC-4626 conformance across the whole range of the mark.
+    /// @dev OpenZeppelin is pinned at 5.6.1, where the base `ERC4626.maxWithdraw(owner)` **is**
+    ///      `previewRedeem(maxRedeem(owner))` and both `withdraw` and `redeem` enforce their maximum
+    ///      with `ERC4626ExceededMaxWithdraw` / `ERC4626ExceededMaxRedeem`. This contract overrides
+    ///      the two views independently, which is what broke the identity; the audit measured the
+    ///      shipped pair agreeing only to within two wei. Exact is the property, because it is the
+    ///      identity that makes the reported maximum an executable bound rather than a quote.
+    ///
+    ///      ERC-4626 also forbids any of the four from reverting. None of them makes an external
+    ///      call and every conversion is a `mulDiv` whose result is bounded by an input, so calling
+    ///      them here is the assertion.
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_R22F2_theMaxViewsConformAcrossTheMarkRange(uint256 markSeed) public {
+        _deposit(alice, DEPOSIT);
+        _lend(5_000e6);
+        uint256 mark = bound(markSeed, 0, pool.outstandingPrincipal());
+        if (mark != 0) _mark(mark);
+
+        pool.maxDeposit(alice);
+        pool.maxMint(alice);
+        uint256 maxRedeemable = pool.maxRedeem(alice);
+        uint256 maxWithdrawable = pool.maxWithdraw(alice);
+
+        assertEq(
+            maxWithdrawable,
+            pool.previewRedeem(maxRedeemable),
+            "the asset-denominated maximum is not the share-denominated one, priced"
+        );
+
+        // And both are executable at the figure reported, which is the whole point of the identity.
+        uint256 clean = vm.snapshotState();
+        vm.prank(alice);
+        pool.withdraw(maxWithdrawable, alice, alice);
+        vm.revertToState(clean);
+        vm.prank(alice);
+        pool.redeem(maxRedeemable, alice, alice);
+    }
+
+    /// @notice INERTNESS: with nothing reserved, the bound must not move the numbers.
+    /// @dev The bound converts the idle cash at the **un-impaired** price, and at
+    ///      `exitReserve() == 0` the un-impaired price *is* the exit price - so `maxRedeem` is
+    ///      unchanged identically, by construction rather than by rounding.
+    ///
+    ///      `maxWithdraw` is now derived from it rather than taken as a second minimum, and that
+    ///      composes two floors where the old expression had one. **MEASURED, and it is not
+    ///      identically zero, so it is stated rather than claimed away.** On a pool whose share
+    ///      price is an exact `10 ** offset` - which every deposit-only fixture is, including
+    ///      `test_maxWithdrawReportsWhatCanActuallyBeTakenNow` - the two agree exactly, and so do
+    ///      they whenever the caller's own balance is the binding term. On an inexact price with the
+    ///      idle cash binding, the derived figure is exactly **one wei lower** and never higher:
+    ///      8,304.579169 against 8,304.579170, found in six fuzz runs once a donation is in the
+    ///      fixture.
+    ///
+    ///      **That wei is the conservative side of a disagreement the shipped pair already had, not
+    ///      a new one.** Today `maxWithdraw` reports the full idle cash while `maxRedeem` reports
+    ///      the share count that pays one wei less than it - the ERC-4626 identity was already
+    ///      broken, in the direction where the asset figure is not executable through the share
+    ///      door. Picking the other side is what makes the reported maximum an executable bound.
+    ///
+    ///      **Rounding the conversion up instead was examined and refused.** `Ceil` restores the
+    ///      exact figure at `exitReserve() == 0`, and at a high enough share price - a small supply
+    ///      against a large book, which a socialised loss reaches - it lets `maxRedeem` report a
+    ///      share count whose payout exceeds the idle cash the pool actually holds. A maximum that
+    ///      cannot be executed is a worse ERC-4626 defect than a maximum that is one wei short.
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_R22F2_theBoundIsInertWhileNothingIsReserved(
+        uint256 lentSeed,
+        uint256 heldSeed,
+        uint256 donationSeed
+    ) public {
+        uint256 held = bound(heldSeed, 1e6, DEPOSIT);
+        _deposit(alice, held);
+        _deposit(bob, DEPOSIT);
+
+        // **Breaks the exact 1000:1 share ratio, and without this the test is far weaker than it
+        // reads.** A pool built only out of deposits sits at exactly `10 ** offset` shares per
+        // asset, and on that ratio every conversion here round-trips exactly - so a fuzz over
+        // deposit sizes alone reports inertness for an expression that is inert only on that one
+        // ratio. MEASURED: without this line an `assertEq` here passes 256 runs; with it the same
+        // `assertEq` fails on run six, at one wei. A donation is the shortest route to an inexact
+        // price, because `totalAssets()` reads a raw `balanceOf` - the same reachability
+        // `maxDeposit`'s NatSpec is written around.
+        usdc.mint(address(pool), bound(donationSeed, 0, DEPOSIT));
+
+        _lend(bound(lentSeed, 1, pool.available()));
+
+        assertEq(pool.exitReserve(), 0, "fixture: nothing may be reserved in the inert case");
+
+        uint256 shipped = Math.min(pool.previewRedeem(pool.balanceOf(alice)), pool.unreservedIdle());
+        uint256 derived = pool.maxWithdraw(alice);
+
+        assertLe(derived, shipped, "the derived maximum rose, which would be a liquidity claim it cannot back");
+        assertGe(derived + 1, shipped, "the derived maximum moved by more than the one wei of the second floor");
+        assertEq(
+            pool.maxRedeem(alice),
+            Math.min(pool.balanceOf(alice), pool.convertToShares(pool.unreservedIdle())),
+            "maxRedeem moved while nothing was reserved"
+        );
+    }
+
+    /// @notice A deposit may not mint zero shares.
+    /// @dev The poisoned end state this finding leads to, closed from the other side. Once the
+    ///      share price is high enough that a deposit rounds to nothing, `deposit` used to take the
+    ///      USDC and mint nothing for it - a silent, total loss for the depositor and a windfall for
+    ///      everyone already in. Reached here by the shortest honest route rather than through the
+    ///      crush: `totalAssets()` reads a raw `balanceOf`, so a donation moves the price without
+    ///      minting anything, which is the same donation `maxDeposit`'s NatSpec is written around.
+    ///
+    ///      `mint` is unaffected in practice - it is quoted in shares, so a caller asking for zero
+    ///      shares is the only way to reach this from that side, and refusing that is right too.
+    function test_R22F2_depositCannotMintZeroShares() public {
+        _deposit(alice, 1);
+        usdc.mint(address(pool), 1_000e6);
+
+        assertEq(pool.previewDeposit(1), 0, "fixture: this deposit must be the zero-share one");
+
+        vm.expectRevert(LenderPool.ZeroAmount.selector);
+        vm.prank(bob);
+        pool.deposit(1, bob);
+
+        // CONTROL: the same pool still takes a deposit large enough to buy a share.
+        vm.prank(bob);
+        assertGt(pool.deposit(1e6, bob), 0, "a real deposit was refused as well");
     }
 
     /// @dev `_poolBalance()` is private. Reconstructed from the three public reads it is made of,

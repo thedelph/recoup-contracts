@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {Config} from "../src/Config.sol";
 import {LenderPool} from "../src/LenderPool.sol";
@@ -63,6 +64,14 @@ contract LenderHandler is Test {
     ///         nothing. `test_handlerCanReachEveryStateTheInvariantsCheck` asserts them.
     uint256 public depositsDone;
     uint256 public depositsRefusedByCap;
+
+    /// @notice The second legal refusal on the entry side, added by audit round 22 finding 2.
+    /// @dev A deposit too small to buy one wei of share used to take the USDC and mint nothing for
+    ///      it. `_deposit` refuses it now, and this campaign found the state on its own: one
+    ///      `donate` of 2.5e62 wei followed by a 220-wei deposit, in two calls. Counted separately
+    ///      from the cap refusal because they are different refusals about different things, and a
+    ///      single counter would let one of them fall to zero unnoticed.
+    uint256 public depositsRefusedAsZeroShare;
     uint256 public mintsDone;
     uint256 public withdrawsDone;
     uint256 public redeemsDone;
@@ -198,6 +207,36 @@ contract LenderHandler is Test {
     uint256 public exitPriceFellWithNeitherAReserveNorALoss;
     uint256 public exitPriceFalls;
 
+    /// @notice The deposit-cap counter, watched the same way as the five above.
+    /// @dev **Audit round 22, finding 15: this layer had no property on `netDeposits` at all.**
+    ///      Twenty-three invariants at 256 runs / 128,000 calls each passed 24 of 24 with round
+    ///      21's flagship fix reverted at **both** doors - the two lines commit `719f4e4` added -
+    ///      so the layer was blind to the flagship fix of the round it was extended in.
+    ///
+    ///      `netDepositsFalls` is the reach control and it is the reason the green above is not
+    ///      "the walk never withdraws": an invariant asserting the counter never falls goes red
+    ///      immediately, shrunk to `deposit -> queueExit`. It is asserted non-zero by the tripwire
+    ///      rather than shipped as an invariant, because the state it names is ordinary rather
+    ///      than forbidden.
+    ///
+    ///      **What this pair does NOT catch, said plainly rather than implied by omission.**
+    ///      Reverting the round-21 fix changes the *size* of a fall, never the *cause* of a rise,
+    ///      so `netDepositsRoseWithNoDepositOrMint` stays at zero under both neuters. The
+    ///      discriminator for that is the conservation property - `netDeposits` equalling the sum
+    ///      of every holder's principal basis - and it belongs with whichever accounting rule
+    ///      wins, not here. What is shipped here is the half that is true regardless of the rule:
+    ///      a counter measuring what lenders put in may only ever rise when a lender puts
+    ///      something in.
+    uint256 public netDepositsRoseWithNoDepositOrMint;
+    uint256 public netDepositsRises;
+    uint256 public netDepositsFalls;
+
+    /// @notice Independent entry-side check for the principal-unit issuance formula.
+    /// @dev This remains live after a total-loss generation reset, unlike a condition gated on the
+    ///      lifetime loss counter, which can never return to zero.
+    uint256 public principalUnitIssuances;
+    uint256 public principalUnitIssuanceMismatches;
+
     /// @notice Reads the six watched quantities either side of every action.
     /// @dev The post-block is a call rather than inline code because the pair does not fit on the
     ///      stack otherwise, and because a single writer for all six keeps the "loss landed" test
@@ -224,6 +263,8 @@ contract LenderHandler is Test {
         uint256 reserve;
         uint256 losses;
         uint256 lends;
+        uint256 netDeposits;
+        uint256 entries;
     }
 
     Watch private _before;
@@ -243,6 +284,8 @@ contract LenderHandler is Test {
         _before.reserve = pool.exitReserve();
         _before.losses = lossesSocialised;
         _before.lends = lendsDone;
+        _before.netDeposits = pool.netDeposits();
+        _before.entries = depositsDone + mintsDone;
     }
 
     function _settle() private {
@@ -292,6 +335,16 @@ contract LenderHandler is Test {
                 ++exitPriceFellWithNeitherAReserveNorALoss;
             }
         }
+
+        // Read straight off `_before` rather than through locals of its own: the eight above
+        // already crowd the stack across the modifier's `_`, which is why they are storage in the
+        // first place, and two more would put `serviceQueue` over.
+        uint256 net = pool.netDeposits();
+        if (net > _before.netDeposits) {
+            ++netDepositsRises;
+            if (depositsDone + mintsDone == _before.entries) ++netDepositsRoseWithNoDepositOrMint;
+        }
+        if (net < _before.netDeposits) ++netDepositsFalls;
     }
 
     constructor(LenderPool pool_, MockUSDC usdc_, address creditManager_, address epochHarvester_) {
@@ -357,17 +410,28 @@ contract LenderHandler is Test {
         totalMinted += amount;
     }
 
+    function _recordPrincipalUnitIssuance(uint256 unitsBefore, uint256 netBefore, uint256 assets) private {
+        uint256 expected = unitsBefore == 0
+            ? assets
+            : Math.mulDiv(assets, unitsBefore, netBefore, Math.Rounding.Ceil);
+        ++principalUnitIssuances;
+        if (pool.totalPrincipalUnits() != unitsBefore + expected) ++principalUnitIssuanceMismatches;
+    }
+
     // ── lender-facing ────────────────────────────────────────────────────────
 
     function deposit(uint256 actorSeed, uint256 receiverSeed, uint256 assets) external watched {
         address a = _actor(actorSeed);
         address receiver = _actor(receiverSeed);
         assets = bound(assets, 1, 5_000e6);
+        uint256 unitsBefore = pool.totalPrincipalUnits();
+        uint256 netBefore = pool.netDeposits();
         _mint(a, assets);
 
         vm.prank(a);
         try pool.deposit(assets, receiver) {
             ++depositsDone;
+            _recordPrincipalUnitIssuance(unitsBefore, netBefore, assets);
             // **`netDeposits`, not `totalAssets()`, and `LenderPool.sol:738` says why.** The cap is
             // sized from what lenders put in, deliberately, because audit round 11 found a donation
             // to `totalAssets()` would otherwise close the pool permanently. Asserting the cap
@@ -385,8 +449,22 @@ contract LenderHandler is Test {
             // mid-sequence would leave behind. Same claim, still asserted, still exact.
             assertLe(pool.netDeposits(), pool.depositCap(), "deposit crossed the cap");
         } catch (bytes memory err) {
-            assertEq(bytes4(err), LenderPool.DepositCapExceeded.selector, "unexpected deposit revert");
-            ++depositsRefusedByCap;
+            // **Two legal refusals since audit round 22 finding 2, and the second one is why this
+            // arm cannot just assert the cap selector.** A deposit small enough to round to zero
+            // shares is refused rather than swallowed, and this campaign reaches that state
+            // unaided - a donation lifts the share price far enough that a small deposit buys
+            // nothing. Left as a bare `assertEq` against the cap selector it would have been
+            // invisible in the worst way: a forge-std assertion inside a handler reverts, and under
+            // `fail_on_revert = false` a reverting handler call is discarded, so every deposit past
+            // that point would have silently stopped happening. It failed loudly instead only
+            // because `invariant_theHandlerNeverDropsAFrame` watches for exactly that.
+            bytes4 selector = bytes4(err);
+            if (selector == LenderPool.ZeroAmount.selector) {
+                ++depositsRefusedAsZeroShare;
+            } else {
+                assertEq(selector, LenderPool.DepositCapExceeded.selector, "unexpected deposit revert");
+                ++depositsRefusedByCap;
+            }
         }
     }
 
@@ -395,11 +473,14 @@ contract LenderHandler is Test {
         shares = bound(shares, 1, 5_000e9);
         uint256 cost = pool.previewMint(shares);
         if (cost == 0) return;
+        uint256 unitsBefore = pool.totalPrincipalUnits();
+        uint256 netBefore = pool.netDeposits();
         _mint(a, cost);
 
         vm.prank(a);
         try pool.mint(shares, a) {
             ++mintsDone;
+            _recordPrincipalUnitIssuance(unitsBefore, netBefore, cost);
             // Same subject as `deposit` above, for the same reason - including the live read.
             assertLe(pool.netDeposits(), pool.depositCap(), "mint crossed the cap");
         } catch (bytes memory err) {
@@ -888,6 +969,23 @@ contract LenderHandler is Test {
         sum += pool.balanceOf(address(pool));
     }
 
+    /// @dev Includes the pool because queued shares carry their principal units into escrow.
+    function sumPrincipalUnits() external view returns (uint256 sum) {
+        for (uint256 i = 0; i < actors.length; i++) {
+            sum += pool.principalUnits(actors[i]);
+        }
+        sum += pool.principalUnits(address(pool));
+    }
+
+    /// @dev Sums each holder's marked-down asset basis. Individual conversions round up, so the
+    ///      result may exceed `netDeposits` by less than one asset unit per non-empty holder.
+    function sumPrincipalBasis() external view returns (uint256 sum) {
+        for (uint256 i = 0; i < actors.length; i++) {
+            sum += pool.principalBasis(actors[i]);
+        }
+        sum += pool.principalBasis(address(pool));
+    }
+
     /// @dev Walks the array rather than restating `queuedShares`. A checker that read the counter
     ///      would agree with it by construction and prove nothing about the entries behind it.
     function sumLiveQueueShares() external view returns (uint256 sum) {
@@ -896,6 +994,25 @@ contract LenderHandler is Test {
             (,, uint256 shares) = pool.queueEntry(i);
             sum += shares;
         }
+    }
+
+    /// @dev Each live request owns an exact slice of the pool's escrowed principal units. The
+    ///      handler never transfers shares straight to the pool, so every escrowed unit must have
+    ///      exactly one queue entry behind it.
+    function sumLiveQueuePrincipalUnits() external view returns (uint256 sum) {
+        uint256 length = pool.queueLength();
+        for (uint256 i = 0; i < length; i++) {
+            sum += pool.queueEntryPrincipalUnits(i);
+        }
+    }
+
+    function hasPrincipalUnitsOnEmptyQueueEntry() external view returns (bool) {
+        uint256 length = pool.queueLength();
+        for (uint256 i = 0; i < length; i++) {
+            (,, uint256 shares) = pool.queueEntry(i);
+            if (shares == 0 && pool.queueEntryPrincipalUnits(i) != 0) return true;
+        }
+        return false;
     }
 
     /// @dev A live entry behind the head has been stepped over and will never be paid. The head
@@ -1227,6 +1344,82 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.principalRoseWithNoLend(), 0, "principal rose with no lend behind it");
     }
 
+    /// The deposit-cap counter measures what lenders put in. It may only ever rise when a lender
+    /// puts something in, or the cap it gates is measuring something else.
+    ///
+    /// @dev **Audit round 22, finding 15. This layer had no property on `netDeposits` whatsoever**,
+    ///      which is how it passed 24 of 24 at full config with round 21's flagship fix reverted at
+    ///      both doors. Same "monotonic with a cause" shape as the two above, and the same reason
+    ///      it is a handler ghost rather than a remembered field here - forge evaluates every
+    ///      `invariant_` against a snapshot and rolls its writes back, so a `last…` field on this
+    ///      contract would hold what `setUp` left it on all 128,000 calls.
+    ///
+    ///      The principal-unit conservation property below owns the accounting rule itself. This
+    ///      one remains the independent writer check: a basis is established on entry and nowhere
+    ///      else, regardless of how losses mark existing units down.
+    ///
+    ///      **`netDeposits <= totalAssets()` is still deliberately not shipped, for a current rather
+    ///      than historical reason.** The no-loss dust-transfer regression keeps that inequality
+    ///      green while it pays zero assets and lowers `netDeposits` by one. It therefore cannot
+    ///      distinguish correct principal release from cap-loosening drift. The old RED measurement
+    ///      belonged to `_principalPortion`'s deleted floor rule; retaining it here as though it
+    ///      constrained the replacement would give an obsolete implementation authority over this
+    ///      one. The deterministic residual tests own the two rounding directions instead.
+    function invariant_netDepositsOnlyRisesOnADepositOrMint() public view {
+        assertEq(
+            handler.netDepositsRoseWithNoDepositOrMint(), 0, "the deposit-cap counter rose with no entry behind it"
+        );
+    }
+
+    /// @notice Every successful entry issues units from the independent pre-entry ratio.
+    function invariant_principalUnitIssuanceMatchesThePreEntryRatio() public view {
+        assertEq(handler.principalUnitIssuanceMismatches(), 0, "a deposit or mint issued the wrong principal units");
+    }
+
+    /// @notice Transfers conserve aggregate units and exits retire the units carried by their shares.
+    /// @dev Audit round 22 findings 3, 15 and 22. The actor list is exhaustive for this handler and
+    ///      the pool is the fifth possible holder while shares are queued. Summing units proves the
+    ///      storage conservation directly. Summing the marked-down bases proves they reconstruct
+    ///      `netDeposits`, allowing only the strict ceiling-rounding bound.
+    ///
+    ///      No no-loss equality is asserted here. `units == netDeposits` and `basis == netDeposits`
+    ///      can both remain green while a dust transfer followed by a zero-asset redemption burns
+    ///      one unit and one asset-wei of `netDeposits` together, increasing cap headroom although
+    ///      no asset left. The deterministic ten-cycle regression owns that economic boundary; this
+    ///      invariant keeps the unconditional storage-conservation bounds it can actually prove.
+    function invariant_principalUnitsConserveNetDeposits() public view {
+        uint256 units = handler.sumPrincipalUnits();
+        uint256 basis = handler.sumPrincipalBasis();
+        uint256 net = pool.netDeposits();
+
+        assertEq(units, pool.totalPrincipalUnits(), "principal units escaped the known holders");
+        assertEq(
+            handler.sumLiveQueuePrincipalUnits(),
+            pool.principalUnits(address(pool)),
+            "queue requests lost their escrowed principal provenance"
+        );
+        assertFalse(handler.hasPrincipalUnitsOnEmptyQueueEntry(), "an empty queue entry retained principal units");
+        assertEq(units == 0, net == 0, "principal units and admitted principal disagree on emptiness");
+        assertLe(net, units, "admitted principal rose above its accounting units");
+        assertGe(basis, net, "holder bases do not reconstruct admitted principal");
+        assertLe(basis - net, handler.actorCount(), "holder-basis rounding exceeded one unit per boundary");
+    }
+
+    /// @notice A holder with no vault shares cannot retain principal-accounting units.
+    function invariant_noPrincipalUnitsOutliveShares() public view {
+        uint256 count = handler.actorCount();
+        for (uint256 i = 0; i < count; i++) {
+            address actor = handler.actors(i);
+            if (pool.balanceOf(actor) == 0) {
+                assertEq(pool.principalUnits(actor), 0, "an exited actor retained principal units");
+            }
+        }
+
+        if (pool.balanceOf(address(pool)) == 0) {
+            assertEq(pool.principalUnits(address(pool)), 0, "empty queue escrow retained principal units");
+        }
+    }
+
     /// The pool's headline claim to lenders, and the one most easily broken by a rounding edit:
     /// the **entry** price falls for exactly one reason, and a realised loss is it.
     ///
@@ -1440,6 +1633,25 @@ contract LenderPoolInvariants is Test {
         );
         assertEq(pool.yieldRate(), 0, "and the stream must actually be frozen by it");
 
+        // **The entry-side refusal audit round 22 finding 2 added, and it belongs in this opening
+        // block for the same reason the two above do: a nearly-empty pool is the only place it is
+        // free to reach.** `previewDeposit` rounds to zero only when the share price is above one
+        // asset per wei of share, which is 10 ** offset times par - unreachable on a funded book,
+        // and one donation away on an empty one. That is round 11's `maxDeposit` shape exactly.
+        //
+        // Snapshotted, because the donation would otherwise sit in `totalAssets()` for the rest of
+        // this test and break the `MIN_SUPPLY_FOR_YIELD` arithmetic three lines down, which needs
+        // the first deposit to mint at exactly the offset ratio. The counter is read before the
+        // revert and asserted after it.
+        {
+            uint256 snap = vm.snapshotState();
+            handler.donate(1_000e6);
+            handler.deposit(0, 0, 1);
+            bool refused = handler.depositsRefusedAsZeroShare() > 0;
+            vm.revertToState(snap);
+            assertTrue(refused, "a deposit that buys no share must be refused, not swallowed");
+        }
+
         // 10,000 wei is exactly `MIN_SUPPLY_FOR_YIELD` at a decimals offset of three, so this clears
         // the share floor and nothing else. The capital rule is the one audit round 13 added on top
         // of it, and this is the gap between the two: enough holders to pay, not enough capital for
@@ -1456,6 +1668,13 @@ contract LenderPoolInvariants is Test {
 
         handler.mintShares(2, 1_000e9);
         assertEq(handler.mintsDone(), 1, "mint must be possible");
+
+        // The rising half of the deposit-cap counter's denominator. Audit round 22, finding 15:
+        // the numerator `invariant_netDepositsOnlyRisesOnADepositOrMint` watches is worth nothing
+        // without evidence the quantity moves at all, and this file's own history is that a
+        // numerator pinned at zero by an unreachable state reads exactly like a property holding.
+        assertGt(handler.netDepositsRises(), 0, "the deposit-cap counter never rose");
+        assertGt(handler.principalUnitIssuances(), 0, "principal-unit issuance was never observed");
 
         // The cap is 25,000e6 and 15,000e6 is in. Four more 5,000e6 deposits cross it.
         for (uint256 i = 0; i < 4; i++) {
@@ -1489,6 +1708,12 @@ contract LenderPoolInvariants is Test {
         handler.redeemMax(1);
         assertEq(handler.withdrawsDone(), 1, "maxWithdraw must be executable");
         assertEq(handler.redeemsDone(), 1, "maxRedeem must be executable");
+
+        // **The reach control, and it is what stops the green above reading as "the walk never
+        // withdraws".** An invariant asserting the counter never falls goes red immediately,
+        // shrunk to `deposit -> queueExit`; the state is ordinary rather than forbidden, so it is
+        // asserted here as a denominator instead of shipped as a property.
+        assertGt(handler.netDepositsFalls(), 0, "the deposit-cap counter never fell, so nothing exits");
 
         uint256 lendable = pool.available();
         assertGt(lendable, 0, "the fixture must have something to lend");

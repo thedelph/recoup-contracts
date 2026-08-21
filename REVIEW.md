@@ -137,7 +137,7 @@ testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Five suites, 31 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
+Six suites, 58 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
 one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no state
 in which all three of an auction's exits revert, because that state would be permanently stranded
 collateral and only a fuzzer looking for it would ever find it.

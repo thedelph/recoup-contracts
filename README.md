@@ -8,15 +8,16 @@ Status: **deployed to Base Sepolia** (redeployed 2026-08-19), nothing on mainnet
 layer, the credit core, the epoch harvester and the liquidation auction are implemented, and the
 whole loan lifecycle - including a liquidation filling at 82% of NAV and an unfilled one falling
 through to the workout path - is fork-tested against the live DexFi contracts. Lending reaches the
-credit core through an interfaced seam, and the pool behind that seam is published here with two
-findings open against it, which the next paragraphs state rather than leave to be found. No
+credit core through an interfaced seam, and the pool behind that seam is published here with its
+open and partly remediated findings stated below rather than left to be found. No
 third-party money is accepted before an external audit; the exact shape of that gate, and what it
 deliberately does not cover, is spelled out further down.
 
-**`LenderPool` is here, and two findings are open against it.** The real one - the ERC-4626 vault,
-the withdrawal queue, the yield stream and the impairment pricing - is `src/LenderPool.sol`. It was
+**`LenderPool` is here, and its deployment blockers are stated below.** The real one - the
+ERC-4626 vault, the withdrawal queue, the yield stream and the impairment pricing - is
+`src/LenderPool.sol`. It was
 withheld from this repository until 2026-08-19; the section under the architecture diagram says why
-it is not any more. The first of the two open findings: a loss-making position carries no impairment
+it is not any more. One of the open findings: a loss-making position carries no impairment
 until somebody calls `liquidate`, so in the gap between a loan going bad and that call, the pool
 prices every exit at the full pre-loss price and a lender who leaves first is paid out of the
 lenders who stay.
@@ -52,9 +53,9 @@ liquidator for position in the same block. No calibration of the bounty closes a
 I have no clean mitigation for it in this architecture: any delay between a post and liquidatability
 contradicts the rule that keeps liquidation priced on the last known NAV through a keeper outage.
 
-**And rounds twenty and twenty-one found a second, larger one, which is now the main reason the
-pool is not here.** A lender who asks to withdraw parks a request, and the pool holds back the
-un-impaired value of those queued shares from everybody else. Separately, and correctly, it refuses
+**And rounds twenty and twenty-one found another, larger blocker.** A lender who asks to withdraw
+parks a request, and the pool holds back the un-impaired value of those queued shares from everybody
+else. Separately, and correctly, it refuses
 to service the queue at all while a position is marked down. Each rule is defensible on its own.
 Together they mean a parker reserves a claim they are forbidden to be paid, at a price they would
 never be paid at, and nothing permissionless drains it. Measured: a parker holding 15.8% of the book
@@ -177,9 +178,8 @@ staked and earning. Three exits, and the guards exist to prove no state closes a
 
 LenderPool: implemented. ERC-4626 over USDC, lending only to CreditManager, a FIFO withdrawal
 queue that escrows shares rather than burning them, and exits priced on a reserve so a leaver
-cannot outrun a loss they already carry. **Two findings were open against it on 2026-08-19 and are
-named below.** Check `AUDITS.md` and the commit history rather than this line for their current
-state; work on the second was in flight when this was written.
+cannot outrun a loss they already carry. **Its open and partly remediated findings are named
+below.** Check the findings below and the commit history rather than relying on a fixed count here.
 All parameters live in src/Config.sol - no magic numbers anywhere else.
 ```
 
@@ -187,8 +187,8 @@ All parameters live in src/Config.sol - no magic numbers anywhere else.
 It was held back because findings are open against it and publishing the mechanism without the fix
 seemed the wrong trade while nothing carrying the code was deployed. The 2026-08-19 Base Sepolia
 redeploy put it on chain and Basescan verification published the full source, so withholding it here
-stopped protecting anything and started making this README wrong. It is published, with the findings
-open at that date stated rather than left to be discovered:
+stopped protecting anything and started making this README wrong. It is published, with the current
+deployment blockers stated rather than left to be discovered:
 
 - **A loss-making position has no mark until somebody volunteers to liquidate it** (round 17). The
   window is narrowed to one transaction-ordering slot and the residual is irreducible without an
@@ -198,6 +198,31 @@ open at that date stated rather than left to be discovered:
   `available()` can reach zero, which halts borrowing protocol-wide. Four candidate fixes were built
   and each was refuted; what is left is impaired pricing plus serve-while-marked, which are one
   change.
+- **Principal-cap accounting is partly remediated, not closed** (round 22, F3). Loss-aware principal
+  units remove the original 114-cycle, one-asset-wei-per-cycle rotating-lender ratchet, and exact
+  request units preserve queue provenance. Unrestricted ERC-20 merges still average differently
+  priced share lots. Even without a loss, a dust-share split can make a redemption round to zero
+  assets, eroding the cap linearly by one asset-wei per completed cycle. Separately, the post-loss
+  path retains its own double-ceiling residual at an integer boundary, and repeated near-total loss
+  and refill cycles can eventually exhaust the quotient's integer range. It remains a deployment
+  blocker.
+- **Loss recovery uses a stream that cannot preserve who bore the loss** (round 22, F10).
+  `recoverLoss` feeds recovered value into the general yield stream, whose unreleased pot is excluded
+  from the price paid by new deposits. Measured, a lender arriving one block into a 628.750000 USDC
+  recovery captured 128.994204 USDC, or 20.5%, despite bearing none of the loss. That entry-pricing
+  rule applies to every live stream, so changing only `recoverLoss`'s rating parameters cannot fix
+  recovery ownership. It remains a deployment blocker.
+- **A non-epoch recovery inherits the epoch clock** (round 22, F11). `recoverLoss` and the surplus
+  branch of `repayPrincipal` use time since the last yield epoch to size their stream even though
+  neither cash flow accrued over that interval. The same 400 USDC recovery therefore streams over
+  five days after a recent epoch and 180 days after a long drought; a lender exiting after day five
+  forfeited 388.888889 USDC in the measured long-drought case. It remains a deployment blocker.
+- **Permissionless queue service can crystallise shares into cash the receiver cannot collect**
+  (round 22, F12). Any caller can burn a queued lender's shares and park the proceeds in
+  `claimable[receiver]`. If that receiver cannot call the pool or the USDC transfer to it is blocked,
+  the lender has no way to recover the shares or redirect the claim after service. Delegated claiming
+  would address only the first case, not an asset-level transfer rejection. It remains a deployment
+  blocker.
 
 **No lender capital is exposed and none can be.** The pool is deployed but not wired as
 `CreditManager`'s liquidity source and holds nothing, so it cannot lend and therefore cannot take a
@@ -228,14 +253,10 @@ forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: th
                 # run mid-flight rather than fail it
 ```
 
-That reports **0 failed**, and the only skips are the mainnet fork tests below, which need
-`RUN_FORK_TESTS=true`. CI runs the same command on every push and pull request, so the green tick
-on `main` is the standing claim rather than anything written here.
-
-**The pass count is deliberately not quoted.** It used to be, and it was wrong by 135 tests and
-three suites within a day of being written, because it is a derived number that nothing in this
-repository re-checks against the prose. `forge test` prints the current one on the tree you are
-holding, which is the only copy worth trusting.
+Measured on 2026-08-21 for this tree: **725 passed, 0 failed, 13 skipped across 30 suites**. The
+skips are the mainnet fork tests below, which need `RUN_FORK_TESTS=true`. This is a dated baseline,
+not a substitute for running the command: CI runs it on every push and pull request, and the green
+tick on `main` is the standing claim.
 
 ### Mainnet fork tests
 
@@ -330,7 +351,7 @@ Four habits came out of that and now apply by default:
   audited twice for correctness and deleted on the third pass, when someone finally asked the prior
   question and found it never closed the hole it was written for.
 
-Alongside the audits: stateful invariant fuzzing over five suites (31 invariants), and the mainnet
+Alongside the audits: stateful invariant fuzzing over six suites (58 invariants), and the mainnet
 fork tests above, which are the real integration proof.
 
 An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does
