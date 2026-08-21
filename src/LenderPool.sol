@@ -70,9 +70,11 @@ import {ILenderPool} from "./interfaces/ILenderPool.sol";
 ///
 ///      So the recognition gap is narrowed instead of the door being shut: `CreditManager` marks
 ///      the expected shortfall in the moment the auction opens, and a leaver is paid on
-///      `exitAssets()`, which already carries it. Entries stay on `totalAssets()` - see
-///      `previewRedeem` and `exitAssets` for why that asymmetry is the mechanism rather than an
-///      inconsistency, and for the Maple source it was verified against.
+///      `exitAssets()`, which already carries it. Entries never deduct that impairment. During an
+///      active yield stream their previews additionally price the projected unreleased tail, while
+///      the ERC-4626 conversion views remain on released `totalAssets()`. See `previewDeposit`,
+///      `previewRedeem` and `exitAssets` for why those two asymmetries are mechanisms rather than
+///      inconsistencies, and for the Maple source the impairment split was verified against.
 ///
 ///      **This used to say "there is nothing left to run from, so there is no reason to stop
 ///      anybody", and audit round seventeen executed it as false.** The mark does not exist until
@@ -828,11 +830,44 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         delete _impairedIndexPlusOne[borrower];
     }
 
+    /// @notice The gross value used only to quote and execute ERC-4626 entries.
+    /// @dev `totalAssets()` holds an active stream's projected tail out of released NAV. Selling
+    ///      new shares against that smaller figure after delivery lets the entrant capture part of
+    ///      the tail as it releases, diluting the shares that formed the delivered cohort. Adding
+    ///      the live tail back here makes a newcomer pay for that value without stepping the exit
+    ///      price or changing the standard `convertToAssets` and `convertToShares` views.
+    ///
+    ///      A frozen backlog is deliberately different. `yieldRate == 0` means no cohort is being
+    ///      paid and time releases nothing; the next delivered epoch establishes the cohort when
+    ///      `_rateStream` folds the backlog into a live pot. Charging a depositor for that frozen
+    ///      money before then would make its principal depend on value it cannot yet earn.
+    ///
+    ///      Impairments are not deducted here. Entry pricing remains on the un-impaired book so an
+    ///      entrant cannot buy the discount and profit when the mark is released.
+    function _entryAssets() private view returns (uint256 assets) {
+        assets = totalAssets();
+        if (yieldRate != 0) assets += unreleasedYield();
+    }
+
+    /// @dev OpenZeppelin 5.6.1's entry conversion with `_entryAssets()` substituted for
+    ///      `totalAssets()`. The virtual one asset and `10 ** _decimalsOffset()` shares are kept
+    ///      exactly, including the deposit-side floor that prevents over-issuing shares.
+    function _entryToShares(uint256 assets) private view returns (uint256) {
+        return Math.mulDiv(assets, totalSupply() + 10 ** _decimalsOffset(), _entryAssets() + 1, Math.Rounding.Floor);
+    }
+
+    /// @dev The exact-share inverse of `_entryToShares`, retaining OpenZeppelin's asset-side
+    ///      ceiling so a mint never underpays the gross entry price.
+    function _entryToAssets(uint256 shares) private view returns (uint256) {
+        return Math.mulDiv(shares, _entryAssets() + 1, totalSupply() + 10 ** _decimalsOffset(), Math.Rounding.Ceil);
+    }
+
     /// @notice What the pool is worth to somebody leaving it: assets less reserved shortfalls.
-    /// @dev The entry side deliberately does **not** deduct this - see `previewDeposit`. That
-    ///      asymmetry is the whole mechanism, and it is Maple's: an entrant who bought at the
-    ///      impaired price would profit when the impairment was released, which is round-11's
-    ///      buy-the-dip finding arriving through the front door instead.
+    /// @dev The entry side deliberately does **not** deduct this. Its active-tail adjustment is
+    ///      independent of the impairment split; see `_entryAssets` and `previewDeposit`. Not
+    ///      deducting the reserve is the whole impairment mechanism, and it is Maple's: an entrant
+    ///      who bought at the impaired price would profit when the impairment was released, which
+    ///      is round-11's buy-the-dip finding arriving through the front door instead.
     function exitAssets() public view returns (uint256) {
         uint256 assets = totalAssets();
         uint256 reserved = exitReserve();
@@ -902,8 +937,29 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         return taken >= cap ? 0 : cap - taken;
     }
 
+    /// @inheritdoc ERC4626
+    /// @dev Converts the remaining asset cap at the same gross active-tail price `previewMint`
+    ///      executes. Rounding down guarantees the quoted share maximum costs no more than
+    ///      `maxDeposit(receiver)` when `previewMint` applies its inverse ceiling.
     function maxMint(address receiver) public view override(ERC4626, IERC4626) returns (uint256) {
-        return convertToShares(maxDeposit(receiver));
+        return _entryToShares(maxDeposit(receiver));
+    }
+
+    /// @inheritdoc ERC4626
+    /// @dev Prices a deposit against the un-impaired book plus the projected tail of a live yield
+    ///      stream. A post-delivery entrant therefore pays for the whole active pot and cannot
+    ///      dilute the delivered cohort as it releases. Frozen yield stays excluded until a later
+    ///      epoch re-rates it. `_entryToShares` preserves OpenZeppelin's virtual terms and floor.
+    function previewDeposit(uint256 assets) public view override(ERC4626, IERC4626) returns (uint256) {
+        return _entryToShares(assets);
+    }
+
+    /// @inheritdoc ERC4626
+    /// @dev The exact-share inverse of `previewDeposit`, on the same gross active-tail basis and
+    ///      with OpenZeppelin's ceiling rounding. It intentionally can exceed `convertToAssets`
+    ///      during a live stream; the conversion view continues to report released NAV.
+    function previewMint(uint256 shares) public view override(ERC4626, IERC4626) returns (uint256) {
+        return _entryToAssets(shares);
     }
 
     /// @inheritdoc ERC4626
@@ -1035,10 +1091,11 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     }
 
     /// @inheritdoc ERC4626
-    /// @dev **The exit side of the dual price.** `previewDeposit` and `previewMint` are deliberately
-    ///      left on `totalAssets()`, so an entrant does not receive the impairment discount and
-    ///      cannot profit when the impairment is released. Maple documents that arbitrage as the
-    ///      reason for the same split.
+    /// @dev **The exit side of the dual price.** `previewDeposit` and `previewMint` deliberately
+    ///      do not deduct the impairment, so an entrant cannot buy that discount and profit when
+    ///      the impairment is released. During a live stream they also add the projected tail to
+    ///      the entry basis; that is a separate anti-dilution adjustment. Maple documents the
+    ///      impairment arbitrage as the reason for the first split.
     ///
     ///      Note for integrators: the ERC-4626 `convertToAssets`/`convertToShares` views stay on
     ///      the un-impaired figure, matching Maple. Read `previewRedeem` for what you would
@@ -1207,13 +1264,14 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         // **The surplus is streamed, not banked, and audit round 11 is why.** Left as idle float it
         // lands in `totalAssets()` in the repaying block, which is an instantaneous share-price step
         // - and `settlePrincipal` is permissionless, so a just-in-time depositor picks the block and
-        // takes a pro-rata slice of a recovery they were exposed to for zero seconds. That is
-        // exactly the defect the yield stream exists to prevent, arriving on the principal leg
-        // where nobody had thought to look for it.
+        // can take a pro-rata slice immediately. That same-block capture is exactly the defect the
+        // yield stream exists to prevent, arriving on the principal leg where nobody had thought
+        // to look for it.
         //
-        // It is real money and it does belong to lenders. Streaming it hands it to the lenders who
-        // were actually invested while the loss it reverses was outstanding, rather than to whoever
-        // was watching the mempool.
+        // It is real money and it does belong to the pool. Streaming it, together with gross
+        // active-tail entry pricing, assigns it economically to the shares present at delivery
+        // rather than to whoever enters after seeing the transaction. Share accounting does not
+        // preserve which accounts held through the historical write-down.
         uint256 outstanding = outstandingPrincipal;
         uint256 surplus = amount > outstanding ? amount - outstanding : 0;
         outstandingPrincipal = outstanding > amount ? outstanding - amount : 0;
@@ -1242,8 +1300,9 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      implementation would take nothing and the harvester would correctly report that
     ///      nothing was delivered.
     ///
-    ///      No shares are minted, which is the entire mechanism: assets rise, supply does not, so
-    ///      every existing share is worth more.
+    ///      No shares are minted. Released assets rise while supply does not, and entry previews
+    ///      charge a newcomer for the projected active tail so shares already present at delivery
+    ///      are not diluted while that value moves into released NAV.
     ///
     ///      **The epoch is streamed, not applied at once**, and this is audit round 10's finding 6.
     ///      An instantaneous share-price step is free money for anyone watching the mempool:
@@ -1563,11 +1622,11 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         emit LossSocialised(absorbed);
     }
 
-    /// @notice Book money recovered on a loss this pool has already absorbed. CreditManager only.
+    /// @notice Book money returned on an asset this pool already wrote down. CreditManager only.
     /// @dev **Audit round 21, finding 14: the leg `socialiseLoss` never had.** A workout's forced
     ///      close writes the debt off while DexFi's redemption is still in flight, and the tranche
-    ///      that lands afterwards has to reach the lenders who took that loss - not the insurance
-    ///      fund, which helps them only if a *future* borrower defaults.
+    ///      that lands afterwards has to reach this pool rather than the insurance fund, which
+    ///      helps the pool only if a *future* borrower defaults.
     ///
     ///      **It cannot arrive through `repayPrincipal`, and that was measured before this was
     ///      built.** That leg nets against `outstandingPrincipal`, which the socialisation has
@@ -1586,8 +1645,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///
     ///      **Streamed, never banked**, on exactly the rules `repayPrincipal`'s surplus branch
     ///      uses, because `LiquidationAuction.workoutSettleAfterClose` is permissionless and an
-    ///      instantaneous share-price step is a slice of somebody else's recovery for whoever picks
-    ///      the block. That is round 10's finding 6, and this is a third leg it has to cover.
+    ///      instantaneous share-price step is capturable by whoever picks the block. The active
+    ///      stream belongs economically to the shares present when delivery occurs: later entries
+    ///      pay its gross value, but the pool does not reconstruct which accounts historically
+    ///      bore the write-down. That is round 10's finding 6, and this is a third leg it covers.
     ///
     ///      No `YieldExceedsCapital` guard, unlike `distributeYield`: a recovery genuinely can
     ///      exceed everything the pool now holds, precisely because the loss it reverses is what

@@ -53,8 +53,8 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      insurance netting and the exposure clamp both sit between them and the answer.
     event LossReservesSet(uint256 unplacedLoss, uint256 insuranceCover, uint256 exitReserve);
     event LossSocialised(uint256 amount);
-    /// @notice Money recovered on a loss this pool has already absorbed, routed into the yield
-    ///         stream rather than landing in the share price in its own block.
+    /// @notice Money returned on an asset this pool has already written down, routed into the
+    ///         yield stream rather than landing in the share price in its own block.
     /// @dev The exact counterpart of `LossSocialised`, and separate from `PrincipalSurplusStreamed`
     ///      on purpose: a surplus repayment reverses a write-down through the principal leg and
     ///      moves `outstandingPrincipal`, while this arrives on a loan that has already been
@@ -79,9 +79,11 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     // Phase 2 treasury float also implements. That is the whole point of the seam:
     // swapping the pool in behind CreditManager needs no change to CreditManager.
 
-    /// @notice Receive the lender share of harvested yield - raises share price over the following
-    ///         `YIELD_STREAM_DURATION`, not in the delivering block. See `LenderPool` for why.
+    /// @notice Receive the lender share of harvested yield. It raises released share value over
+    ///         the rated stream window, not in the delivering block. See `LenderPool` for why.
     ///         EpochHarvester only.
+    /// @dev While the stream is active, entry previews include its projected unreleased tail so a
+    ///      post-delivery entrant pays for the pot instead of diluting the delivered cohort.
     function distributeYield(uint256 amount) external;
 
     /// @notice Reserve the shortfall a borrower's live liquidation is expected to produce.
@@ -109,9 +111,12 @@ interface ILenderPool is IERC4626, ILiquiditySource {
 
     /// @notice Assets less `exitReserve()`. What somebody leaving is priced against.
     /// @dev **Integrators: the ERC-4626 `convertToAssets`/`convertToShares` views deliberately
-    ///      report the un-impaired figure**, matching Maple. That asymmetry is the mechanism, not
-    ///      an oversight: an entrant who bought at the impaired price would profit when the
-    ///      impairment was released. Read `previewRedeem` for what a redemption would actually pay.
+    ///      report released, un-impaired NAV**, matching Maple on the impairment split. That
+    ///      asymmetry is the mechanism, not an oversight: an entrant who bought at the impaired
+    ///      price would profit when the impairment was released. During a live yield stream,
+    ///      `previewDeposit` and `previewMint` additionally price the projected unreleased tail;
+    ///      during a frozen backlog they remain on released NAV. Read `previewRedeem` for what a
+    ///      redemption would actually pay.
     function exitAssets() external view returns (uint256);
 
     /// @notice USDC currently out on loan. The ceiling on every reserve above, because a pool
@@ -150,13 +155,15 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      what it took, and every caller must retain the difference.
     function socialiseLoss(uint256 amount) external returns (uint256 absorbed);
 
-    /// @notice Book money recovered on a loss this pool already took, as yield. CreditManager only.
+    /// @notice Book money returned on an asset this pool already wrote down, as yield.
+    ///         CreditManager only.
     /// @dev **Audit round 21, finding 14.** `socialiseLoss` is not reversible through
     ///      `repayPrincipal`: that leg nets against `outstandingPrincipal`, which the socialisation
     ///      has already written down, so a recovery arriving that way is recognised only when the
     ///      surviving book unwinds. It arrives here instead, where it is what it actually is - a
-    ///      gain on an asset the pool has already written off - and is streamed for the same
-    ///      reason every other inbound gain is.
+    ///      gain on an asset the pool has already written off and is streamed for the same reason
+    ///      every other inbound gain is. The stream is allocated economically to shares present
+    ///      when the recovery is delivered; it does not reconstruct historical loss bearers.
     function recoverLoss(uint256 amount) external;
 
     /// @return index position in the FIFO queue (0 = next), remaining assets still owed
