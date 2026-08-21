@@ -1303,6 +1303,39 @@ contract LenderPoolTest is Test {
         assertEq(pool.principalUnits(carol), freshAssets, "Carol must recover her fresh-generation basis");
     }
 
+    /// @notice Known residual: a dust share split can loosen the cap without a realised loss.
+    /// @dev At par, the three-decimal virtual offset gives a ten-asset-wei deposit 10,000 share-wei
+    ///      and ten principal units. Transferring one share-wei ceil-moves one whole unit. That dust
+    ///      share then redeems for zero assets because the exit conversion floors, but its unit burn
+    ///      still removes one asset-wei from `netDeposits`. Ten executed cycles drive the counter
+    ///      from ten to zero while all ten assets remain. The error is gas-bound at one USDC
+    ///      micro-unit per completed boundary; it is not the original nonlinear 114-cycle ratchet.
+    function test_R22F3_knownResidual_noLossDustTransferThenZeroAssetRedeemErodesLinearly() public {
+        uint256 aliceShares = _deposit(alice, 10);
+        assertEq(aliceShares, 10_000, "fixture: the virtual offset must mint one thousand shares per asset-wei");
+
+        uint256 assetsBefore = usdc.balanceOf(address(pool));
+        uint256 headroomBefore = pool.maxDeposit(bob);
+
+        for (uint256 i = 0; i < 10; i++) {
+            vm.prank(alice);
+            pool.transfer(bob, 1);
+
+            assertEq(pool.principalUnits(bob), 1, "each dust split must ceil-move one principal unit");
+            assertEq(pool.previewRedeem(1), 0, "each one-share position must redeem for zero assets");
+
+            vm.prank(bob);
+            uint256 assetsOut = pool.redeem(1, bob, bob);
+
+            uint256 remaining = 9 - i;
+            assertEq(assetsOut, 0, "each boundary must pay no assets");
+            assertEq(usdc.balanceOf(address(pool)), assetsBefore, "no asset may leave the pool");
+            assertEq(pool.totalPrincipalUnits(), remaining, "each zero-asset exit must burn exactly one unit");
+            assertEq(pool.netDeposits(), remaining, "each zero-asset exit must loosen the cap by one asset-wei");
+            assertEq(pool.maxDeposit(bob), headroomBefore + i + 1, "cap erosion must be linear across boundaries");
+        }
+    }
+
     /// @notice Known residual: after a loss, quotient rounding can loosen the cap by one asset-wei.
     /// @dev The candidate remains a partial remediation until this boundary has transferable
     ///      fractional provenance. The error is one USDC micro-unit per completed round trip, not

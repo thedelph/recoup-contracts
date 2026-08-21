@@ -17,7 +17,7 @@ deliberately does not cover, is spelled out further down.
 ERC-4626 vault, the withdrawal queue, the yield stream and the impairment pricing - is
 `src/LenderPool.sol`. It was
 withheld from this repository until 2026-08-19; the section under the architecture diagram says why
-it is not any more. One open finding: a loss-making position carries no impairment
+it is not any more. One of the open findings: a loss-making position carries no impairment
 until somebody calls `liquidate`, so in the gap between a loan going bad and that call, the pool
 prices every exit at the full pre-loss price and a lender who leaves first is paid out of the
 lenders who stay.
@@ -53,9 +53,9 @@ liquidator for position in the same block. No calibration of the bounty closes a
 I have no clean mitigation for it in this architecture: any delay between a post and liquidatability
 contradicts the rule that keeps liquidation priced on the last known NAV through a keeper outage.
 
-**And rounds twenty and twenty-one found another, larger blocker, which is now the main reason the
-pool is not wired.** A lender who asks to withdraw parks a request, and the pool holds back the
-un-impaired value of those queued shares from everybody else. Separately, and correctly, it refuses
+**And rounds twenty and twenty-one found another, larger blocker.** A lender who asks to withdraw
+parks a request, and the pool holds back the un-impaired value of those queued shares from everybody
+else. Separately, and correctly, it refuses
 to service the queue at all while a position is marked down. Each rule is defensible on its own.
 Together they mean a parker reserves a claim they are forbidden to be paid, at a price they would
 never be paid at, and nothing permissionless drains it. Measured: a parker holding 15.8% of the book
@@ -198,12 +198,31 @@ deployment blockers stated rather than left to be discovered:
   `available()` can reach zero, which halts borrowing protocol-wide. Four candidate fixes were built
   and each was refuted; what is left is impaired pricing plus serve-while-marked, which are one
   change.
-- **Principal-cap accounting is partly remediated, not closed** (round 22). Loss-aware principal
+- **Principal-cap accounting is partly remediated, not closed** (round 22, F3). Loss-aware principal
   units remove the original 114-cycle, one-asset-wei-per-cycle rotating-lender ratchet, and exact
   request units preserve queue provenance. Unrestricted ERC-20 merges still average differently
-  priced share lots, a post-loss integer boundary can loosen the cap by one asset-wei per completed
-  round trip, and repeated near-total loss and refill cycles can eventually exhaust the quotient's
-  integer range. It remains a deployment blocker.
+  priced share lots. Even without a loss, a dust-share split can make a redemption round to zero
+  assets, eroding the cap linearly by one asset-wei per completed cycle. Separately, the post-loss
+  path retains its own double-ceiling residual at an integer boundary, and repeated near-total loss
+  and refill cycles can eventually exhaust the quotient's integer range. It remains a deployment
+  blocker.
+- **Loss recovery uses a stream that cannot preserve who bore the loss** (round 22, F10).
+  `recoverLoss` feeds recovered value into the general yield stream, whose unreleased pot is excluded
+  from the price paid by new deposits. Measured, a lender arriving one block into a 628.750000 USDC
+  recovery captured 128.994204 USDC, or 20.5%, despite bearing none of the loss. That entry-pricing
+  rule applies to every live stream, so changing only `recoverLoss`'s rating parameters cannot fix
+  recovery ownership. It remains a deployment blocker.
+- **A non-epoch recovery inherits the epoch clock** (round 22, F11). `recoverLoss` and the surplus
+  branch of `repayPrincipal` use time since the last yield epoch to size their stream even though
+  neither cash flow accrued over that interval. The same 400 USDC recovery therefore streams over
+  five days after a recent epoch and 180 days after a long drought; a lender exiting after day five
+  forfeited 388.888889 USDC in the measured long-drought case. It remains a deployment blocker.
+- **Permissionless queue service can crystallise shares into cash the receiver cannot collect**
+  (round 22, F12). Any caller can burn a queued lender's shares and park the proceeds in
+  `claimable[receiver]`. If that receiver cannot call the pool or the USDC transfer to it is blocked,
+  the lender has no way to recover the shares or redirect the claim after service. Delegated claiming
+  would address only the first case, not an asset-level transfer rejection. It remains a deployment
+  blocker.
 
 **No lender capital is exposed and none can be.** The pool is deployed but not wired as
 `CreditManager`'s liquidity source and holds nothing, so it cannot lend and therefore cannot take a
@@ -234,7 +253,7 @@ forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: th
                 # run mid-flight rather than fail it
 ```
 
-Measured on 2026-08-20 for this tree: **724 passed, 0 failed, 13 skipped across 30 suites**. The
+Measured on 2026-08-21 for this tree: **725 passed, 0 failed, 13 skipped across 30 suites**. The
 skips are the mainnet fork tests below, which need `RUN_FORK_TESTS=true`. This is a dated baseline,
 not a substitute for running the command: CI runs it on every push and pull request, and the green
 tick on `main` is the standing claim.

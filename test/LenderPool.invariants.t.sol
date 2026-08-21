@@ -1358,16 +1358,13 @@ contract LenderPoolInvariants is Test {
     ///      one remains the independent writer check: a basis is established on entry and nowhere
     ///      else, regardless of how losses mark existing units down.
     ///
-    ///      **`netDeposits <= totalAssets()` was derived, measured and deliberately not shipped.**
-    ///      It is RED at run 49 of a full campaign - 29,557 against 29,556 - bounded at exactly one
-    ///      USDC unit over 128,000 calls, in the conservative direction, and it is a floor artefact
-    ///      of `_principalPortion`'s `Math.Rounding.Floor`. Shipping it needs a tolerance, and a
-    ///      tolerance of one unit would be a fixture literal pinned to the exact rounding step of
-    ///      the rule being replaced - calibrated to one campaign's observed maximum rather than to
-    ///      a proved bound, on a quantity whose drift is per-exit and therefore not obviously
-    ///      capped at one. An assertion that goes red on the replacement rule for arithmetic
-    ///      reasons is worse than no assertion, so the measurement is recorded here and the
-    ///      inequality is left for whoever owns the rule.
+    ///      **`netDeposits <= totalAssets()` is still deliberately not shipped, for a current rather
+    ///      than historical reason.** The no-loss dust-transfer regression keeps that inequality
+    ///      green while it pays zero assets and lowers `netDeposits` by one. It therefore cannot
+    ///      distinguish correct principal release from cap-loosening drift. The old RED measurement
+    ///      belonged to `_principalPortion`'s deleted floor rule; retaining it here as though it
+    ///      constrained the replacement would give an obsolete implementation authority over this
+    ///      one. The deterministic residual tests own the two rounding directions instead.
     function invariant_netDepositsOnlyRisesOnADepositOrMint() public view {
         assertEq(
             handler.netDepositsRoseWithNoDepositOrMint(), 0, "the deposit-cap counter rose with no entry behind it"
@@ -1379,11 +1376,17 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.principalUnitIssuanceMismatches(), 0, "a deposit or mint issued the wrong principal units");
     }
 
-    /// @notice Principal units are neither created by transfers nor lost at either exit door.
+    /// @notice Transfers conserve aggregate units and exits retire the units carried by their shares.
     /// @dev Audit round 22 findings 3, 15 and 22. The actor list is exhaustive for this handler and
     ///      the pool is the fifth possible holder while shares are queued. Summing units proves the
     ///      storage conservation directly. Summing the marked-down bases proves they reconstruct
     ///      `netDeposits`, allowing only the strict ceiling-rounding bound.
+    ///
+    ///      No no-loss equality is asserted here. `units == netDeposits` and `basis == netDeposits`
+    ///      can both remain green while a dust transfer followed by a zero-asset redemption burns
+    ///      one unit and one asset-wei of `netDeposits` together, increasing cap headroom although
+    ///      no asset left. The deterministic ten-cycle regression owns that economic boundary; this
+    ///      invariant keeps the unconditional storage-conservation bounds it can actually prove.
     function invariant_principalUnitsConserveNetDeposits() public view {
         uint256 units = handler.sumPrincipalUnits();
         uint256 basis = handler.sumPrincipalBasis();
@@ -1400,11 +1403,6 @@ contract LenderPoolInvariants is Test {
         assertLe(net, units, "admitted principal rose above its accounting units");
         assertGe(basis, net, "holder bases do not reconstruct admitted principal");
         assertLe(basis - net, handler.actorCount(), "holder-basis rounding exceeded one unit per boundary");
-
-        if (pool.lifetimeSocialisedLoss() == 0) {
-            assertEq(units, net, "without a realised loss every principal unit must remain at par");
-            assertEq(basis, net, "without a realised loss the holder bases must be exact");
-        }
     }
 
     /// @notice A holder with no vault shares cannot retain principal-accounting units.

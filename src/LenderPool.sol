@@ -356,9 +356,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///
     ///      Units are a scalar balance on a fungible ERC-20. If differently priced lots merge in
     ///      one account and are later split, their basis is averaged; exact lot identity cannot be
-    ///      reconstructed from one balance. Quotient rounding after a loss can also loosen the cap
-    ///      by at most one asset unit per completed boundary. Both residuals have deterministic
-    ///      tests and keep the broader finding only partly closed.
+    ///      reconstructed from one balance. Two integer boundaries can also loosen the cap by at
+    ///      most one asset unit each: double-ceiling after a loss, and a no-loss dust-share split
+    ///      whose rounded unit is then burned by a zero-asset redemption. All three residuals have
+    ///      deterministic tests and keep the broader finding only partly closed.
     mapping(address account => uint256 units) private _principalUnits;
 
     /// @dev Generation tags let a total loss invalidate old zero-basis units in O(1). Old vault
@@ -1348,7 +1349,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev Every ERC-4626 entry funnels through here. The asset amount credits `netDeposits`, while
     ///      the receiver gets principal units at the pre-deposit ratio. If a loss has reduced
     ///      `netDeposits`, issuing more units for the same assets keeps new capital from inheriting
-    ///      that old loss. With no loss the ratio is one and assets equal units exactly.
+    ///      that old loss. Before a socialised loss the active unit ratio remains one, so this
+    ///      issuance gives assets and units the same number. That ratio is not proof that the cap
+    ///      followed assets out: a dust transfer and zero-asset redemption can burn one unit and
+    ///      one `netDeposits` asset-wei together while no asset leaves the pool.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         // **A deposit that mints nothing is a donation the depositor did not mean to make**, and
         // audit round 22 finding 2 is why the guard is here rather than filed as dust. Once the
@@ -1418,9 +1422,11 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev Removes `units` from the current generation and debits their marked-down principal.
     ///      Ceiling is deliberate: flooring a partial path is the direction that lets residual
     ///      principal accumulate against the deposit cap. Because unit issuance also rounds up, a
-    ///      post-loss entry and exit can loosen the cap by one asset unit; the candidate records
-    ///      that residual rather than reversing into the cap-brick direction. A full-unit burn is
-    ///      exact against the remaining aggregate.
+    ///      post-loss entry and exit can loosen the cap by one asset unit. A separate no-loss
+    ///      boundary exists when a dust share ceil-moves one unit and then redeems for zero assets:
+    ///      this burn still removes that unit's one-asset-wei basis. The candidate records both
+    ///      bounded residuals rather than reversing into the cap-brick direction. A full-unit burn
+    ///      is exact against the remaining aggregate.
     function _burnPrincipalUnits(uint256 units) private {
         uint256 totalUnits = totalPrincipalUnits;
         uint256 basis = units == totalUnits
