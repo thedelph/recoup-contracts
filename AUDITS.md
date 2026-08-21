@@ -1,22 +1,15 @@
 # Audit log
 
 Every finding listed here is **fixed and covered by a regression test**, unless it is explicitly
-named as accepted or deferred. Nothing below describes a live defect. It is published because a
-protocol asking to be trusted should show what review actually found, not just assert that review
-happened.
+named as accepted or deferred. Current open risks are tracked separately in
+[KNOWN_RISKS.md](KNOWN_RISKS.md).
 
-The current security posture, including what is knowingly **not** mitigated, is in
-[README.md](README.md). This file is the history.
+This file is the historical record. Each round is an internal 12-agent adversarial review pass, and
+rounds are appended newest first.
 
-Each round is a 12-agent Solidity audit pass. Rounds are appended, newest first.
-
-**This file stops at round nine and the protocol is on round twenty-two.** That is a gap in the
-write-up, not in the work: the fixes from rounds ten onwards are in the code published here, and
-the README's security posture section is kept current against the whole count. The gap used to
-have a reason - most of those rounds are about the lender pool, which was held back, and
-describing an attack in detail against a contract nobody can read is worse than saying plainly
-that the round happened. The pool was published on 2026-08-19, so that reason has gone and the
-write-up is simply behind. The rounds follow when they are written.
+**This log currently stops at round nine; the protocol has completed twenty-two rounds.** The code,
+tests and `KNOWN_RISKS.md` reflect the later work. The remaining historical write-up is still to be
+added.
 
 ---
 
@@ -119,4 +112,4 @@ they covered:
 Alongside those: constructor zero-address checks, `renounceOwnership` disabled on the
 live-authority contracts, and a `pause`/`unpause` pair on `CreditManager`. The suite grew from 33
 to 45 tests in the same pass. Remaining known items are tracked against the phase that resolves
-them, and an external audit is still a hard gate before any real funds.
+them, and an external audit is still a hard gate before third-party funds.
