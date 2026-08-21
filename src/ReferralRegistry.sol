@@ -55,7 +55,6 @@ contract ReferralRegistry {
     error AlreadyBound(bytes32 code);
     error SelfReferral();
     error CodeNotBindable(bytes32 code);
-    error ZeroAddress();
 
     // ── Events ───────────────────────────────────────────────────────────────
 
@@ -130,28 +129,7 @@ contract ReferralRegistry {
 
     /// @notice Claim an unused code for yourself.
     function register(bytes32 code) external {
-        _register(code, msg.sender);
-    }
-
-    /// @notice Claim an unused code **for someone else**, who becomes its owner and payee.
-    /// @dev Originally intended to claim a partner code during deployment, but the deploy script
-    ///      cannot make that atomic: broadcast mode emits one transaction per external call. The
-    ///      permissionless form also lets a stranger weld an unused code to an unspendable payee,
-    ///      permanently burning every referee's one-shot binding. This broader round-13 finding is
-    ///      open. Do not use this function for partner onboarding or deploy this source while the
-    ///      design is unresolved; deletion is the recorded recommendation unless onboarding a
-    ///      partner without their own transaction becomes a firm requirement.
-    function registerFor(bytes32 code, address owner) external {
-        if (owner == address(0)) revert ZeroAddress();
-        // **Audit round 12.** `NON_BINDABLE` is the constructor's tombstone: it means "reserved by
-        // Recoup, permanently unbindable", and `bind` treats it as a refusal that can never be
-        // lifted. `register` cannot mint it, because it can only ever write `msg.sender`. This
-        // function could, and one call was enough to brick any advertised-but-unclaimed code
-        // forever - write-once mappings, no owner, no transfer, so no recovery at any price - while
-        // emitting an event byte-identical to genuine brand protection, which the payout calculator
-        // is told to skip. Two writers of the same mapping, only one of them constrained.
-        if (owner == NON_BINDABLE) revert CodeNotBindable(code);
-        _register(code, owner);
+        _register(code);
     }
 
     /// @dev One account may hold many codes, deliberately: partner integrations want a code per
@@ -169,15 +147,16 @@ contract ReferralRegistry {
     ///
     ///      1. **Claim before you publish.** A code must be registered on-chain before it appears
     ///         in any marketing, link or announcement. The window is unbounded otherwise.
-    ///      2. **There is no current partner-code procedure while `registerFor` is design-open.** If
-    ///         it is deleted, the partner registers for itself; any alternative must be explicitly
-    ///         accepted and tested before publication.
+    ///      2. **Partners self-register.** The partner's payout wallet or Safe must call `register`
+    ///         before the code is published. There is no delegated writer that can assign a code
+    ///         to an address that did not make the call.
     ///      3. Brand and confusable spellings are claimed in the constructor, before the address
     ///         exists to race against.
     ///
     ///      What remains after those is impersonation with a *different* string, which is the same
     ///      problem as a lookalike domain and is not one an on-chain rule can tell apart.
-    function _register(bytes32 code, address owner) private {
+    function _register(bytes32 code) private {
+        address owner = msg.sender;
         if (!isCanonical(code)) revert MalformedCode(code);
         address incumbent = referrerOf[code];
         // Reverts even when the caller already owns it. `register` must never be a silent no-op

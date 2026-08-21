@@ -1,9 +1,10 @@
 # Known risks and activation gates
 
-This is the launch-critical and material current security posture for the public contracts at
-protocol code baseline `95e2c76` (2026-08-21). It is organised by present effect, not by discovery
-date. Historical internal review notes are in [`AUDITS.md`](AUDITS.md); the code-level integration
-tour is in [`REVIEW.md`](REVIEW.md).
+This is the launch-critical and material current security posture for the public contracts. The
+core protocol executable-logic baseline remains `95e2c76` (2026-08-21); the later referral-only
+change removes delegated registration without changing the core loan or lender-pool logic. This
+record is organised by present effect, not by discovery date. Historical internal review notes are
+in [`AUDITS.md`](AUDITS.md); the code-level integration tour is in [`REVIEW.md`](REVIEW.md).
 
 Internal adversarial review, unit tests, invariant campaigns and mainnet fork tests are evidence, but
 they are not an external audit.
@@ -142,28 +143,42 @@ semantics.
 
 ## Other pre-launch risks and dependencies
 
-### `ReferralRegistry.registerFor` can assign a code to an unusable payee
+### Referral source fixed through partner self-registration; live deployment remains disabled
 
-The current source prevents assignment to the reserved `NON_BINDABLE` sentinel, but permissionless
-`registerFor` can still assign an unused code to another unspendable address. A referee can then burn
-their one-time binding on a payee that can never claim. Referral-program use remains blocked until
-this is removed, consent-gated or explicitly accepted with an operational policy.
+Delegated `registerFor(bytes32,address)` and the registry-only `ZeroAddress` error are removed. The
+remaining public registration function derives the owner from `msg.sender`, so a partner's payout
+wallet or Safe must call `register(bytes32)` before its code is published. A raw call to the former
+`0x791d1a9e` selector reverts with empty data and leaves both mappings unchanged, and a contract
+wallet can self-register and resolve as the payout address. The storage layout remains the two
+existing mappings in slots 0 and 1.
 
-While that design remains open, the standalone deployment script rejects every run whose chain ID
-is not 31337 before the legacy confirmation check. This executable guard prevents broadcasting the
-current source through that script; it does not resolve `registerFor`.
+The standalone deploy script permits local chain ID 31337 for tests and rehearsal. Every non-local
+chain reverts with `LiveDeploymentDisabled` before the legacy confirmation phrase is considered, so
+that phrase cannot bypass the gate. This source correction is not authorisation for a public-chain
+transaction.
 
 ### The deployed Sepolia `ReferralRegistry` is stale
 
-The source includes the guard that prevents a stranger from assigning the `NON_BINDABLE` tombstone
-to somebody else's referral code. The carried-over Sepolia instance predates that fix, so its
-bytecode does not enforce the guard. It holds no value, no protocol contract reads it and the
+The committed address remains `0x30B9B1D7A40aa7D14613cb1742EFaaB155dC84a0`. Its 1,489-byte
+runtime predates the tombstone guard and still exposes the deleted delegated writer. Measured on
+2026-08-20, a stranger's `registerFor(code, NON_BINDABLE)` call succeeded there. The 1,554-byte
+candidate that rejected that call is historical; current self-registration source builds to a
+1,350-byte runtime. The deployed registry holds no value, no protocol contract reads it and the
 referral programme has not launched, but the address must not be used as proof of current behaviour.
 
-Measured on 2026-08-20, the deployed runtime was 1,489 bytes versus 1,554 bytes for the current
-source. A stranger's `registerFor(code, NON_BINDABLE)` call succeeded on the deployed instance while
-the current source reverted `CodeNotBindable`. Replacement is not complete; do not publish or
-reserve codes against the stale instance.
+The current creation/runtime sizes are 2,150/1,350 bytes, with keccak256 hashes
+`0x574a196d16ed1a5c2d1f41293e756628f3038ea49ab39a66c166c82cb51a7fba` and
+`0x07da903bdd0b827c5b8a8b8164a789ec28087119ca9e32d1f67478f9021d7a37`. Compiler metadata remains
+a 51-byte CBOR trailer with embedded IPFS digest
+`0x4d91b88c1f71ca44d584b8ae34d865bbc6c69d1b99eb89993497b7049e335df2`.
+
+A 2026-08-21 loopback-only Base Sepolia-fork rehearsal exposed chain ID 31337 and used one local
+deployment transaction, 16 constructor reservation logs and 841,101 gas. Reserved codes resolved to
+`NON_BINDABLE`; `DEXFI` began unclaimed; former-selector refusal, partner self-registration,
+referee binding, collision rejection and reserved-code refusal all passed; and deployed runtime
+matched the build exactly. No live key or signing material was used, no public transaction was sent
+and the committed address did not change. Replacement remains disabled and unauthorised; do not
+publish or reserve codes against the stale instance.
 
 ### `ProtocolFeeSplitter` can strand both recipients' fees
 

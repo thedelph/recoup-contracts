@@ -21,8 +21,14 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Base Sepolia | Historic mock-stack deployment; explorer-verified at deployment, but not current-source parity. Addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
 | Base mainnet | No Recoup contracts deployed |
 | Lender pool | Source and testnet instance exist, but the pool is empty, unwired and blocked from activation |
-| Referral registry | Referral use remains blocked; the carried-over Sepolia instance also has stale bytecode |
+| Referral registry | Source fixed through partner self-registration; the carried-over Sepolia instance remains defective and unused, and live replacement is disabled and unauthorised |
 | External audit | Not completed |
+
+For non-reserved referral codes, the only registration path now assigns the code to its caller. A
+partner's payout wallet or Safe must call `register(bytes32)` before the code is published;
+delegated `registerFor(bytes32,address)` has been removed. This source has only been rehearsed
+locally. The committed Sepolia address is unchanged, and the standalone deploy script rejects every
+non-local chain with `LiveDeploymentDisabled`.
 
 The real DexFi bond and farm contracts exist only on Base mainnet. Mainnet fork tests exercise those
 live contracts and their current state. The Sepolia mocks mirror their verified interfaces,
@@ -91,8 +97,8 @@ forge build
 forge test
 ```
 
-On the current public tree, the normal run is 736 passed, 0 failed and 13 skipped across 30 suites,
-749 total. Ten skips are the optional mainnet fork tests; three are fixture-decay detectors that are
+On the current public tree, the normal run is 733 passed, 0 failed and 13 skipped across 30 suites,
+746 total. Ten skips are the optional mainnet fork tests; three are fixture-decay detectors that are
 intentionally disabled in those fork harnesses. CI runs the full unit and invariant suite on every
 push and pull request.
 

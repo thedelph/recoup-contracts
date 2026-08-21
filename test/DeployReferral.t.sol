@@ -82,18 +82,23 @@ contract DeployReferralTest is Test {
         registry.bind(bytes32("OFFICIAL"));
     }
 
-    /// @dev DEXFI is deliberately absent. It is a counterparty's brand, ownership is permanent and
-    ///      there is no transfer, so claiming it would mean the code bearing DexFi's name pays a
-    ///      Recoup address forever - the exact arrangement the partner rule forbids.
-    function test_deploy_doesNotClaimAPartnersBrand() public {
+    /// @dev DEXFI is deliberately absent. Its payout wallet must claim the code itself before
+    ///      publication, after which a referee can bind and resolve that wallet as the payee.
+    function test_deploy_leavesDexfiForPartnerSelfRegistrationAndBinding() public {
         ReferralRegistry registry = script.run();
         assertFalse(registry.isRegistered(bytes32("DEXFI")), "a partner brand was claimed");
 
-        // And it remains claimable by the partner, to their own payout address.
+        // It remains claimable by the partner, from their own payout address.
         address dexfiPayout = makeAddr("dexfiPayout");
         vm.prank(dexfiPayout);
         registry.register(bytes32("DEXFI"));
         assertEq(registry.referrerOf(bytes32("DEXFI")), dexfiPayout);
+
+        address referee = makeAddr("dexfiReferee");
+        vm.prank(referee);
+        registry.bind(bytes32("DEXFI"));
+        assertEq(registry.boundCode(referee), bytes32("DEXFI"));
+        assertEq(registry.referrerFor(referee), dexfiPayout, "the payout wallet did not resolve");
     }
 
     /// @dev Unreserved codes stay open. The seeding is brand protection, not a land grab.
@@ -114,24 +119,24 @@ contract DeployReferralTest is Test {
         assertFalse(registry.isCanonical(bytes32("REC0UP")), "and not registerable either");
     }
 
-    /// @dev A stray `forge script` must not reach a public chain while the source design remains
-    ///      open. Local construction stays available to the tests above.
-    function test_deploy_refusesPublicChainWhileSourceDesignIsOpen() public {
+    /// @dev A stray `forge script` must not reach a public chain. Resolving the source design does
+    ///      not authorize a live replacement. Local construction stays available to the tests above.
+    function test_deploy_refusesPublicChainWhileLiveDeploymentIsDisabled() public {
         vm.chainId(84532);
-        vm.expectRevert(DeployReferralRegistry.SourceDesignOpen.selector);
+        vm.expectRevert(DeployReferralRegistry.LiveDeploymentDisabled.selector);
         script.run();
     }
 
     /// @dev Neuter-worthy guard: the exact legacy confirmation was previously sufficient to reach
-    ///      broadcast. Removing the source-design check makes this call succeed and this test fail.
+    ///      broadcast. Removing the live-deployment check makes this call succeed and this test fail.
     ///      Calling the pure validator avoids `vm.setEnv`, whose process-global value leaks between
     ///      Foundry tests and made the old environment-driven test order-dependent.
-    function test_deploy_legacyConfirmationCannotBypassOpenSourceDesign() public {
-        vm.expectRevert(DeployReferralRegistry.SourceDesignOpen.selector);
+    function test_deploy_legacyConfirmationCannotBypassLiveDeploymentDisable() public {
+        vm.expectRevert(DeployReferralRegistry.LiveDeploymentDisabled.selector);
         script.validateBroadcastApproval("RECOUP_DEPLOY_REFERRAL");
     }
 
-    /// @dev Preserves the second gate's exact phrase for a future source-design disposition. Tests
+    /// @dev Preserves the second gate's exact phrase for any future deployment disposition. Tests
     ///      it directly rather than through the process-global environment.
     function test_confirmation_acceptsOnlyTheExactPhrase() public view {
         assertTrue(script.isConfirmed("RECOUP_DEPLOY_REFERRAL"));

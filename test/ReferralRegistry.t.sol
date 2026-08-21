@@ -6,9 +6,13 @@ import {Test, Vm} from "forge-std/Test.sol";
 import {Config} from "../src/Config.sol";
 import {ReferralRegistry} from "../src/ReferralRegistry.sol";
 
-/// @dev A smart wallet binding on its own behalf. Referees are not necessarily EOAs and the
-///      frontend's intended path batches `bind` with the first borrow via EIP-5792.
-contract WalletReferee {
+/// @dev A minimal smart-wallet call forwarder. A Safe performs the same registry calls from its
+///      own address after applying its own authorization policy, which is outside this registry.
+contract WalletAccount {
+    function registerCode(ReferralRegistry registry, bytes32 code) external {
+        registry.register(code);
+    }
+
     function bindTo(ReferralRegistry registry, bytes32 code) external {
         registry.bind(code);
     }
@@ -261,7 +265,7 @@ contract ReferralRegistryTest is Test {
 
     function test_bind_worksForAContractAccount() public {
         _register(alice, CODE);
-        WalletReferee wallet = new WalletReferee();
+        WalletAccount wallet = new WalletAccount();
 
         wallet.bindTo(registry, CODE);
 
@@ -497,69 +501,36 @@ contract ReferralRegistryTest is Test {
         new ReferralRegistry(reserved);
     }
 
-    // ── registerFor ──────────────────────────────────────────────────────────
+    // ── Partner self-registration ────────────────────────────────────────────
 
-    /// @dev Exists so a partner code can be claimed with the PARTNER as owner and payee. `register`
-    ///      alone can only ever write `msg.sender`, so the only way for a partner to own their code
-    ///      was to send their own transaction after the address was public - leaving the squatting
-    ///      window open on precisely the codes worth stealing.
-    function test_registerFor_assignsToTheNamedOwnerNotTheCaller() public {
+    /// @dev Pins the removed method by its literal selector so it cannot return under a renamed
+    ///      interface or an accidentally restored ABI. With no fallback, an unknown selector
+    ///      reverts with empty data and cannot write either one-shot mapping.
+    function test_removedRegisterForSelector_revertsEmptyAndWritesNothing() public {
         address partner = makeAddr("partner");
+        bytes memory callData = abi.encodeWithSelector(bytes4(0x791d1a9e), CODE, partner);
 
-        vm.prank(alice);
-        registry.registerFor(bytes32("BERNARD"), partner);
-
-        assertEq(registry.referrerOf(bytes32("BERNARD")), partner, "the partner owns it");
-
-        vm.prank(bob);
-        registry.bind(bytes32("BERNARD"));
-        assertEq(registry.referrerFor(bob), partner, "and is the payee");
-    }
-
-    function test_registerFor_rejectsTheZeroOwner() public {
-        vm.expectRevert(ReferralRegistry.ZeroAddress.selector);
-        vm.prank(alice);
-        registry.registerFor(CODE, address(0));
-    }
-
-    /// @notice Nobody outside the constructor may mint the reserved tombstone.
-    /// @dev **Audit round 12.** `NON_BINDABLE` is a public constant, so anyone could read it and
-    ///      write it into `referrerOf` for an advertised-but-unclaimed code. That is not squatting,
-    ///      which the contract accepts and reasons about at length: it is a permanent brick.
-    ///      `register` then reverts `CodeTaken` for the real owner and `bind` reverts
-    ///      `CodeNotBindable` for every referee, forever - write-once mappings, no owner, no
-    ///      transfer, so there is no price at which it can be undone. The event it emitted was
-    ///      byte-identical to genuine brand protection, so the payout calculator would have skipped
-    ///      it as official rather than flagging it.
-    function test_registerFor_cannotMintTheReservedSentinel() public {
-        // Resolved before the cheatcodes: reading the constant is itself a call, and as an inline
-        // argument it is the one `expectRevert` arms against.
-        address sentinel = registry.NON_BINDABLE();
-
-        vm.expectRevert(abi.encodeWithSelector(ReferralRegistry.CodeNotBindable.selector, CODE));
         vm.prank(attacker);
-        registry.registerFor(CODE, sentinel);
+        (bool ok, bytes memory revertData) = address(registry).call(callData);
 
-        // Still claimable by whoever it was advertised for, which is the whole point.
-        _register(alice, CODE);
-        assertEq(registry.referrerOf(CODE), alice, "the code was bricked anyway");
+        assertFalse(ok, "the removed selector unexpectedly succeeded");
+        assertEq(revertData.length, 0, "the removed selector did not hit the empty fallback revert");
+        assertEq(registry.referrerOf(CODE), address(0), "the removed selector assigned a payee");
+        assertEq(registry.boundCode(attacker), bytes32(0), "the caller's binding changed");
+        assertEq(registry.boundCode(partner), bytes32(0), "the named payee's binding changed");
     }
 
-    function test_registerFor_respectsWriteOnce() public {
-        _register(alice, CODE);
-        vm.expectRevert(abi.encodeWithSelector(ReferralRegistry.CodeTaken.selector, CODE, alice));
-        vm.prank(attacker);
-        registry.registerFor(CODE, attacker);
-    }
+    /// @dev Partner payout accounts need not be EOAs. A contract wallet calls `register` from its
+    ///      own address and is therefore the immutable owner and resolved payee.
+    function test_register_contractWalletSelfRegistersAsPayee() public {
+        WalletAccount payoutWallet = new WalletAccount();
 
-    /// @dev The owner named by `registerFor` can still be refused as a self-referral, so the
-    ///      courtesy check is not bypassable by routing through the other entrypoint.
-    function test_registerFor_stillBlocksSelfReferral() public {
-        vm.prank(alice);
-        registry.registerFor(CODE, bob);
+        payoutWallet.registerCode(registry, CODE);
+        assertEq(registry.referrerOf(CODE), address(payoutWallet), "the wallet does not own the code");
 
-        vm.expectRevert(ReferralRegistry.SelfReferral.selector);
         vm.prank(bob);
         registry.bind(CODE);
+        assertEq(registry.boundCode(bob), CODE, "the referee did not bind to the wallet's code");
+        assertEq(registry.referrerFor(bob), address(payoutWallet), "the wallet is not the payee");
     }
 }
