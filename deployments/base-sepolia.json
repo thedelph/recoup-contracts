@@ -3,7 +3,7 @@
   "chainId": 84532,
   "deployedAt": "2026-08-19",
   "verified": true,
-  "verificationScope": "Explorer verification of the deployment-era bytecode, not parity with this current public source tree. Measured 2026-08-21: 3 of 13 checked deployments passed the strict length-and-metadata gate (all three mocks); eight protocol contracts had equal length but different metadata, while LenderPool and ReferralRegistry differed in size.",
+  "verificationScope": "Explorer verification of the deployment-era bytecode, not parity with this current public source tree. Measured 2026-08-21: 3 of 13 checked deployments passed the strict length-and-metadata gate (all three mocks); eight protocol contracts had equal length but different metadata, while LenderPool and ReferralRegistry differed in size. The later referral-only source correction leaves that result at 3 of 13 because the live ReferralRegistry still differs.",
   "note": "Mock DexFi stack. Real DexFi bonds exist only on Base mainnet, so MockUSDC/MockBond/MockFarm stand in and mirror the verified ABIs including the whitelist gate. The adapter is self-whitelisted here; on mainnet that is DexFi's call and the current integration requirement.",
   "contracts": {
     "NAVOracle": "0x2adf6efe82c7a38214be2a2d8d06d2e98ee4eafa",
@@ -23,7 +23,13 @@
     "MockFarm": "0x203276cb4d823643448619f02d7f42dbabe8f11f"
   },
   "mocksNote": "Fresh mocks. DeployTestnet builds its own MockUSDC/MockBond/MockFarm, so nothing carries over from 2026-08-03: the old seeded position lives on the old bond and the old vault.",
-  "referralRegistryNote": "Carried over from the 2026-08-03 deployment. Its bytecode predates the NON_BINDABLE tombstone guard in the current source, and the source retains a separate open registerFor design risk. The registry is unused, holds no value and is not read by the protocol. Replacement is incomplete; do not use this address for referrals. Update this note after replacement.",
+  "referralRegistryNote": "Carried over from the 2026-08-03 deployment. Its 1489-byte runtime predates the NON_BINDABLE tombstone guard and still exposes delegated registerFor; measured on 2026-08-20, registerFor(code, NON_BINDABLE) from a stranger succeeded. Current source fixes the broader design by deleting registerFor and requiring partner self-registration, but the registry is unused, holds no value and is not read by the protocol. The committed address remains defective; do not use it for referrals. Live replacement is disabled and unauthorised.",
+  "referralRegistrySource": {
+    "status": "SOURCE FIXED; LIVE BYTECODE DEFECTIVE; LIVE DEPLOYMENT DISABLED AND NOT AUTHORISED",
+    "compatibility": "Only registerFor(bytes32,address) / 0x791d1a9e is removed from method identifiers. The ABI additionally removes only the registry's ZeroAddress error. Storage remains mapping(bytes32=>address) in slot 0 and mapping(address=>bytes32) in slot 1.",
+    "build": "Creation 2150 bytes, keccak256 0x574a196d16ed1a5c2d1f41293e756628f3038ea49ab39a66c166c82cb51a7fba. Runtime 1350 bytes, keccak256 0x07da903bdd0b827c5b8a8b8164a789ec28087119ca9e32d1f67478f9021d7a37. CBOR remains 51 bytes with embedded IPFS digest 0x4d91b88c1f71ca44d584b8ae34d865bbc6c69d1b99eb89993497b7049e335df2. The preceding historical candidate was 1554 runtime bytes.",
+    "localRehearsal": "Loopback only, chain ID 31337, forked from Base Sepolia block 45781376. One local deployment transaction used 841101 gas and emitted 16 CodeRegistered reservation logs. All reserved codes resolved to NON_BINDABLE; DEXFI began unclaimed; the former selector reverted with empty data; partner self-registration, referee binding, collision rejection and reserved-code refusal passed; and deployed runtime exactly matched the current build. No public transaction was sent and the committed address did not change."
+  },
   "riskParameters": {
     "maxLtvBps": 2500,
     "liquidationThresholdBps": 5000,
