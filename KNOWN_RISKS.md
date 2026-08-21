@@ -149,6 +149,10 @@ The current source prevents assignment to the reserved `NON_BINDABLE` sentinel, 
 their one-time binding on a payee that can never claim. Referral-program use remains blocked until
 this is removed, consent-gated or explicitly accepted with an operational policy.
 
+While that design remains open, the standalone deployment script rejects every run whose chain ID
+is not 31337 before the legacy confirmation check. This executable guard prevents broadcasting the
+current source through that script; it does not resolve `registerFor`.
+
 ### The deployed Sepolia `ReferralRegistry` is stale
 
 The source includes the guard that prevents a stranger from assigning the `NON_BINDABLE` tombstone

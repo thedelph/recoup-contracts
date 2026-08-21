@@ -91,8 +91,8 @@ forge build
 forge test
 ```
 
-At protocol code baseline `95e2c76`, the normal run is 735 passed, 0 failed and 13 skipped across
-30 suites. Ten skips are the optional mainnet fork tests; three are fixture-decay detectors that are
+On the current public tree, the normal run is 736 passed, 0 failed and 13 skipped across 30 suites,
+749 total. Ten skips are the optional mainnet fork tests; three are fixture-decay detectors that are
 intentionally disabled in those fork harnesses. CI runs the full unit and invariant suite on every
 push and pull request.
 

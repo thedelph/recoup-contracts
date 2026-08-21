@@ -114,17 +114,25 @@ contract DeployReferralTest is Test {
         assertFalse(registry.isCanonical(bytes32("REC0UP")), "and not registerable either");
     }
 
-    /// @dev A stray `forge script` must not reach a public chain. Local runs need no ceremony,
-    ///      which is why the gate is chain-conditional.
-    function test_deploy_requiresConfirmationOffLocal() public {
-        vm.chainId(8453);
-        vm.expectRevert(DeployReferralRegistry.ConfirmationMissing.selector);
+    /// @dev A stray `forge script` must not reach a public chain while the source design remains
+    ///      open. Local construction stays available to the tests above.
+    function test_deploy_refusesPublicChainWhileSourceDesignIsOpen() public {
+        vm.chainId(84532);
+        vm.expectRevert(DeployReferralRegistry.SourceDesignOpen.selector);
         script.run();
     }
 
-    /// @dev Tests the rule directly rather than through the environment. Calling `vm.setEnv` here
-    ///      would mutate the real process environment for the whole `forge test` run and leak into
-    ///      the test above, which is what made it pass alone and fail in the full suite.
+    /// @dev Neuter-worthy guard: the exact legacy confirmation was previously sufficient to reach
+    ///      broadcast. Removing the source-design check makes this call succeed and this test fail.
+    ///      Calling the pure validator avoids `vm.setEnv`, whose process-global value leaks between
+    ///      Foundry tests and made the old environment-driven test order-dependent.
+    function test_deploy_legacyConfirmationCannotBypassOpenSourceDesign() public {
+        vm.expectRevert(DeployReferralRegistry.SourceDesignOpen.selector);
+        script.validateBroadcastApproval("RECOUP_DEPLOY_REFERRAL");
+    }
+
+    /// @dev Preserves the second gate's exact phrase for a future source-design disposition. Tests
+    ///      it directly rather than through the process-global environment.
     function test_confirmation_acceptsOnlyTheExactPhrase() public view {
         assertTrue(script.isConfirmed("RECOUP_DEPLOY_REFERRAL"));
         assertFalse(script.isConfirmed(""));

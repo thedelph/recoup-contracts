@@ -134,14 +134,13 @@ contract ReferralRegistry {
     }
 
     /// @notice Claim an unused code **for someone else**, who becomes its owner and payee.
-    /// @dev Exists so a partner code can be claimed atomically at deployment with the partner as
-    ///      owner, which is what `register` alone cannot express: it only ever writes
-    ///      `msg.sender`, so the only way for a partner to own their code was to send their own
-    ///      transaction after the address was public - leaving precisely the window described
-    ///      below open on precisely the codes worth stealing.
-    ///
-    ///      Safe to leave permissionless: assigning a code to an address you do not control is
-    ///      giving it away, so there is no profit in it, and the write-once rule still applies.
+    /// @dev Originally intended to claim a partner code during deployment, but the deploy script
+    ///      cannot make that atomic: broadcast mode emits one transaction per external call. The
+    ///      permissionless form also lets a stranger weld an unused code to an unspendable payee,
+    ///      permanently burning every referee's one-shot binding. This broader round-13 finding is
+    ///      open. Do not use this function for partner onboarding or deploy this source while the
+    ///      design is unresolved; deletion is the recorded recommendation unless onboarding a
+    ///      partner without their own transaction becomes a firm requirement.
     function registerFor(bytes32 code, address owner) external {
         if (owner == address(0)) revert ZeroAddress();
         // **Audit round 12.** `NON_BINDABLE` is the constructor's tombstone: it means "reserved by
@@ -170,8 +169,9 @@ contract ReferralRegistry {
     ///
     ///      1. **Claim before you publish.** A code must be registered on-chain before it appears
     ///         in any marketing, link or announcement. The window is unbounded otherwise.
-    ///      2. **Claim partner codes with `registerFor`**, inside the deployment transaction where
-    ///         possible, naming the partner's own payout address.
+    ///      2. **There is no current partner-code procedure while `registerFor` is design-open.** If
+    ///         it is deleted, the partner registers for itself; any alternative must be explicitly
+    ///         accepted and tested before publication.
     ///      3. Brand and confusable spellings are claimed in the constructor, before the address
     ///         exists to race against.
     ///
