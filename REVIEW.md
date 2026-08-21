@@ -7,24 +7,25 @@ rather than asserting.
 The one thing Recoup needs from DexFi is a single `addWhitelist` call on the custody adapter.
 Everything below is really about what that call does and does not buy.
 
-Start with [README.md](README.md) for the architecture and the security posture. This file is the
-code-level tour.
+Start with [README.md](README.md) for the architecture and current status, then
+[KNOWN_RISKS.md](KNOWN_RISKS.md) for the activation gates. This file is the code-level tour.
 
 ## Suggested reading order
 
-1. `src/adapters/DirectCallAdapter.sol` - the only Recoup address that ever touches a DexFi
-   contract. Small, and if you only read one file, read this one.
-2. `src/CollateralVault.sol` - accounting and the LTV rules. It is the only caller of the adapter.
+1. `src/adapters/DirectCallAdapter.sol` - the Recoup custody contract that stakes in and withdraws
+   from the DexFi farm. It is the only Recoup address that needs transfer whitelisting.
+2. `src/CollateralVault.sol` - accounting and the LTV rules. It is the only caller of the adapter and
+   initiates deposit transfers into it.
 3. `test/fork/CollateralVault.fork.t.sol` - the same thing running against your live contracts.
 4. `src/Config.sol` - every fixed parameter and every external address in one place. No magic
    numbers anywhere else.
 5. `src/RiskParams.sol` - the four parameters that are *not* fixed. Max LTV, the liquidation
-   threshold and the two borrow caps live in storage behind a timelocked setter, bounded in
-   bytecode, and the liquidation threshold can be raised and never lowered. Read this before
-   assuming a number you found in `Config.sol` is what a deployment enforces.
+   threshold and the two borrow caps live in storage behind an owner-gated setter, bounded in
+   bytecode, and the liquidation threshold can be raised and never lowered. The intended go-live
+   owner is a timelock; the current Sepolia owner is an EOA. Read this before assuming a number you
+   found in `Config.sol` is what a deployment enforces.
 
-Everything else (credit, harvest, liquidation, referrals) sits above this layer and never talks to
-a DexFi contract directly.
+Credit, harvest, liquidation and referral logic sit above this custody boundary.
 
 ## Where can your bonds go once they are in the adapter?
 
@@ -186,16 +187,15 @@ opening none from 20 of 20 to 0 of 20.
 
 ## What has been reviewed
 
-[AUDITS.md](AUDITS.md) has the round-by-round record, and the README explains the habits that came
-out of it. The short version: every phase gets a multi-agent Solidity review before it merges, and
-every fix round is itself re-audited, because the rate at which fix rounds produce their own
-defects has stayed high: twenty-two rounds so far, and twelve of rounds nine to twenty-one found
-something in the round immediately before them.
+[AUDITS.md](AUDITS.md) contains the historical internal-review record. The current evidence also
+includes deterministic regressions, stateful invariants and live-contract fork tests;
+[KNOWN_RISKS.md](KNOWN_RISKS.md) records the open posture and activation gates.
 
-No external audit has been commissioned yet. The README says plainly where that sits relative to
-third-party funds, and what is knowingly not mitigated in the meantime.
+No external audit has been commissioned. Internal review and passing tests do not replace that
+gate before third-party capital.
 
 ## Questions
 
-Open an issue, or ask Chris directly in the group chat. If something here disagrees with the code,
-the code is right and this file is a bug.
+Open an issue for public documentation or integration questions. Do not publish suspected
+vulnerability details in a public issue; contact the maintainer privately first. Please report any
+inconsistency between this guide, the tests and contract behaviour.
