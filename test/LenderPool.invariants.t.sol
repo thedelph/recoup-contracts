@@ -25,11 +25,11 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///      invariant calls in audit round 15: the clock never moved, so `unreleasedYield` never
 ///      decayed, both anti-JIT rules in `_rateStream` were dead code, and the two price-monotonicity
 ///      invariants only ever saw a price moving down. The action's own counter is not the evidence
-///      that this is fixed - `streamReleases` and `entryPriceRisesOnTheClock` are, because they
+///      that this is fixed - `streamReleases` and `releasedBookPriceRisesOnTheClock` are, because they
 ///      count the clock reaching the mechanism rather than the clock moving.
 contract LenderHandler is Test {
-    /// @notice A fixed number of shares to price, so `convertToAssets` of it is a share price rather
-    ///         than a total that moves when supply does.
+    /// @notice A fixed number of shares to value on the released, un-impaired book, so the result is
+    ///         a price rather than a total that moves when supply does.
     /// @dev Declared here and read by the suite rather than written down in both. The handler needs
     ///      it for the clock ghosts and the suite needs it for the two monotonicity invariants, and
     ///      a fixture literal that appears twice is one edit away from meaning two different things.
@@ -86,8 +86,9 @@ contract LenderHandler is Test {
     ///         it was still worth an asset-wei on the un-impaired book: it must stay zero.
     /// @dev Audit round 12's eviction, as a counter rather than as one scenario. A markdown is
     ///      temporary and a lost place in a FIFO queue is not, so "this can never be worth anything"
-    ///      has to be asked of the entry price, never of the exit price. The release branch is
-    ///      already written that way; nothing was watching whether it stayed that way.
+    ///      has to be asked of the released, un-impaired book price, never of the exit price. The
+    ///      release branch is already written that way; nothing was watching whether it stayed that
+    ///      way.
     uint256 public dustReleasedWhileStillWorthSomething;
     uint256 public lendsDone;
     uint256 public lendsWhileQueued;
@@ -117,7 +118,7 @@ contract LenderHandler is Test {
     uint256 public donationsDone;
     uint256 public timeAdvances;
     uint256 public streamReleases;
-    uint256 public entryPriceRisesOnTheClock;
+    uint256 public releasedBookPriceRisesOnTheClock;
     uint256 public yieldRefusedAsTooLargeForTheCapital;
     uint256 public yieldRefusedWithNoSharesOutstanding;
 
@@ -201,8 +202,8 @@ contract LenderHandler is Test {
     uint256 public principalRoseWithNoLend;
     uint256 public principalRises;
 
-    uint256 public entryPriceFellWithNoRealisedLoss;
-    uint256 public entryPriceFalls;
+    uint256 public releasedBookPriceFellWithNoRealisedLoss;
+    uint256 public releasedBookPriceFalls;
 
     uint256 public exitPriceFellWithNeitherAReserveNorALoss;
     uint256 public exitPriceFalls;
@@ -237,6 +238,23 @@ contract LenderHandler is Test {
     uint256 public principalUnitIssuances;
     uint256 public principalUnitIssuanceMismatches;
 
+    /// @notice Successful live-tail entries and independently observed quote disagreements.
+    /// @dev The production previews deliberately diverge from `convertToAssets`/`convertToShares`
+    ///      while a stream is live: exact entry prices include the projected unreleased tail, while
+    ///      the conversion views continue to report the released, un-impaired book. These counters
+    ///      reproduce OpenZeppelin's virtual-share arithmetic from public state instead of asking
+    ///      either preview for the answer. Assertions do not belong in the handler because a
+    ///      forge-std assertion reverts and `fail_on_revert = false` would discard the evidence.
+    uint256 public activeTailDeposits;
+    uint256 public activeTailDepositQuoteMismatches;
+    uint256 public activeTailMints;
+    uint256 public activeTailMintQuoteMismatches;
+
+    struct ActiveTailQuote {
+        bool observed;
+        uint256 amount;
+    }
+
     /// @notice Reads the six watched quantities either side of every action.
     /// @dev The post-block is a call rather than inline code because the pair does not fit on the
     ///      stack otherwise, and because a single writer for all six keeps the "loss landed" test
@@ -258,7 +276,7 @@ contract LenderHandler is Test {
         uint256 head;
         uint256 loss;
         uint256 principal;
-        uint256 entryPrice;
+        uint256 releasedBookPrice;
         uint256 exitPrice;
         uint256 reserve;
         uint256 losses;
@@ -279,7 +297,7 @@ contract LenderHandler is Test {
         _before.head = pool.queueHead();
         _before.loss = pool.lifetimeSocialisedLoss();
         _before.principal = pool.outstandingPrincipal();
-        _before.entryPrice = pool.convertToAssets(PRICE_PROBE_SHARES);
+        _before.releasedBookPrice = pool.convertToAssets(PRICE_PROBE_SHARES);
         _before.exitPrice = pool.previewRedeem(PRICE_PROBE_SHARES);
         _before.reserve = pool.exitReserve();
         _before.losses = lossesSocialised;
@@ -292,7 +310,7 @@ contract LenderHandler is Test {
         uint256 headBefore = _before.head;
         uint256 lossBefore = _before.loss;
         uint256 principalBefore = _before.principal;
-        uint256 entryBefore = _before.entryPrice;
+        uint256 releasedBookBefore = _before.releasedBookPrice;
         uint256 exitBefore = _before.exitPrice;
         uint256 reserveBefore = _before.reserve;
         uint256 lossesBefore = _before.losses;
@@ -318,10 +336,10 @@ contract LenderHandler is Test {
             if (lendsDone == lendsBefore) ++principalRoseWithNoLend;
         }
 
-        uint256 entry = pool.convertToAssets(PRICE_PROBE_SHARES);
-        if (entry < entryBefore) {
-            ++entryPriceFalls;
-            if (!aLossLanded) ++entryPriceFellWithNoRealisedLoss;
+        uint256 releasedBook = pool.convertToAssets(PRICE_PROBE_SHARES);
+        if (releasedBook < releasedBookBefore) {
+            ++releasedBookPriceFalls;
+            if (!aLossLanded) ++releasedBookPriceFellWithNoRealisedLoss;
         }
 
         uint256 exit_ = pool.previewRedeem(PRICE_PROBE_SHARES);
@@ -418,19 +436,50 @@ contract LenderHandler is Test {
         if (pool.totalPrincipalUnits() != unitsBefore + expected) ++principalUnitIssuanceMismatches;
     }
 
+    /// @dev An independent transcription of the exact-entry deposit quote. The pool's preview is
+    ///      deliberately not read: this counter exists to catch that preview falling back to the
+    ///      released book. A zero-rate pot is frozen, not an active tail, and remains outside the
+    ///      quote until a later delivery rates it again.
+    function _activeTailDepositQuote(uint256 assets) private view returns (ActiveTailQuote memory quote) {
+        uint256 tail = pool.unreleasedYield();
+        if (pool.yieldRate() == 0 || tail == 0) return quote;
+
+        uint256 virtualShares = 10 ** (pool.decimals() - usdc.decimals());
+        quote.observed = true;
+        quote.amount =
+            Math.mulDiv(assets, pool.totalSupply() + virtualShares, pool.totalAssets() + tail + 1, Math.Rounding.Floor);
+    }
+
+    /// @dev The share-input twin: OpenZeppelin's virtual terms, but against the same active gross
+    ///      shareholder book and rounded up so a requested share amount is fully paid for.
+    function _activeTailMintQuote(uint256 shares) private view returns (ActiveTailQuote memory quote) {
+        uint256 tail = pool.unreleasedYield();
+        if (pool.yieldRate() == 0 || tail == 0) return quote;
+
+        uint256 virtualShares = 10 ** (pool.decimals() - usdc.decimals());
+        quote.observed = true;
+        quote.amount =
+            Math.mulDiv(shares, pool.totalAssets() + tail + 1, pool.totalSupply() + virtualShares, Math.Rounding.Ceil);
+    }
+
     // ── lender-facing ────────────────────────────────────────────────────────
 
     function deposit(uint256 actorSeed, uint256 receiverSeed, uint256 assets) external watched {
         address a = _actor(actorSeed);
         address receiver = _actor(receiverSeed);
         assets = bound(assets, 1, 5_000e6);
+        ActiveTailQuote memory tailQuote = _activeTailDepositQuote(assets);
         uint256 unitsBefore = pool.totalPrincipalUnits();
         uint256 netBefore = pool.netDeposits();
         _mint(a, assets);
 
         vm.prank(a);
-        try pool.deposit(assets, receiver) {
+        try pool.deposit(assets, receiver) returns (uint256 mintedShares) {
             ++depositsDone;
+            if (tailQuote.observed) {
+                ++activeTailDeposits;
+                if (mintedShares != tailQuote.amount) ++activeTailDepositQuoteMismatches;
+            }
             _recordPrincipalUnitIssuance(unitsBefore, netBefore, assets);
             // **`netDeposits`, not `totalAssets()`, and `LenderPool.sol:738` says why.** The cap is
             // sized from what lenders put in, deliberately, because audit round 11 found a donation
@@ -471,6 +520,7 @@ contract LenderHandler is Test {
     function mintShares(uint256 actorSeed, uint256 shares) external watched {
         address a = _actor(actorSeed);
         shares = bound(shares, 1, 5_000e9);
+        ActiveTailQuote memory tailQuote = _activeTailMintQuote(shares);
         uint256 cost = pool.previewMint(shares);
         if (cost == 0) return;
         uint256 unitsBefore = pool.totalPrincipalUnits();
@@ -478,9 +528,13 @@ contract LenderHandler is Test {
         _mint(a, cost);
 
         vm.prank(a);
-        try pool.mint(shares, a) {
+        try pool.mint(shares, a) returns (uint256 paidAssets) {
             ++mintsDone;
-            _recordPrincipalUnitIssuance(unitsBefore, netBefore, cost);
+            if (tailQuote.observed) {
+                ++activeTailMints;
+                if (paidAssets != tailQuote.amount) ++activeTailMintQuoteMismatches;
+            }
+            _recordPrincipalUnitIssuance(unitsBefore, netBefore, paidAssets);
             // Same subject as `deposit` above, for the same reason - including the live read.
             assertLe(pool.netDeposits(), pool.depositCap(), "mint crossed the cap");
         } catch (bytes memory err) {
@@ -722,10 +776,11 @@ contract LenderHandler is Test {
         // guard below fire *less* often, which is the direction that hides the bug rather than the
         // direction that flakes.
         uint256 owedAtHead = headShares == 0 ? 0 : pool.previewRedeem(headShares);
-        // The same head valued on the entry price, which is the predicate the release branch is
-        // actually written against. Read here rather than derived from `owedAtHead`, because since
-        // impairment pricing the two are different numbers and telling them apart is the whole
-        // point: zero at both is dust, zero at only the exit price is a marked-down lender.
+        // The same head valued on the released, un-impaired book, which is the predicate the
+        // release branch is actually written against. Read here rather than derived from
+        // `owedAtHead`, because since impairment pricing the two are different numbers and telling
+        // them apart is the whole point: zero at both is dust, zero at only the exit price is a
+        // marked-down lender.
         uint256 unimpairedAtHead = headShares == 0 ? 0 : pool.convertToAssets(headShares);
 
         // The head entry itself, so the eviction check below reads an *outcome* rather than
@@ -927,13 +982,15 @@ contract LenderHandler is Test {
     ///      artefact. Two full stream durations is enough to see a stream open, decay and close.
     function passTime(uint256 seed) external watched {
         uint256 unreleasedBefore = pool.unreleasedYield();
-        uint256 priceBefore = pool.convertToAssets(PRICE_PROBE_SHARES);
+        uint256 releasedBookBefore = pool.convertToAssets(PRICE_PROBE_SHARES);
 
         skip(bound(seed, 1 hours, Config.YIELD_STREAM_DURATION * 2));
         ++timeAdvances;
 
         if (unreleasedBefore != 0 && pool.unreleasedYield() < unreleasedBefore) ++streamReleases;
-        if (pool.convertToAssets(PRICE_PROBE_SHARES) > priceBefore) ++entryPriceRisesOnTheClock;
+        if (pool.convertToAssets(PRICE_PROBE_SHARES) > releasedBookBefore) {
+            ++releasedBookPriceRisesOnTheClock;
+        }
     }
 
     function socialiseLoss(uint256 amount) external watched {
@@ -1420,26 +1477,34 @@ contract LenderPoolInvariants is Test {
         }
     }
 
-    /// The pool's headline claim to lenders, and the one most easily broken by a rounding edit:
-    /// the **entry** price falls for exactly one reason, and a realised loss is it.
+    /// The released, un-impaired book price falls for exactly one reason: a realised loss.
     ///
-    /// Renamed rather than rewritten when impairment pricing landed. The design note said this
-    /// invariant would break and have to be split in two; reading the contract rather than the spec
-    /// showed it does not, because it probes `convertToAssets`, which stays on the un-impaired
-    /// figure exactly as Maple's does. So it already *was* the entry-price half of the claim, under
-    /// a name that hid which half. An impairment must never move this number: an entrant who bought
-    /// at the impaired price would profit the moment the mark came off, which is round-11's
-    /// buy-the-dip finding. The exit half is the sibling below.
+    /// This probes `convertToAssets`, not an executable entry quote. Exact deposit and mint previews
+    /// include a live stream's projected unreleased tail, while this conversion continues to show
+    /// only what has reached the book. Impairment must not move it either: the marked exit price is
+    /// the separate sibling below.
     ///
     /// @dev **This is the one the discard cost most.** Written here it compared today's price with
     ///      `lastPrice`, which forge pinned at the `setUp` value of 1,000,000,000 - while the price
     ///      the campaign actually reaches was measured at 2,001,000,000,000. The guard therefore
-    ///      carried a factor of two thousand of slack: the entry price could have fallen by 99.95%
-    ///      in a single action and this invariant would still have been green.
-    function invariant_theEntryPriceOnlyFallsOnARealisedLoss() public view {
+    ///      carried a factor of two thousand of slack: the released book price could have fallen by
+    ///      99.95% in a single action and this invariant would still have been green.
+    function invariant_theReleasedBookPriceOnlyFallsOnARealisedLoss() public view {
         assertEq(
-            handler.entryPriceFellWithNoRealisedLoss(), 0, "the entry price fell with no socialised loss behind it"
+            handler.releasedBookPriceFellWithNoRealisedLoss(),
+            0,
+            "the released book price fell with no socialised loss behind it"
         );
+    }
+
+    /// @notice Exact entries price the projected active tail rather than acquiring it for free.
+    /// @dev The handler derives both quotes independently from public accounting state and
+    ///      OpenZeppelin's virtual terms. Deposit and mint have separate numerators because a
+    ///      shared zero could otherwise hide one unexercised door; the deterministic reach test
+    ///      below requires both denominators to move.
+    function invariant_activeTailEntryQuotesUseTheGrossShareholderBook() public view {
+        assertEq(handler.activeTailDepositQuoteMismatches(), 0, "an active-tail deposit used the wrong quote");
+        assertEq(handler.activeTailMintQuoteMismatches(), 0, "an active-tail mint used the wrong quote");
     }
 
     /// And the other half, which is the one impairment pricing added: the **exit** price falls only
@@ -1536,16 +1601,19 @@ contract LenderPoolInvariants is Test {
         assertEq(sum, handler.totalMinted(), "USDC left the fixture");
     }
 
-    /// The `_decimalsOffset() == 3` guarantee as a standing property rather than one scenario.
+    /// The `_decimalsOffset() == 3` rounding guarantee as an instantaneous property.
     ///
     /// **Swept in audit round 16 and deliberately kept.** It is the same algebraic family as the
     /// identity that had to be rewritten above - both sides read the pool's own conversions, and
     /// neither touches `usdc.balanceOf(address(pool))` - so it holds for every `S` and every `T`
     /// against the current rounding. It is not vacuous in the way that one was, because it *does*
     /// discriminate: flip either conversion's rounding direction and this goes red, which is the
-    /// only thing it claims to guard. Recorded here rather than deleted, because deleting an
-    /// invariant that still separates two implementations is the overcorrection, and because the
-    /// next sweep should not have to re-derive why this one survived.
+    /// only thing it claims to guard. It does **not** prove that a cheap entry cannot capture yield
+    /// as a stream releases later: both legs here are quoted at one instant. The independent
+    /// active-tail quote invariant above guards that entry basis. Recorded here rather than
+    /// deleted, because deleting an invariant that still separates two implementations is the
+    /// overcorrection, and because the next sweep should not have to re-derive why this one
+    /// survived.
     function invariant_roundTripsNeverProfit() public view {
         assertLe(pool.previewRedeem(pool.previewDeposit(1_000e6)), 1_000e6, "deposit-then-redeem minted value");
         assertGe(pool.previewWithdraw(pool.previewMint(1_000e9)), 1_000e9, "mint-then-withdraw minted value");
@@ -1692,6 +1760,15 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.yieldDistributions(), 1, "yield must be deliverable");
         assertGt(pool.unreleasedYield(), 0, "an epoch must be reachable mid-stream");
 
+        // Exercise both exact-entry doors while that tail is live. These go through the handler,
+        // not bare pool calls, so the same independent quote counters used by the random campaign
+        // are the evidence. The small amounts leave ample room under the principal cap reached
+        // above; a cap refusal would leave the denominator at zero and fail here.
+        handler.deposit(2, 2, 1e6);
+        handler.mintShares(3, 1e9);
+        assertGt(handler.activeTailDeposits(), 0, "an active-tail deposit quote was never observed");
+        assertGt(handler.activeTailMints(), 0, "an active-tail mint quote was never observed");
+
         // Through the handler's own action rather than a bare `skip`, so the two derived clock
         // ghosts are exercised by the same call the fuzzer makes. A tripwire that moved time by a
         // route the fuzzer does not have would assert reachability of a state the random sequences
@@ -1699,7 +1776,11 @@ contract LenderPoolInvariants is Test {
         handler.passTime(Config.YIELD_STREAM_DURATION);
         assertGt(handler.timeAdvances(), 0, "the clock must be movable");
         assertGt(handler.streamReleases(), 0, "moving the clock must release a running stream");
-        assertGt(handler.entryPriceRisesOnTheClock(), 0, "the entry price must be able to rise on the clock alone");
+        assertGt(
+            handler.releasedBookPriceRisesOnTheClock(),
+            0,
+            "the released book price must be able to rise on the clock alone"
+        );
         assertEq(pool.unreleasedYield(), 0, "and must be reachable fully released");
 
         // Actors 0 and 1 exit completely here, which is why the queue below is driven by actors
@@ -1930,7 +2011,9 @@ contract LenderPoolInvariants is Test {
         );
         assertGt(handler.lifetimeLossRises(), 0, "the disclosure counter never rose, so its cause was never tested");
         assertGt(handler.principalRises(), 0, "principal never rose, so the no-lend counter proves nothing");
-        assertGt(handler.entryPriceFalls(), 0, "the entry price never fell, so its cause was never tested");
+        assertGt(
+            handler.releasedBookPriceFalls(), 0, "the released book price never fell, so its cause was never tested"
+        );
         assertGt(handler.exitPriceFalls(), 0, "the exit price never fell, so its cause was never tested");
     }
 }

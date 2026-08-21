@@ -410,7 +410,173 @@ contract LenderPoolTest is Test {
         vm.prank(mallory);
         uint256 out = pool.redeem(shares, mallory, mallory);
 
-        assertLt(out - DEPOSIT, 100e6, "a compressed tail would have paid out several times this");
+        assertLe(out, DEPOSIT, "an early exit must not profit from the active tail");
+    }
+
+    /// @notice Active yield is part of the price of entering, even though it is not released NAV.
+    /// @dev The expected values restate OpenZeppelin 5.6.1's virtual asset/share arithmetic from
+    ///      public reads. Only the denominator changes: a live stream adds its projected tail so a
+    ///      post-delivery entrant pays for the whole delivered cohort pot rather than diluting it.
+    function test_F10_previewDepositAndMintPriceTheProjectedActiveTailWithOZVirtuals() public {
+        _deposit(alice, DEPOSIT);
+        _distributeYield(500e6);
+        skip(1 days);
+
+        uint256 assets = 1_000e6;
+        uint256 entryAssets = pool.totalAssets() + pool.unreleasedYield();
+        uint256 virtualShares = 10 ** uint256(pool.decimals() - usdc.decimals());
+        uint256 expectedShares =
+            Math.mulDiv(assets, pool.totalSupply() + virtualShares, entryAssets + 1, Math.Rounding.Floor);
+        assertEq(pool.previewDeposit(assets), expectedShares, "deposit ignored the projected active tail");
+        assertLt(pool.previewDeposit(assets), pool.convertToShares(assets), "entry still used released NAV");
+
+        uint256 shares = expectedShares;
+        uint256 expectedAssets =
+            Math.mulDiv(shares, entryAssets + 1, pool.totalSupply() + virtualShares, Math.Rounding.Ceil);
+        assertEq(pool.previewMint(shares), expectedAssets, "mint did not invert the gross entry price");
+        assertGt(pool.previewMint(shares), pool.convertToAssets(shares), "mint still used released NAV");
+    }
+
+    /// @notice Depositing after delivery buys no part of the already-delivered tail.
+    function test_F10_postDeliveryYieldEntrantCannotCaptureTheTail() public {
+        uint256 incumbentShares = _deposit(alice, DEPOSIT);
+        _distributeYield(500e6);
+
+        uint256 entrantShares = _deposit(bob, DEPOSIT);
+        vm.warp(pool.yieldStreamEndsAt() + 1);
+
+        vm.prank(bob);
+        uint256 entrantOut = pool.redeem(entrantShares, bob, bob);
+        assertLe(entrantOut, DEPOSIT, "a post-delivery entrant captured the cohort's tail");
+        assertApproxEqAbs(entrantOut, DEPOSIT, 2, "gross pricing did not return the entrant's principal");
+        assertGt(pool.previewRedeem(incumbentShares), DEPOSIT + 499e6, "the delivered cohort was diluted");
+    }
+
+    /// @notice The exact-share entry door uses the same gross price as a deposit.
+    function test_F10_postDeliveryMintCannotCaptureTheTail() public {
+        _deposit(alice, DEPOSIT);
+        _distributeYield(500e6);
+
+        uint256 shares = 5_000e6 * (10 ** uint256(pool.decimals() - usdc.decimals()));
+        uint256 quotedAssets = pool.previewMint(shares);
+        vm.prank(bob);
+        uint256 assetsIn = pool.mint(shares, bob);
+        assertEq(assetsIn, quotedAssets, "mint execution departed from its gross quote");
+
+        vm.warp(pool.yieldStreamEndsAt() + 1);
+        vm.prank(bob);
+        uint256 out = pool.redeem(shares, bob, bob);
+        assertLe(out, assetsIn, "a post-delivery mint captured the cohort's tail");
+        assertApproxEqAbs(out, assetsIn, 2, "gross mint pricing did not return the entrant's principal");
+    }
+
+    /// @notice The share-denominated cap is the gross-price floor of the remaining asset cap.
+    function test_F10_maxMintUsesLiveTailAndCannotCrossTheAssetCap() public {
+        _deposit(alice, DEPOSIT);
+        _distributeYield(500e6);
+
+        uint256 maxAssets = pool.maxDeposit(bob);
+        uint256 entryAssets = pool.totalAssets() + pool.unreleasedYield();
+        uint256 virtualShares = 10 ** uint256(pool.decimals() - usdc.decimals());
+        uint256 expectedShares =
+            Math.mulDiv(maxAssets, pool.totalSupply() + virtualShares, entryAssets + 1, Math.Rounding.Floor);
+        uint256 maxShares = pool.maxMint(bob);
+        assertEq(maxShares, expectedShares, "maxMint used the released rather than gross entry price");
+        assertLe(pool.previewMint(maxShares), maxAssets, "the advertised maximum crosses the asset cap");
+        assertGt(pool.previewMint(maxShares + 1), maxAssets, "one more share still fits under the cap");
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.DepositCapExceeded.selector, maxShares + 1, maxShares));
+        pool.mint(maxShares + 1, bob);
+
+        usdc.mint(bob, maxAssets);
+        vm.prank(bob);
+        uint256 assetsIn = pool.mint(maxShares, bob);
+        assertLe(assetsIn, maxAssets, "mint execution crossed the remaining asset cap");
+        assertLe(pool.netDeposits(), pool.depositCap(), "mint crossed the deposit cap");
+    }
+
+    /// @notice A live impairment changes exits, not the gross price of entering an active stream.
+    function test_F10_activeStreamImpairmentMarksOnlyTheExitPrice() public {
+        uint256 incumbentShares = _deposit(alice, DEPOSIT);
+        _lend(6_000e6);
+        _distributeYield(500e6);
+
+        uint256 entryBefore = pool.previewDeposit(1_000e6);
+        uint256 exitBefore = pool.previewRedeem(incumbentShares);
+        uint256 entryAssets = pool.totalAssets() + pool.unreleasedYield();
+        uint256 virtualShares = 10 ** uint256(pool.decimals() - usdc.decimals());
+        uint256 expectedEntry =
+            Math.mulDiv(1_000e6, pool.totalSupply() + virtualShares, entryAssets + 1, Math.Rounding.Floor);
+
+        _impair(carol, 1_000e6);
+
+        assertLt(pool.previewRedeem(incumbentShares), exitBefore, "the impairment missed the exit price");
+        assertEq(pool.previewDeposit(1_000e6), entryBefore, "the impairment leaked into entry pricing");
+        assertEq(pool.previewDeposit(1_000e6), expectedEntry, "entry omitted the active tail");
+    }
+
+    /// @notice A frozen backlog is not a cohort pot and remains outside entry pricing.
+    /// @dev With no live release rate, the next depositor must see the ordinary ERC-4626 price.
+    ///      The next delivered epoch re-rates the frozen money and establishes its cohort then.
+    function test_F10_frozenBacklogKeepsEntryPreviewsOnReleasedAssets() public {
+        uint256 incumbentShares = _deposit(alice, DEPOSIT);
+        _distributeYield(500e6);
+        skip(1 days);
+
+        vm.prank(alice);
+        pool.redeem(incumbentShares, alice, alice);
+        assertEq(pool.yieldRate(), 0, "fixture: the tail did not freeze");
+        assertGt(pool.unreleasedYield(), 0, "fixture: there is no frozen backlog");
+
+        uint256 assets = 1_000e6;
+        assertEq(pool.previewDeposit(assets), pool.convertToShares(assets), "frozen yield entered the deposit price");
+
+        uint256 virtualShares = 10 ** uint256(pool.decimals() - usdc.decimals());
+        uint256 shares = assets * virtualShares;
+        assertEq(pool.previewMint(shares), pool.convertToAssets(shares), "frozen yield entered the mint price");
+    }
+
+    /// @notice A lender already present when an epoch is delivered participates in that epoch.
+    function test_F10_preDeliveryEntrantParticipatesInTheDeliveredEpoch() public {
+        _deposit(alice, DEPOSIT);
+        uint256 entrantShares = _deposit(bob, DEPOSIT);
+
+        _distributeYield(500e6);
+        vm.warp(pool.yieldStreamEndsAt() + 1);
+
+        vm.prank(bob);
+        uint256 out = pool.redeem(entrantShares, bob, bob);
+        assertApproxEqAbs(out - DEPOSIT, 250e6, 2, "a pre-delivery cohort member missed its share");
+    }
+
+    /// @notice A post-delivery entrant who exits before release forfeits the premium it paid.
+    function test_F10_postDeliveryEarlyExitForfeitsTheTailPremium() public {
+        _deposit(alice, DEPOSIT);
+        _distributeYield(500e6);
+
+        uint256 entrantShares = _deposit(bob, DEPOSIT);
+        vm.prank(bob);
+        uint256 out = pool.redeem(entrantShares, bob, bob);
+
+        assertLt(out, DEPOSIT, "an early exit recovered the active-tail premium");
+    }
+
+    /// @notice Re-rating overlapping streams does not reopen either delivered pot to a newcomer.
+    function test_F10_overlappingReratedStreamKeepsTheDeliveredCohortWhole() public {
+        uint256 incumbentShares = _deposit(alice, DEPOSIT);
+        _distributeYield(400e6);
+        skip(Config.YIELD_STREAM_DURATION / 2);
+        _distributeYield(200e6);
+
+        uint256 entrantShares = _deposit(bob, DEPOSIT);
+        vm.warp(pool.yieldStreamEndsAt() + 1);
+
+        vm.prank(bob);
+        uint256 entrantOut = pool.redeem(entrantShares, bob, bob);
+        assertLe(entrantOut, DEPOSIT, "the entrant captured an overlapping stream tail");
+        assertApproxEqAbs(entrantOut, DEPOSIT, 2, "the rerated gross price did not return principal");
+        assertGt(pool.previewRedeem(incumbentShares), DEPOSIT + 599e6, "re-rating diluted the delivered cohort");
     }
 
     /// @dev Unreleased yield must not outlive the shareholders it was meant for. With the stream
@@ -496,8 +662,8 @@ contract LenderPoolTest is Test {
     /// @notice A recovery on a loss already taken raises the share price, over the stream.
     /// @dev It is a gain on an asset this pool has already written off, so it is streamed on the
     ///      same rules as `repayPrincipal`'s surplus: `LiquidationAuction.workoutSettleAfterClose`
-    ///      is permissionless, and an instantaneous step is a slice of somebody else's recovery for
-    ///      whoever picks the block.
+    ///      is permissionless, and an instantaneous step is capturable by whoever enters and picks
+    ///      the block. The stream instead assigns the value to the shares present at delivery.
     function test_recoverLoss_raisesTheSharePriceOverTheStream() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _lend(4_000e6);
@@ -515,11 +681,11 @@ contract LenderPoolTest is Test {
 
         assertEq(pool.totalAssets(), assetsAfterTheLoss, "not in the recovering block");
         assertEq(pool.lifetimeLossRecovered(), 600e6);
-        assertEq(pool.lifetimeSocialisedLoss(), 1_000e6, "the loss they took is not netted away");
+        assertEq(pool.lifetimeSocialisedLoss(), 1_000e6, "the gross write-down is not netted away");
 
         vm.warp(pool.yieldStreamEndsAt() + 1);
         assertEq(pool.totalAssets(), assetsAfterTheLoss + 600e6, "and in full once the stream has run");
-        assertGt(pool.convertToAssets(aliceShares), valueAfterTheLoss, "the lender who stayed is repaid");
+        assertGt(pool.convertToAssets(aliceShares), valueAfterTheLoss, "the delivered cohort received the stream");
     }
 
     /// @notice It is a gain, not a repayment: no loan is re-recognised to pay for it.
@@ -1759,13 +1925,17 @@ contract LenderPoolTest is Test {
         assertApproxEqAbs(pool.totalAssets(), assetsBefore + 3_000e6, 2, "the surplus never landed");
     }
 
-    /// @notice The attack, written attacker-first.
+    /// @notice A delivery-block entrant cannot turn the streamed surplus into an immediate step.
     /// @dev **Order matters and this repo has paid for learning that.** Written the other way round
     ///      - repay, then deposit - the test passes against the unfixed contract, because the
     ///      depositor arrives after the step instead of in front of it. Mallory deposits first and
     ///      then calls the repayment herself, which is the permissionless `settlePrincipal` reaching
     ///      through, so she picks the block exactly as the finding describes.
-    function test_repayPrincipal_justInTimeDepositorCannotCaptureTheSurplus() public {
+    ///
+    ///      Because Mallory holds shares when the surplus is delivered, she is part of that
+    ///      delivery cohort and participates if she remains through the stream. This test proves
+    ///      only that she cannot enter, trigger delivery and realise the whole gain immediately.
+    function test_repayPrincipal_deliveryBlockEntrantCannotCaptureTheSurplusImmediately() public {
         _deposit(alice, DEPOSIT);
         _lend(4_000e6);
         vm.prank(creditManager);
@@ -1780,7 +1950,7 @@ contract LenderPoolTest is Test {
         vm.prank(bob);
         uint256 out = pool.redeem(exitable, bob, bob);
 
-        assertLe(out, DEPOSIT, "a just-in-time depositor captured a recovery they were not exposed to");
+        assertLe(out, DEPOSIT, "a delivery-block entrant captured the streamed surplus immediately");
         assertGt(mallorysShares, 0, "the fixture must actually have minted her shares");
     }
 

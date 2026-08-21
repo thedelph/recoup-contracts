@@ -188,7 +188,7 @@ It was held back because findings are open against it and publishing the mechani
 seemed the wrong trade while nothing carrying the code was deployed. The 2026-08-19 Base Sepolia
 redeploy put it on chain and Basescan verification published the full source, so withholding it here
 stopped protecting anything and started making this README wrong. It is published, with the current
-deployment blockers stated rather than left to be discovered:
+deployment blockers and material residual risks stated rather than left to be discovered:
 
 - **A loss-making position has no mark until somebody volunteers to liquidate it** (round 17). The
   window is narrowed to one transaction-ordering slot and the residual is irreducible without an
@@ -206,23 +206,35 @@ deployment blockers stated rather than left to be discovered:
   path retains its own double-ceiling residual at an integer boundary, and repeated near-total loss
   and refill cycles can eventually exhaust the quotient's integer range. It remains a deployment
   blocker.
-- **Loss recovery uses a stream that cannot preserve who bore the loss** (round 22, F10).
-  `recoverLoss` feeds recovered value into the general yield stream, whose unreleased pot is excluded
-  from the price paid by new deposits. Measured, a lender arriving one block into a 628.750000 USDC
-  recovery captured 128.994204 USDC, or 20.5%, despite bearing none of the loss. That entry-pricing
-  rule applies to every live stream, so changing only `recoverLoss`'s rating parameters cannot fix
-  recovery ownership. It remains a deployment blocker.
+- **Post-delivery active-tail dilution is closed narrowly** (round 22, F10). While a stream is live,
+  deposits and mints price against released assets plus the projected unreleased tail, with the
+  existing ERC-4626 virtual terms and Floor/Ceil rounding. `maxMint` uses the same gross basis. New
+  capital arriving after ordinary yield or a recovery is delivered therefore pays for the tail
+  instead of diluting the shares already present. This is not historical loss-bearer accounting:
+  capital arriving before delivery can participate, a holder leaving before release gives up the
+  unreleased value, and a frozen backlog is excluded until a later delivery re-rates it. A
+  post-delivery entrant that exits before release is priced only on released assets, so it can
+  receive less than its deposited principal while the prepaid tail stays with remaining holders.
+  Historical recovery entitlement remains a material design gap, but the measured post-delivery
+  capture is no longer a deployment blocker.
 - **A non-epoch recovery inherits the epoch clock** (round 22, F11). `recoverLoss` and the surplus
   branch of `repayPrincipal` use time since the last yield epoch to size their stream even though
   neither cash flow accrued over that interval. The same 400 USDC recovery therefore streams over
   five days after a recent epoch and 180 days after a long drought; a lender exiting after day five
   forfeited 388.888889 USDC in the measured long-drought case. It remains a deployment blocker.
+- **Re-rating a running stream can keep extending its tail** (round 22, F6a). `_rateStream` floors
+  every new duration at the old stream's remaining time, so repeated deliveries postpone the end
+  and make the early-exit forfeiture above last longer. It remains a deployment blocker.
 - **Permissionless queue service can crystallise shares into cash the receiver cannot collect**
   (round 22, F12). Any caller can burn a queued lender's shares and park the proceeds in
   `claimable[receiver]`. If that receiver cannot call the pool or the USDC transfer to it is blocked,
   the lender has no way to recover the shares or redirect the claim after service. Delegated claiming
   would address only the first case, not an asset-level transfer rejection. It remains a deployment
   blocker.
+
+The exact current pool deployment blockers are round-22 F3, F11, F6a and F12, plus round-21 F7.
+The round-17 ordering residual and F10's historical loss-bearer gap remain disclosed risks. Neither
+changes the verdict: the pool is not approved to wire, fund or hold third-party capital.
 
 **No lender capital is exposed and none can be.** The pool is deployed but not wired as
 `CreditManager`'s liquidity source and holds nothing, so it cannot lend and therefore cannot take a
@@ -253,10 +265,11 @@ forge test      # unit + invariant tests vs real-ABI mocks. Allow ~6 minutes: th
                 # run mid-flight rather than fail it
 ```
 
-Measured on 2026-08-21 for this tree: **725 passed, 0 failed, 13 skipped across 30 suites**. The
-skips are the mainnet fork tests below, which need `RUN_FORK_TESTS=true`. This is a dated baseline,
-not a substitute for running the command: CI runs it on every push and pull request, and the green
-tick on `main` is the standing claim.
+Measured on 2026-08-21 for this tree: **735 passed, 0 failed, 13 skipped across 30 suites**. Ten
+skips are the mainnet fork integration tests below, which need `RUN_FORK_TESTS=true`; the other
+three are inherited fixture-decay detectors intentionally disabled in those fork harnesses. This
+is a dated baseline, not a substitute for running the command: CI runs it on every push and pull
+request, and the green tick on `main` is the standing claim.
 
 ### Mainnet fork tests
 
@@ -351,7 +364,7 @@ Four habits came out of that and now apply by default:
   audited twice for correctness and deleted on the third pass, when someone finally asked the prior
   question and found it never closed the hole it was written for.
 
-Alongside the audits: stateful invariant fuzzing over six suites (58 invariants), and the mainnet
+Alongside the audits: stateful invariant fuzzing over six suites (59 invariants), and the mainnet
 fork tests above, which are the real integration proof.
 
 An invariant suite can be vacuously green - handler actions are wrapped so an expected revert does

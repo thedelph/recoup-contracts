@@ -137,10 +137,16 @@ testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Six suites, 58 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
+Six suites, 59 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
 one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no state
 in which all three of an auction's exits revert, because that state would be permanently stranded
 collateral and only a fuzzer looking for it would ever find it.
+
+`LenderPool.invariants.t.sol` also reconstructs active-tail deposit and mint quotes independently
+from public state. It uses the projected unreleased tail, OpenZeppelin's virtual terms, Floor for a
+deposit and Ceil for a mint, then compares those values with what the two entry doors actually
+execute. This is separate from the instantaneous round-trip property: a same-block entry and exit
+cannot detect value captured only as a stream releases later.
 
 The part worth knowing about how they are built: **an invariant suite can report green having
 tested nothing.** Handler actions have to be wrapped in `try`, because most random call sequences
