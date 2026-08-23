@@ -1131,7 +1131,7 @@ contract CreditManagerTest is RiskParamsFixture {
     ///
     ///      That is what this test measures: the cap drops under a live armed position, and the
     ///      borrower is refused for the honest reason (they are over the new cap) rather than
-    ///      trapped between two errors. The premise behind that request is corrected in the session write-up.
+    ///      trapped between two errors. The premise behind that request was corrected after it was made.
     function test_loweringThePerAccountCapDoesNotStrandAnArmedPosition() public {
         uint256 loan = Config.MIN_BOUNTIED_DEBT + 100e6;
         vm.prank(alice);

@@ -227,6 +227,35 @@ position yield to insurance, and a live position can temporarily block the trans
 - The external audit remains a hard gate before third-party capital regardless of internal review
   count or CI status.
 
+## What this source does not yet contain
+
+This repository is a curated publication of the protocol's contracts rather than a mirror of the
+working tree, and it currently lags that tree. The lag is stated here rather than left to be found,
+because the code you are reading is the code the statements below are about.
+
+**Measured on this tree:** `src/CreditManager.sol` here predates the round-22 remediation. Four of
+that round's fixes are therefore absent from this source, and the defects they close are live in it.
+This is the same class of disclosure as the Round 22 F18 row further down, which named one instance
+of the same lag; these are the rest of it.
+
+| Finding | Severity | Absent from this source |
+|---|---|---|
+| Round 22 F4 | Medium to high | `setYieldRecipient` is the one money-carrying pointer with no contract-level binding check, so a full epoch's gross yield can be redirected by an owner action. The fix, an `owedToRecipient` balance drained by a permissionless `flushYieldTo`, is not here. A binding check was separately measured to be the wrong fix, because it recreates the blacklist trap the setter exists to escape |
+| Round 22 F5 | Medium | A blacklisted liquidity source freezes `pendingPrincipal` **and the escape from it**, together: the counter's only drain runs through the pointer and the pointer's only escape runs through the counter. The fix, an `owedToSource` balance plus a permissionless `flushPrincipalTo`, is not here |
+| Round 22 F8 | Medium | `workoutSettleAfterClose` resolves its payee from live state while `closeWorkout` can empty that state in the same block. The fix, a `bearer` recorded on the workout at every close, is not here |
+| Round 22 F9 | Medium | A loss can be attributed to the wrong era, in the direction that makes lender losses operator-withdrawable. The partial fix, `lossBearerOf` recorded at write-down time, is not here. Upstream this finding is only partly closed, and round 23 regraded it |
+| Round 23 remediation | mixed | Absent in full. The clearest way to see the lag from inside this source: the **exit-side** EIP-5143 overloads are present on `LenderPool` (`redeem` with `minAssetsOut`, `withdraw` with `maxSharesIn`) and the **entry-side** pair is not. That asymmetry is round-23 finding 3, closed upstream |
+
+**What this does not mean.** The activation-blocker table in `README.md` describes *this* tree and is
+accurate for it, including the Round 22 F11 and F6a rows: their fixes are part of the round-23
+remediation and are likewise absent here. Nothing in this section is closed in the code you are
+reading.
+
+**One property this lag preserves, and it is worth knowing.** `src/CreditManager.sol` here compiles
+to 23,833 bytes of runtime code, which is byte-for-byte what is deployed at the Base Sepolia address
+in `deployments/base-sepolia.json`. **What you read here is what is running on that testnet.** A
+future sync will close the gap above and end that correspondence until the next redeploy.
+
 ## Mainnet go-live requirements
 
 These are additional to the pool blockers and external-audit gate.
