@@ -80,6 +80,8 @@ The pool is not approved to wire or fund. The current blockers are:
 | Round 22 F12 | Permissionless queue service can turn shares into a claim that its receiver cannot collect |
 | Round 21 F7 | An impaired queued withdrawal can over-reserve liquidity while being ineligible for service |
 
+**This table describes this source.** It also lags the working tree in ways that are not blockers but are defects live in the code you are reading: see [What this source does not yet contain](KNOWN_RISKS.md#what-this-source-does-not-yet-contain).
+
 Other material residual risks are Round 17's transaction-ordering window and F10's lack of
 historical loss-bearer entitlement. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) contains the launch-critical
 and material current risks, measured traces and go-live rules. Closing the five pool blockers is
