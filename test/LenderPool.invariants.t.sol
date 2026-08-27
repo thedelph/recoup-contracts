@@ -4,10 +4,12 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import {Config} from "../src/Config.sol";
 import {LenderPool} from "../src/LenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {LowCeilingPool} from "./LenderPoolPrincipalRescaling.t.sol";
 
 /// @notice Randomised call sequences against the lender pool. The fuzzer plays four lenders, the
 ///         credit manager and the harvester in arbitrary order; the invariants below must hold
@@ -78,8 +80,86 @@ contract LenderHandler is Test {
     uint256 public requestsQueued;
     uint256 public requestsRefusedAsDuplicate;
     uint256 public cancelsDone;
+
+    /// @notice Times a share was offered straight to the escrow and refused. Round-23 finding 16.
+    /// @dev The denominator for the exclusion this replaced. An exclusion that names a state and
+    ///      then counts nothing is indistinguishable from one that has quietly stopped reaching it.
+    uint256 public escrowDonationsRefused;
+
+    /// @notice Times a queue entry was offered the escrow as its **receiver** and refused, and
+    ///         times one was accepted. Audit round 24, the fifth door.
+    /// @dev **The receiver set used to be `actors` and nothing else, and that is why 128,000 calls
+    ///      a run saw nothing.** The four doors round-23 finding 16 shut are all about a share
+    ///      arriving at `address(pool)`; this is the pool arriving in `WithdrawalRequest.receiver`,
+    ///      which puts the pool's own USDC into `claimable[address(pool)]` when the queue services.
+    ///      A contract fix on its own would have left the campaign exactly as blind, so the draw is
+    ///      widened here in the same change - a guard nothing can offer a violation to is not a
+    ///      guard the campaign has tested.
+    ///
+    ///      Same shape as `escrowDonationsRefused`/`escrowDonationsAccepted`: the refusal is the
+    ///      denominator and the acceptance is the numerator that must stay zero.
+    uint256 public escrowReceiverRequestsRefused;
+    uint256 public escrowReceiverRequestsAccepted;
+
+    /// @notice Times an ERC-4626 **exit** was offered the escrow as its receiver and refused, and
+    ///         times one was accepted. Audit round 25 finding 1, the four doors one field along
+    ///         from the fifth.
+    /// @dev **This pair is the other half of that finding, and without it the fix ships blind.**
+    ///      Round 24 widened the receiver draw at `requestWithdrawal` and at nothing else, so
+    ///      `withdrawMax` and `redeemMax` went on passing `receiver == owner` and the exit doors'
+    ///      receiver parameter had **zero variance in 128,000 calls a run**. A guard nothing can
+    ///      offer a violation to is not a guard the campaign has tested - the same sentence the
+    ///      round-24 counter above is written under, and the reason it is repeated here rather
+    ///      than assumed to have generalised.
+    ///
+    ///      Four doors, two actions: `withdrawMax` and `redeemMax` each draw a door as well as a
+    ///      receiver, so the round-20 bounded overloads are exercised too. They carry no guard of
+    ///      their own and are shut only because they delegate, which is a property of the bodies
+    ///      as written and is exactly the kind of thing a refactor removes silently.
+    ///
+    ///      Same shape as the two pairs above: the refusal is the denominator that says the draw
+    ///      still reaches the door, and the acceptance is the numerator that must stay zero.
+    uint256 public escrowExitReceiversRefused;
+    uint256 public escrowExitReceiversAccepted;
+
+    /// @notice And the numerator: times a door **accepted** one. Must stay zero.
+    /// @dev Counted rather than reverted on, and that distinction is the whole value of this
+    ///      action. The first draft reverted the handler frame when a door let the share through,
+    ///      which meant the corrupt state was discarded before any invariant could see it.
+    ///      **MEASURED, with all four doors reopened: `invariant_principalUnitsConserveNetDeposits`
+    ///      passed 256 runs and 128,000 calls, and only the deterministic reach test went red.** An
+    ///      action that undoes the damage it causes is not a detector. Letting the donation stand
+    ///      is what puts the escrow equality on the hook.
+    uint256 public escrowDonationsAccepted;
     uint256 public fullFills;
     uint256 public partialFills;
+
+    /// @notice The two ghosts that make the partial-fill branch *visible* rather than merely
+    ///         reachable, and the denominator that stops the first from being vacuous.
+    /// @dev **Audit round 25, finding 2.** The partial-fill branch was reached and nothing looked
+    ///      inside it: flipping `serviceQueue`'s `_exitToShares(idle, Floor)` to `Ceil` stayed
+    ///      green across all 58 `LenderPool` invariant evaluations and all 900 deterministic
+    ///      tests. `partialFills` counted the branch; no assertion anywhere said what the branch
+    ///      had to produce.
+    ///
+    ///      `partialFillsBurningMoreThanTheCashCovers` is the numerator and
+    ///      `invariant_aPartialFillNeverBurnsMoreThanItsCashCovers` requires it to be zero. The
+    ///      predicate is `sharesBurned * (exitAssets() + 1) <= idle * (totalSupply() + 10**3)`,
+    ///      evaluated on state read **before** the call and restated here rather than asked of the
+    ///      pool. Asking the pool to convert `idle` would be the shape round 25 filed against
+    ///      `RiskParams.invariants.t.sol`: a function checked against its own output agrees with
+    ///      itself under every mutation.
+    ///
+    ///      `partialFillsWithInexactShareRounding` is the denominator, and it is the one that
+    ///      matters. Where `idle * s` divides `a` exactly, Floor and Ceil are the same number and
+    ///      the numerator above **cannot** rise however many partial fills happen. That is not
+    ///      hypothetical: `LenderPool.t.sol`'s
+    ///      `test_theRoundNumberFixtureCannotSeeThePartialFillRounding` pins a fixture where the
+    ///      division is exact and the mutation survives. So the reach test asserts this counter is
+    ///      non-zero, not merely that `partialFills` is.
+    uint256 public partialFillsWithInexactShareRounding;
+    uint256 public partialFillsBurningMoreThanTheCashCovers;
+
     uint256 public dustReleases;
 
     /// @notice **The numerator beside `dustReleases`.** Times an entry was handed back as dust while
@@ -92,6 +172,9 @@ contract LenderHandler is Test {
     uint256 public dustReleasedWhileStillWorthSomething;
     uint256 public lendsDone;
     uint256 public lendsWhileQueued;
+    /// @notice Lends that took `available()` to the wei, which is the state a partial fill
+    ///         needs in front of it. See `lendTheWholeFloat`.
+    uint256 public floatEmptyingLends;
     uint256 public repaysDone;
     uint256 public overRepaysDone;
     /// @notice Recoveries booked against a loss the pool had already absorbed, and the ones that
@@ -121,6 +204,19 @@ contract LenderHandler is Test {
     uint256 public releasedBookPriceRisesOnTheClock;
     uint256 public yieldRefusedAsTooLargeForTheCapital;
     uint256 public yieldRefusedWithNoSharesOutstanding;
+
+    /// @notice The entry pause, and the three things it has to actually reach. Round-28 item 6's
+    ///         `LenderPool` half, alongside round-28 item 10.
+    /// @dev `pausesDone` on its own would be the defect the clock ghosts above were written against
+    ///      wearing a new name: it proves the switch was thrown, not that any invariant was ever
+    ///      *evaluated* on the far side of it. `entriesRefusedByThePause` says the campaign put a
+    ///      deposit or a mint against a shut door and `exitsWhilePaused` says it took money out
+    ///      through one that stayed open, which is the premise the guardian's reach rests on and
+    ///      the only one of the three that would be worth anything on its own.
+    uint256 public pausesDone;
+    uint256 public unpausesDone;
+    uint256 public entriesRefusedByThePause;
+    uint256 public exitsWhilePaused;
 
     /// @notice Times `serviceQueue` refused while the money to pay its head was sitting in the
     ///         pool. The signature of the bug this suite was written around: it must stay zero.
@@ -238,6 +334,42 @@ contract LenderHandler is Test {
     uint256 public principalUnitIssuances;
     uint256 public principalUnitIssuanceMismatches;
 
+    /// @notice The denominator under the correction audit round 24 made to the ghost above, and
+    ///         the one number that says this campaign is not measuring drift zero.
+    /// @dev **Audit round 24: `_recordPrincipalUnitIssuance` was FALSE, and no campaign could see
+    ///      it.** It compared `totalPrincipalUnits()` with `unitsBefore + expected` - which is the
+    ///      figure at the exponent the entry was quoted at, not the figure the contract is left
+    ///      holding when `_deposit` renormalises on the way out. The expression is corrected rather
+    ///      than the call excluded, because excluding the calls where the exponent moved is exactly
+    ///      how a vacuous invariant is made to look green, and that is the class being fixed here.
+    ///
+    ///      This counter exists so the correction cannot rot back into vacuity unnoticed. If it is
+    ///      zero the ghost has only ever been evaluated at `shift == 0`, where the corrected and
+    ///      the false expressions are identical - which is the state the shipped-ceiling campaign
+    ///      is in and the reason `LenderPoolInvariantsAtALoweredCeiling` exists.
+    uint256 public principalUnitIssuancesAcrossAShift;
+
+    /// @notice Times `_renormaliseUnits` actually fired during an action, the largest number of
+    ///         live queue entries standing when one did, and the largest escrow residue observed.
+    /// @dev **The three numbers audit round 24 found nobody had.** At the shipped ceiling
+    ///      `unitExponent` was 0 at every seed across 128,000 calls, so every relaxed bound in
+    ///      `invariant_principalUnitsConserveNetDeposits` was being evaluated at drift zero and the
+    ///      campaign would have passed identically with those `assertLe`s written as the `assertEq`s
+    ///      they replaced.
+    ///
+    ///      `maxLiveEntriesAtAShift` is the `h` the escrow bound is written against, and it is
+    ///      recorded **at the shift** rather than continuously, because that is the only moment the
+    ///      residue can change: between shifts every credit and every debit against the escrow moves
+    ///      the entry and the escrow by exactly the same figure. That is also why one walk of the
+    ///      queue per renormalisation is enough to keep `maxEscrowResidueObserved` complete.
+    uint256 public renormalisationsObserved;
+    uint256 public maxLiveEntriesAtAShift;
+    uint256 public maxEscrowResidueObserved;
+
+    /// @notice Completed crush-and-recover cycles, which is the only thing that moves the price of
+    ///         admission far enough for the ceiling to bind.
+    uint256 public crushAndRecoverCycles;
+
     /// @notice Successful live-tail entries and independently observed quote disagreements.
     /// @dev The production previews deliberately diverge from `convertToAssets`/`convertToShares`
     ///      while a stream is live: exact entry prices include the projected unreleased tail, while
@@ -283,9 +415,28 @@ contract LenderHandler is Test {
         uint256 lends;
         uint256 netDeposits;
         uint256 entries;
+        uint256 unitExponent;
     }
 
     Watch private _before;
+
+    /// @notice The two pre-call readings the partial-fill check needs.
+    /// @dev **Storage for the same two reasons `Watch` above is.** They have to stay live across
+    ///      the external call the action makes, and `serviceQueue` is the action this file already
+    ///      measured as sitting at the compiler's stack limit - two more locals there is what tips
+    ///      it over. Written by `_observeFill` at the top of the `serviceQueue` action, read by
+    ///      `_recordPartialFill` in the branch that took one. Nothing else touches it, and the
+    ///      handler's actions never nest - `serviceAThinnedQueue` is deliberately not `watched`
+    ///      for exactly that reason - so one slot is enough.
+    struct FillWatch {
+        uint256 supply;
+        uint256 exitAssets;
+    }
+
+    FillWatch private _fill;
+
+    mapping(address account => bool credited) private _creditedInGeneration;
+    uint256 public creditedHolderCount;
 
     modifier watched() {
         _observe();
@@ -304,6 +455,7 @@ contract LenderHandler is Test {
         _before.lends = lendsDone;
         _before.netDeposits = pool.netDeposits();
         _before.entries = depositsDone + mintsDone;
+        _before.unitExponent = pool.unitExponent();
     }
 
     function _settle() private {
@@ -363,6 +515,74 @@ contract LenderHandler is Test {
             if (depositsDone + mintsDone == _before.entries) ++netDepositsRoseWithNoDepositOrMint;
         }
         if (net < _before.netDeposits) ++netDepositsFalls;
+
+        _recordCreditedHolders();
+        _recordRenormalisation();
+    }
+
+    /// @dev Recorded at the shift and only at the shift. The escrow residue - escrowed units in
+    ///      excess of what the live entries between them claim - changes at no other moment:
+    ///      `_requestWithdrawal` credits the escrow exactly what it writes on the entry,
+    ///      `cancelWithdrawalRequest` and both `serviceQueue` branches debit exactly what they read
+    ///      off it, and a shift is the only event that floors the two sides independently. One walk
+    ///      of the queue per renormalisation is therefore complete, and a walk after every action
+    ///      would cost the campaign a queue scan per call to learn nothing new.
+    function _recordRenormalisation() private {
+        if (pool.unitExponent() == _before.unitExponent) return;
+        ++renormalisationsObserved;
+
+        (uint256 queueUnits, uint256 liveEntries) = _liveQueueUnits();
+        if (liveEntries > maxLiveEntriesAtAShift) maxLiveEntriesAtAShift = liveEntries;
+
+        uint256 residue = pool.principalUnits(address(pool)) - queueUnits;
+        if (residue > maxEscrowResidueObserved) maxEscrowResidueObserved = residue;
+    }
+
+    /// @dev The `h` the renormalisation drift bound is written against: every account that has been
+    ///      credited units **at any point in the current generation**.
+    ///
+    ///      **Not the accounts currently reading a non-zero figure, and the difference is a real
+    ///      failure rather than a theoretical one.** A holder whose units have floored all the way
+    ///      to zero contributed its floor to the drift on the way down and can then exit without
+    ///      clearing its stored figure, because `_update` only writes the remainder when it moves
+    ///      units. Counting the visible holders reported `h = 1` against a real drift of 1 and
+    ///      failed a bound that is true; the fuzz in `LenderPoolPrincipalRescaling.t.sol` found it
+    ///      on run 3. Recorded after every action and cleared when a generation roll clears the
+    ///      ledger it is counting.
+    function _recordCreditedHolders() private {
+        // **The roll check goes FIRST, and audit round 25 found out why.** The saturation early
+        // return below used to sit above this block, which made the reset unreachable: once four
+        // lenders and the escrow had each held anything, the count was pinned at five and no
+        // generation roll could clear it. MEASURED at 5 after a full unwind leaving
+        // `totalPrincipalUnits == 0`, so the bound this counter feeds degraded to the slack
+        // constant this file argues against two paragraphs above, and the deterministic sibling -
+        // which has no early return - disagreed with it about the same quantity.
+        // `test_aGenerationRollClearsTheCreditedHolderCount` is the guard on the ordering.
+        if (pool.totalPrincipalUnits() == 0) {
+            for (uint256 i = 0; i < actors.length; i++) {
+                _creditedInGeneration[actors[i]] = false;
+            }
+            _creditedInGeneration[address(pool)] = false;
+            creditedHolderCount = 0;
+            return;
+        }
+
+        // Nothing left to learn once every possible holder is marked, and this runs after every
+        // action of every campaign, so the early return is worth its two lines. It has to stay
+        // below the roll check for the reason above.
+        if (creditedHolderCount == actors.length + 1) return;
+
+        for (uint256 i = 0; i < actors.length; i++) {
+            _markCredited(actors[i]);
+        }
+        _markCredited(address(pool));
+    }
+
+    function _markCredited(address account) private {
+        if (_creditedInGeneration[account]) return;
+        if (pool.principalUnits(account) == 0 && pool.balanceOf(account) == 0) return;
+        _creditedInGeneration[account] = true;
+        ++creditedHolderCount;
     }
 
     constructor(LenderPool pool_, MockUSDC usdc_, address creditManager_, address epochHarvester_) {
@@ -383,12 +603,62 @@ contract LenderHandler is Test {
         }
     }
 
+    function _observeFill() private {
+        _fill.supply = pool.totalSupply();
+        _fill.exitAssets = pool.exitAssets();
+    }
+
+    /// @notice What a partial fill had to produce, checked from outside against state read before
+    ///         the call.
+    /// @dev **The conversion is restated, never asked of the pool.** `serviceQueue` computes the
+    ///      share slice as `_exitToShares(idle, Floor)`; asking the pool for that same number and
+    ///      comparing would agree with itself under every mutation, which is the tautology shape
+    ///      round 25 filed against `RiskParams.invariants.t.sol`. These are OZ's ERC-4626 terms
+    ///      written out, with `exitAssets()` in place of `totalAssets()` and `10**3` for
+    ///      `_decimalsOffset()`.
+    ///
+    ///      **Why call-level deltas are the right measurement here and would not be in the other
+    ///      two branches.** A call the handler counts as a partial fill stops on the entry it
+    ///      partially filled: the loop `break`s underneath it, and everything the walk could have
+    ///      done in front of it - stepping over a zero-share husk, releasing dust - moves no USDC
+    ///      and burns no shares. So exactly one burn happened in the whole call and the supply
+    ///      delta is that burn. A fill counted as full may be one of several in the same call and
+    ///      is not measured this way.
+    ///
+    ///      **Under-counts on purpose, in one case.** A partial fill that happens *behind* a dust
+    ///      release in the same call is counted as `dustReleases` by the prediction above and never
+    ///      reaches here. Under-counting a denominator is safe; over-counting it is not.
+    function _recordPartialFill(uint256 idleBefore) private {
+        uint256 s = _fill.supply + 10 ** 3;
+        uint256 a = _fill.exitAssets + 1;
+        uint256 floored = Math.mulDiv(idleBefore, s, a, Math.Rounding.Floor);
+
+        // The denominator. Where the division is exact the two roundings are one number and the
+        // numerator below is structurally incapable of rising, so a campaign that only ever hit
+        // exact ratios would report a green invariant over nothing.
+        if (floored != Math.mulDiv(idleBefore, s, a, Math.Rounding.Ceil)) {
+            ++partialFillsWithInexactShareRounding;
+        }
+
+        uint256 burned = _fill.supply - pool.totalSupply();
+        if (burned > floored) ++partialFillsBurningMoreThanTheCashCovers;
+    }
+
     function _actor(uint256 seed) internal view returns (address) {
         return actors[seed % actors.length];
     }
 
     function _borrower(uint256 seed) internal view returns (address) {
         return borrowers[seed % borrowers.length];
+    }
+
+    /// @dev The receiver draw for `requestWithdrawal`, and the pool is in it. See
+    ///      `escrowReceiverRequestsRefused` for why. Deliberately **not** `_actor`: the owner draw
+    ///      must stay the actor set, because an owner is somebody who can hold shares and the pool
+    ///      escrow is not.
+    function _receiverIncludingTheEscrow(uint256 seed) internal view returns (address) {
+        uint256 slot = seed % (actors.length + 1);
+        return slot == actors.length ? address(pool) : actors[slot];
     }
 
     /// @dev So an invariant can walk the other direction and check that no marked borrower is
@@ -428,12 +698,38 @@ contract LenderHandler is Test {
         totalMinted += amount;
     }
 
+    /// @dev **Corrected in audit round 24, and the correction is the whole point of the ghost.**
+    ///      `_deposit` credits the receiver at the pre-entry ratio and *then* calls
+    ///      `_renormaliseUnits`, so what the contract is left holding is
+    ///      `(unitsBefore + expected) >> shift`, not `unitsBefore + expected`. Written without the
+    ///      shift this ghost was simply false on every entry that crossed the ceiling, and no
+    ///      campaign could see it because none of them ever crossed one.
+    ///
+    ///      The shift term is exact rather than a tolerance. `_renormaliseUnits` halves the
+    ///      aggregate one bit at a time, and repeated integer halving is a single shift -
+    ///      `floor(floor(x/2)/2) == floor(x/4)` - so the whole loop is `>> shift` with
+    ///      `shift = unitExponent_after - unitExponent_before`. A shift of 256 or more yields zero,
+    ///      which is what the contract's own reads do and is the honest answer at that resolution.
+    ///
+    ///      **Not excluded, corrected.** Skipping the calls where the exponent moved would make
+    ///      this counter green by refusing to look at the only calls that can falsify it, which is
+    ///      the defect class this change exists to close. `principalUnitIssuancesAcrossAShift` is
+    ///      the denominator that says the corrected branch is reached at all.
+    ///
+    ///      The pre-call exponent is read off `_before` rather than passed in: `watched` has
+    ///      already recorded it, nothing between `_observe` and the pool call can move it, and both
+    ///      call sites are close enough to the stack limit that an extra argument is a risk for no
+    ///      gain.
     function _recordPrincipalUnitIssuance(uint256 unitsBefore, uint256 netBefore, uint256 assets) private {
         uint256 expected = unitsBefore == 0
             ? assets
             : Math.mulDiv(assets, unitsBefore, netBefore, Math.Rounding.Ceil);
         ++principalUnitIssuances;
-        if (pool.totalPrincipalUnits() != unitsBefore + expected) ++principalUnitIssuanceMismatches;
+
+        uint256 shift = pool.unitExponent() - _before.unitExponent;
+        if (shift != 0) ++principalUnitIssuancesAcrossAShift;
+
+        if (pool.totalPrincipalUnits() != (unitsBefore + expected) >> shift) ++principalUnitIssuanceMismatches;
     }
 
     /// @dev An independent transcription of the exact-entry deposit quote. The pool's preview is
@@ -507,9 +803,17 @@ contract LenderHandler is Test {
             // `fail_on_revert = false` a reverting handler call is discarded, so every deposit past
             // that point would have silently stopped happening. It failed loudly instead only
             // because `invariant_theHandlerNeverDropsAFrame` watches for exactly that.
+            // **Three legal refusals since round-28 item 10 added the entry pause**, and the new
+            // one is counted separately from the other two for the reason the second one is: they
+            // are different refusals about different things, and folding them together would let
+            // any one of them fall to zero unnoticed. The pause arm is also the one that must not
+            // be swallowed by the cap arm - the whole point of the modifier is that a shut pool
+            // says so instead of claiming to be full.
             bytes4 selector = bytes4(err);
             if (selector == LenderPool.ZeroAmount.selector) {
                 ++depositsRefusedAsZeroShare;
+            } else if (selector == Pausable.EnforcedPause.selector) {
+                ++entriesRefusedByThePause;
             } else {
                 assertEq(selector, LenderPool.DepositCapExceeded.selector, "unexpected deposit revert");
                 ++depositsRefusedByCap;
@@ -517,8 +821,15 @@ contract LenderHandler is Test {
         }
     }
 
-    function mintShares(uint256 actorSeed, uint256 shares) external watched {
+    /// @dev The receiver draw here is `_actor` and not `_receiverIncludingTheEscrow`, and the
+    ///      distinction is deliberate rather than an omission. What this action varies is
+    ///      *receiver against owner*, the split `invariant_usdcIsConserved` defends; the escrow on
+    ///      this particular door is already offered on every draw by
+    ///      `attemptDonationToTheEscrow`, which counts the refusal, and a second unconstrained
+    ///      source of it here would make that counter's denominator unreadable.
+    function mintShares(uint256 actorSeed, uint256 receiverSeed, uint256 shares) external watched {
         address a = _actor(actorSeed);
+        address receiver = _actor(receiverSeed);
         shares = bound(shares, 1, 5_000e9);
         ActiveTailQuote memory tailQuote = _activeTailMintQuote(shares);
         uint256 cost = pool.previewMint(shares);
@@ -528,7 +839,7 @@ contract LenderHandler is Test {
         _mint(a, cost);
 
         vm.prank(a);
-        try pool.mint(shares, a) returns (uint256 paidAssets) {
+        try pool.mint(shares, receiver) returns (uint256 paidAssets) {
             ++mintsDone;
             if (tailQuote.observed) {
                 ++activeTailMints;
@@ -538,57 +849,145 @@ contract LenderHandler is Test {
             // Same subject as `deposit` above, for the same reason - including the live read.
             assertLe(pool.netDeposits(), pool.depositCap(), "mint crossed the cap");
         } catch (bytes memory err) {
-            assertEq(bytes4(err), LenderPool.DepositCapExceeded.selector, "unexpected mint revert");
-            ++depositsRefusedByCap;
+            // Same third arm as `deposit` above, and for the same reason.
+            if (bytes4(err) == Pausable.EnforcedPause.selector) {
+                ++entriesRefusedByThePause;
+            } else {
+                assertEq(bytes4(err), LenderPool.DepositCapExceeded.selector, "unexpected mint revert");
+                ++depositsRefusedByCap;
+            }
         }
     }
 
     /// @dev `maxWithdraw` as an executable claim rather than an assertion that restates its own
     ///      `min()`. The contract's NatSpec promises it "reports what can genuinely be taken now",
     ///      and the only honest way to check a promise like that is to take it.
-    function withdrawMax(uint256 actorSeed) external watched {
+    ///
+    ///      **The receiver and the door are both drawn since audit round 25 finding 1, and before
+    ///      that neither varied.** This action used to be `withdraw(assets, a, a)`: one door out of
+    ///      the two the pool offers, and a receiver that was always the owner, so the parameter the
+    ///      finding is about had zero variance in 128,000 calls a run. The escrow is in the
+    ///      receiver draw for the reason `escrowExitReceiversRefused` gives, and the bounded
+    ///      round-20 overload is in the door draw because it carries no guard of its own - it is
+    ///      shut only by delegating here, and a refactor could take that away without touching a
+    ///      line this file reads.
+    ///
+    ///      The bound passed to the overload is `type(uint256).max`, deliberately inert. A bound
+    ///      that could fire would make a refusal ambiguous between the guard and the slippage
+    ///      check, and telling those apart is this action's whole job.
+    ///
+    ///      The catch arm splits on the selector for the same reason the deposit arm does. A
+    ///      refusal for the *right* reason is counted; anything else is still the original
+    ///      assertion, because `maxWithdraw` offering more than `withdraw` will pay is the failure
+    ///      this action was written for and must not be swallowed by the new arm.
+    function withdrawMax(uint256 actorSeed, uint256 receiverSeed, uint256 doorSeed) external watched {
         address a = _actor(actorSeed);
+        address receiver = _receiverIncludingTheEscrow(receiverSeed);
         uint256 assets = pool.maxWithdraw(a);
         if (assets == 0) return;
 
         bool marked = pool.exitReserve() != 0;
+        bool bounded = doorSeed % 2 == 1;
         uint256 exitAssetsBefore = pool.exitAssets();
         uint256 supplyBefore = pool.totalSupply();
 
-        vm.prank(a);
-        try pool.withdraw(assets, a, a) returns (uint256 burned) {
-            ++withdrawsDone;
-            if (marked) {
-                ++exitsPricedAgainstAnImpairment;
-                if (_paidAboveTheExitPrice(assets, burned, exitAssetsBefore, supplyBefore)) {
-                    ++exitsAboveTheImpairedPrice;
-                }
+        uint256 burned;
+        bool wasPaid;
+        bytes memory err;
+        if (bounded) {
+            vm.prank(a);
+            try pool.withdraw(assets, receiver, a, type(uint256).max) returns (uint256 shares) {
+                burned = shares;
+                wasPaid = true;
+            } catch (bytes memory e) {
+                err = e;
             }
-        } catch {
-            assertTrue(false, "maxWithdraw offered more than withdraw would pay");
+        } else {
+            vm.prank(a);
+            try pool.withdraw(assets, receiver, a) returns (uint256 shares) {
+                burned = shares;
+                wasPaid = true;
+            } catch (bytes memory e) {
+                err = e;
+            }
+        }
+
+        if (!wasPaid) {
+            assertEq(
+                bytes4(err),
+                LenderPool.EscrowIsNotAHolder.selector,
+                "maxWithdraw offered more than withdraw would pay"
+            );
+            assertEq(receiver, address(pool), "an ordinary receiver was refused as if it were the escrow");
+            ++escrowExitReceiversRefused;
+            return;
+        }
+
+        if (receiver == address(pool)) ++escrowExitReceiversAccepted;
+        // The premise, counted rather than argued: money left through this door while the entry
+        // door was shut. Read after the pool call, so there is no prank left standing on it.
+        if (pool.paused()) ++exitsWhilePaused;
+        ++withdrawsDone;
+        if (marked) {
+            ++exitsPricedAgainstAnImpairment;
+            if (_paidAboveTheExitPrice(assets, burned, exitAssetsBefore, supplyBefore)) {
+                ++exitsAboveTheImpairedPrice;
+            }
         }
     }
 
-    function redeemMax(uint256 actorSeed) external watched {
+    /// @dev The share-input twin of `withdrawMax`, drawn the same way and for the same reasons.
+    ///      The bounded overload's floor is 0 here rather than `type(uint256).max`, which is the
+    ///      inert end on this side: the comparison runs the other way.
+    function redeemMax(uint256 actorSeed, uint256 receiverSeed, uint256 doorSeed) external watched {
         address a = _actor(actorSeed);
+        address receiver = _receiverIncludingTheEscrow(receiverSeed);
         uint256 shares = pool.maxRedeem(a);
         if (shares == 0) return;
 
         bool marked = pool.exitReserve() != 0;
+        bool bounded = doorSeed % 2 == 1;
         uint256 exitAssetsBefore = pool.exitAssets();
         uint256 supplyBefore = pool.totalSupply();
 
-        vm.prank(a);
-        try pool.redeem(shares, a, a) returns (uint256 paid) {
-            ++redeemsDone;
-            if (marked) {
-                ++exitsPricedAgainstAnImpairment;
-                if (_paidAboveTheExitPrice(paid, shares, exitAssetsBefore, supplyBefore)) {
-                    ++exitsAboveTheImpairedPrice;
-                }
+        uint256 got;
+        bool wasPaid;
+        bytes memory err;
+        if (bounded) {
+            vm.prank(a);
+            try pool.redeem(shares, receiver, a, 0) returns (uint256 assets) {
+                got = assets;
+                wasPaid = true;
+            } catch (bytes memory e) {
+                err = e;
             }
-        } catch {
-            assertTrue(false, "maxRedeem offered more than redeem would pay");
+        } else {
+            vm.prank(a);
+            try pool.redeem(shares, receiver, a) returns (uint256 assets) {
+                got = assets;
+                wasPaid = true;
+            } catch (bytes memory e) {
+                err = e;
+            }
+        }
+
+        if (!wasPaid) {
+            assertEq(
+                bytes4(err), LenderPool.EscrowIsNotAHolder.selector, "maxRedeem offered more than redeem would pay"
+            );
+            assertEq(receiver, address(pool), "an ordinary receiver was refused as if it were the escrow");
+            ++escrowExitReceiversRefused;
+            return;
+        }
+
+        if (receiver == address(pool)) ++escrowExitReceiversAccepted;
+        if (pool.paused()) ++exitsWhilePaused;
+        ++redeemsDone;
+        if (marked) {
+            ++exitsPricedAgainstAnImpairment;
+            if (_paidAboveTheExitPrice(got, shares, exitAssetsBefore, supplyBefore)) {
+                ++exitsAboveTheImpairedPrice;
+            }
         }
     }
 
@@ -702,18 +1101,31 @@ contract LenderHandler is Test {
     ///      unexercised, and it is what `invariant_usdcIsConserved` defends: servicing burns
     ///      against the owner and pays the receiver, so a mix-up moves money to the wrong lender
     ///      without changing any total.
+    ///
+    ///      **The escrow is in the receiver draw since audit round 24, and the acceptance is
+    ///      counted rather than reverted on.** Same shape and same reason as
+    ///      `attemptDonationToTheEscrow`: an action that undoes the damage it causes is not a
+    ///      detector, so a request that names `address(pool)` and is allowed through is left
+    ///      standing for the invariants to see rather than rolled back by an assertion here.
     function requestWithdrawal(uint256 actorSeed, uint256 receiverSeed, uint256 shares) external watched {
         address a = _actor(actorSeed);
         uint256 held = pool.balanceOf(a);
         if (held == 0) return;
         shares = bound(shares, 1, held);
+        address receiver = _receiverIncludingTheEscrow(receiverSeed);
 
         vm.prank(a);
-        try pool.requestWithdrawal(shares, _actor(receiverSeed)) {
+        try pool.requestWithdrawal(shares, receiver) {
             ++requestsQueued;
+            if (receiver == address(pool)) ++escrowReceiverRequestsAccepted;
         } catch (bytes memory err) {
-            assertEq(bytes4(err), LenderPool.AlreadyQueued.selector, "unexpected requestWithdrawal revert");
-            ++requestsRefusedAsDuplicate;
+            bytes4 selector = bytes4(err);
+            if (selector == LenderPool.EscrowIsNotAHolder.selector) {
+                ++escrowReceiverRequestsRefused;
+            } else {
+                assertEq(selector, LenderPool.AlreadyQueued.selector, "unexpected requestWithdrawal revert");
+                ++requestsRefusedAsDuplicate;
+            }
         }
     }
 
@@ -735,11 +1147,18 @@ contract LenderHandler is Test {
         }
     }
 
-    /// @dev Actor to actor only, never to the pool. A share transferred straight into the pool
-    ///      would be indistinguishable from escrow and would break
-    ///      `invariant_escrowedSharesEqualTheContractsOwnBalance` permanently - but that is an
-    ///      ERC-20 fact about every escrow-by-transfer design, not a defect in this one, and there
-    ///      is nothing the pool could do about it. Excluded on the record rather than silently.
+    /// @dev Actor to actor. The pool used to be excluded from the destination set on the grounds
+    ///      that a share transferred straight into it is "an ERC-20 fact about every
+    ///      escrow-by-transfer design, not a defect in this one, and there is nothing the pool
+    ///      could do about it".
+    ///
+    ///      **Round 23 found that exclusion expired.** It was written for the shares leg, where it
+    ///      was true, and PR #246 later added a *units* leg to the same address, where it was not:
+    ///      a donated share also mints escrow principal units that no queue entry claims and
+    ///      nothing can ever retire, which is deposit-cap headroom gone for good. That was round-23
+    ///      finding 16. There was something the pool could do about it, and it now does - see
+    ///      `attemptDonationToTheEscrow` immediately below, which is the same call this exclusion
+    ///      used to cover, kept in the sequence and required to be refused.
     function transferShares(uint256 fromSeed, uint256 toSeed, uint256 amount) external watched {
         address from = _actor(fromSeed);
         address to = _actor(toSeed);
@@ -749,6 +1168,70 @@ contract LenderHandler is Test {
 
         vm.prank(from);
         pool.transfer(to, amount);
+    }
+
+    /// @notice The call the exclusion above used to remove from the sequence, put back and
+    ///         required to fail.
+    /// @dev **This is what turns `invariant_principalUnitsConserveNetDeposits`'s escrow equality
+    ///      from a fact about the fixture into a fact about the contract.** Before round-23
+    ///      finding 16's fix the equality held only because no handler action could reach the
+    ///      pool's own address; the invariant read as coverage that was not there. Now the fuzzer
+    ///      offers a share at all three of the doors that are not `requestWithdrawal`, and the
+    ///      contract refuses all three.
+    ///
+    ///      **A success is counted and left standing, never reverted.** See
+    ///      `escrowDonationsAccepted` for the measurement that forced that shape: undoing the
+    ///      donation hid it from every invariant in the file. A refusal is caught and its selector
+    ///      asserted, both because `invariant_theHandlerNeverDropsAFrame` runs this handler under
+    ///      `fail-on-revert = true` and because a refusal for some *other* reason must not read as
+    ///      the guard working.
+    function attemptDonationToTheEscrow(uint256 fromSeed, uint256 amount, uint256 doorSeed) external watched {
+        address from = _actor(fromSeed);
+        uint256 held = pool.balanceOf(from);
+        if (held == 0) return;
+        amount = bound(amount, 1, held);
+
+        uint256 door = doorSeed % 3;
+        bool accepted;
+        bytes memory err;
+
+        if (door == 0) {
+            vm.prank(from);
+            try pool.transfer(address(pool), amount) {
+                accepted = true;
+            } catch (bytes memory e) {
+                err = e;
+            }
+        } else if (door == 1) {
+            // Assets, not shares, on this door, and bounded by the cap as well as by the balance:
+            // an ordinary `DepositCapExceeded` is not evidence about this guard either way.
+            uint256 room = pool.maxDeposit(address(pool));
+            uint256 assets = amount > room ? room : amount;
+            if (assets == 0) return;
+            vm.prank(from);
+            try pool.deposit(assets, address(pool)) {
+                accepted = true;
+            } catch (bytes memory e) {
+                err = e;
+            }
+        } else {
+            uint256 room = pool.maxMint(address(pool));
+            uint256 shares = amount > room ? room : amount;
+            if (shares == 0) return;
+            vm.prank(from);
+            try pool.mint(shares, address(pool)) {
+                accepted = true;
+            } catch (bytes memory e) {
+                err = e;
+            }
+        }
+
+        if (accepted) {
+            ++escrowDonationsAccepted;
+        } else {
+            assertEq(bytes4(err), LenderPool.EscrowIsNotAHolder.selector, "unexpected escrow-door revert");
+            ++escrowDonationsRefused;
+        }
     }
 
     // ── the queue ────────────────────────────────────────────────────────────
@@ -791,6 +1274,9 @@ contract LenderHandler is Test {
         // owner's balance tells the two apart with no prediction at all.
         (address headOwner,, uint256 headEntryShares) = _headEntry();
         uint256 headOwnerSharesBefore = headOwner == address(0) ? 0 : pool.balanceOf(headOwner);
+        // The supply and exit-asset readings the partial-fill check needs, into storage rather
+        // than onto the stack. See `_recordPartialFill`.
+        _observeFill();
 
         try pool.serviceQueue(maxEntries) {
             if (headShares == 0) return;
@@ -810,6 +1296,7 @@ contract LenderHandler is Test {
                 ++fullFills;
             } else {
                 ++partialFills;
+                _recordPartialFill(idleBefore);
             }
         } catch (bytes memory err) {
             bytes4 sel = bytes4(err);
@@ -894,6 +1381,57 @@ contract LenderHandler is Test {
         } catch (bytes memory err) {
             assertEq(bytes4(err), LenderPool.InsufficientLiquidity.selector, "unexpected lend revert");
         }
+    }
+
+    /// @notice Lend exactly what `available()` says, to the wei.
+    /// @dev **This exists because `lend` above essentially never picks that number and the
+    ///      partial-fill branch needs it.** `lend` draws uniformly over `[1, available() + 1000e6]`,
+    ///      so the probability of landing on the boundary is negligible, and a fill can only be
+    ///      partial while the head is worth more than the idle cash left behind. It also covers the
+    ///      boundary of `available()` itself, which nothing was hitting exactly.
+    function lendTheWholeFloat() external watched {
+        uint256 lendable = pool.available();
+        if (lendable == 0) return;
+
+        vm.prank(creditManager);
+        try pool.lend(lendable) {
+            ++lendsDone;
+            ++floatEmptyingLends;
+            assertGe(
+                usdc.balanceOf(address(pool)) - pool.totalClaimable(),
+                (pool.totalAssets() * Config.RESERVE_RATIO_BPS) / Config.BPS,
+                "lending the whole float ate the hot float"
+            );
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), LenderPool.InsufficientLiquidity.selector, "unexpected lend revert");
+        }
+    }
+
+    /// @notice The three moves that make a partial fill, in the only order that can produce one.
+    /// @dev **This is the widening audit round 25 asked for, and the reason it has to be a compound
+    ///      action rather than a nudge to the existing ones is an ordering constraint in the
+    ///      contract.** `available()` subtracts what the queue is already owed, so once a large
+    ///      request is standing the manager cannot lend the money out from under it. A partial fill
+    ///      therefore requires lend-then-queue-then-service, in that order, with nothing that adds
+    ///      idle cash in between - and a uniform random walk over thirty-odd actions produces that
+    ///      ordering rarely. **Measured before this existed: the branch was reached in 1 of 8
+    ///      unseeded 128,000-call campaigns.**
+    ///
+    ///      **Not `watched`.** Each of the three calls below is watched in its own right, and
+    ///      `Watch` is a single storage slot on the assumption that actions never nest. Wrapping
+    ///      this one too would make `_settle` compare against a snapshot taken inside the frame it
+    ///      is closing. Same shape as `RiskParamsHandler.proposeNearby`.
+    ///
+    ///      **It does not force the branch.** The actor may hold nothing, may already be queued, a
+    ///      reserve may be standing, and the head may be worth less than the float - all of which
+    ///      leave this a full fill, a refusal or a no-op. What it removes is the ordering
+    ///      improbability, not the state.
+    function serviceAThinnedQueue(uint256 actorSeed, uint256 receiverSeed, uint256 shares, uint256 maxEntries)
+        external
+    {
+        this.lendTheWholeFloat();
+        this.requestWithdrawal(actorSeed, receiverSeed, shares);
+        this.serviceQueue(maxEntries);
     }
 
     function repayPrincipal(uint256 amount) external watched {
@@ -993,6 +1531,113 @@ contract LenderHandler is Test {
         }
     }
 
+    /// @notice Throw the entry pause, from the owner. Round-28 items 6 and 10.
+    /// @dev **Reads first, then the prank, then the call, and the order is not stylistic.**
+    ///      `vm.prank` is spent on the *next* call including a staticcall, so `vm.prank(owner_);
+    ///      if (pool.paused())` would spend the prank on the read and send the switch call from the
+    ///      handler - which is not the owner, so every frame would refuse. That mistake is on record
+    ///      in this repository as 15,967 reverts out of 15,967 reading as
+    ///      `OwnableUnauthorizedAccount`, which is a plausible protocol failure rather than an
+    ///      obvious tooling one, and that is what made it expensive. Both reads happen above the
+    ///      prank here for that reason.
+    ///
+    ///      **Reopening is deliberately rarer than shutting.** A switch thrown on every other call
+    ///      would leave the pool paused for about half the walk in short alternating runs, and what
+    ///      this action is for is getting the *other* invariants evaluated against a paused pool for
+    ///      a stretch long enough that a deposit, an exit and a queue service all land inside one.
+    ///      One reopen in three keeps the shut state the sticky one without making it absorbing.
+    ///
+    ///      The owner is read from the pool rather than stored, because the handler is not told who
+    ///      it is - and reading it keeps this correct if the fixture ever hands ownership on.
+    function togglePause(uint256 seed) external watched {
+        bool shut = pool.paused();
+        address owner_ = pool.owner();
+        if (shut && seed % 3 != 0) return;
+
+        vm.prank(owner_);
+        if (shut) {
+            pool.unpause();
+            ++unpausesDone;
+        } else {
+            pool.pause();
+            ++pausesDone;
+        }
+    }
+
+    /// @notice A loss taken and handed straight back, in one frame. Audit round 24.
+    ///
+    /// @dev **The action the campaign needed to reach `_renormaliseUnits` at all, and without it
+    ///      the renormalisation shipped by round 23 had no fuzz coverage whatever.** The ceiling
+    ///      binds on `totalPrincipalUnits / netDeposits`, the price of admission. Deposits alone
+    ///      cannot move that quotient - they issue at it - so nothing this handler could do in a
+    ///      single frame ever crossed a ceiling, at 2**128 or anywhere else. What moves it is a loss
+    ///      that lowers the counter followed by a recovery that does not restore it, and the fuzzer
+    ///      composing `lend`, `socialiseLoss` and `recoverLoss` in that order, repeatedly, at
+    ///      compatible sizes, is not something 500 random calls does.
+    ///
+    ///      **Gentle rather than total, and the difference decides whether anything is observable.**
+    ///      Crushing the counter to one asset-wei multiplies the aggregate by about 1e10 on the next
+    ///      deposit and the renormalisation that follows shifts thirty-odd bits at once - every stale
+    ///      figure floors straight to zero, having lost far less than one post-shift unit each, so
+    ///      the integer drift is exactly zero and the bounds are back to being measured at drift
+    ///      zero by another route. Taking a fraction and refilling multiplies the aggregate by that
+    ///      fraction instead, which crosses in a shift of a few bits and leaves stale figures
+    ///      holding real numbers. `LenderPoolPrincipalRescaling.t.sol`'s `_gentleCrushCycle` is the
+    ///      deterministic sibling and records the same measurement.
+    ///
+    ///      Every call is guarded or wrapped: `invariant_theHandlerNeverDropsAFrame` runs this
+    ///      handler with `fail-on-revert = true`, so a frame that dies here is a fixture fault.
+    ///      The ghosts the other actions maintain are incremented from here too - `lendsDone`,
+    ///      `lossesSocialised`, `lossRecoveriesDone`, `timeAdvances` - because `_settle` excuses a
+    ///      price fall on `lossesSocialised` moving and a principal rise on `lendsDone` moving, and
+    ///      an action that did those things without saying so would fire two invariants that are
+    ///      correct.
+    function crushLossAndRecoverIt(uint256 seed) external watched {
+        uint256 assets = pool.totalAssets();
+        if (assets == 0) return;
+
+        // A fraction of the book, never all of it. Taking the last asset-wei empties the pool, the
+        // clamp in `_reduceNetDeposits` fires on merit, the generation rolls and the quotient goes
+        // back to one - which is the state that has to stay reachable but must not be the only one.
+        uint256 target = assets - assets / bound(seed, 2, 16);
+        uint256 crushed;
+
+        for (uint256 i = 0; i < 8 && crushed < target; i++) {
+            uint256 lendable = pool.available();
+            if (lendable != 0) {
+                vm.prank(creditManager);
+                try pool.lend(lendable) {
+                    ++lendsDone;
+                } catch {}
+            }
+
+            uint256 exposure = pool.outstandingPrincipal();
+            if (exposure == 0) break;
+            uint256 take = exposure < target - crushed ? exposure : target - crushed;
+            if (take == 0) break;
+
+            vm.prank(creditManager);
+            pool.socialiseLoss(take);
+            crushed += take;
+            ++lossesSocialised;
+        }
+
+        if (crushed == 0) return;
+
+        _mint(creditManager, crushed);
+        vm.startPrank(creditManager);
+        usdc.approve(address(pool), crushed);
+        pool.recoverLoss(crushed);
+        vm.stopPrank();
+        ++lossRecoveriesDone;
+
+        // The recovery is rated as a stream, so it has to be allowed to finish or it never reaches
+        // the book and the refill that crosses the ceiling is issued against money still in the pot.
+        skip(Config.YIELD_STREAM_DURATION + 1);
+        ++timeAdvances;
+        ++crushAndRecoverCycles;
+    }
+
     function socialiseLoss(uint256 amount) external watched {
         uint256 outstanding = pool.outstandingPrincipal();
         amount = bound(amount, 1, outstanding + 2_000e6);
@@ -1053,13 +1698,31 @@ contract LenderHandler is Test {
         }
     }
 
-    /// @dev Each live request owns an exact slice of the pool's escrowed principal units. The
-    ///      handler never transfers shares straight to the pool, so every escrowed unit must have
-    ///      exactly one queue entry behind it.
-    function sumLiveQueuePrincipalUnits() external view returns (uint256 sum) {
+    /// @dev Each live request owns an exact slice of the pool's escrowed principal units, so
+    ///      every escrowed unit must have exactly one queue entry behind it.
+    ///
+    ///      **This used to justify itself with "the handler never transfers shares straight to the
+    ///      pool", which made it a fact about the fixture rather than about the contract** - and
+    ///      round-23 finding 16 was exactly the transfer the fixture declined to make. Since that
+    ///      fix the four doors into escrow that are not `requestWithdrawal` all revert, and
+    ///      `attemptDonationToTheEscrow` drives them from inside the sequence, so the equality is
+    ///      now enforced by the contract and exercised by the fuzzer.
+    ///
+    ///      **Round 23 turned that equality into a bounded inequality** and the bound is the number
+    ///      of live entries, so both figures come back from one walk: the queue is walked on every
+    ///      invariant evaluation of every campaign and a second pass for the count would double it.
+    function sumLiveQueuePrincipalUnits() external view returns (uint256 sum, uint256 liveEntries) {
+        return _liveQueueUnits();
+    }
+
+    /// @dev The same walk, reachable from inside the handler. `_recordRenormalisation` needs it and
+    ///      an external self-call to reach a `public` view would spend any prank left standing.
+    function _liveQueueUnits() private view returns (uint256 sum, uint256 liveEntries) {
         uint256 length = pool.queueLength();
         for (uint256 i = 0; i < length; i++) {
             sum += pool.queueEntryPrincipalUnits(i);
+            (,, uint256 shares) = pool.queueEntry(i);
+            if (shares != 0) ++liveEntries;
         }
     }
 
@@ -1155,7 +1818,7 @@ contract LenderPoolInvariants is Test {
     function setUp() public {
         address admin = makeAddr("admin");
         usdc = new MockUSDC();
-        pool = new LenderPool(IERC20(address(usdc)), admin);
+        pool = _deployPool(IERC20(address(usdc)), admin);
 
         vm.startPrank(admin);
         pool.setCreditManager(creditManager);
@@ -1166,6 +1829,15 @@ contract LenderPoolInvariants is Test {
         targetContract(address(handler));
 
         PRICE_PROBE = handler.PRICE_PROBE_SHARES();
+    }
+
+    /// @dev The one seam in this fixture, and it exists so the whole campaign can be run a second
+    ///      time against a renormalisation ceiling a fuzzer can actually reach. See
+    ///      `LenderPoolInvariantsAtALoweredCeiling` at the bottom of this file, and `LowCeilingPool`
+    ///      in `LenderPoolPrincipalRescaling.t.sol` for why the seam is a ceiling override and
+    ///      nothing else.
+    function _deployPool(IERC20 usdc_, address admin) internal virtual returns (LenderPool) {
+        return new LenderPool(usdc_, admin);
     }
 
     /// Escrow and its counter are two representations of one fact, mutated by four different
@@ -1186,8 +1858,19 @@ contract LenderPoolInvariants is Test {
     ///      Empty body on purpose. The assertion is the config line, enforced by the runner. The
     ///      global `fail_on_revert = false` in `foundry.toml` stays correct for every other
     ///      invariant here and is what lets the `try`/`catch` idiom work at all.
+    ///
+    ///      **`virtual` since audit round 24, and a subclass MUST re-declare it. MEASURED.** Forge
+    ///      attaches an inline `forge-config` to the *declaration*, not to the inherited symbol, so
+    ///      the line above does not follow this function into a child contract. With `donate`
+    ///      neutered to revert unconditionally, this contract failed on the first frame and
+    ///      `LenderPoolInvariantsAtALoweredCeiling` - inheriting the guard and nothing else -
+    ///      reported **PASS over 181 dropped frames**. An empty body whose entire assertion is one
+    ///      comment is exactly the shape that fails silently when that comment is not applied, and
+    ///      nothing in the run says so: the guard still prints, still passes, and still counts.
+    ///      The repository's documentation check refuses a subclass that inherits it without
+    ///      re-declaring.
     /// forge-config: default.invariant.fail-on-revert = true
-    function invariant_theHandlerNeverDropsAFrame() public view {}
+    function invariant_theHandlerNeverDropsAFrame() public view virtual {}
 
     function invariant_escrowedSharesEqualTheContractsOwnBalance() public view {
         assertEq(pool.queuedShares(), pool.balanceOf(address(pool)), "escrow and counter disagree");
@@ -1374,9 +2057,90 @@ contract LenderPoolInvariants is Test {
     /// Money set aside for a serviced lender is no longer the pool's. The pool must always hold at
     /// least what it has promised, and the counter must agree with the individual balances behind
     /// it - two writers, one fact.
+    ///
+    /// @dev **`sumClaimable` walks the actors only, so since audit round 24 put the pool into the
+    ///      receiver draw the first line here is a second, independent detector for the fifth
+    ///      escrow door** - a payout set aside for `address(pool)` lands in the counter and in no
+    ///      actor's balance. It was already written this way and it was already true; what changed
+    ///      is that the fixture can now offer it a violation. The direct statement is the invariant
+    ///      immediately below.
+    /// @notice A pool shut to entry advertises no room to enter, and never reverts saying so.
+    /// @dev 🟥 **The ERC-4626 half of round-28 item 10, asserted over the walk.** EIP-4626 requires
+    ///      `maxDeposit` to return zero when deposits are disabled *including temporarily*, and
+    ///      forbids it from reverting under any condition - which is why the pause is expressed as
+    ///      a zero cap here and as a revert only on `deposit` and `mint`. Being a `view` that the
+    ///      runner calls on every step, this fires on both halves: a non-zero cap fails the
+    ///      assertion, and a `maxDeposit` that learned to revert kills the invariant call outright.
+    function invariant_aPausedPoolAdvertisesNoRoomToEnter() public view {
+        if (!pool.paused()) return;
+        assertEq(pool.maxDeposit(address(this)), 0, "a paused pool advertised room to deposit");
+        assertEq(pool.maxMint(address(this)), 0, "a paused pool advertised room to mint");
+    }
+
+    /// @notice The pause shuts entry and nothing else. Every exit maximum is what it would be with
+    ///         the door open.
+    /// @dev **The premise the guardian's reach rests on, as an invariant rather than as a sentence.**
+    ///      Audit round 27 refused a guardian-reachable pause next door because that one shut the
+    ///      borrower's cure; this one is only defensible while the exits stay open, so the claim is
+    ///      checked on every step of the walk rather than left to the unit tests. The right-hand
+    ///      side deliberately restates `maxRedeem`'s own formula, which reads nothing about the
+    ///      pause: the day somebody adds `if (paused()) return 0;` to an exit view, the two sides
+    ///      part company and this fires.
+    function invariant_aPausedPoolStillAdvertisesEveryExit() public view {
+        if (!pool.paused()) return;
+        uint256 idleShares = pool.convertToShares(pool.unreservedIdle());
+        uint256 n = handler.actorCount();
+        for (uint256 i = 0; i < n; i++) {
+            uint256 held = pool.balanceOf(handler.actors(i));
+            assertEq(
+                pool.maxRedeem(handler.actors(i)),
+                held < idleShares ? held : idleShares,
+                "the pause moved an exit maximum"
+            );
+        }
+    }
+
     function invariant_setAsideMoneyIsAlwaysCovered() public view {
         assertEq(pool.totalClaimable(), handler.sumClaimable(), "the claimable counter drifted");
         assertLe(pool.totalClaimable(), usdc.balanceOf(address(pool)), "owes more than it holds");
+    }
+
+    /// @notice The escrow is never a payee. Audit round 24: the fifth escrow door.
+    /// @dev `requestWithdrawal` is the only writer of `WithdrawalRequest.receiver` and therefore
+    ///      the only route by which this contract's address can reach `claimable`. With that door
+    ///      shut the balance is not merely bounded, it is zero - so this is written as an equality
+    ///      rather than as a bound, and the handler offers the fuzzer the violation on every draw.
+    ///
+    ///      Both halves, because they fail in different worlds. The counter catches a door that
+    ///      opens; the ghost catches a door that opens **and** is never serviced, which is the
+    ///      state a shorter random sequence reaches first.
+    function invariant_theEscrowIsNeverItsOwnPayee() public view {
+        assertEq(
+            handler.escrowReceiverRequestsAccepted(), 0, "a queue entry was allowed to name the escrow as receiver"
+        );
+        assertEq(pool.claimable(address(pool)), 0, "the pool set its own balance aside as owed to itself");
+    }
+
+    /// @notice The escrow is never an exit's payee either. Audit round 25 finding 1: the four
+    ///         ERC-4626 doors one field along from the fifth.
+    /// @dev **The counter, and a standing ghost that does not depend on the counter.** An exit
+    ///      naming this address burns shares and moves no USDC, so the damage is a share-price
+    ///      step and not a balance the pool can be asked about afterwards - there is no
+    ///      `claimable(address(pool))` equivalent to read back. What there is, is the escrow's own
+    ///      share balance: with `requestWithdrawal` the only route in, every share this contract
+    ///      holds belongs to a live queue entry, and an exit accepted at any of the four doors
+    ///      would burn shares the queue still claims.
+    ///
+    ///      Written as an equality against the live entries rather than as a bound, for the reason
+    ///      round-23 finding 16 gives: refusing rather than tolerating is what buys a detector
+    ///      sharp enough to state as `==`.
+    function invariant_theEscrowIsNeverAnExitPayee() public view {
+        assertEq(handler.escrowExitReceiversAccepted(), 0, "an exit door paid out to the escrow");
+        assertEq(
+            pool.balanceOf(address(pool)),
+            pool.queuedShares(),
+            "the escrow holds a share count the queue does not account for"
+        );
     }
 
     /// Monotonic *with a cause*, which is what a unit test cannot express.
@@ -1448,21 +2212,87 @@ contract LenderPoolInvariants is Test {
         uint256 units = handler.sumPrincipalUnits();
         uint256 basis = handler.sumPrincipalBasis();
         uint256 net = pool.netDeposits();
+        uint256 total = pool.totalPrincipalUnits();
 
-        assertEq(units, pool.totalPrincipalUnits(), "principal units escaped the known holders");
-        assertEq(
-            handler.sumLiveQueuePrincipalUnits(),
-            pool.principalUnits(address(pool)),
-            "queue requests lost their escrowed principal provenance"
+        // **Two of these were equalities until round 23 and are now bounded inequalities, and the
+        // relaxation is the price of the finding-7 fix.** `_renormaliseUnits` divides the whole
+        // ledger by a power of two by moving the exponent it is read against, and each stored
+        // figure floors independently at the moment it is next read - so `sum(floor) <= floor(sum)`
+        // and the aggregate over-counts. The bound is derived rather than slack: at most one unit
+        // per figure that has been credited in the current generation, `holders - 1`, which
+        // `LenderPoolPrincipalRescaling.t.sol` proves tight by neutering it to `holders - 2`.
+        // Written here as `holders` rather than `holders - 1` on purpose: the handler's count is
+        // itself an approximation of "ever credited this generation", so the campaign carries one
+        // unit of slack and the deterministic file carries the tight form. A campaign is
+        // corroboration; the tight bound is asserted where it can be neutered.
+        //
+        // The direction is the one that matters and it is not free: the aggregate **over**-counts,
+        // so no holder's units can exceed it and no burn can underflow it.
+        //
+        // **What this costs, on the record: round-23 finding 16's detector is one of these two
+        // lines.** An escrow donation shows up as `escrow units > sum of live request units`, which
+        // is exactly the signature a lazy shift now introduces as legitimate noise. It is still a
+        // detector because the bound is small and derived, and because finding 16's fix closed the
+        // four doors into escrow that are not `requestWithdrawal` - so the only way to exceed the
+        // bound is the bug. It would not be a detector against a slack constant.
+        // **Audit round 24: the escrow bound below was FALSE and no campaign could see it.** It was
+        // written against the entries that are live *now*, and the escrow's residue does not belong
+        // to them. The escrow's figure is floored once, as a sum; each entry floors independently;
+        // so a shift leaves `floor(sum(r_i) + D) - sum(floor(r_i))` behind, and every entry can then
+        // leave carrying exactly its own read while that difference stays with an address that has
+        // no shares and no entry. MEASURED deterministically in
+        // `LenderPoolPrincipalRescaling.t.sol`: after both entries cancel, `balanceOf(pool) == 0`,
+        // `queuedShares == 0` and `principalUnits(pool) == 1`. Written against the live count that
+        // reads `1 <= 0`.
+        //
+        // The bound that is true is `H - 1`, with `H` the largest number of entries that were live
+        // when a shift fired - the same induction the holder bound above uses, one level in. With
+        // `D` the residue before a shift of `k`, `h` the entries live at it and `r_i` their reads,
+        // `D' = floor((sum(r_i) + D) / 2**k) - sum(floor(r_i / 2**k)) <= floor((D + h*(2**k - 1)) / 2**k)`,
+        // which is `h - 1` whenever `D <= h - 1`; `D` starts at zero, so it is inductive, and a
+        // shift with fewer entries live can only shrink it. Entries arriving and leaving between
+        // shifts move `D` by nothing at all: `_requestWithdrawal` credits the escrow exactly what it
+        // writes on the entry, and cancel, dust release and both fill branches debit exactly what
+        // they read off it.
+        //
+        // `H` therefore has to be a historical maximum rather than today's count, and the handler
+        // records it at the shift itself. Nothing looser is being smuggled in: at `H == 0` this is
+        // an equality with zero, and the deterministic sibling neuters it at `H - 2` and goes red.
+        (uint256 queueUnits,) = handler.sumLiveQueuePrincipalUnits();
+        uint256 escrow = pool.principalUnits(address(pool));
+        uint256 entriesAtAShift = handler.maxLiveEntriesAtAShift();
+
+        assertLe(units, total, "principal units escaped the known holders");
+        assertLe(total - units, handler.creditedHolderCount(), "the unit aggregate drifted beyond its bound");
+        assertLe(queueUnits, escrow, "queue requests claim more escrowed principal than the escrow holds");
+        assertLe(
+            escrow - queueUnits,
+            entriesAtAShift == 0 ? 0 : entriesAtAShift - 1,
+            "escrowed principal units drifted beyond the flooring residue a shift can leave"
         );
         assertFalse(handler.hasPrincipalUnitsOnEmptyQueueEntry(), "an empty queue entry retained principal units");
-        assertEq(units == 0, net == 0, "principal units and admitted principal disagree on emptiness");
-        assertLe(net, units, "admitted principal rose above its accounting units");
+        assertEq(total == 0, net == 0, "principal units and admitted principal disagree on emptiness");
+        assertLe(net, total, "admitted principal rose above its accounting units");
         assertGe(basis, net, "holder bases do not reconstruct admitted principal");
         assertLe(basis - net, handler.actorCount(), "holder-basis rounding exceeded one unit per boundary");
+        assertLt(total, pool.principalUnitCeiling(), "the unit aggregate was left above its ceiling");
     }
 
-    /// @notice A holder with no vault shares cannot retain principal-accounting units.
+    /// @notice A holder with no vault shares cannot retain principal-accounting units, and an empty
+    ///         escrow keeps at most the flooring residue a renormalisation can leave.
+    ///
+    /// @dev **The actor half is an equality and the escrow half cannot be, and audit round 24 found
+    ///      the second one shipped as an equality anyway.** An actor exits through `_update`'s
+    ///      proportional branch, which writes `heldUnits - movedUnits` and takes `movedUnits ==
+    ///      heldUnits` on a full balance, so an emptied actor is exactly zero. The escrow exits
+    ///      through `_transferWithExactPrincipalUnits` and `_burnWithExactPrincipalUnits`, which
+    ///      move the figure the *entry* carries rather than the figure the escrow holds - and after
+    ///      a shift those two are not the same number, because the escrow's was floored as a sum and
+    ///      the entries' were floored one by one. So the escrow can be left holding a residue with
+    ///      no shares and no entry behind it, and that is not a defect in the contract: it is the
+    ///      documented, bounded cost of lazy renormalisation, worth at most one asset-wei of cap
+    ///      headroom per entry. See `invariant_principalUnitsConserveNetDeposits` for the induction
+    ///      and `LenderPoolPrincipalRescaling.t.sol` for the executed trace.
     function invariant_noPrincipalUnitsOutliveShares() public view {
         uint256 count = handler.actorCount();
         for (uint256 i = 0; i < count; i++) {
@@ -1473,7 +2303,12 @@ contract LenderPoolInvariants is Test {
         }
 
         if (pool.balanceOf(address(pool)) == 0) {
-            assertEq(pool.principalUnits(address(pool)), 0, "empty queue escrow retained principal units");
+            uint256 entriesAtAShift = handler.maxLiveEntriesAtAShift();
+            assertLe(
+                pool.principalUnits(address(pool)),
+                entriesAtAShift == 0 ? 0 : entriesAtAShift - 1,
+                "empty queue escrow retained more than a shift's flooring residue"
+            );
         }
     }
 
@@ -1637,6 +2472,35 @@ contract LenderPoolInvariants is Test {
         );
     }
 
+    /// @notice A partial fill never burns more shares than the cash it pays out can buy back.
+    /// @dev **The branch was reached and nothing looked inside it.** Audit round 25, finding 2:
+    ///      flipping `serviceQueue`'s partial-fill `_exitToShares(idle, Floor)` to `Ceil` stayed
+    ///      green across all 58 invariant evaluations in this file and all 900 deterministic tests
+    ///      in the repo - zero detection in a 993-test suite - while `partialFills` had been
+    ///      counting the branch since it was written. Counting a branch is not a statement about
+    ///      what the branch does.
+    ///
+    ///      The predicate is `sharesBurned * (exitAssets() + 1) <= idle * (totalSupply() + 10**3)`,
+    ///      on state read before the call, restated in `_recordPartialFill` rather than asked of
+    ///      the pool. In words: the pool may not retire a share slice worth more, at the price it
+    ///      is paying at, than the cash it actually hands over. Rounding the conversion up is
+    ///      exactly the way to break it, which is what the contract's own comment says and what
+    ///      nothing was checking.
+    ///
+    ///      **What would have to be true for this to pass without measuring anything**: every
+    ///      partial fill in the campaign landing on an exact division, where Floor and Ceil are the
+    ///      same number and the counter cannot rise. That is a real state, not a hypothetical -
+    ///      `LenderPool.t.sol::test_theRoundNumberFixtureCannotSeeThePartialFillRounding` pins a
+    ///      fixture where it holds. `test_handlerCanReachEveryStateTheInvariantsCheck` therefore
+    ///      asserts `partialFillsWithInexactShareRounding`, not `partialFills`.
+    function invariant_aPartialFillNeverBurnsMoreThanItsCashCovers() public view {
+        assertEq(
+            handler.partialFillsBurningMoreThanTheCashCovers(),
+            0,
+            "a partial fill burned a bigger share slice than its idle cash converts to"
+        );
+    }
+
     /// @notice A markdown is temporary; a lost place in a FIFO queue is not.
     /// @dev Audit round 12 found the release branch could not tell "worthless" from "marked down to
     ///      nothing", and one permissionless call handed the whole queue back. The branch was fixed
@@ -1734,7 +2598,7 @@ contract LenderPoolInvariants is Test {
         handler.deposit(1, 1, 5_000e6);
         assertEq(handler.depositsDone(), 3, "deposits must be possible");
 
-        handler.mintShares(2, 1_000e9);
+        handler.mintShares(2, 2, 1_000e9);
         assertEq(handler.mintsDone(), 1, "mint must be possible");
 
         // The rising half of the deposit-cap counter's denominator. Audit round 22, finding 15:
@@ -1765,7 +2629,7 @@ contract LenderPoolInvariants is Test {
         // are the evidence. The small amounts leave ample room under the principal cap reached
         // above; a cap refusal would leave the denominator at zero and fail here.
         handler.deposit(2, 2, 1e6);
-        handler.mintShares(3, 1e9);
+        handler.mintShares(3, 3, 1e9);
         assertGt(handler.activeTailDeposits(), 0, "an active-tail deposit quote was never observed");
         assertGt(handler.activeTailMints(), 0, "an active-tail mint quote was never observed");
 
@@ -1785,8 +2649,8 @@ contract LenderPoolInvariants is Test {
 
         // Actors 0 and 1 exit completely here, which is why the queue below is driven by actors
         // 2 and 3 - the only two still holding shares.
-        handler.withdrawMax(0);
-        handler.redeemMax(1);
+        handler.withdrawMax(0, 0, 0);
+        handler.redeemMax(1, 1, 0);
         assertEq(handler.withdrawsDone(), 1, "maxWithdraw must be executable");
         assertEq(handler.redeemsDone(), 1, "maxRedeem must be executable");
 
@@ -1845,6 +2709,26 @@ contract LenderPoolInvariants is Test {
 
         handler.serviceQueue(5);
         assertEq(handler.partialFills(), 1, "the partial-fill path was never taken");
+        // **Reaching the branch was never the whole problem.** Where `idle * s` divides `a`
+        // exactly, Floor and Ceil are one number and
+        // `invariant_aPartialFillNeverBurnsMoreThanItsCashCovers` is structurally incapable of
+        // failing. This driver has reached the branch since the day it was written and the
+        // Floor -> Ceil mutation survived it anyway. So the assertion is on the denominator.
+        assertGt(
+            handler.partialFillsWithInexactShareRounding(),
+            0,
+            "the partial fill this driver builds rounds exactly, so nothing here can see the rounding"
+        );
+        // `_recordPartialFill` writes the decimals offset out as `10 ** 3` rather than asking the
+        // pool for it, which is deliberate and is only safe while the offset is what it says. A
+        // change there would make the ghost mis-predict silently in whichever direction, so it goes
+        // red here instead.
+        assertEq(pool.decimals(), 9, "the decimals offset moved, so `_recordPartialFill`'s 10**3 is stale");
+        assertEq(
+            handler.partialFillsBurningMoreThanTheCashCovers(),
+            0,
+            "the driven partial fill burned more shares than its cash converts to"
+        );
 
         // Fund it and the head clears - the case that used to leave a residual behind forever.
         // One entry only, so actor 2 stays queued and the cancel below has something to cancel.
@@ -1878,6 +2762,55 @@ contract LenderPoolInvariants is Test {
         assertEq(pool.outstandingPrincipal(), principalBeforeTheRecovery, "a recovery is not a repayment");
 
         handler.transferShares(2, 3, type(uint256).max);
+
+        // **Round-23 finding 16, and its denominator.** All three doors, on the same actor, in one
+        // block: a refusal that stopped being reachable would otherwise look identical to a
+        // refusal that never fires. Actor 3 holds the shares actor 2 just handed over.
+        handler.attemptDonationToTheEscrow(3, 1e9, 0);
+        handler.attemptDonationToTheEscrow(3, 1e6, 1);
+        handler.attemptDonationToTheEscrow(3, 1e9, 2);
+        assertEq(handler.escrowDonationsRefused(), 3, "all three escrow doors must refuse and be reachable");
+        assertEq(handler.escrowDonationsAccepted(), 0, "an escrow door accepted a share");
+
+        // **The fifth door, and its denominator.** `receiverSeed` 4 is the escrow: the draw is
+        // `seed % (actors.length + 1)` and there are four actors. Actor 3 holds shares and is not
+        // queued here, so this reaches the contract's guard rather than the handler's own bail-out
+        // or the duplicate-request refusal - a refusal for the wrong reason would read as this
+        // guard working, which is the failure the selector split in the action exists to stop.
+        assertGt(pool.balanceOf(handler.actors(3)), 0, "the fifth-door probe needs shares to offer");
+        handler.requestWithdrawal(3, 4, 1e9);
+        assertGt(
+            handler.escrowReceiverRequestsRefused(), 0, "naming the escrow as receiver must be refused and reachable"
+        );
+        assertEq(handler.escrowReceiverRequestsAccepted(), 0, "a queue entry named the escrow as its receiver");
+        assertEq(pool.claimable(address(pool)), 0, "the escrow was booked as its own payee");
+
+        // **And the four exit doors, audit round 25 finding 1, with their denominator.** Same seed
+        // convention as the fifth door above: receiver seed 4 is the escrow. Both doors are driven
+        // on each side because the round-20 bounded overloads carry no guard of their own - they
+        // are shut only by delegating to the three-argument pair, so a refusal at one door is not
+        // evidence about the other, and a refactor that gave an overload its own body would leave
+        // this line green while reopening the door.
+        //
+        // The exit counters are read as a delta rather than absolutely, because a refusal that was
+        // miscounted as a completed exit would otherwise be invisible: the campaign's own
+        // `withdrawsDone`/`redeemsDone` are what several reachability assertions above stand on.
+        assertGt(pool.maxWithdraw(handler.actors(3)), 0, "the exit-door probe needs something to take");
+        assertGt(pool.maxRedeem(handler.actors(3)), 0, "the exit-door probe needs shares to burn");
+        uint256 exitsCountedBefore = handler.withdrawsDone() + handler.redeemsDone();
+        handler.withdrawMax(3, 4, 0);
+        handler.withdrawMax(3, 4, 1);
+        handler.redeemMax(3, 4, 0);
+        handler.redeemMax(3, 4, 1);
+        assertEq(
+            handler.escrowExitReceiversRefused(), 4, "all four exit doors must refuse the escrow and be reachable"
+        );
+        assertEq(handler.escrowExitReceiversAccepted(), 0, "an exit door paid out to the escrow");
+        assertEq(
+            handler.withdrawsDone() + handler.redeemsDone(),
+            exitsCountedBefore,
+            "a refused exit was counted as a completed one"
+        );
 
         // A donation, which nobody owns and no function here can sweep. It is the slack that makes
         // the backing invariant an inequality, and it is the state audit round 11's `maxDeposit`
@@ -1955,7 +2888,7 @@ contract LenderPoolInvariants is Test {
         );
 
         // 4. And an exit through the front door, which is a different valuation path.
-        handler.withdrawMax(3);
+        handler.withdrawMax(3, 3, 0);
         assertGt(
             handler.exitsPricedAgainstAnImpairment(), 0, "no immediate exit was ever priced against a live mark"
         );
@@ -1998,6 +2931,38 @@ contract LenderPoolInvariants is Test {
             handler.exitsAboveTheImpairedPrice(), 0, "an exit was paid above the impaired price during the tripwire"
         );
 
+        // ── the entry pause (round-28 items 6 and 10) ────────────────────────
+        //
+        // Placed here rather than at the top because everything above has built a book with
+        // lenders in it and money to pay them. A pause thrown on an empty pool would count the
+        // switch and say nothing about what the invariants see on the far side of it, which is the
+        // whole reason this action exists.
+        handler.togglePause(0);
+        assertGt(handler.pausesDone(), 0, "the entry pause was never reachable");
+        assertTrue(pool.paused(), "fixture: the pool must actually be shut here");
+
+        // The entry doors refuse, and they refuse by naming the pause: the handler's catch arms
+        // still assert the cap selector on anything else, so a shut pool that reported itself full
+        // would fail here rather than be counted.
+        handler.deposit(0, 0, 1_000e6);
+        handler.mintShares(0, 0, 1_000e9);
+        assertGt(handler.entriesRefusedByThePause(), 0, "a shut door never refused an entry");
+        invariant_aPausedPoolAdvertisesNoRoomToEnter();
+
+        // And the exits stay open, which is the premise the guardian's reach rests on. Called as a
+        // function first, so the claim is checked against a state this test built deliberately
+        // rather than only against whatever the random walk happens to reach.
+        invariant_aPausedPoolStillAdvertisesEveryExit();
+        assertGt(pool.maxRedeem(handler.actors(0)), 0, "fixture: an actor must have an exit to take");
+        handler.redeemMax(0, 0, 0);
+        assertGt(handler.exitsWhilePaused(), 0, "no exit was taken while the pool was shut");
+
+        // Reopened, because a switch that only goes one way would leave every invariant above this
+        // point evaluated in one state for the rest of the run. Seed 0 takes the reopen branch.
+        handler.togglePause(0);
+        assertGt(handler.unpausesDone(), 0, "the pool could not be reopened");
+        assertFalse(pool.paused(), "the pool stayed shut");
+
         // ── the denominators under the five watched observations ─────────────
         //
         // **Five numerators that must stay zero are worth exactly as much as the evidence that the
@@ -2015,5 +2980,251 @@ contract LenderPoolInvariants is Test {
             handler.releasedBookPriceFalls(), 0, "the released book price never fell, so its cause was never tested"
         );
         assertGt(handler.exitPriceFalls(), 0, "the exit price never fell, so its cause was never tested");
+
+        // **The denominator under the action audit round 24 added.** It is last because it warps a
+        // full stream duration and rewrites the book, and everything above wants the fixture it
+        // built.
+        //
+        // What is asserted here is that the action completes and absorbs something. That the cycle
+        // *raises the price of admission* is deliberately not asserted at this point in the
+        // sequence, and the reason is worth keeping: by here the book carries far more yield than
+        // the counter admits, so the yield-first loss debit covers the whole loss and `netDeposits`
+        // does not move at all. MEASURED, the quotient after one cycle here is exactly the quotient
+        // before it. The claim belongs where the mechanism is actually driven, which is
+        // `LenderPoolInvariantsAtALoweredCeiling.test_theCampaignActuallyRenormalisesAndCanStrandTheEscrow`.
+        uint256 lossesBeforeTheCycle = handler.lossesSocialised();
+        handler.crushLossAndRecoverIt(16);
+        assertGt(handler.crushAndRecoverCycles(), 0, "the crush-and-recover cycle was never completed");
+        assertGt(handler.lossesSocialised(), lossesBeforeTheCycle, "the cycle absorbed nothing");
+        assertGt(handler.lossRecoveriesDone(), 0, "the cycle recovered nothing");
+
+        // **The denominator under `lendTheWholeFloat`, which the campaign's partial-fill widening
+        // rests on.** A ghost nothing reads is coverage that is not there, and
+        // the repository's documentation check refuses one outright. Last in the sequence because it
+        // empties the lendable book and nothing above should be run against that.
+        assertGt(pool.available(), 0, "the fixture must have something left to lend to the wei");
+        handler.lendTheWholeFloat();
+        assertGt(handler.floatEmptyingLends(), 0, "lending the float to the wei was never reachable");
+        assertEq(pool.available(), 0, "lending the whole float left something lendable behind");
+    }
+
+    /// @notice The handler's credited-holder count must fall back to zero when a generation roll
+    ///         clears the ledger it is counting.
+    ///
+    /// @dev **This exists because the reset was unreachable and no campaign could say so.** Audit
+    ///      round 25 measured `creditedHolderCount` at **5** after a full unwind leaving
+    ///      `totalPrincipalUnits == 0`: the saturation early return sat above the roll check, so
+    ///      once every actor and the escrow had held anything the counter was pinned for the rest
+    ///      of the run. The bound it feeds -
+    ///      `invariant_principalUnitsConserveNetDeposits`'s `total - units <= creditedHolderCount` -
+    ///      then degraded to a slack constant of 5, which is the exact failure the comment above
+    ///      `_recordCreditedHolders` argues against, and the deterministic sibling in
+    ///      `LenderPoolPrincipalRescaling.t.sol` has no early return and does reset, so the two
+    ///      copies of one quantity disagreed.
+    ///
+    ///      Deterministic rather than asserted over the walk, for the reason the tripwire above
+    ///      gives: the direction of the defect is loosening only, so a random campaign cannot fail
+    ///      on it however long it runs. Neutering it is one line - move the early return back above
+    ///      the roll check and this reads 5 against 0.
+    function test_aGenerationRollClearsTheCreditedHolderCount() public {
+        handler.deposit(0, 0, 4_000e6);
+        handler.deposit(1, 1, 3_000e6);
+        handler.deposit(2, 2, 2_000e6);
+        handler.deposit(3, 3, 1_000e6);
+
+        // The escrow is the fifth holder and the only one that is not an actor: a queued request
+        // moves shares to the pool's own address, which is what makes the count saturate.
+        handler.requestWithdrawal(0, 0, type(uint256).max);
+        assertEq(handler.requestsQueued(), 1, "the fixture needs a live request to credit the escrow");
+        assertEq(
+            handler.creditedHolderCount(),
+            handler.actorCount() + 1,
+            "premise: every actor and the escrow must have been credited"
+        );
+
+        // Unwind. Cancel first so the escrow gives its shares back, then take everything out; with
+        // nothing lent, `maxWithdraw` is the whole holding at every actor.
+        handler.cancelWithdrawal(0);
+        // The three seeds are pinned rather than arbitrary, and the receiver one is load-bearing.
+        // Round 26 widened `withdrawMax` to draw a receiver and a door, and `_receiverIncludingTheEscrow`
+        // can return the pool itself; if it did so here the escrow would be credited again and the
+        // count below could not reach zero. With four actors, `_actor(i)` is `actors[i % 4]` and
+        // `_receiverIncludingTheEscrow(i)` is `actors[i % 5]`, so passing `i` twice makes every actor
+        // pay itself. The door seed is even, which is the plain three-argument overload: this test is
+        // about the counter rolling, not about which door rolls it.
+        for (uint256 i = 0; i < 4; i++) {
+            handler.withdrawMax(i, i, 0);
+        }
+
+        assertEq(pool.totalPrincipalUnits(), 0, "premise: the unwind must actually roll the generation");
+        assertEq(handler.creditedHolderCount(), 0, "a generation roll left the credited-holder count pinned");
+    }
+}
+
+/// @notice **The same campaign, against a renormalisation ceiling a fuzzer can reach.**
+///
+/// @dev **Audit round 24: three shipped invariants in the file above were false, and no campaign
+///      could see it, because the campaign was running at drift zero.** The suite constructs a plain
+///      `LenderPool`, so `principalUnitCeiling()` is `2**128` in every run, and `unitExponent` was
+///      measured at 0 at seeds `0x2408` and `0x1111` across 128,000 calls each. Every relaxed bound
+///      round 23 introduced was therefore evaluated with the mechanism that forced the relaxation
+///      switched off - the campaign would have passed identically with those `assertLe`s written as
+///      the `assertEq`s they replaced, which is the definition of the thing not being tested. A
+///      control using a generation-roll ghost went red on the same runs, which is how that was
+///      established rather than assumed.
+///
+///      So the ceiling is lowered and everything else is left exactly as it was. `LowCeilingPool` is
+///      the seam `LenderPoolPrincipalRescaling.t.sol` already carries for the deterministic half of
+///      this mechanism, reused rather than rebuilt: overriding `principalUnitCeiling()` and nothing
+///      else, with `test_thePrincipalUnitCeilingIsTheShippedValue` over there pinning what the real
+///      pool uses. Every invariant, ghost and reachability assertion in the contract above is
+///      inherited unchanged, which is the point - this is not a second suite with its own bounds, it
+///      is the same claims evaluated where the arithmetic they are about actually happens.
+///
+///      Both campaigns are kept. The shipped-ceiling run is the production regime and it is the one
+///      that would notice a change making the ceiling reachable in ordinary operation; this one is
+///      the only place the relaxed bounds are anything but assertions about zero.
+///
+///      **It runs at 64 rather than 256, and the number is measured rather than picked.** MEASURED
+///      standalone, which is the only footing on which any two of these figures are comparable: the
+///      shipped-ceiling campaign is 228.58s before `crushLossAndRecoverIt` and 262.78s after, so the
+///      new action costs **34s**, and this campaign is **60.4s at 64 runs**. Whole-suite wall clock
+///      went 25m59s at 256 to 22m57s at 64.
+///
+///      **A suite's "finished in" inside a parallel `forge test` measures how long it waited as much
+///      as how long it ran, so it is not a cost.** This contract reported 1,555.77s in the full run
+///      and 60.4s on its own, against 3,185s of its own CPU - it is simply the last suite scheduled.
+///      An earlier draft of this paragraph put the 1,555.77s beside the *standalone* 262.78s and
+///      concluded the campaign was six times the cost of its parent. It is not; the two numbers were
+///      never measured the same way. Compare standalone with standalone, or whole-suite with
+///      whole-suite, and never one of each.
+///
+///      At 64 this still walks 32,000 calls per invariant, the shipped-ceiling campaign keeps the
+///      full 256 over the production regime, and the tight claims are asserted deterministically by
+///      the reach test below rather than left to the random walk. Cutting the *other* campaign would
+///      have been the wrong lever: that one is the regime the protocol actually ships in.
+/// forge-config: default.invariant.runs = 64
+contract LenderPoolInvariantsAtALoweredCeiling is LenderPoolInvariants {
+    function _deployPool(IERC20 usdc_, address admin) internal override returns (LenderPool) {
+        return new LowCeilingPool(usdc_, admin);
+    }
+
+    /// @notice Re-declared, and it has to be. See the parent's copy for the measurement.
+    /// @dev Forge attaches inline config to a declaration, not to an inherited symbol. Inheriting
+    ///      this guard without re-declaring it gives a frame guard that runs under the global
+    ///      `fail_on_revert = false` and passes over every dropped frame - MEASURED at 181 of them
+    ///      in this contract while the parent failed on the first. The documentation check
+    ///      refuses the omission, because nothing in a run reports it.
+    ///
+    ///      **`virtual override`, and the `virtual` half is not decoration.** Audit round 25 found
+    ///      this declaration was `override` alone, which makes the detector's own prescribed repair
+    ///      impossible for the next subclass: a third suite re-declaring this guard does not compile
+    ///      at all (`Error (4334): Trying to override non-virtual function`), so the check would
+    ///      demand a line that cannot be written. The re-declaration recurs every time a subclassed
+    ///      campaign is added - that is #279's own conclusion - so the chain has to stay open, and
+    ///      now refuses a non-virtual override for the same reason it
+    ///      refuses a missing one.
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_theHandlerNeverDropsAFrame() public view virtual override {}
+
+    /// @notice The seam is the ceiling and nothing else.
+    function test_theCampaignRunsAgainstALoweredCeiling() public view {
+        assertEq(pool.principalUnitCeiling(), 1 << 40, "the harness ceiling moved");
+        assertLt(pool.principalUnitCeiling(), 1 << 128, "this campaign must not be at the shipped ceiling");
+    }
+
+    /// @notice **The reach check for the whole point of this contract, and without it the campaign
+    ///         above is the same vacuity in a second costume.**
+    ///
+    /// @dev Deterministic rather than a floor asserted over the random walk, for the reason the
+    ///      parent's tripwire gives: a per-run reachability assertion fails on the first unlucky
+    ///      sequence. What this proves is that the *handler's own actions* can reach a
+    ///      renormalisation here - not a bare `vm` poke the fuzzer has no equivalent of - so the
+    ///      random campaign is drawing from a space that contains one.
+    ///
+    ///      Two lenders queue before the cycles start, because the escrow residue only exists when
+    ///      the escrow's figure is a sum of more than one entry: floored once as a sum against each
+    ///      entry floored on its own. With a single entry the two are the same number and the bound
+    ///      being fixed here would read zero however many shifts fired.
+    function test_theCampaignActuallyRenormalisesAndCanStrandTheEscrow() public {
+        handler.deposit(0, 0, 9_000e6);
+        handler.deposit(1, 1, 5_000e6);
+        handler.deposit(2, 2, 3_000e6);
+
+        // Receiver seeds 1 and 2 are actors, not the escrow - the fifth door is the parent's
+        // business and a refused request would leave nothing queued for the residue to form in.
+        handler.requestWithdrawal(1, 1, type(uint256).max);
+        handler.requestWithdrawal(2, 2, type(uint256).max);
+        assertEq(handler.requestsQueued(), 2, "the fixture needs two entries floored independently");
+
+        // Re-queued on every pass on purpose. A stale entry loses a bit of resolution at every
+        // shift and never regains it, so after three or four cycles both entries read zero and the
+        // residue can no longer form from them - which is the same "the shift size decides what is
+        // observable" trap `_gentleCrushCycle` was written for, arriving through the clock instead
+        // of through the size.
+        uint256 unitsBeforeTheCycles = pool.totalPrincipalUnits();
+        uint256 netBeforeTheCycles = pool.netDeposits();
+        for (uint256 i = 0; i < 24 && handler.maxEscrowResidueObserved() == 0; i++) {
+            handler.cancelWithdrawal(1);
+            handler.cancelWithdrawal(2);
+            handler.requestWithdrawal(1, 1, type(uint256).max);
+            handler.requestWithdrawal(2, 2, type(uint256).max);
+            handler.crushLossAndRecoverIt(16);
+            handler.deposit(0, 0, 4_000e6);
+        }
+
+        assertGt(
+            pool.totalPrincipalUnits() * netBeforeTheCycles,
+            unitsBeforeTheCycles * pool.netDeposits(),
+            "the cycles did not raise the price of admission, so nothing could ever reach the ceiling"
+        );
+
+        assertGt(handler.renormalisationsObserved(), 0, "the handler's own actions never renormalised");
+        assertGt(pool.unitExponent(), 0, "the exponent never moved, so every bound was measured at drift zero");
+        emit log_named_uint("MEASURED unitExponent reached by handler actions", pool.unitExponent());
+        emit log_named_uint("MEASURED renormalisations", handler.renormalisationsObserved());
+        emit log_named_uint("MEASURED live entries at a shift", handler.maxLiveEntriesAtAShift());
+        emit log_named_uint("MEASURED escrow residue", handler.maxEscrowResidueObserved());
+        emit log_named_uint("MEASURED issuances across a shift", handler.principalUnitIssuancesAcrossAShift());
+
+        assertGt(
+            handler.principalUnitIssuancesAcrossAShift(),
+            0,
+            "no entry was ever quoted across a shift, so the corrected issuance ghost is untested"
+        );
+
+        // **And the residue itself, which is the quantity the false bound could not see.** Zero
+        // here would mean the escrow bound is still only ever evaluated at drift zero, by a longer
+        // route. MEASURED in this trace: `unitExponent` 10 over seven renormalisations, two
+        // entries live at a shift, and a residue of exactly 1 - the same figure round 24 measured
+        // by hand.
+        assertGt(handler.maxEscrowResidueObserved(), 0, "the escrow never carried a residue at all");
+        assertLe(
+            handler.maxEscrowResidueObserved(),
+            handler.maxLiveEntriesAtAShift() - 1,
+            "the residue exceeded one unit per entry boundary"
+        );
+
+        // The three corrected claims, evaluated here rather than only by the random walk, so the
+        // state they were false in is reached by a sequence somebody can read.
+        invariant_principalUnitIssuanceMatchesThePreEntryRatio();
+        invariant_principalUnitsConserveNetDeposits();
+        invariant_noPrincipalUnitsOutliveShares();
+
+        // **And then drain the queue, which is the half that makes this a detector rather than a
+        // measurement.** MEASURED: with both entries still standing, the pre-fix escrow bound reads
+        // `1 <= 2` and passes, and the pre-fix `assertEq` sits behind a `balanceOf(pool) == 0` guard
+        // it never reaches - so neither neuter goes red until the entries leave and the residue is
+        // all that is left. That is the whole shape of the finding, a residue belonging to entries
+        // which no longer exist, so the state has to be in the sequence rather than left to the walk.
+        handler.cancelWithdrawal(1);
+        handler.cancelWithdrawal(2);
+        assertEq(pool.balanceOf(address(pool)), 0, "the escrow kept shares after both entries cancelled");
+        assertEq(pool.queuedShares(), 0, "the queue did not drain");
+        emit log_named_uint("MEASURED escrow units with no shares and no entry", pool.principalUnits(address(pool)));
+        assertGt(pool.principalUnits(address(pool)), 0, "the residue did not survive the drain, so nothing is tested");
+
+        invariant_principalUnitsConserveNetDeposits();
+        invariant_noPrincipalUnitsOutliveShares();
     }
 }

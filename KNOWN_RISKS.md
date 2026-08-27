@@ -16,9 +16,9 @@ they are not an external audit.
 - A **third-party capital gate** is additional. Even after the activation blockers close, no public,
   DexFi or Bond Fund capital is accepted before an external audit.
 - A **residual risk** is a known limitation that must stay disclosed and be reconsidered at go-live,
-  even when it is not one of the five current activation blockers.
+  even when it is not one of the three current activation blockers.
 
-Closing the five pool blockers is necessary but not sufficient for mainnet. The governance, wiring,
+Closing the three remaining pool blockers is necessary but not sufficient for mainnet. The governance, wiring,
 deployment and review gates below still apply.
 
 The merged principal-accounting and active-tail entry-pricing mechanisms require a fresh internal
@@ -33,7 +33,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty and not wired as `CreditManager`'s liquidity source |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
-| Current-source parity | The 2026-08-21 comparison of this public tree passed the strict length-and-metadata gate for 3 of 13 checked deployments: the three mocks |
+| Current-source parity | **None, deliberately.** This source is now synced to the working tree, which the Sepolia set predates. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
 | External audit | Not completed |
 | Third-party funds | Not accepted |
 
@@ -66,26 +66,17 @@ Known residual paths are:
 Closing this requires an explicit product/accounting choice: exact transferable lot provenance,
 restrictions on share composition, or a bounded and proven rescaling policy.
 
-### Round 22 F11: recovery cash inherits the epoch clock
+### Closed in this sync: Round 22 F11 and Round 22 F6a
 
-`recoverLoss` and the surplus branch of `repayPrincipal` rate non-epoch cash using time since the last
-yield epoch, even though that cash did not accrue over that interval. The same 400 USDC recovery was
-measured streaming over five days after a recent epoch and 180 days after a long drought. A lender
-leaving after day five forfeited 388.888889 USDC in the long-drought case.
+Both were listed here as activation blockers against the previous published source and are **fixed in
+this one**. F11 was non-epoch recovery cash rated on the yield-epoch clock (the same 400 USDC
+recovery measured streaming over five days after a recent epoch and over 180 days after a drought, a
+lender leaving on day five forfeiting 388.888889 USDC in the drought case). F6a was `_rateStream`
+flooring a new stream's duration at the old one's remaining time, so repeated deliveries could
+postpone the end of a tail indefinitely.
 
-Recovery timing needs its own clock or an explicit delivery rule.
-
-### Round 22 F6a: stream re-rating can extend the tail
-
-When `_rateStream` receives another delivery during a live stream, it floors the new duration at the
-old stream's remaining time. Repeated deliveries can therefore keep postponing the end of the tail.
-This composes with F10 entry pricing because a later entrant's prepaid tail remains locked for as long
-as the stream remains live.
-
-The duration and overlap policy must be bounded before activation.
-
-F11 and F6a must be validated together. A narrow recovery-clock fix can be masked by F6a's
-remaining-duration floor and appear to change nothing while a live tail dominates.
+They are recorded here rather than deleted because the earlier revision of this file told readers to
+treat them as live, and a reader returning to it is owed the reason the rows disappeared.
 
 ### Round 22 F12: queue service can create an uncollectable claim
 
@@ -227,34 +218,30 @@ position yield to insurance, and a live position can temporarily block the trans
 - The external audit remains a hard gate before third-party capital regardless of internal review
   count or CI status.
 
-## What this source does not yet contain
+## What this source contains
 
-This repository is a curated publication of the protocol's contracts rather than a mirror of the
-working tree, and it currently lags that tree. The lag is stated here rather than left to be found,
-because the code you are reading is the code the statements below are about.
+This repository is a curated publication of the protocol's contracts. Previous revisions lagged the
+working tree and said so here. **That lag is closed.** The four round-22 fixes this section used to
+list as absent - F4 (`setYieldRecipient` redirecting a full epoch's gross yield, closed by an
+`owedToRecipient` balance drained by a permissionless `flushYieldTo`), F5 (a blacklisted liquidity
+source freezing `pendingPrincipal` and the escape from it together, closed by `owedToSource` plus a
+permissionless `flushPrincipalTo`), F8 (`workoutSettleAfterClose` resolving its payee from state
+`closeWorkout` can empty in the same block, closed by recording a `bearer` at every close) and F9
+(`lossBearerOf` recorded at write-down time) - are all present. So is the round-23 remediation in
+full, including the entry-side EIP-5143 overloads whose absence was the clearest way to see the old
+gap from inside the source.
 
-**Measured on this tree:** `src/CreditManager.sol` here predates the round-22 remediation. Four of
-that round's fixes are therefore absent from this source, and the defects they close are live in it.
-This is the same class of disclosure as the Round 22 F18 row further down, which named one instance
-of the same lag; these are the rest of it.
+**One property the lag preserved, and this sync ends it.** The published `src/CreditManager.sol`
+used to compile to 23,833 bytes of runtime code, byte-for-byte what is deployed at the Base Sepolia
+address in `deployments/base-sepolia.json`, so what you read here was what was running on that
+testnet. It no longer is. This source compiles to a different `CreditManager`, and the Sepolia
+deployment is now **historic**: verify it against the block explorer rather than against this tree,
+and read `deployments/base-sepolia.json` as a record of what was deployed rather than a description
+of this code.
 
-| Finding | Severity | Absent from this source |
-|---|---|---|
-| Round 22 F4 | Medium to high | `setYieldRecipient` is the one money-carrying pointer with no contract-level binding check, so a full epoch's gross yield can be redirected by an owner action. The fix, an `owedToRecipient` balance drained by a permissionless `flushYieldTo`, is not here. A binding check was separately measured to be the wrong fix, because it recreates the blacklist trap the setter exists to escape |
-| Round 22 F5 | Medium | A blacklisted liquidity source freezes `pendingPrincipal` **and the escape from it**, together: the counter's only drain runs through the pointer and the pointer's only escape runs through the counter. The fix, an `owedToSource` balance plus a permissionless `flushPrincipalTo`, is not here |
-| Round 22 F8 | Medium | `workoutSettleAfterClose` resolves its payee from live state while `closeWorkout` can empty that state in the same block. The fix, a `bearer` recorded on the workout at every close, is not here |
-| Round 22 F9 | Medium | A loss can be attributed to the wrong era, in the direction that makes lender losses operator-withdrawable. The partial fix, `lossBearerOf` recorded at write-down time, is not here. Upstream this finding is only partly closed, and round 23 regraded it |
-| Round 23 remediation | mixed | Absent in full. The clearest way to see the lag from inside this source: the **exit-side** EIP-5143 overloads are present on `LenderPool` (`redeem` with `minAssetsOut`, `withdraw` with `maxSharesIn`) and the **entry-side** pair is not. That asymmetry is round-23 finding 3, closed upstream |
-
-**What this does not mean.** The activation-blocker table in `README.md` describes *this* tree and is
-accurate for it, including the Round 22 F11 and F6a rows: their fixes are part of the round-23
-remediation and are likewise absent here. Nothing in this section is closed in the code you are
-reading.
-
-**One property this lag preserves, and it is worth knowing.** `src/CreditManager.sol` here compiles
-to 23,833 bytes of runtime code, which is byte-for-byte what is deployed at the Base Sepolia address
-in `deployments/base-sepolia.json`. **What you read here is what is running on that testnet.** A
-future sync will close the gap above and end that correspondence until the next redeploy.
+**This is a disclosure that moved in both directions.** The defects listed above are no longer live
+in the code you are reading, which is better. The ability to reproduce the deployed bytecode from
+this source is gone, which is worse. Neither is worth discovering by surprise.
 
 ## Mainnet go-live requirements
 
@@ -273,7 +260,7 @@ These are additional to the pool blockers and external-audit gate.
 
 ## Additional current limitations
 
-These do not add to the five-item pool activation list, but they remain open, partly closed or
+These do not add to the three-item pool activation list, but they remain open, partly closed or
 accepted for the present pre-launch state.
 
 ### Pool, stream and liquidation
@@ -283,7 +270,7 @@ accepted for the present pre-launch state.
 | Round 21 borrower stream cadence | Bond movement and zero-claim epochs can bypass the intended epoch gap and repeatedly re-rate borrower yield; the measured trace still had 35% unreleased after five days |
 | Round 22 F16 | Public callers can pin the lot or cap the price, but cannot bind both in one call; price monotonicity across a re-strike is not restored and the widened fuzz test is still owed |
 | Round 22 F17 | `LenderPool.claim` remains the unswept member of the delegated `*For` claim class |
-| Round 22 F18 | The public source lacks the later partial workout-yield fix: a clean close still sweeps the borrower's collateral yield to insurance, and the pre-close ordering hazard also remains |
+| Round 22 F18 | **Partly closed, and this sync ships the closed half.** The insurance booking at a clean workout close is now bounded to what the lot could actually reach, rather than to what it generated. The **pre-close ordering hazard remains open**: a stranger sweeping mid-workout still changes what the close sees |
 | Round 22 F19 | `claimSurplusFor` can front-run the auction's own sweep into a revert |
 | Round 22 F23 | `_settle` can advance a borrower's yield index past a payout that floors to zero; the proposed one-line fix was measured inert |
 | Long-gap lender yield | A long delivery gap can defer several epochs and then stream about 3.10 epochs over five days rather than their original accrual windows |

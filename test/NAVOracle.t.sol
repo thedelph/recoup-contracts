@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {Config} from "../src/Config.sol";
 import {NAVOracle} from "../src/NAVOracle.sol";
@@ -403,6 +404,57 @@ contract NAVOracleTest is Test {
         vm.prank(confirmer);
         oracle.confirmNav(parked);
         assertEq(oracle.navPerBond(), parked);
+    }
+
+    /// @notice **Audit round 26, follow-up item 7.** The discarded post says so on chain.
+    /// @dev `postNav` has three outcomes and until this commit only two had a name. Beyond the
+    ///      budget with a live pending in the slot, the write-once rule above throws the value
+    ///      away: nothing is stored, the transaction succeeds, and the `NAVPending` emitted
+    ///      alongside carries the *stored* pair - byte-identical to the previous park's log, by
+    ///      design, because an observer that saw the posted value there would be reading a price
+    ///      this contract did not keep. So the rejected price reached no log at all, and telling a
+    ///      discarded post from a fresh one needed two `NAVPending` events and arithmetic.
+    ///
+    ///      **Measured on the live Base Sepolia oracle, not imagined.** The post in block 45763844
+    ///      at 2026-08-21 07:06:16 UTC landed against a slot holding 2557149953 with
+    ///      `pendingConfirmableAt` at 2026-08-20 19:05:36 UTC, free only from 19:05:36 the
+    ///      following day. It re-emitted the earlier pair unchanged and the keeper, unable to see
+    ///      its own value anywhere, reported an unknown outcome and told the operator not to re-run.
+    ///
+    ///      An event and not a revert. Reverting would fail loudly and would fail an honest keeper
+    ///      following a real correction on every run until the confirmer acts, which is the moment
+    ///      the second key most needs a working feed behind it. This costs one log and no control
+    ///      flow: the branch it sits in already existed as the `if` that did nothing.
+    function test_R30_aDiscardedPostRecordsThePriceItThrewAway() public {
+        _post((NAV * 70) / 100);
+        uint256 parked = oracle.pendingNav();
+        uint256 slotFreeAt = oracle.pendingConfirmableAt() + Config.NAV_PENDING_EXPIRY;
+
+        skip(6 hours);
+        uint256 rejected = (NAV * 50) / 100;
+
+        vm.expectEmit(false, false, false, true, address(oracle));
+        emit NAVOracle.NAVPostIgnored(rejected, slotFreeAt);
+        _post(rejected);
+
+        assertEq(oracle.pendingNav(), parked, "premise: the post was discarded, not parked");
+        assertEq(oracle.navPerBond(), NAV, "premise: and not accepted either");
+    }
+
+    /// @notice The control. A post that genuinely parks does not claim to have been discarded.
+    /// @dev Without this the event could be emitted unconditionally and the test above would still
+    ///      pass, which would make the new log worth less than no log: an operator filtering on it
+    ///      would see every out-of-budget post and learn nothing.
+    function test_R30_aPostThatParksDoesNotAnnounceItselfIgnored() public {
+        vm.recordLogs();
+        _post((NAV * 70) / 100);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 signature = keccak256("NAVPostIgnored(uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != signature, "a fresh park announced itself discarded");
+        }
+        assertEq(oracle.pendingNav(), (NAV * 70) / 100, "premise: this post really did park");
     }
 
     /// @dev The escape hatch that makes the write-once rule liveable: the second key can drop a

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {LtvMath} from "../src/LtvMath.sol";
@@ -37,6 +38,18 @@ contract VaultHandler is Test {
     address[] public actors;
     uint256 public ghostTotalBondCount; // mirror of Σ vault.bondCount
     uint256 public ghostSeizedToWinners;
+    /// @notice Bonds that came into existence through `depositETH` rather than out of an actor's
+    ///         starting wallet.
+    /// @dev **A conservation invariant has a fixture literal in it, and a new mint path is a change
+    ///      to that literal.** `invariant_bondConservation` says `wallets + staked + winners ==
+    ///      100_000 * actorCount`, which holds only while the *only* bonds in the system are the
+    ///      ones this handler's constructor minted into wallets. `depositETH` mints new units
+    ///      straight into the farm, so without this term the invariant goes red on the first ETH
+    ///      deposit the campaign draws - and it would have gone red for the right reason, which is
+    ///      why the term is added rather than the invariant weakened. It still says the vault
+    ///      creates and destroys nothing: every unit is in a wallet, in the farm, or with a winner,
+    ///      and the right-hand side now names both sources those units can have come from.
+    uint256 public ghostMintedByEth;
 
     /// @notice Coverage ghosts, distinct from the two mirrors above: those are
     ///         *quantities* and stay at zero whether an action never ran or ran and
@@ -45,6 +58,26 @@ contract VaultHandler is Test {
     ///         meaningless and must not fail a run - so a fixture that could never reach
     ///         a seize would report four green invariants having exercised nothing.
     ///         `test_handlerCanReachEveryStateTheInvariantsCheck` asserts these.
+    uint256 public depositsDone;
+    /// @notice Deposits refused by the bond-deposit switch. **Not by the pause** - the two were
+    ///         separated in audit round 25 finding 1, and the old name said the opposite
+    ///         of what is now true, which is why it was renamed rather than left alone.
+    uint256 public depositsRefusedByTheirOwnSwitch;
+    uint256 public pauseToggles;
+    /// @notice Flips of the third switch. Read by the reachability tripwire, like its siblings:
+    ///         a counter no invariant or tripwire reads is the unread-coverage-ghost shape the
+    ///         repository's documentation check looks for.
+    uint256 public bondDepositToggles;
+    /// @notice ETH deposits that landed, and ETH deposits the pause refused.
+    /// @dev **Round 26 follow-up item 5 / round 28 item 6.** `togglePause`'s own note says the two
+    ///      remaining `whenNotPaused` sites in the protocol are `CollateralVault.depositETH` and
+    ///      `CreditManager.borrow`, and that "`depositETH` has no action in this handler". This is
+    ///      that action. The second counter is the load-bearing one, for the reason
+    ///      `depositsRefusedByTheirOwnSwitch` exists next door: a refusal that is swallowed is not
+    ///      evidence the branch was reached, and both are read by
+    ///      `test_handlerCanReachEveryStateTheInvariantsCheck`.
+    uint256 public ethDepositsDone;
+    uint256 public ethDepositsRefusedByThePause;
     uint256 public withdrawsDone;
     uint256 public withdrawsRefusedByLtv;
     uint256 public harvestsWithYield;
@@ -89,14 +122,158 @@ contract VaultHandler is Test {
     ///      handler frame - so `fail_on_revert = false` discarded the call, and the guard written
     ///      for exactly this case sat one line below something that could never reach it.
     ///      Mirrors `withdraw` below, which has always read the balance first.
+    /// @dev **The `try` is what lets a switch-flipping action exist at all, and it is a
+    ///      prerequisite rather than a tidy-up.** This call used to be bare, which was correct
+    ///      while nothing in the handler could make it revert. The moment a switch over
+    ///      `depositBonds` could be on, a bare call here kills the frame and
+    ///      `invariant_theHandlerNeverDropsAFrame` fires. **Measured on this fixture before the
+    ///      `try` went in: 7,779 of 128,000 frames revert, 6.08%, every one of them this action,
+    ///      and the frame guard goes red on the two-call sequence `togglePause` then `deposit`.**
+    ///
+    ///      **That measurement is now a historical one, and the reason the `try` is needed has
+    ///      moved.** `depositBonds` came off `whenNotPaused` in the round-27 remediation, so
+    ///      `togglePause` no longer makes this revert at all; `toggleBondDeposits` does. The `try`
+    ///      is load-bearing for the same structural reason and against a different action, which
+    ///      is exactly the kind of change that leaves a correct guard sitting behind a stale
+    ///      justification - so the justification is restated rather than left.
+    ///      With it: 0 reverts, 0 discards.
+    ///
+    ///      The refusal is counted rather than swallowed, and typed rather than bare, for the
+    ///      reason `withdraw` states below: anything other than `BondDepositsArePaused` reaching
+    ///      here is a
+    ///      fixture fault, and a bare `catch {}` would hide it for as long as the suite exists.
     function deposit(uint256 actorSeed, uint256 amount) external {
         address a = _actor(actorSeed);
         uint256 heldOutside = bond.bondBalance(a);
         if (heldOutside == 0) return;
         amount = bound(amount, 1, heldOutside);
         vm.prank(a);
-        vault.depositBonds(amount);
-        ghostTotalBondCount += amount;
+        try vault.depositBonds(amount) {
+            ghostTotalBondCount += amount;
+            ++depositsDone;
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), CollateralVault.BondDepositsArePaused.selector, "unexpected depositBonds revert");
+            ++depositsRefusedByTheirOwnSwitch;
+        }
+    }
+
+    /// @notice The other deposit door: DexFi's signed ETH mint, which auto-stakes for the adapter.
+    /// @dev **Round 26 follow-up item 5, closed as round 28 item 6: this door had no campaign
+    ///      standing under it in the paused state, because it had no action in this handler at
+    ///      all.** It is one of exactly two `whenNotPaused` sites left in `src/`, and unlike its
+    ///      sibling `depositBonds` - which came off the pause in the round-27 remediation because
+    ///      it is the borrower's cure - this one stays behind it on purpose: it sends ETH into
+    ///      DexFi's mint, which is new exposure rather than a way out of one.
+    ///
+    ///      **The typed `catch` is the point of the action, not a tidy-up.** `whenNotPaused` is the
+    ///      first modifier on `depositETH`, so with the switch on there is exactly one legal answer
+    ///      and anything else reaching here is a fixture fault a bare `catch {}` would hide for as
+    ///      long as this suite exists - the rule `withdraw` and `deposit` already state. The `try`
+    ///      itself is load-bearing for the reason `deposit`'s docstring gives: without it a paused
+    ///      frame dies and `invariant_theHandlerNeverDropsAFrame` fires.
+    ///
+    ///      **The mint payload is built here rather than passed in**, because every field of it is
+    ///      a constraint the adapter checks and a fuzzed one would only ever produce reverts the
+    ///      typed `catch` would then have to tolerate: `receiver` must be the adapter
+    ///      (`ReceiverMustBeAdapter`), `msg.value` must equal `paymentAmount` exactly
+    ///      (`PaymentMismatch`, strict on purpose - the bond burns any overpayment), and the minted
+    ///      count must match `amountNfts` (`MintAmountMismatch`). What is fuzzed is the only thing
+    ///      that changes the protocol's state: which actor deposits and how many units.
+    ///
+    ///      The deadline is a year out rather than an hour, because nothing in this handler warps
+    ///      time today and a fixture that depends on that staying true is one `skip` away from
+    ///      failing on `DeadlineExpired` in an unrelated round.
+    function depositEth(uint256 actorSeed, uint256 units) external {
+        address a = _actor(actorSeed);
+        units = bound(units, 1, 500);
+        // 0.001 ETH a unit. Any strictly positive price does; what matters is that `msg.value` and
+        // `paymentAmount` are the same number, which the adapter requires exactly.
+        uint256 payment = units * 1e15;
+        bytes memory mintData = abi.encode(
+            IDexFiBond.MintDataInput({
+                uuid: 1,
+                nonce: 0,
+                receiver: address(adapter),
+                amountNfts: units,
+                paymentAmount: payment,
+                deadline: block.timestamp + 365 days,
+                signature: ""
+            })
+        );
+
+        // `vm.deal` before `vm.prank`, not after. Both orderings happen to work here because a
+        // cheatcode call does not spend a single-shot prank, but the ordering rule this file has
+        // twice been bitten by is "nothing between the prank and the call", and writing it the
+        // other way round invites the next reader to put a `paused()` read there.
+        vm.deal(a, payment);
+        vm.prank(a);
+        try vault.depositETH{value: payment}(mintData) {
+            ghostTotalBondCount += units;
+            ghostMintedByEth += units;
+            ++ethDepositsDone;
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), Pausable.EnforcedPause.selector, "unexpected depositETH revert");
+            ++ethDepositsRefusedByThePause;
+        }
+    }
+
+    /// @notice Flip the vault's pause switch, both ways.
+    /// @dev **The recorded fact this closes: the string `pause` appeared zero times in all six
+    ///      invariant suites, so every invariant in this repo covered the unpaused state only.**
+    ///      Stated against the suites rather than against a count on purpose - "how many
+    ///      invariants" has five different correct answers here depending on the basis, and the
+    ///      claim being closed is about coverage, not arithmetic. Pause is one of exactly **two**
+    ///      remaining `whenNotPaused` sites in the protocol - `CollateralVault.depositETH` and
+    ///      `CreditManager.borrow` - and it is an operating mode the protocol is expected to sit
+    ///      in during an incident, not a corner. **It was three until the deposit gate was split**;
+    ///      `depositBonds` now answers to `toggleBondDeposits` below.
+    ///
+    ///      **Measured rather than argued**: a probe invariant asserting `!vault.paused()` goes red
+    ///      on the very first `togglePause` the campaign draws, so all five invariants declared in
+    ///      this file are evaluated in the paused state as well as out of it. A second probe
+    ///      asserting `depositsRefusedByTheirOwnSwitch == 0` goes red too, so the refusal itself is
+    ///      reached and not merely possible.
+    ///
+    ///      🟩 **Both remaining sites are covered as of round 28 item 6.** This paragraph used to
+    ///      end "the other two `whenNotPaused` sites still have no campaign standing under them:
+    ///      `depositETH` has no action in this handler, and `CreditManager.invariants.t.sol` has no
+    ///      pause action at all". `depositEth` above is the first of those; `CreditHandler
+    ///      .togglePause` is the second. Same measurement in both places: a probe invariant
+    ///      asserting the door was never refused by the pause goes red on a campaign, and the
+    ///      shrunken counterexample is the toggle itself.
+    ///
+    ///      **Reads `paused()` before the prank, and that ordering is the whole of the bug this
+    ///      action shipped with for one measurement.** `vm.prank` is spent on the very next call
+    ///      including a staticcall, so `vm.prank(admin); if (vault.paused())` spends the prank on
+    ///      the read and sends `pause()` from the handler, which is not the owner. Measured: 15,967
+    ///      of 15,967 calls reverted `OwnableUnauthorizedAccount` and the frame guard went red on a
+    ///      single `togglePause`. The failure looks like a plausible access-control revert rather
+    ///      than a tooling error, which is exactly why this repo has catalogued it twice before.
+    ///
+    ///      **No `try`, on purpose.** The branch above picks whichever of the two calls is legal
+    ///      from the state it just read, and `admin` is the owner, so this cannot revert. If it
+    ///      ever does, the frame guard should say so rather than a `catch` swallowing it.
+    function togglePause() external {
+        bool isPaused = vault.paused();
+        vm.prank(admin);
+        if (isPaused) vault.unpause();
+        else vault.pause();
+        ++pauseToggles;
+    }
+
+    /// @dev The third switch, added when the deposit gate was split off the pause (audit round 25,
+    ///      finding 1). It needs its own action rather than riding on `togglePause`, because the
+    ///      entire point of the split is that the two move **independently** - a handler that
+    ///      flipped both together would leave the campaign unable to reach the three mixed states,
+    ///      which are exactly the ones an operator will be in during an incident.
+    ///
+    ///      Same prank-before-read ordering as the sibling above, and for the same reason: the
+    ///      `bondDepositsPaused()` read is a staticcall and would eat the prank.
+    function toggleBondDeposits() external {
+        bool isShut = vault.bondDepositsPaused();
+        vm.prank(admin);
+        vault.setBondDepositsPaused(!isShut);
+        ++bondDepositToggles;
     }
 
     function withdraw(uint256 actorSeed, uint256 amount) external {
@@ -306,6 +483,13 @@ contract CollateralVaultInvariants is RiskParamsFixture {
 
     /// Bond units are conserved: everything minted is in wallets, the farm, or
     /// with auction winners - nothing is created or destroyed by the vault.
+    /// @dev **The right-hand side gained a term in round 28 and did not get weaker.** It used to be
+    ///      the bare literal `100_000 * actorCount`, which was the whole supply only while the sole
+    ///      way bonds entered the system was the handler's constructor minting them into wallets.
+    ///      `depositEth` mints new units through DexFi's signed mint straight into the farm, so the
+    ///      identity now names both sources. `ghostMintedByEth` is written only inside that action's
+    ///      success branch, so a mint that reverted contributes nothing and the invariant still
+    ///      fails on a unit that appears from anywhere else.
     function invariant_bondConservation() public view {
         uint256 inWallets;
         for (uint256 i = 0; i < handler.actorCount(); i++) {
@@ -315,7 +499,7 @@ contract CollateralVaultInvariants is RiskParamsFixture {
         uint256 winners = handler.ghostSeizedToWinners();
         assertEq(
             inWallets + staked + winners,
-            100_000 * handler.actorCount(),
+            100_000 * handler.actorCount() + handler.ghostMintedByEth(),
             "minted == wallets + staked + seized"
         );
     }
@@ -387,5 +571,63 @@ contract CollateralVaultInvariants is RiskParamsFixture {
         handler.reassign(1);
         assertEq(handler.reassignsDone(), 1, "the workout reassignment must be reachable");
         assertEq(vault.bondCount(handler.auction()), 1_000, "the claim must land on the auction");
+
+        // **The paused operating mode.** Until round-26 remediation the string `pause` appeared
+        // zero times in all six invariant suites, so all of this repo's invariants covered the
+        // unpaused state only. Both directions are driven here, and the refusal is asserted on the
+        // handler's own counter rather than on `vm.expectRevert`, so this is evidence the campaign
+        // can stand in the paused state rather than evidence the modifier exists.
+        //
+        // **What changed when the deposit gate was split off the pause** (audit round 25,
+        // finding 1): `togglePause` no longer refuses a deposit at all, so the first half below now
+        // asserts the *opposite* of what it used to. That is the fix, and it is asserted here
+        // rather than only in `PausedMode.t.sol` because this file is where a future round will
+        // look to find out what the campaign can reach.
+        assertEq(handler.depositsDone(), 2, "deposits must have been reachable while unpaused");
+        handler.togglePause();
+        assertTrue(vault.paused(), "the toggle must reach the switch");
+        handler.deposit(2, 1_000);
+        assertEq(handler.depositsDone(), 3, "a paused vault must STILL take a deposit - it is the cure");
+        assertEq(handler.depositsRefusedByTheirOwnSwitch(), 0, "and refuse nothing on the pause flag");
+
+        // The third switch, which is the one that does refuse, driven independently of the pause.
+        handler.toggleBondDeposits();
+        assertTrue(vault.bondDepositsPaused(), "the third toggle must reach its own switch");
+        assertTrue(vault.paused(), "and must not have disturbed the pause flag");
+        handler.deposit(2, 1_000);
+        assertEq(handler.depositsRefusedByTheirOwnSwitch(), 1, "the bond-deposit switch must refuse");
+        assertEq(handler.depositsDone(), 3, "and must not take the deposit");
+
+        handler.toggleBondDeposits();
+        assertFalse(vault.bondDepositsPaused(), "the third toggle must come back the other way");
+
+        // **The other door, and the one the pause DOES shut** - round 26 follow-up item 5, closed as
+        // round 28 item 6. `depositETH` is still `whenNotPaused` on purpose: it sends ETH into
+        // DexFi's mint, so it is new exposure rather than the borrower's way out of one, which is
+        // the distinction the round-27 split drew. Driven while the pause is still on, so this is
+        // the refusal rather than a claim about it.
+        assertTrue(vault.paused(), "premise: the pause is still on");
+        handler.depositEth(3, 40);
+        assertEq(handler.ethDepositsDone(), 0, "an ETH deposit landed against a paused vault");
+        assertEq(handler.ethDepositsRefusedByThePause(), 1, "the ETH-deposit pause refusal was never exercised");
+
+        handler.togglePause();
+        assertFalse(vault.paused(), "the toggle must come back the other way");
+        handler.deposit(2, 1_000);
+        assertEq(handler.depositsDone(), 4, "reopening must let deposits through again");
+        assertEq(handler.pauseToggles(), 2, "both directions of the switch must be reachable");
+        assertEq(handler.bondDepositToggles(), 2, "and both directions of the third one");
+
+        // And the same door open again, which is what makes the refusal above evidence about the
+        // pause rather than about a mint payload this fixture can never satisfy. The new bonds are
+        // minted into the farm, never into a wallet, which is why `invariant_bondConservation`
+        // needed a term for them rather than a looser identity.
+        uint256 stakedBefore = handler.ghostTotalBondCount();
+        handler.depositEth(3, 40);
+        assertEq(handler.ethDepositsDone(), 1, "an ETH deposit must be possible while unpaused");
+        assertEq(handler.ghostMintedByEth(), 40, "the ETH mint must be counted as new supply");
+        assertEq(handler.ghostTotalBondCount(), stakedBefore + 40, "and must reach the vault's books");
+        (uint256 stakedNow,) = farm.userInfo(address(adapter));
+        assertEq(stakedNow, handler.sumBondCounts(), "the ETH mint must land staked, not loose");
     }
 }

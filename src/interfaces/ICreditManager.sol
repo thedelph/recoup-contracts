@@ -64,6 +64,13 @@ interface ICreditManager {
     /// @return Yield this position has earned but not yet settled.
     function pendingYieldOf(address borrower) external view returns (uint256);
 
+    /// @return Yield already settled out of a position and waiting to be collected.
+    /// @dev The other half of `pendingYieldOf`: the two together are everything this manager
+    ///      still owes an account, and neither alone is. Exposed for audit round 22, finding 18,
+    ///      where `LiquidationAuction.closeWorkout` has to bound what it books against money that
+    ///      actually exists, and a settled-but-uncollected balance is money that exists.
+    function claimableOf(address account) external view returns (uint256);
+
     /// @return Debt net of unsettled yield - what the borrower actually owes.
     ///         `debtOf` is the stored figure and can be stale between settlements.
     function currentDebtOf(address borrower) external view returns (uint256);
@@ -143,6 +150,21 @@ interface ICreditManager {
     ///         the meantime claim the whole accumulator against a zero index. A manager
     ///         that has never been attached reports zero.
     function accYieldPerBond() external view returns (uint256);
+
+    /// @notice What `bonds` bonds have earned since the accumulator stood at `sinceIndex`, in USDC.
+    /// @dev The arithmetic `_settle` runs on a position, exposed so a caller holding a *slice* of a
+    ///      position can ask about that slice. `LiquidationAuction` holds every open workout's lot
+    ///      under one ledger entry, so its own accrual is the sum of them and no per-workout figure
+    ///      can be recovered from it; a workout records the accumulator when its lot arrived and
+    ///      asks this.
+    ///
+    ///      A view rather than a formula the caller writes, because the scale factor is internal to
+    ///      the manager and a second copy of `bonds x delta / ACC_PRECISION` is a second model of the
+    ///      same quantity. Audit round 22, finding 18.
+    ///
+    ///      Prices against the *projected* accumulator, exactly as `pendingYieldOf` does, so the
+    ///      answer does not depend on whether anybody has called `accrueYield` recently.
+    function yieldAccruedOn(uint256 bonds, uint256 sinceIndex) external view returns (uint256);
 
     /// @notice The vault this manager is bound to. Exposed so the vault can refuse to
     ///         point at a manager bound elsewhere: `settleForVault` is caller-gated on

@@ -182,9 +182,22 @@ contract WirePhase4 is DeployBase {
     ///      wherever the proposer is a key rather than a Safe - and otherwise prints the calldata
     ///      for whoever does. Either way it is **one** call to transcribe, not one per leg, and the
     ///      count is printed rather than written down anywhere.
+    ///
+    ///      **Audit round 22, finding 7: it resolves `GovParams` too now, and that is a real change
+    ///      to what an operator must have in the environment before step two.** The full set -
+    ///      `RECOUP_OWNER`, `RECOUP_KEEPER`, `RECOUP_NAV_CONFIRMER`, `RECOUP_PROTOCOL_FEE_WALLET`,
+    ///      `RECOUP_YIELD_RECIPIENT` - was already required by `executeQueued()` and by
+    ///      `assertOnly()`, so nothing new has to be discovered; it has to be correct forty-eight
+    ///      hours earlier. `RECOUP_OWNER` must name the **timelock**, not the proposing key: the
+    ///      batch executes as the owner, so a graph the timelock does not own cannot execute it,
+    ///      and `_queue` is now where that is found out.
     function queue() external {
         _requireConfirmation();
-        _queue(_resolveDeployed(), TimelockController(payable(_required("RECOUP_TIMELOCK"))));
+        _queue(
+            _resolveDeployed(),
+            TimelockController(payable(_required("RECOUP_TIMELOCK"))),
+            _resolveParams(msg.sender)
+        );
     }
 
     /// @notice Shut `borrow` and the vault's two deposits as their OWN timelock operation, before
@@ -203,7 +216,15 @@ contract WirePhase4 is DeployBase {
     ///      and buys an id an operator can recompute from the printed calldata alone. A pause,
     ///      though, is legitimately repeatable: a switchover attempt abandoned and retried a month
     ///      later needs to pause again, and with a fixed salt that second pause would be
-    ///      un-schedulable. `RECOUP_SWITCHOVER_ATTEMPT` is that discriminator, defaulting to
+    ///      un-schedulable.
+    ///
+    ///      **Audit round 22, finding 7 narrows the recovery claim above rather than overturning
+    ///      it: `cancel` frees a *pending* id and cannot touch a `Done` one, and a batch with a
+    ///      codeless target reaches `Done` by succeeding.** That is why the census in `_queue` has
+    ///      to run before `scheduleBatch` and not after `executeBatch` - the argument for
+    ///      `SALT == bytes32(0)` covers a batch that reverts, and that batch does not revert.
+    ///
+    ///      `RECOUP_SWITCHOVER_ATTEMPT` is that discriminator, defaulting to
     ///      `bytes32(0)` for the first attempt. It is the one convention this file invents; OZ's
     ///      Governor has `bytes20(address(this)) ^ descriptionHash` and there is no equivalent for a
     ///      direct timelock caller.
@@ -218,6 +239,21 @@ contract WirePhase4 is DeployBase {
 
     /// @dev Split from `queuePause()` for the reason `_queue` below gives.
     function _queuePause(Deployed memory d, TimelockController timelock, bytes32 salt) internal {
+        // **Round 22, finding 7, the narrow half.** Same hazard as `_queue`'s: a codeless target
+        // makes `executeBatch` succeed silently, so an operator can spend forty-eight hours
+        // "pausing" nothing and only learn about it from a different error two steps later.
+        // `_ownablesOf` reverts `DeployedMemberNotOwnable(i)` on a member with no code, and that
+        // covers both of this batch's targets.
+        //
+        // **Deliberately the liveness census and NOT `_assertCoreGraph`, unlike `_queue`.** This
+        // step is the one a wind-down depends on: it shuts `borrow` so that the debt standing
+        // behind the door can be repaid. Gating it on the full graph would make it refusable over
+        // a stale `RECOUP_KEEPER` - an address that is *meant* to rotate - and refusing to shut
+        // the door because a rotated keeper does not match an environment variable is a worse
+        // trade than the one it would buy. `queue()` is where the operator commits to a window,
+        // and that is where the full census belongs.
+        _ownablesOf(d);
+
         (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _phase4PauseCalls(d);
         uint256 delay = timelock.getMinDelay();
 
@@ -311,6 +347,14 @@ contract WirePhase4 is DeployBase {
     ///      through `writeDownLoss` on a live position.
     ///
     ///      That is a claim about *this* list. Anyone adding a leg here owes this function a read.
+    ///
+    ///      **And it is a claim about the legs' STATE, not about their targets - audit round 22,
+    ///      finding 7 read the sentence above literally and found the gap on the other side of it.**
+    ///      Four of these reads come off two of the eight operator-typed addresses; the remaining
+    ///      six were never touched before the operator committed to a window, and a codeless one
+    ///      makes `executeBatch` succeed silently. That is checked in `_queue`, immediately above
+    ///      the call to this function, by `_assertCoreGraph`. Do not fold the two together: this
+    ///      one is about a window that can shut, that one is about a graph that exists.
     function _requireSwitchoverWindowShut(Deployed memory d) internal view {
         _requireBothPaused(d);
 
@@ -327,7 +371,42 @@ contract WirePhase4 is DeployBase {
     ///      siblings and poisons them - measured, four failures in five, before this split existed.
     ///      Everything that decides anything is below this line; the two resolutions above are
     ///      covered by `test_wirePhase4_namesTheAddressItIsMissing`.
-    function _queue(Deployed memory d, TimelockController timelock) internal {
+    function _queue(Deployed memory d, TimelockController timelock, GovParams memory p) internal {
+        // **Audit round 22, finding 7: the batch's TARGETS are checked here now, not only its
+        // preconditions.** `_requireSwitchoverWindowShut` below reads four values off two of the
+        // eight operator-typed addresses, and used to say of itself that those were "the complete
+        // set of preconditions the six legs actually evaluate". That is still true and it is not
+        // the same claim as "the six legs will do what they say", because the other six addresses
+        // were never touched before the operator committed to a window.
+        //
+        // MEASURED, with `RECOUP_EPOCH_HARVESTER` mistyped to a codeless address: OZ 5.6.1's
+        // `TimelockController._execute` uses `Address.verifyCallResult`, **not**
+        // `verifyCallResultFromTarget`, so it never asks whether the target has code - and a call
+        // to a codeless address returns success with empty returndata. `queue()` scheduled without
+        // complaint, an outsider fired the printed calldata after maturity, it SUCCEEDED,
+        // `isOperationDone` went true, and the end state was `harvester.lenderPool() == address(0)`
+        // with the protocol unpaused: round 11's shipped state - the pool carrying the credit risk
+        // with the lender share going nowhere - reproduced by one typo. `cancel(id)` then reverts
+        // `TimelockUnexpectedOperationState`, because a Done id is burned forever, so the recorded
+        // recovery in this contract's header does not apply. That recovery covers a *reverting*
+        // batch. This one does not revert.
+        //
+        // **The fix is a relocation, not a new predicate.** `_executeQueued` already ran
+        // `_assertPhase4Wiring` in the same transaction and it already caught exactly this input -
+        // `_ownablesOf` reverts `DeployedMemberNotOwnable(7)` on a member with no code, and the
+        // whole transaction unwound including the timelock's `Done` write. The check was on the
+        // wrong side of the forty-eight hour window, and it only ever protected the operator who
+        // used the sanctioned entry point rather than the stranger who may fire `executeBatch`.
+        //
+        // `_assertCoreGraph` rather than `_ownablesOf` alone, because it is precisely the half of
+        // `_assertPhase4Wiring` that is *already true* at queue time - the switchover moves none of
+        // it - so running it early costs nothing and catches more than the codeless case: a member
+        // typed as some other live contract of ours, an ownership handover that never happened, and
+        // since round 22's finding 13, a pool on the wrong settlement token. The half that cannot
+        // move is the three pointers the switchover exists to set, and those stay in
+        // `_assertPhase4Wiring` where they belong.
+        _assertCoreGraph(d, p);
+
         // **Round 21, finding 2: refuse to commit to a window nothing is guarding.** Every escape
         // from a blocked switchover costs the operator another forty-eight hours, so the cheapest
         // place to fail is here, before the clock starts. `queuePause()` is what satisfies this.
@@ -410,7 +489,13 @@ contract WirePhase4 is DeployBase {
     ///      not gated on the confirmation phrase: reading state changes nothing and an operator
     ///      should never be discouraged from checking.
     function assertOnly() external view {
-        _assertPhase4Wiring(_resolveDeployed(), _resolveParams(msg.sender));
+        // **`_readParams`, not `_resolveParams`, and the difference is the whole point of the
+        // docstring above.** Resolving runs `_validateParams`, which since round 29 refuses a
+        // deployment owned by a contract with no guardian named - which is exactly the state an
+        // operator would run this report to understand. A read that refuses to answer in the case
+        // it exists for is not a read. The values are still the real ones: `_assertCoreGraph`
+        // reads `p.owner` out of them, so they cannot be faked.
+        _assertPhase4Wiring(_resolveDeployed(), _readParams(msg.sender));
         console.log("Phase-4 wiring holds.");
     }
 
@@ -419,8 +504,7 @@ contract WirePhase4 is DeployBase {
     ///      guard, though: unlike a deployment this is legitimate on a testnet, on a fork and on
     ///      anvil, and a chain allow-list here would have to be edited every time it is exercised.
     function _requireConfirmation() internal view {
-        if (keccak256(bytes(vm.envOr("RECOUP_SWITCHOVER_CONFIRM", string("")))) != keccak256(bytes(CONFIRM_PHRASE)))
-        {
+        if (keccak256(bytes(_envOrString("RECOUP_SWITCHOVER_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))) {
             revert SwitchoverConfirmationMissing();
         }
     }
@@ -452,7 +536,7 @@ contract WirePhase4 is DeployBase {
     /// @dev Named in the revert, because "one of the addresses is unset" is not an error message
     ///      anybody can act on.
     function _required(string memory name) internal view returns (address a) {
-        a = vm.envOr(name, address(0));
+        a = _envOrAddress(name, address(0));
         if (a == address(0)) revert DeployedAddressMissing(name);
     }
 }

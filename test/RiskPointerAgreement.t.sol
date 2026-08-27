@@ -563,4 +563,11 @@ contract TwoFacedManager {
     function setRiskParams(address riskParams_) external {
         riskParams = riskParams_;
     }
+
+    /// @dev Audit round 22 finding 18 added `yieldAccruedOn` to the tail probes on this pointer.
+    ///      A stub that fails an OLDER check makes a test red for the wrong reason, which is the
+    ///      note `FourSelectorManager` in `SetterGuards.t.sol` already carries.
+    function yieldAccruedOn(uint256, uint256) external pure returns (uint256) {
+        return 0;
+    }
 }

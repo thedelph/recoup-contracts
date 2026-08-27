@@ -138,8 +138,14 @@ testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Six suites, 59 invariants, fuzzed over randomised call sequences: `test/*.invariants.t.sol`. The
-one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no state
+Six suite files declaring 66 `invariant_*` functions, fuzzed over randomised call sequences:
+`test/*.invariants.t.sol`. Sixty of those names are distinct; the gap is the frame guard
+`invariant_theHandlerNeverDropsAFrame`, declared once in each of the seven campaign contracts
+across the thirteen test contracts those six files hold. Counted by declaration, not by
+assertion, and the earlier figure of 59 matched none of these bases.
+
+The one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no
+state
 in which all three of an auction's exits revert, because that state would be permanently stranded
 collateral and only a fuzzer looking for it would ever find it.
 

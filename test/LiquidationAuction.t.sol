@@ -330,14 +330,198 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         assertGt(auction.endsAt(id), 0, "endsAt stays readable");
     }
 
-    function testFuzz_currentPriceIsMonotonicallyNonIncreasing(uint32 firstStep, uint32 secondStep) public {
-        // Both steps stay inside the window: past it the auction lapses and
-        // `currentPrice` refuses rather than quoting a price no bid can fill.
-        uint256 id = _openAuction();
-        skip(bound(firstStep, 0, Config.AUCTION_DURATION / 2));
+    /// @notice **The Dutch curve only falls, and the curve is the PREMIUM.** The whole-lot price
+    ///         has no monotonicity property at all, because the lot is the borrower's to grow.
+    /// @dev **Audit round 23, finding 18. The old assertion here was the finding.** This used to be
+    ///      `testFuzz_currentPriceIsMonotonicallyNonIncreasing`: two steps each bounded to
+    ///      `Config.AUCTION_DURATION / 2` under the comment "past it the auction lapses", asserting
+    ///      `assertLe(currentPrice(id), earlier, "a Dutch price must only ever fall")`. Two separate
+    ///      things were wrong with it and only one of them was the bound.
+    ///
+    ///      **The bound's stated reason had already expired.** The lapse is at a whole
+    ///      `AUCTION_DURATION`; `currentPrice` refuses only *past* `startedAt + AUCTION_DURATION`
+    ///      and quotes right up to it. Half a duration was never the interval the comment named,
+    ///      so the test covered half the window it could have and read as covering all of it.
+    ///
+    ///      **And the assertion is false on the half it did cover.** `currentPrice` prices the
+    ///      *live* lot - `_lotPrice(_vault.bondCount(a.borrower), a.startNav, _premiumBps(...))` -
+    ///      and `depositBonds` is the borrower's own unilateral call, available at every instant of
+    ///      the window. MEASURED at `_softNav()`, no lapse and no re-strike, time only moving
+    ///      forward: `AUCTION_DURATION / 4` quotes **867.675000** at 9,200 bps, and
+    ///      `AUCTION_DURATION / 2` after a +20-bond deposit quotes **950.670000** at 8,400 bps. The
+    ///      curve fell 800 bps while the quote rose 82.995000. Pinned by the deterministic test
+    ///      below, so the counterexample survives as a number rather than as a comment.
+    ///
+    ///      **What is true, and what this asserts instead:**
+    ///
+    ///        1. `currentPremiumBps` is non-increasing for as long as `a.startedAt` is unchanged.
+    ///           That is the whole Dutch curve - `_premiumBps` is a pure function of
+    ///           `block.timestamp - startedAt` and of nothing else.
+    ///        2. The quote is exactly `_lotPrice(live lot, frozen startNav, that premium)`. Every
+    ///           move in the quote is therefore attributable to one of three named inputs, two of
+    ///           which cannot rise. That is the strongest form: it fails if the curve inverts, if
+    ///           the recorded lot is quoted instead of the live one, or if a NAV repost reaches the
+    ///           price - so the repost is fuzzed here rather than only pinned one case at a time.
+    ///        3. With the lot held still the old assertion does hold, so it is kept, guarded by the
+    ///           condition that makes it true rather than by a bound that hid the case.
+    ///
+    ///      Consistent with round 23's finding 13 by construction. This says nothing about what a
+    ///      bidder pays, only about what the two quoting views return, so it does not depend on
+    ///      there being a setting of the two-bound door that is both re-strike-safe and
+    ///      top-up-proof. There is none.
+    function testFuzz_theCurveOnlyFallsWhileTheStrikeIsUnchanged(
+        uint32 firstStep,
+        uint32 secondStep,
+        uint16 topUp,
+        uint64 navStep
+    ) public {
+        uint256 openedAt = block.timestamp;
+        uint256 id = _openAuctionAt(_softNav());
+        (,,,,, uint256 startNav,,) = auction.auctions(id);
+
+        // Anywhere on the curve, which is defined on the whole closed window rather than on half
+        // of it.
+        uint256 firstAt = openedAt + bound(firstStep, 0, Config.AUCTION_DURATION);
+        vm.warp(firstAt);
+        uint256 premiumEarlier = auction.currentPremiumBps(id);
         uint256 earlier = auction.currentPrice(id);
-        skip(bound(secondStep, 0, Config.AUCTION_DURATION / 2));
-        assertLe(auction.currentPrice(id), earlier, "a Dutch price must only ever fall");
+        uint256 bondsEarlier = vault.bondCount(alice);
+        assertEq(earlier, _lotPrice(bondsEarlier, startNav, premiumEarlier), "the quote is lot x startNav x curve");
+
+        // The two inputs the old test never varied. Alice holds 1,000 bonds and 100 are already
+        // posted, so a top-up is a real deposit rather than a fixture that quietly does nothing.
+        uint256 added = bound(topUp, 0, 900);
+        if (added != 0) {
+            vm.prank(alice);
+            vault.depositBonds(added);
+        }
+        oracle.setNav(bound(navStep, 1, NAV * 4));
+
+        vm.warp(firstAt + bound(secondStep, 0, openedAt + Config.AUCTION_DURATION - firstAt));
+        uint256 premiumLater = auction.currentPremiumBps(id);
+        uint256 later = auction.currentPrice(id);
+        uint256 bondsLater = vault.bondCount(alice);
+
+        assertLe(premiumLater, premiumEarlier, "the Dutch curve must only ever fall");
+        assertEq(later, _lotPrice(bondsLater, startNav, premiumLater), "and the quote must stay attributable");
+        assertLe(later, _lotPrice(bondsLater, startNav, premiumEarlier), "no part of a rise may come from the curve");
+        if (bondsLater == bondsEarlier) {
+            assertLe(later, earlier, "with the lot held still, the whole-lot price only falls too");
+        }
+    }
+
+    /// @notice Round 23's finding 18, pinned as the exact numbers it was measured as.
+    /// @dev The rise is designed behaviour, not a defect: `currentPrice` quotes the live lot so
+    ///      that a top-up is not sold for nothing, which
+    ///      `test_currentPrice_pricesTheLiveLotSoATopUpIsNotSoldForNothing` states directly. What
+    ///      was defective was the suite claiming the opposite one screen away. Both live here now,
+    ///      so a future reader cannot resolve the tension by deleting whichever they met first.
+    function test_currentPrice_risesInsideOneWindowWhenTheBorrowerGrowsTheLot() public {
+        uint256 id = _openAuctionAt(_softNav());
+
+        skip(Config.AUCTION_DURATION / 4);
+        assertEq(auction.currentPremiumBps(id), 9_200);
+        assertEq(auction.currentPrice(id), 867.675e6);
+
+        vm.prank(alice);
+        vault.depositBonds(20);
+        skip(Config.AUCTION_DURATION / 4);
+
+        assertEq(auction.currentPremiumBps(id), 8_400, "the curve fell 800 bps");
+        assertEq(auction.currentPrice(id), 950.670e6, "and the quote rose 82.995000 anyway, with no lapse");
+    }
+
+    /// @notice **A re-strike rebases the curve; it does not continue it.** A given id can quote a
+    ///         higher number after a lapse than before one, and every term of the new quote is
+    ///         re-read rather than carried over.
+    /// @dev **Audit round 22, finding 16, test half, rewritten rather than landed.** The widened
+    ///      fuzz test held on `fix/the-price-test-off-its-interval` reached exactly this state and
+    ///      then asserted `assertLe(currentPrice(id), earlier)` over it. MEASURED against this
+    ///      tree, first case: **314375000 > 309722250**. The two-bound door added in round 22
+    ///      bounds a bidder's exposure; it does not restore price monotonicity across a re-strike,
+    ///      and nothing in the design does. The reach that commit opened is worth keeping and its
+    ///      assertion is not, so the reach is kept here and the assertion is replaced.
+    ///
+    ///      The lapse instant is an absolute `vm.warp` rather than a second relative `skip`, and
+    ///      that is load-bearing: two relative skips of up to a duration each can still land
+    ///      *inside* the window, where `liquidate` reverts `AuctionAlreadyLive` and the test goes
+    ///      red for a reason that has nothing to do with pricing.
+    ///
+    ///      NAV is moved before the re-strike because the re-strike re-reads it: `start` rewrites
+    ///      `startedAt`, `bondCount`, `startNav` and `startPrice` in place on the same id. Moving it
+    ///      is what makes `startNav == freshNav` discriminate a re-strike that carried the old
+    ///      snapshot forward. It moves downward only, because the position has to stay liquidatable
+    ///      for `liquidate` to be legal at all. The direction of the price change with NAV held
+    ///      still is the deterministic test below.
+    function testFuzz_aReStrikeRebasesTheCurveRatherThanContinuingIt(
+        uint32 firstStep,
+        uint32 lapseStep,
+        uint64 navStep
+    ) public {
+        uint256 openedAt = block.timestamp;
+        uint256 id = _openAuctionAt(_softNav());
+
+        vm.warp(openedAt + bound(firstStep, 0, Config.AUCTION_DURATION));
+        uint256 premiumBefore = auction.currentPremiumBps(id);
+
+        // Strictly past the lapse and strictly inside the reset window: the only interval in which
+        // a re-strike is legal at all.
+        vm.warp(
+            openedAt + Config.AUCTION_DURATION
+                + bound(lapseStep, 1, Config.AUCTION_RESET_WINDOW - Config.AUCTION_DURATION)
+        );
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionLapsed.selector, id));
+        auction.currentPrice(id);
+
+        uint256 freshNav = bound(navStep, _crashedNav(), _softNav());
+        oracle.setNav(freshNav);
+        vm.prank(keeper);
+        credit.liquidate(alice);
+
+        (, uint96 startedAt,,,, uint256 startNav,,) = auction.auctions(id);
+        assertEq(auction.auctionOf(alice), id, "a re-strike must not mint a new id");
+        assertEq(auction.firstOpenedAt(id), openedAt, "and it must not move its own deadline");
+        assertEq(startedAt, uint96(block.timestamp), "the strike is new, so the clock restarts here");
+        assertEq(startNav, freshNav, "priced off current NAV, never off the snapshot it replaces");
+        assertEq(
+            auction.currentPremiumBps(id),
+            Config.AUCTION_START_PREMIUM_BPS,
+            "rebased to the top of the curve rather than continuing down it"
+        );
+        assertGe(
+            auction.currentPremiumBps(id),
+            premiumBefore,
+            "and this is the deleted assertion, the right way round and in the quantity that has the property"
+        );
+        assertEq(
+            auction.currentPrice(id),
+            _lotPrice(vault.bondCount(alice), freshNav, Config.AUCTION_START_PREMIUM_BPS),
+            "and the quote is attributable to the new strike, term for term"
+        );
+    }
+
+    /// @notice The rise across a re-strike, pinned, with NAV held still so nothing else can explain
+    ///         it. This is the case the held fuzz test asserted backwards.
+    /// @dev MEASURED: the id sits at its floor on **213.775000** and the re-strike one second later
+    ///      quotes **314.375000**, a 47.06% rise with no NAV movement behind it.
+    ///      `test_R22_thePinnedBidStillPaysTheRestruckPrice` measures what that costs a bidder at
+    ///      `_softNav()`; this one is about the quoting views alone.
+    function test_currentPrice_rebasesUpwardAcrossAReStrikeWithNavHeldStill() public {
+        uint256 openedAt = block.timestamp;
+        uint256 id = _openAuction();
+
+        skip(Config.AUCTION_DURATION);
+        uint256 atTheFloor = auction.currentPrice(id);
+        assertEq(atTheFloor, 213.775e6, "the last quotable instant, at the floor");
+
+        vm.warp(openedAt + Config.AUCTION_DURATION + 1);
+        vm.prank(keeper);
+        credit.liquidate(alice);
+
+        assertEq(auction.auctionOf(alice), id, "the same id, re-struck in place");
+        assertEq(auction.currentPremiumBps(id), Config.AUCTION_START_PREMIUM_BPS);
+        assertEq(auction.currentPrice(id), 314.375e6, "back to 100% of an unchanged NAV");
+        assertGt(auction.currentPrice(id), atTheFloor, "a re-strike rebases upward; it does not decay");
     }
 
     /// @notice The snapshot, made executable. A NAV repost must not move a live
@@ -1277,7 +1461,7 @@ contract LiquidationAuctionTest is RiskParamsFixture {
 
         assertEq(credit.debtOf(alice), _maxBorrowAtCeiling(), "still owed");
         assertEq(credit.unsocialisedLoss(), 0, "and nothing guessed at lenders' expense");
-        (,,,, uint256 debtAtExpiry,,,) = auction.workouts(id);
+        (,,,, uint256 debtAtExpiry,,,,,,) = auction.workouts(id);
         assertEq(debtAtExpiry, _maxBorrowAtCeiling());
     }
 
@@ -1417,7 +1601,7 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         skip(Config.AUCTION_DURATION);
         auction.expireToWorkout(id);
 
-        (, uint96 openedAt,,,,,,) = auction.workouts(id);
+        (, uint96 openedAt,,,,,,,,,) = auction.workouts(id);
         vm.expectRevert(
             abi.encodeWithSelector(
                 LiquidationAuction.WorkoutStillRunning.selector, openedAt + Config.WORKOUT_MAX_DURATION
@@ -1583,7 +1767,7 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         skip(Config.WORKOUT_MAX_DURATION);
         auction.closeWorkout(id);
 
-        (,,,,,,, uint256 writtenDown) = auction.workouts(id);
+        (,,,,,,, uint256 writtenDown,,,) = auction.workouts(id);
         emit log_named_uint("MEASURED recoverable after a close that insurance part-covered", writtenDown);
         assertEq(writtenDown, 328.750000e6, "628.750000 written off, 300.000000 of it already paid home");
         assertEq(credit.pendingPrincipal(), 300e6, "insurance's part is already on its way to the funder");
@@ -1598,7 +1782,7 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         assertEq(usdc.balanceOf(operator), 400e6 - 328.750000e6, "the pull is clamped, not the caller refused");
         assertEq(credit.pendingPrincipal(), 300e6 + 328.750000e6, "and the funder is whole for the whole loan");
 
-        (,,,,,,, uint256 left) = auction.workouts(id);
+        (,,,,,,, uint256 left,,,) = auction.workouts(id);
         assertEq(left, 0, "nothing left to recover");
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NothingLeftToRecover.selector, id));
         auction.workoutSettleAfterClose(id, 1e6);
@@ -1622,7 +1806,7 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         vm.stopPrank();
 
         auction.closeWorkout(id); // legal immediately, and rightly so
-        (,,,,,,, uint256 writtenDown) = auction.workouts(id);
+        (,,,,,,, uint256 writtenDown,,,) = auction.workouts(id);
         assertEq(writtenDown, 0, "nothing was written off, so nothing can be repaid");
 
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NothingLeftToRecover.selector, id));
@@ -2377,6 +2561,114 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         credit.claimSurplus();
         assertEq(credit.bountyEscrowOf(alice), 0, "claimSurplus's _refundBounty did not run");
         assertGe(usdc.balanceOf(alice) - before, Config.LIQUIDATION_CALL_BOUNTY, "and it did not pay");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audit round 22, finding 16. The pinned bid bounds the LOT and not the PRICE.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Run an auction to its floor, take the quote a keeper would sign for, then let anybody
+    ///      re-strike it. The re-strike resets the premium from the floor back to 100% of NAV on the
+    ///      same id, so the price a `bid` pays goes UP without the lot changing hands.
+    function _quoteThenRestrike() private returns (uint256 id, uint256 quoted) {
+        id = _openAuctionAt(_softNav());
+        skip(Config.AUCTION_DURATION);
+        quoted = auction.currentPrice(id); // the last quotable instant, at the floor
+
+        // One second past the window, so the auction has lapsed and `start` re-strikes in place.
+        // Permissionless: `liquidate` is, and the position is still underwater.
+        skip(1);
+        vm.prank(makeAddr("griefer"));
+        credit.liquidate(alice);
+        assertEq(auction.auctionOf(alice), id, "fixture: the re-strike minted a new id instead");
+    }
+
+    /// @notice **The hazard.** The single-argument pin fires on a lot change and misses the change
+    ///         that raises the price per bond.
+    /// @dev MEASURED: quoted 641.325000, the same `bid(id)` paid 943.125000 - +301.800000, a rise of
+    ///      4,705.9 bps - and `claimableOf[borrower]` went 0 -> 282.937500, so the borrower whose
+    ///      position it is collects the difference. `start` states the invariant this breaks in its
+    ///      own comment: "A Dutch price must only ever fall."
+    ///
+    ///      This test asserts the behaviour rather than a fix, because the re-strike itself is
+    ///      wanted - round 19 built it deliberately, and blocking it turns a stale ticket into a
+    ///      perpetual call option. What was missing is a door that bounds both quantities at once;
+    ///      the tests below are that door.
+    function test_R22_thePinnedBidStillPaysTheRestruckPrice() public {
+        (uint256 id, uint256 quoted) = _quoteThenRestrike();
+
+        _fundBidder(bidder, 10_000e6);
+        uint256 spentBefore = usdc.balanceOf(bidder);
+        vm.prank(bidder);
+        auction.bid(id);
+        uint256 paid = spentBefore - usdc.balanceOf(bidder);
+
+        emit log_named_uint("MEASURED quoted before the re-strike", quoted);
+        emit log_named_uint("MEASURED paid by the same pinned bid", paid);
+        assertGt(paid, quoted, "the pin would have to be catching this for the finding to be wrong");
+        assertGt(credit.claimableOf(alice), 0, "and the borrower collects the difference");
+    }
+
+    /// @notice **The fix: the door that offers both bounds.** It refuses the re-struck price.
+    /// @dev CONTROL B, asserted in the same breath: the two-argument overload already refuses on
+    ///      price, so a price bound on the pinned form alone would have been inert. The gap was
+    ///      never either bound on its own - it was that no single call offered both, so a keeper had
+    ///      to choose which of the two griefs to be exposed to.
+    function test_R22_theBothBoundsDoorRefusesARestruckPrice() public {
+        (uint256 id, uint256 quoted) = _quoteThenRestrike();
+        uint256 live = auction.currentPrice(id);
+        uint256 lot = vault.bondCount(alice);
+        _fundBidder(bidder, 10_000e6);
+
+        vm.prank(bidder);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.PriceAboveCap.selector, live, quoted));
+        auction.bid(id, lot, quoted);
+
+        // CONTROL B: the price-only overload already did this half.
+        vm.prank(bidder);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.PriceAboveCap.selector, live, quoted));
+        auction.bid(id, quoted);
+    }
+
+    /// @notice And it refuses a lot change, which the price-only overload does not.
+    /// @dev CONTROL C: the pin is not inert - a top-up genuinely moves the lot - and CONTROL D, the
+    ///      other arm of the same call: with both bounds satisfied the fill goes through at the
+    ///      quoted price, so the door is not simply refusing everything.
+    function test_R22_theBothBoundsDoorRefusesALotChangeAndFillsWhenNeither() public {
+        uint256 id = _openAuction();
+        uint256 lot = vault.bondCount(alice);
+        uint256 quoted = auction.currentPrice(id);
+        _fundBidder(bidder, 10_000e6);
+
+        // The borrower tops up: the lot moves, the price per bond does not.
+        bond.mint(alice, 1);
+        vm.prank(alice);
+        vault.depositBonds(1);
+        assertEq(vault.bondCount(alice), lot + 1, "fixture: the top-up did not land");
+
+        vm.prank(bidder);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.LotChanged.selector, lot, lot + 1));
+        auction.bid(id, lot, type(uint256).max);
+
+        // CONTROL C: the price-only overload accepts exactly this, which is why the lot bound is
+        // the half it is missing.
+        uint256 livePrice = auction.currentPrice(id);
+        uint256 spentBefore = usdc.balanceOf(bidder);
+        vm.prank(bidder);
+        auction.bid(id, lot + 1, livePrice);
+        assertEq(spentBefore - usdc.balanceOf(bidder), livePrice, "the fill did not go through at the quote");
+        assertGt(quoted, 0, "fixture: nothing was quoted");
+    }
+
+    /// @notice A zero expectation is refused rather than read as "whatever the lot is".
+    /// @dev A silent zero is the shape `currentPrice` refuses for the same reason: a keeper must not
+    ///      be able to act on one. Nothing else in this contract treats zero as a wildcard.
+    function test_R22_theBothBoundsDoorRefusesAZeroLotExpectation() public {
+        uint256 id = _openAuction();
+        _fundBidder(bidder, 10_000e6);
+        vm.prank(bidder);
+        vm.expectRevert(LiquidationAuction.ZeroAmount.selector);
+        auction.bid(id, 0, type(uint256).max);
     }
 }
 

@@ -68,10 +68,33 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     ///      record whatsoever - not even the fact that it had happened.
     event ProtocolFeeWalletSet(address indexed wallet);
     event CreditManagerSet(address indexed creditManager);
+    /// @notice The custody adapter this contract claims from was repointed.
+    /// @dev **One argument, and audit round 26 is why it is no longer two.** This event carried the
+    ///      seeded watermark alongside the address, which put it under
+    ///      `keccak("CustodyAdapterSet(address,uint256)")` while `CollateralVault`'s
+    ///      identically-named event sat under `keccak("CustodyAdapterSet(address)")`.
+    ///
+    ///      The comment above the vault's three pointer events states the criterion those events
+    ///      were given their shape by: a `topic0` is the event name **and its arity**, so one
+    ///      whole-protocol `eth_getLogs` filtered on a signature is the watch that catches a
+    ///      pointer pair diverging, and an event not sharing that signature is invisible to it.
+    ///      Applied to the three events it was written for, the criterion held on two and failed on
+    ///      this one. `CreditManagerSet(address)` is emitted in the one-argument form by five
+    ///      contracts and `LiquidationAuctionSet(address)` by two, and `SetterGuards.t.sol` asserts
+    ///      both shared filters. The custody adapter is the third genuine cross-contract pair -
+    ///      `setCustodyAdapter` below binds the incoming adapter to `creditManager.vault()`, and
+    ///      its own NatSpec records the frozen yield stream an operator reaches by repointing one
+    ///      side and not the other - and it was the one pair the shared filter could not see.
+    ///
+    ///      So the payload moved to its own event rather than the criterion gaining an exception.
+    ///      Nothing observable is lost: both events are emitted in the same transaction by the same
+    ///      contract, so a watcher wanting the watermark reads the pair.
+    event CustodyAdapterSet(address indexed adapter);
+    /// @notice The corroboration high-water mark was re-seeded from an incoming custody adapter.
     /// @param seededCorroboration The incoming adapter's `farmYieldDelivered` at the swap, which
     ///        becomes the new high-water mark. Emitted rather than left implicit because a wrong
     ///        value here declines every subsequent epoch, and that is worth being able to see.
-    event CustodyAdapterSet(address indexed adapter, uint256 seededCorroboration);
+    event CorroborationWatermarkSeeded(address indexed adapter, uint256 seededCorroboration);
     /// @notice An epoch was declined because the farm had not funded it.
     /// @param epoch The epoch this would have been, had it run. Not consumed - `epochCount` is
     ///        untouched, exactly as in the zero-yield case.
@@ -270,7 +293,10 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         if (boundVault != liveVault) revert AdapterVaultMismatch(boundVault);
         custodyAdapter = adapter;
         lastCorroboratedYield = adapter.farmYieldDelivered();
-        emit CustodyAdapterSet(address(adapter), lastCorroboratedYield);
+        // Two events, one move. The first shares a `topic0` with the vault's half of this pointer
+        // pair so one filter sees both; the second carries the watermark that used to ride on it.
+        emit CustodyAdapterSet(address(adapter));
+        emit CorroborationWatermarkSeeded(address(adapter), lastCorroboratedYield);
     }
 
     /// @notice Repoint the pool the lender share is paid to.
@@ -416,16 +442,15 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // letting it propagate would freeze USDC that is already sitting here and
         // needs no farm call at all.
         //
-        // The return value is kept, not discarded. It cannot *size* the epoch - the paragraph
-        // above is why - and since audit round 11 it is no longer what decides whether the epoch
-        // is real either; the adapter's `farmYieldDelivered` counter does that, and it sees every
-        // farm-touching path rather than this one call. What is left to `corroborated` is the
-        // narrower claim that the farm paid out *inside this very call*, which is all the cooldown
-        // clock below needs.
-        uint256 corroborated;
-        try adapter.claimYield() returns (uint256 c) {
-            corroborated = c;
-        } catch {}
+        // **The return value is discarded now, and audit round 22 finding 6b is why.** It never
+        // could *size* the epoch - the paragraph above is why - and since round 11 it has not
+        // decided whether the epoch is real either; `farmYieldDelivered` does that, and it sees
+        // every farm-touching path rather than this one call. The last thing it was still used for
+        // was the cooldown clock below, and using it there is precisely the defect: it made the
+        // clock narrower than the check that reads it, so the gate never closed. With that gone
+        // there is no remaining question this figure answers, and keeping it would be a signal
+        // nothing consumes - the shape a later reader reintroduces a branch from.
+        try adapter.claimYield() {} catch {}
         // All three carried balances come off the top. They are this contract's USDC but not this
         // epoch's yield, and counting any of them as `claimed` would pay it out a second time -
         // the lender share to borrowers, or the protocol fee to everyone.
@@ -530,17 +555,30 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         }
         lastCorroboratedYield = delivered;
 
-        // The cooldown clock, still keyed on `corroborated` rather than on the floor just above,
-        // and that is the conservative choice rather than an oversight. `corroborated != 0` means
-        // the farm paid out inside this call. An epoch corroborated the other way - a
-        // `withdrawBonds` that swept an outage's worth of yield in here while the farm's claim
-        // path was down - has no reason to be rate limited: the pot is real and the window it is
-        // rated over is the one it genuinely accrued in. Advancing the clock for those too would
-        // delay the next honest epoch by up to `MIN_EPOCH_GAP` and buy nothing, because the floor
-        // above already means a second epoch cannot run until the farm has delivered another
-        // `MIN_EPOCH_FARM_YIELD` - a rate limit no donation can pay for. Round 10 needed this line
-        // to be the entire defence; it no longer is.
-        if (corroborated != 0) lastHarvestAt = block.timestamp;
+        // **The cooldown clock, and audit round 22 finding 6b is the whole of this paragraph.**
+        //
+        // This line used to read `if (corroborated != 0) lastHarvestAt = block.timestamp;`, keyed on
+        // whether the farm paid out inside this very call. The check at the top of this function is
+        // not keyed on anything - it refuses on `lastHarvestAt` unconditionally - so the gate was
+        // read one way and written another, and **it therefore never closed**. Sweep the farm with a
+        // stranger's `depositBonds` first and `claimYield()` here finds nothing, so `corroborated`
+        // is zero while `fromFarm` clears the floor above and the epoch runs in full. MEASURED: two
+        // accepted epochs **one hour apart** against a `MIN_EPOCH_GAP` of 432,000 seconds, with
+        // `lastHarvestAt` reading 0 after both.
+        //
+        // The reasoning it replaces argued the narrow clock was "conservative", because the floor
+        // above is already "a rate limit no donation can pay for". That is true of a *donation* and
+        // false of the farm: `Config.MIN_EPOCH_FARM_YIELD` is one dollar, and a live farm produces
+        // one dollar continuously, so the floor bounds nothing on the timescale a five-day cooldown
+        // exists for. The cooldown bounds how often the borrower stream is **re-rated**, and an
+        // epoch corroborated by a bond movement re-rates it exactly as much as one corroborated by a
+        // claim. What decides is whether an epoch happened, not which path delivered the money.
+        //
+        // Unconditional here and nowhere else: every state that must NOT consume the cooldown - a
+        // zero-yield epoch, an uncorroborated one - returns before this line, which is what makes
+        // rounds 10 and 11 still hold. Round 10 needed the old line to be the entire defence; it no
+        // longer is, and the narrow form had become a hole rather than a leftover.
+        lastHarvestAt = block.timestamp;
         uint256 epoch = ++epochCount;
 
         // The protocol fee takes the rounding remainder so the parts always sum to

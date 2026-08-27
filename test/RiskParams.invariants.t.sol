@@ -183,7 +183,7 @@ contract RiskParamsInvariants is StdInvariant, Test {
     ///      other five invariant suites have carried this since the round that added it, for the
     ///      reason four of them still state verbatim: a reverting handler frame is discarded, the
     ///      ghost that would have recorded it dies with the frame, and only the runner counting
-    ///      frames from outside can see it. `scripts/check-doc-claims.mjs` keyed its coverage
+    ///      frames from outside can see it. The repository's documentation check keyed its coverage
     ///      number on the reachability tripwire alone, so it read six of six on a tree where five
     ///      of six carried the guard - and this suite, the first created after the doctrine
     ///      shipped, is the one it missed. The checker now counts this function too, and rejects it
@@ -199,7 +199,7 @@ contract RiskParamsInvariants is StdInvariant, Test {
     ///      only the config line differing: with it, this fails on the first dropped frame while
     ///      the other three invariants pass over 42,546 reverts; without it, this passes over
     ///      42,598 reverts and reports nothing. A guard that silently does not take is worse than
-    ///      none, so `scripts/check-doc-claims.mjs` now rejects the function without the line.
+    ///      none, so that check now rejects the function without the line.
     ///
     ///      Empty body on purpose. The assertion is the config line, enforced by the runner. The
     ///      global `fail_on_revert = false` in `foundry.toml` stays correct for every other
@@ -207,17 +207,68 @@ contract RiskParamsInvariants is StdInvariant, Test {
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
 
-    /// @notice Whatever is stored satisfies every relation and every bound.
-    /// @dev **Weak, and recorded as weak.** Both writers run `checkRiskParams` before assigning, so
-    ///      this reduces to "the setter validates before it writes" - one line, verifiable by
-    ///      reading. It is kept because that is exactly the line a later edit can drop, and because
-    ///      a relation added to the validator is covered here for free. It is not evidence about
-    ///      the ratchet, which is what the invariant below is for.
+    /// @notice Whatever is stored sits inside the four hard bounds this protocol shipped, and
+    ///         inside the two relations that can be stated without restating the auction floor.
+    /// @dev **This was a TAUTOLOGY until round-26 remediation, and the docstring that stood here
+    ///      argued for the shape that made it one.** It ran `riskParams.checkRiskParams(
+    ///      riskParams.params())`: the contract's own validator, against the contract's own
+    ///      storage. Both writers run that same validator before assigning, so the assertion
+    ///      reduced to "the setter calls the function it calls" and could not fail for any
+    ///      definition of legal the validator itself held. Audit round 25, finding 1 executed the
+    ///      consequence rather than arguing it: a mutant of `RiskParams` with the `maxLtvBps`
+    ///      bound deleted stores `maxLtvBps = 4000` against a shipped ceiling of 3,500 and **all
+    ///      four invariants in this file stay green**.
+    ///
+    ///      The old claim that "a relation added to the validator is covered here for free" was
+    ///      the argument for that shape and it is exactly backwards. What a validator run against
+    ///      its own output covers for free is itself. It is deleted rather than softened.
+    ///
+    ///      **So the bounds are literals.** They are the ceilings and floors named in `Config`'s
+    ///      risk header and committed to DexFi on 2026-08-06 - 3,500 / 5,800 / 250k / 25k, with
+    ///      `Config.MIN_BOUNTIED_DEBT` under both caps - not a reading of `RiskParams`' own
+    ///      constants. Those constants are `internal` and cannot be read from here at all, which
+    ///      is the accident that keeps this honest: there is no way to write the tautology back in
+    ///      by naming a symbol.
+    ///
+    ///      **What would have to be true for this to pass without measuring anything**: a campaign
+    ///      in which no proposal is ever accepted, so storage never leaves the deploy seed and
+    ///      every comparison below is evaluated once, at a set the constructor already validated.
+    ///      That is the fifteen-times-catalogued shape and it is guarded from outside:
+    ///      `test_handlerCanReachEveryStateTheInvariantsCheck` asserts `accepted > 0`, asserts a
+    ///      ceiling move, and asserts the high-water threshold rises above the seed.
+    ///
+    ///      **What is deliberately NOT restated, so nobody reads this as covering the validator.**
+    ///      Relations (B), (C) and (E) are absent. Each is implied by the four literal bounds at
+    ///      today's `Config.AUCTION_FLOOR_BPS` and `Config.MIN_BOUNTIED_DEBT`: (B) because 5,800 is
+    ///      under the 6,800 floor, (C) with 33 bps of margin at that same ceiling, and (E) because
+    ///      the per-account floor below **is** `MIN_BOUNTIED_DEBT`. The margin in (C) is pinned in
+    ///      `test/RiskParameters.t.sol::test_relationCsMarginIsPinnedAtBothEndsOfTheRatchet`, which
+    ///      is where a cut to the auction floor goes red. It would not go red here, and saying so
+    ///      is the point: the previous shape claimed coverage of all five and delivered none.
     function invariant_theStoredSetIsAlwaysLegal() public view {
-        // The contract's own validator, run against its own storage. Using it rather than
-        // restating the five comparisons means a relation added later is covered here for free,
-        // and a relation weakened later cannot be weakened in only one of two places.
-        riskParams.checkRiskParams(riskParams.params());
+        IRiskParams.Params memory p = riskParams.params();
+
+        // The four hard bounds, as literals. `RiskParams.MAX_LTV_BPS_MIN` and its seven siblings
+        // are internal; these are the same numbers written out, which is what makes a mutation to
+        // any one of them visible here rather than invisible.
+        assertGe(p.maxLtvBps, 500, "stored maxLtvBps fell under the shipped floor of 500");
+        assertLe(p.maxLtvBps, 3_500, "stored maxLtvBps passed the shipped ceiling of 3,500");
+        assertGe(
+            p.liquidationThresholdBps, 5_000, "stored liquidationThresholdBps fell under the shipped floor of 5,000"
+        );
+        assertLe(
+            p.liquidationThresholdBps, 5_800, "stored liquidationThresholdBps passed the ratchet terminus of 5,800"
+        );
+        assertGe(p.globalBorrowCap, 500e6, "stored globalBorrowCap fell under MIN_BOUNTIED_DEBT");
+        assertLe(p.globalBorrowCap, 250_000e6, "stored globalBorrowCap passed the shipped ceiling of 250k");
+        assertGe(p.perAccountBorrowCap, 500e6, "stored perAccountBorrowCap fell under MIN_BOUNTIED_DEBT");
+        assertLe(p.perAccountBorrowCap, 25_000e6, "stored perAccountBorrowCap passed the shipped ceiling of 25k");
+
+        // Relation (A). A position that is liquidatable the instant it opens is not a loan.
+        assertLt(p.maxLtvBps, p.liquidationThresholdBps, "the borrow ceiling reached the liquidation threshold");
+
+        // Relation (D). Equality is legal: one account may hold the entire book.
+        assertLe(p.perAccountBorrowCap, p.globalBorrowCap, "the per-account cap passed the global cap");
     }
 
     /// @notice The liquidation threshold never travels downward, whatever is proposed.
@@ -266,12 +317,20 @@ contract RiskParamsInvariants is StdInvariant, Test {
     ///      `Config.GLOBAL_BORROW_CAP_MAX` as a compile-time constant, because neither may revert
     ///      and so neither may read this contract. That is only sound while the live cap cannot
     ///      exceed it. This is the assertion that keeps it sound.
-    /// @dev **Also weak, and for the same reason as `invariant_theStoredSetIsAlwaysLegal`.**
+    /// @dev **Weak in a way the sibling above no longer is, and the difference is worth stating.**
     ///      `checkRiskParams` enforces `GLOBAL_CAP_MAX`, which *is* `Config.GLOBAL_BORROW_CAP_MAX`,
     ///      as a bound twenty lines above the transition guard - so this cannot fail while the
     ///      setter is the only writer. It is kept as the statement of a cross-contract dependency
     ///      that lives in three files and is enforced in one: if the bound in `RiskParams` is ever
     ///      relaxed away from the constant the other two clamp on, this is what goes red.
+    ///
+    ///      It overlaps `invariant_theStoredSetIsAlwaysLegal`'s literal `250_000e6` ceiling on
+    ///      purpose and the two are not the same assertion. That one says the stored cap is inside
+    ///      the number this protocol shipped; this one says it is inside the symbol
+    ///      `LenderPool.impair` and `LiquidationAuction._bid` compile against. They are equal
+    ///      today. A change to `Config.GLOBAL_BORROW_CAP_MAX` moves this one and leaves that one
+    ///      standing, which is the direction that matters: the literal is the commitment, the
+    ///      symbol is the clamp.
     function invariant_theLiveCapNeverExceedsTheClampTheOthersUse() public view {
         assertLe(
             riskParams.globalBorrowCap(),

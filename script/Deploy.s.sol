@@ -73,7 +73,7 @@ contract DeployTestnet is DeployBase {
         if (block.chainid != BASE_SEPOLIA_CHAIN_ID) revert WrongChain(block.chainid);
 
         if (
-            keccak256(bytes(vm.envOr("RECOUP_TESTNET_CONFIRM", string("")))) != keccak256(bytes(CONFIRM_PHRASE))
+            keccak256(bytes(_envOrString("RECOUP_TESTNET_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))
         ) revert TestnetConfirmationMissing();
 
         vm.startBroadcast();
@@ -132,12 +132,12 @@ contract DeployMainnet is DeployBase {
 
         // A stray `forge script` should not be able to reach mainnet by accident.
         if (
-            keccak256(bytes(vm.envOr("RECOUP_MAINNET_CONFIRM", string("")))) != keccak256(bytes(CONFIRM_PHRASE))
+            keccak256(bytes(_envOrString("RECOUP_MAINNET_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))
         ) revert MainnetConfirmationMissing();
 
         // The custody decision (direct-call vs a Safe-based backend) is a human
         // judgement that depends on DexFi's whitelist answer. Force it to be stated.
-        string memory custody = vm.envOr("RECOUP_CUSTODY_ADAPTER", string(""));
+        string memory custody = _envOrString("RECOUP_CUSTODY_ADAPTER", "");
         if (keccak256(bytes(custody)) != keccak256(bytes("direct"))) revert CustodyDecisionUnrecorded();
 
         // _resolveParams enforces the rest: owner, treasury, keeper and fee wallet

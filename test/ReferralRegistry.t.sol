@@ -142,6 +142,54 @@ contract ReferralRegistryTest is Test {
         assertFalse(registry.isCanonical(bytes32("ABCDEFGHIJKLMNOPQ")), "max + 1");
     }
 
+    /// @notice **Audit round 23, finding 22(b).** `isCanonical`'s NatSpec stated the charset twice
+    ///         and the two statements disagreed: "uppercase `A-Z`, digits `0-9`, `-` and `_`"
+    ///         against "`0` and `1` are deliberately excluded, leaving 36 symbols". The code
+    ///         implements the second. The first is the sentence a frontend copies.
+    ///
+    /// @dev The expectation is the docstring **transcribed**, not the implementation restated. A
+    ///      test that recomputed `0x41-0x5A || 0x32-0x39 || 0x2D || 0x5F` would agree with whatever
+    ///      charset the code happened to have, which is the tautology this exists instead of - so
+    ///      the literal below is the alphabet the prose names, character for character, and it is
+    ///      load-bearing: MEASURED, putting `0` and `1` back into it alone fails this test at
+    ///      `38 != 36` with the contract untouched.
+    ///
+    ///      **What it cannot catch, stated because the finding it closes is a prose defect.** This
+    ///      pins the *code* to the transcription. Editing the source docstring back to "digits
+    ///      `0-9`" without touching the loop was applied and the whole suite stayed green: no test
+    ///      here reads the contract's source text, and `foundry.toml` sets no `fs_permissions`, so
+    ///      none can. The prose side wants a doc-claim check outside Foundry.
+    ///
+    ///      Every byte 0x01-0xFF is tried in all three positions of a minimum-length code, so a
+    ///      rule that happened to be position-dependent could not hide in the middle of one.
+    function test_isCanonical_theAcceptedAlphabetIsExactlyTheThirtySix() public {
+        bytes memory documented = bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZ23456789-_");
+        assertEq(documented.length, 36, "the docstring's own count, spelled out");
+
+        uint256 accepted;
+        for (uint256 c = 1; c < 256; ++c) {
+            bytes1 b = bytes1(uint8(c));
+
+            bool inDocumentedAlphabet;
+            for (uint256 j; j < documented.length; ++j) {
+                if (documented[j] == b) inDocumentedAlphabet = true;
+            }
+
+            bool first = registry.isCanonical(bytes32(bytes.concat(b, "AA")));
+            bool middle = registry.isCanonical(bytes32(bytes.concat("A", b, "A")));
+            bool last = registry.isCanonical(bytes32(bytes.concat("AA", b)));
+
+            assertEq(first, inDocumentedAlphabet, "byte accepted in position 0 disagrees with the docstring");
+            assertEq(middle, inDocumentedAlphabet, "byte accepted in position 1 disagrees with the docstring");
+            assertEq(last, inDocumentedAlphabet, "byte accepted in position 2 disagrees with the docstring");
+
+            if (first) accepted++;
+        }
+
+        emit log_named_uint("MEASURED distinct byte values the code accepts", accepted);
+        assertEq(accepted, 36, "the '36 symbols' half of the docstring is the accurate half");
+    }
+
     /// @dev The frontend uses `isCanonical` to tell "you typed it wrong" apart from "that code
     ///      does not exist", so the view and the enforcement must never disagree. Derived rather
     ///      than asserted: the property is checked against `register`'s actual behaviour.

@@ -61,6 +61,13 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      written off entirely and moves nothing but the pot. An indexer that could not tell them
     ///      apart would report a live loan where there is none.
     event LossRecovered(uint256 amount, uint256 lifetimeRecovered);
+    /// @notice The whole principal-unit ledger was divided by `2 ** shift`. Round-23 finding 7.
+    /// @dev Declared here for the same reason `QueuedWithdrawalReleasedAsDust` is: an indexer that
+    ///      caches `principalUnits` or `queueEntryPrincipalUnits` has no other way to learn that
+    ///      every figure it holds has been rescaled underneath it, and the rescaling is silent in
+    ///      every other log. Carries the resulting exponent as well as the shift, so a reader that
+    ///      missed an earlier one resynchronises from a single log rather than by replaying history.
+    event PrincipalUnitsRenormalised(uint256 shift, uint256 unitExponent, uint256 totalPrincipalUnits);
     event WithdrawalQueued(address indexed lender, uint256 indexed queueIndex, uint256 assets);
     event QueuedWithdrawalServiced(address indexed lender, uint256 indexed queueIndex, uint256 assets);
     /// @notice A queued request was withdrawn by its owner, who took the escrowed shares back.
