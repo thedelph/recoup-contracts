@@ -234,9 +234,30 @@ contract ReferralRegistry {
     /// @dev Exposed so a frontend can tell "you typed it wrong" from "that code does not exist"
     ///      using *this contract's* rule rather than a reimplementation that can disagree.
     ///
-    ///      The rule: uppercase `A-Z`, digits `0-9`, `-` and `_`, between
+    ///      The rule: uppercase `A-Z`, digits `2-9`, `-` and `_`, between
     ///      `Config.REFERRAL_CODE_MIN_LENGTH` and `Config.REFERRAL_CODE_MAX_LENGTH` bytes, encoded
     ///      as a left-aligned ASCII string with zero padding and no interior nulls.
+    ///
+    ///      **Audit round 23, finding 22(b): that line said "digits `0-9`" until 2026-08-22, and it
+    ///      had contradicted the paragraph below it since the charset was written.** The paragraph
+    ///      is the half that was right, and the loop is the authority for both: it accepts
+    ///      `0x41-0x5A`, `0x32-0x39`, `0x2D` and `0x5F`, which is 26 + 8 + 1 + 1 = 36 symbols with
+    ///      no `0` and no `1`. **The wrong half was the half a frontend would have copied**, and
+    ///      that is the whole reason this defect was not merely cosmetic: a frontend built from the
+    ///      "rule" line would have accepted `REC0UP` at the keyboard and then had the chain tell it
+    ///      the code does not exist, which is precisely the confusion the note above says this
+    ///      function is here to prevent.
+    ///
+    ///      **What now guards this, and what still does not - measured, because the obvious claim
+    ///      to write here is false.** `test_isCanonical_theAcceptedAlphabetIsExactlyTheThirtySix`
+    ///      enumerates every byte value in every position of a minimum-length code against the
+    ///      alphabet transcribed from this paragraph, so widening the loop turns it red: MEASURED,
+    ///      `0x32` to `0x30` fails it and two older tests. It does **not** guard the prose. A
+    ///      re-edit of the "rule" line back to "digits `0-9`" was applied and the whole suite stayed
+    ///      green, because nothing in this repository reads its own source text - `foundry.toml`
+    ///      sets no `fs_permissions`, so no test can. The transcription in the test is therefore a
+    ///      one-way tie: the code cannot drift from the prose, the prose can still drift from the
+    ///      code, and closing that needs a doc-claim check outside Foundry rather than another test.
     ///
     ///      **`0` and `1` are deliberately excluded, leaving 36 symbols.** Uppercase-only closes
     ///      the `BERNARD`/`bernard` confusion, but on its own it opens a worse one: in a

@@ -56,6 +56,11 @@ abstract contract DeployBase is Script {
         address keeper;
         address navConfirmer;
         address protocolFeeWallet;
+        /// @dev Go-live item G4. **Optional, and zero is a legal, meaningful value**: it leaves
+        ///      the role unfilled, which is the right answer while the owner is an EOA that can
+        ///      already pause in one transaction. It becomes load-bearing at G2, when the owner
+        ///      becomes a 48-hour timelock and `pause` stops being fast.
+        address guardian;
     }
 
     /// @notice The DexFi side: mocks locally, the verified Config addresses on Base.
@@ -82,6 +87,34 @@ abstract contract DeployBase is Script {
     error KeeperRequired();
     error NavConfirmerRequired();
     error NavKeysMustDiffer();
+    /// @dev Mirrors the check both contracts make. Catching it here means a misconfigured deploy
+    ///      fails before it broadcasts rather than at the third wiring call.
+    error GuardianMustDifferFromOwner();
+    /// @dev **The rule `_assertWiring` cannot make, and round 29's open finding 1 is why it has to
+    ///      be here rather than there.** `_assertWiring` compares the deployed guardian against the
+    ///      PARAMETER, which is the stronger check and the right one - and zero equals zero, so a
+    ///      guardian-less deployment satisfies every post-condition this script has. Nothing was
+    ///      checking what was ASKED FOR.
+    ///
+    ///      Zero is a legal, meaningful value under an EOA owner: that key can already `pause()`
+    ///      in one transaction, so the role adds nothing and an unfilled one costs nothing. It
+    ///      stops being legal the moment the owner is a contract, because `_wire` calls
+    ///      `setGuardian` BEFORE `_handOver` and the only remaining route to a guardian is then a
+    ///      `setGuardian` the new owner has to schedule. Under a `TimelockController` at
+    ///      `Config.ADMIN_TIMELOCK` that is a 48-hour operation, so the failure removes the tool
+    ///      you would need in order to respond to the failure.
+    ///
+    ///      **`code.length` cannot tell a Safe from a timelock, and this refuses both on purpose.**
+    ///      `GovParams.owner` names a Safe as a legitimate go-live shape, and a Safe can still
+    ///      pause in one transaction, so for that case the rule is stricter than the harm strictly
+    ///      requires. Probing for `getMinDelay()` would narrow it and was rejected: a `staticcall`
+    ///      sniffing for an interface is a guess about what the owner IS, when the thing this rule
+    ///      is actually about is that the owner is no longer the key in the operator's hand.
+    ///      Naming a guardian costs one environment variable either way.
+    ///
+    ///      Carries the owner because at 3am the operator needs to see WHICH address it refused -
+    ///      the same reason `YieldRecipientCollision` and `OwnershipNotTransferred` carry theirs.
+    error GuardianRequiredForContractOwner(address owner);
     error ProtocolFeeWalletRequired();
     error YieldRecipientCollision(address recipient, string collidesWith);
     error OwnershipNotTransferred(address contractAddr, address actualOwner);
@@ -159,16 +192,95 @@ abstract contract DeployBase is Script {
 
     // ── Parameters ───────────────────────────────────────────────────────────
 
+    /// @notice The single door every script parameter comes through.
+    /// @dev **`virtual` for exactly one reason, and it is not extensibility.** `vm.setEnv` writes
+    ///      ONE table shared by the whole `forge test` process and forge runs a suite's functions
+    ///      in parallel, so a test that sets a variable and a sibling that sets the same variable
+    ///      are a race in real time, not in EVM state. That was measured in this repo at roughly
+    ///      one run in eight - a plausible protocol revert in a test that was correct - and it was
+    ///      green in five runs of five under `--threads 1`, which is what identified it as a race
+    ///      rather than a defect. Two rounds of narrowing the blast radius (blank one variable, not
+    ///      twenty; export on the line before the call that reads it) made it rarer and could not
+    ///      make it go away, because the hazard is that a writer exists at all.
+    ///
+    ///      A test overrides this instead, backed by storage on the test contract. Forge isolates
+    ///      EVM state per test function, so an override is private to the function that set it and
+    ///      **no test in the process touches the environment**. The race is then absent by
+    ///      construction rather than made unlikely.
+    ///
+    ///      **What that costs, stated rather than discovered later, because nothing else will say
+    ///      it.** An overridden read no longer proves this file's `vm.envOr` call reaches the
+    ///      process environment. It still proves the KEY: an override is keyed on the same string,
+    ///      so a typo in a key name misses the override exactly as it would miss the environment,
+    ///      and `_required` still reverts `DeployedAddressMissing` with the name.
+    ///
+    ///      The one claim left unproven is the body of the two functions below - that the base
+    ///      implementation reads the environment at all - and there is **no test for it, on
+    ///      purpose**. The only way to assert it from inside `forge test` is `vm.setEnv`, which is
+    ///      the cheatcode being removed, and a key nobody else reads is not a safe exception:
+    ///      `setenv` mutates a table other threads are inside `getenv` on, so the hazard is the
+    ///      write and not the key. It is exercised on every real `forge script` run instead, and a
+    ///      seam that stopped reading the environment would break a deploy rather than this suite.
+    ///      Recorded as a residual rather than closed.
+    ///
+    ///      Zero bytecode cost: `DeployBase` is a script and is never deployed.
+    function _envOrAddress(string memory key, address fallbackValue)
+        internal
+        view
+        virtual
+        returns (address)
+    {
+        return vm.envOr(key, fallbackValue);
+    }
+
+    /// @dev The string half of the same seam, for the confirmation phrases. Same reasoning.
+    function _envOrString(string memory key, string memory fallbackValue)
+        internal
+        view
+        virtual
+        returns (string memory)
+    {
+        return vm.envOr(key, fallbackValue);
+    }
+
     /// @notice Resolve operator addresses from the environment, then validate them.
     /// @dev Reading and checking are separate so the rules can be tested directly,
     ///      without a test having to mutate process environment variables that would
     ///      then leak into every other test in the run.
     function _resolveParams(address deployer) internal view returns (GovParams memory p) {
-        p.owner = vm.envOr("RECOUP_OWNER", deployer);
-        p.yieldRecipient = vm.envOr("RECOUP_YIELD_RECIPIENT", address(0));
-        p.keeper = vm.envOr("RECOUP_KEEPER", address(0));
-        p.navConfirmer = vm.envOr("RECOUP_NAV_CONFIRMER", address(0));
-        p.protocolFeeWallet = vm.envOr("RECOUP_PROTOCOL_FEE_WALLET", address(0));
+        p = _readParams(deployer);
+        _validateParams(p, deployer);
+    }
+
+    /// @notice The same addresses, read and not checked.
+    /// @dev **For readers, and there is exactly one: `WirePhase4.assertOnly()`.** That function is
+    ///      a post-condition report an operator runs to find out what a queued switchover actually
+    ///      did, and its own docstring says it is deliberately ungated because "reading state
+    ///      changes nothing and an operator should never be discouraged from checking". Once
+    ///      `_validateParams` gained the contract-owner guardian rule, going through
+    ///      `_resolveParams` would have made that false: a deployment owned by a contract with no
+    ///      guardian named is precisely the state somebody would run the report to understand, and
+    ///      the report would have answered with a parameter error instead of the wiring.
+    ///
+    ///      **A zeroed struct is NOT a substitute and that was measured the hard way.**
+    ///      `_assertPhase4Wiring` looks as though it ignores its `GovParams` - there is no
+    ///      `p.<field>` anywhere in its body - but it hands them whole to `_assertCoreGraph`, which
+    ///      reads `p.owner` for the ownership check. Passing a zeroed struct made it revert
+    ///      `OwnershipNotTransferred` against `address(0)`. The values are needed; only the
+    ///      refusal is not.
+    ///
+    ///      Nothing else may use this. A deployment must go through `_resolveParams`, because the
+    ///      rules are the point.
+    function _readParams(address deployer) internal view returns (GovParams memory p) {
+        p.owner = _envOrAddress("RECOUP_OWNER", deployer);
+        p.yieldRecipient = _envOrAddress("RECOUP_YIELD_RECIPIENT", address(0));
+        p.keeper = _envOrAddress("RECOUP_KEEPER", address(0));
+        p.navConfirmer = _envOrAddress("RECOUP_NAV_CONFIRMER", address(0));
+        p.protocolFeeWallet = _envOrAddress("RECOUP_PROTOCOL_FEE_WALLET", address(0));
+        // No local default, unlike the four above. Those default because a local run must need
+        // zero setup; this one stays zero because an unfilled guardian is the correct default
+        // everywhere, and inventing a local one would put a role in the logs that nobody chose.
+        p.guardian = _envOrAddress("RECOUP_GUARDIAN", address(0));
 
         if (_isLocal()) {
             if (p.yieldRecipient == address(0)) p.yieldRecipient = LOCAL_TREASURY;
@@ -177,7 +289,6 @@ abstract contract DeployBase is Script {
             if (p.protocolFeeWallet == address(0)) p.protocolFeeWallet = LOCAL_TREASURY;
         }
 
-        _validateParams(p, deployer);
     }
 
     /// @notice The rules a real deployment must satisfy.
@@ -185,7 +296,33 @@ abstract contract DeployBase is Script {
     ///      strict everywhere else so a real deployment cannot inherit a default.
     function _validateParams(GovParams memory p, address deployer) internal view {
         if (p.owner == address(0)) revert OwnerRequired();
+        // Checked before the local early-return, unlike everything below it: the rules after this
+        // point are about a real deployment having real operators, and are relaxed locally on
+        // purpose. This one is not a completeness rule - it is the same rule both contracts
+        // enforce in `setGuardian`, so a local deploy that broke it would revert mid-wiring with
+        // no indication which of two roles was wrong.
+        if (p.guardian != address(0) && p.guardian == p.owner) revert GuardianMustDifferFromOwner();
         if (_isLocal()) return;
+
+        // **AFTER the local early-return, unlike the guardian/owner rule five lines up, and the
+        // difference between the two is the reason.** That one mirrors a rule `setGuardian`
+        // enforces in `src/`, so a local deploy breaking it would revert mid-wiring with no
+        // indication which of two roles was wrong. This one mirrors nothing in `src/`: it is a
+        // completeness rule about a real deployment's incident response, which is exactly the
+        // class the local branch relaxes.
+        //
+        // It is also not merely relaxed locally, it MUST be, and that was MEASURED rather than
+        // reasoned about. Under `forge test` the owner is routinely a contract with no guardian,
+        // and `test_localDefaultsDoNotPointAtTheDeployer` resolves `RECOUP_OWNER` all the way to
+        // the test contract through `_resolveParams` - it sets the other four keys to zero and
+        // deliberately leaves this one alone. Placed above the return, that test reverts in CI,
+        // where there is no `contracts/.env` to supply an EOA.
+        // `test_validate_theContractOwnerRuleIsRelaxedLocally` pins this placement, so an edit
+        // that moves it up fails under a name that says why instead of breaking something that
+        // looks unrelated.
+        if (p.guardian == address(0) && p.owner.code.length > 0) {
+            revert GuardianRequiredForContractOwner(p.owner);
+        }
 
         if (p.yieldRecipient == address(0)) revert YieldRecipientRequired();
         if (p.keeper == address(0)) revert KeeperRequired();
@@ -197,6 +334,16 @@ abstract contract DeployBase is Script {
         // A real treasury must be a distinct address. Routing harvested USDC to the
         // key that signed the deploy is the default that looks fine and is not
         // (PRD §4.4, and the yield-routing decision the audit locked in).
+        //
+        // **What these two rules actually protect, corrected in audit round 22 (F11-4).** They do
+        // not decide where a finished deployment's yield goes: `_wire` repoints the adapter at the
+        // `EpochHarvester` and `_assertCoreGraph` refuses any deployment that ends otherwise, so
+        // the shipped sink is never this address. They protect the *interim* one. Every line of
+        // `_deployProtocol` is a separate broadcast transaction, so between the adapter's
+        // constructor and `_wire`'s last call this address is the live sink of a live adapter
+        // already installed on the vault, and a deploy that stops part way through leaves it
+        // there. `test_deploy_theOperatorsYieldRecipientIsTheInterimSinkOnly` measures both halves
+        // of that. See the note at the constructor call site.
         if (p.yieldRecipient == deployer) revert YieldRecipientCollision(p.yieldRecipient, "deployer");
         if (p.yieldRecipient == p.owner) revert YieldRecipientCollision(p.yieldRecipient, "owner");
     }
@@ -216,10 +363,25 @@ abstract contract DeployBase is Script {
     ///      not from this (ephemeral) script contract, so `address(this)` would name
     ///      an address that never holds authority. Scripts pass `msg.sender`; tests
     ///      pass `address(this)`.
+    /// @dev **The rules run HERE, and round 30 is why.** Until then `_validateParams` was reachable
+    ///      only through `_resolveParams` and through one external wrapper in the test suite, so
+    ///      every deployment performed anywhere in this repository - all of CI - went through a
+    ///      path that validated nothing. The three script targets do call `_resolveParams`, so the
+    ///      broadcast path was covered; what was not covered is that the rules are a property of a
+    ///      DEPLOYMENT rather than of an environment read, and the one caller that skipped them was
+    ///      the only caller anybody ever exercises. That is the unreached-guard shape this file
+    ///      keeps finding one level down, arriving one level up.
+    ///
+    ///      **It is a re-check, not a second gate.** `_validateParams` is `view`, idempotent and
+    ///      free of side effects, so a script that already resolved runs it twice and nothing
+    ///      changes. The direction is strictly more refusing: no parameter set that was accepted
+    ///      before is rejected now, and sets that were never checked are.
     function _deployProtocol(Externals memory e, GovParams memory p, address deployer)
         internal
         returns (Deployed memory d)
     {
+        _validateParams(p, deployer);
+
         d.oracle = new NAVOracle(deployer);
         // Constructed before the three contracts that hold it, because they take it as an
         // `immutable`. Seeded from `Config`'s declared defaults, which `RiskParams` re-checks
@@ -239,6 +401,20 @@ abstract contract DeployBase is Script {
         );
         // owner and yieldRecipient are distinct arguments and must stay visibly
         // distinct at the call site: they are unrelated roles.
+        //
+        // **`p.yieldRecipient` is the INTERIM sink, not the shipped one, and audit round 22's
+        // F11-4 is why that is written down here.** `_wire` repoints it to the `EpochHarvester`
+        // below and `_assertCoreGraph` then *requires* the harvester, so no completed deployment
+        // can end with the operator's address in place - which read as a contradiction with
+        // `_validateParams` refusing a deploy over a value it was about to discard.
+        //
+        // It is not discarded. Under `forge script --broadcast` every `new` and every external
+        // call below is its own transaction (40 of them on the 2026-08-19 testnet deploy), so this
+        // address is the adapter's live yield sink for the whole span between this line and
+        // `_wire`'s last one - a span that includes `vault.setCustodyAdapter` and
+        // `adapter.setHarvester`. A deploy that stops part way through leaves it standing on chain.
+        // That is the state `_validateParams`' three rules are about, and it is the only state
+        // they are about.
         d.adapter = new DirectCallAdapter(e.bond, e.farm, e.usdc, address(d.vault), deployer, p.yieldRecipient);
         d.credit = new CreditManager(
             e.usdc,
@@ -274,13 +450,32 @@ abstract contract DeployBase is Script {
         d.vault.setCreditManager(address(d.credit));
         d.vault.setLiquidationAuction(address(d.auction));
 
+        // Go-live item G4. Called unconditionally, including with zero, so that `_assertWiring`
+        // can assert the deployed value **equals the parameter** rather than merely being
+        // non-wrong - the distinction this file already draws about `adapter.yieldRecipient`,
+        // where three checks ruled out the sinks that strand yield and every one of them passed
+        // while 100% of it went to an EOA.
+        //
+        // Note what the contracts' own `guardian != owner()` check can and cannot see from here:
+        // at this point the owner is still `deployer`, so a guardian equal to `p.owner` passes
+        // all three calls and only collapses at `_handOver`. `_validateParams` is what catches that,
+        // and `_assertWiring` re-checks it after the handover, when the state is observable.
+        d.vault.setGuardian(p.guardian);
+        d.credit.setGuardian(p.guardian);
+        // The third holder of the same role, added with the lender pool's entry pause. It sits here
+        // rather than beside the pool's own two graph pointers below because what it wires is G4,
+        // not the pool graph - and a role installed on two of the three contracts that carry it is
+        // the half-installed shape the assertion in `_assertWiring` already exists to refuse.
+        d.pool.setGuardian(p.guardian);
+
         d.credit.setLiquiditySource(address(d.liquidity));
         d.credit.setEpochHarvester(address(d.harvester));
         d.credit.setLiquidationAuction(address(d.auction));
 
         d.liquidity.setCreditManager(address(d.credit));
 
-        // The pool's own two pointers stay here, and only these two. They cost the protocol
+        // The pool's own two graph pointers stay here, and only these two - its guardian is set
+        // in the G4 block above with the other two halves of that role. They cost the protocol
         // nothing while the pool is dormant: they say who the pool would answer if it were ever
         // asked, not that anyone is asking. `setCreditManager` in particular refuses once the pool
         // has principal out, so wiring it now is what keeps it wirable at all later.
@@ -378,9 +573,14 @@ abstract contract DeployBase is Script {
     ///
     ///      **Why a pause is sufficient here, which is a narrower claim than it sounds.** Pausing
     ///      this protocol does not stop the dangerous paths in general: `liquidate`,
-    ///      `writeDownLoss`, `flushSocialisedLoss` and every `LenderPool` entry point are all
-    ///      ungated, and `LenderPool` is not `Pausable` at all. `borrow` is the *only* function in
-    ///      `CreditManager` carrying `whenNotPaused`. It is enough because of what leg 2 already
+    ///      `writeDownLoss` and `flushSocialisedLoss` are all ungated, and `borrow` is the *only*
+    ///      function in `CreditManager` carrying `whenNotPaused`. **This paragraph used to end
+    ///      "and `LenderPool` is not `Pausable` at all", which stopped being true with round-28
+    ///      item 10**: the pool carries its own `Pausable` over `deposit` and `mint` now. That
+    ///      changes nothing here, because the pool's switch is a *third* switch and this operation
+    ///      does not throw it - the same relationship `depositBonds` has to the vault's, two
+    ///      paragraphs down. What it does change is what an operator has to send during an
+    ///      incident, where the pause is now four transactions rather than three. It is enough because of what leg 2 already
     ///      demands: `setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is
     ///      non-zero, so **no pre-existing position can be carried into the gap and defaulted
     ///      there** - and by the identity `outstandingPrincipal == pendingPrincipal + totalDebt`
@@ -389,9 +589,24 @@ abstract contract DeployBase is Script {
     ///      Do not "improve" this by relaxing leg 2's precondition; it is half the reason the
     ///      pause works.
     ///
-    ///      The vault is paused for the same span. Its `depositBonds`/`depositETH` are the only
-    ///      other `whenNotPaused` functions in the protocol, and new collateral arriving mid-
-    ///      switchover is the same class of mistake even though it is not the one that was measured.
+    ///      The vault is paused for the same span. **That sentence used to continue "its
+    ///      `depositBonds`/`depositETH` are the only other `whenNotPaused` functions in the
+    ///      protocol", and since the round-27 remediation only `depositETH` is** - `depositBonds`
+    ///      moved onto its own owner-only switch, which this operation deliberately does NOT
+    ///      throw.
+    ///
+    ///      **That is a decision, not an oversight, and it is worth the paragraph.** The pause
+    ///      here was precautionary rather than load-bearing on the collateral side: its own text
+    ///      says new collateral arriving mid-switchover "is the same class of mistake even though
+    ///      it is not the one that was measured", and the measured lock is `borrow` plus leg 2's
+    ///      `outstandingPrincipal == 0` precondition. A bond deposit creates no debt and moves no
+    ///      principal, so it cannot disturb either. Meanwhile a switchover sits behind a 48-hour
+    ///      timelock, and shutting the borrower's cure for that span is **exactly** the harm audit
+    ///      round 25 finding 1 measured and the round-27 remediation removed. Restoring it here
+    ///      would re-create that finding inside a governance operation.
+    ///
+    ///      So the rule the rest of the protocol now follows applies to the switchover too: shut
+    ///      what creates risk, never what resolves it.
     ///
     ///      **Audit round 20, finding 5: the pause is correct against the operator and is defeated
     ///      by the timelock executor, so the legs became a list.** Round 19's residual was written
@@ -692,7 +907,14 @@ abstract contract DeployBase is Script {
     ///      exists to invert, and the treasury liquidity source, which it replaces. Both are stated
     ///      in the callers rather than parameterised here, because a shared function branching on
     ///      "which phase" would have to be read twice to answer either question.
-    function _assertCoreGraph(Deployed memory d, GovParams memory p) private view {
+    ///
+    ///      **`internal` rather than `private` since audit round 22, finding 7.** `WirePhase4`
+    ///      calls it *before* `scheduleBatch` as well as after `executeBatch`, and it is the only
+    ///      caller outside this file. The reason is in `WirePhase4._queue`: this function is
+    ///      exactly the half of `_assertPhase4Wiring` that is already true at queue time, so
+    ///      running it there costs nothing and moves every failure it can name from the far side
+    ///      of a forty-eight hour window to the near side.
+    function _assertCoreGraph(Deployed memory d, GovParams memory p) internal view {
         // **Derived from `Deployed`, never enumerated, and the third instance of one finding is
         // why.** This block was a hand-typed list of eight, and `d.riskParams` was the ninth. That
         // is round 10's finding exactly - `d.liquidity` was once missing from this list, from
@@ -775,6 +997,61 @@ abstract contract DeployBase is Script {
             revert WiringIncomplete("auction.navOracle");
         }
 
+        // **And the third shared immutable, which is the money, and which had neither a contract
+        // guard nor a line here. Audit round 22, finding 13.** The two blocks above compare the
+        // risk readers and the nav readers - three contracts each, six guards each in the
+        // contracts themselves. `usdc` is held by *six* members of this struct and `bond` by two,
+        // and until this block the census stopped at the two cheapest triples.
+        //
+        // MEASURED, with a control: a `LenderPool` constructed on a *second* USDC, wired exactly
+        // as `_wire` wires one, went through the entire Phase-4 switchover with every leg
+        // accepting, and `_assertPhase4Wiring` passed over it. The same substitution one field
+        // over - a pool pointed at a second `CreditManager` - reverted `WiringIncomplete`, so the
+        // assertion set was not blind in general. It was blind to the settlement token
+        // specifically, because nothing in it ever asked.
+        //
+        // **What actually holds the money today, and it is not this line, so read it as defence in
+        // depth rather than as the last thing standing.** MEASURED on the rogue pool: `borrow`
+        // reverts `LiquidityNotDelivered(3000000000, 0)` and no real USDC moves, because
+        // `CreditManager.borrow` measures its own balance either side of `lend()` and compares the
+        // delta with the amount asked for. That balance bracket is a runtime asset-identity check
+        // nobody had framed as one. It fails closed - a denial of service, not a drain - and it
+        // fails at the first borrow rather than at deployment, which is the whole reason to have
+        // the question asked here as well.
+        //
+        // Anchored on the manager because the manager is the contract that counts the delta above:
+        // "the settlement token" is definitionally the one it measures itself in. A member that
+        // disagrees with it is the member that is wrong, whichever member it is - and one wrong
+        // address cannot pass this block by moving the anchor, because the other five would then
+        // disagree with the anchor instead.
+        address settlement = address(d.credit.usdc());
+        if (address(d.auction.usdc()) != settlement) revert WiringIncomplete("auction.usdc");
+        if (address(d.harvester.usdc()) != settlement) revert WiringIncomplete("harvester.usdc");
+        if (address(d.liquidity.usdc()) != settlement) revert WiringIncomplete("liquidity.usdc");
+        if (address(d.adapter.usdc()) != settlement) revert WiringIncomplete("adapter.usdc");
+        if (d.pool.asset() != settlement) revert WiringIncomplete("pool.asset");
+
+        // The collateral token, same finding, two holders. Anchored on the vault for the reason
+        // `WirePhase4._resolveDeployed` derives `riskParams` off it: the vault is the one member of
+        // this graph with no setter anywhere and no replacement path.
+        address collateral = address(d.vault.bond());
+        if (address(d.adapter.bond()) != collateral) revert WiringIncomplete("adapter.bond");
+
+        // **`adapter.vault` deliberately has NO line here, and the reason is a measurement rather
+        // than an omission.** The back-pointer on the same edge looks like the obvious companion
+        // to `vault.custodyAdapter` twenty lines up, and a `WiringIncomplete("adapter.vault")` was
+        // written, compiled, and found to be unreachable: `CollateralVault.setCustodyAdapter`
+        // reads `adapter.vault()` and reverts `AdapterVaultMismatch` unless it is the installing
+        // vault, and that setter is the pointer's only writer. So with the line above holding,
+        // this one cannot fail. MEASURED: an adapter constructed against a different vault is
+        // refused by `setCustodyAdapter` itself, before any of this runs.
+        //
+        // That is also what makes `adapter.bond` above the real gap rather than a matching pair.
+        // The same setter guards the vault identity and does **not** guard the ERC-1155: an adapter
+        // holding a different `MockBond` installs with no revert. That half is in `src/` and is
+        // filed separately; this is only the deploy-time half of it, and a `setCustodyAdapter`
+        // performed after the script has run is not reached by anything in this file.
+
         // **These four tested for non-zero rather than for the right address, and this file names
         // the rule it was breaking a few lines below: "ruling out wrong destinations is not the
         // same as asserting the right one". It said it and then broke it four times**, which is
@@ -796,6 +1073,21 @@ abstract contract DeployBase is Script {
         }
         if (d.oracle.keeper() != p.keeper) revert WiringIncomplete("oracle.keeper");
         if (d.oracle.navConfirmer() != p.navConfirmer) revert WiringIncomplete("oracle.navConfirmer");
+
+        // Go-live item G4, all three halves of the role, asserted as equality rather than as
+        // non-zero.
+        if (d.vault.guardian() != p.guardian) revert WiringIncomplete("vault.guardian");
+        if (d.credit.guardian() != p.guardian) revert WiringIncomplete("credit.guardian");
+        if (d.pool.guardian() != p.guardian) revert WiringIncomplete("pool.guardian");
+        // **The check neither contract can make for itself.** `setGuardian` compares against the
+        // owner at call time, which during `_wire` is still the deployer - so a guardian equal to
+        // the incoming owner passes there and collapses one `transferOwnership` later. This runs
+        // after `_handOver`, which is the first moment the final pairing is observable on chain.
+        if (p.guardian != address(0)) {
+            if (d.vault.guardian() == d.vault.owner()) revert GuardianMustDifferFromOwner();
+            if (d.credit.guardian() == d.credit.owner()) revert GuardianMustDifferFromOwner();
+            if (d.pool.guardian() == d.pool.owner()) revert GuardianMustDifferFromOwner();
+        }
 
         // The audit's finding #1 in assertion form: the vault has no USDC egress, so
         // routing yield there strands it permanently.
@@ -837,6 +1129,23 @@ abstract contract DeployBase is Script {
     ///      branching on a boolean would have to be read twice to answer either question. Run this
     ///      one immediately after the switchover transaction; `_assertWiring` no longer holds once
     ///      it has, because `credit.liquiditySource` is the pool rather than the treasury float.
+    ///
+    /// @param p **Looks unused and is not. KEPT, decided in audit round 30, with the mechanism
+    ///        named here so the next grep does not have to re-find it.** There is no `p.<field>`
+    ///        anywhere in this body, which is what a field-access grep measures - and this function
+    ///        hands the struct WHOLE to `_assertCoreGraph`, which reads `p.owner` at every one of
+    ///        its ownership checks. Passing a zeroed struct instead was tried and reverts
+    ///        `OwnershipNotTransferred` against `address(0)`.
+    ///        `test_assertPhase4Wiring_readsItsGovParamsAndAZeroedStructIsRefused` is that
+    ///        measurement as an assertion, so the claim in this paragraph is executable rather than
+    ///        remembered.
+    ///
+    ///        **Narrowing it to `address owner` was considered and refused.** Twenty call sites
+    ///        pass the struct, `_assertCoreGraph` is shared with `_assertWiring` and with
+    ///        `WirePhase4._queue`, and the parameter is the only route by which a future operator
+    ///        field could ever be asserted after a switchover. Round 15's finding on this exact
+    ///        function was assertions being DROPPED; narrowing the type is how the next one gets
+    ///        dropped without anybody deciding to.
     function _assertPhase4Wiring(Deployed memory d, GovParams memory p) internal view {
         // **Everything `_assertWiring` checks that a switchover does not change, and audit round 15
         // is why it is here.** This function dropped roughly eighteen assertions, including every
@@ -965,6 +1274,26 @@ abstract contract DeployBase is Script {
         console.log("yieldRecipient    ", p.yieldRecipient);
         console.log("keeper            ", p.keeper);
         console.log("protocolFeeWallet ", p.protocolFeeWallet);
+        // **Two of six operator addresses were missing from this list, and one of them is the
+        // guardian.** The comment on the contract enumeration below states the rule this broke -
+        // "an address nobody prints is an address nobody verifies after a deploy" - and states it
+        // about the CONTRACT list, which was derived from the struct to fix exactly this shape,
+        // while the operator list above it went on printing four of six. Written as a pointer
+        // rather than as "the comment N lines down": that count was wrong by five the day it was
+        // typed, in a file whose own findings are mostly stale counts. `navConfirmer` is the second
+        // key on the price feed and `guardian` is the whole of the fast incident response.
+        console.log("navConfirmer      ", p.navConfirmer);
+        if (p.guardian == address(0)) {
+            // Zero is legal and is the shipped default under an EOA owner, so this is not a
+            // refusal - `_validateParams` owns the one case that is refusable, which is a contract
+            // owner. It is loud because it is the one parameter whose correct value flips silently:
+            // right today, and "this protocol has no fast pause" the moment ownership moves to a
+            // timelock, with nothing in between announcing the change. An operator reading a deploy
+            // log has to be able to see which of those two deployments they just made.
+            console.log("guardian           UNSET - no fast pause. Correct only while the owner is an EOA.");
+        } else {
+            console.log("guardian          ", p.guardian);
+        }
 
         // Printed from the same enumeration `_assertCoreGraph` checks, rather than from a second
         // hand-typed list. `RiskParams` was absent from the old list, so the operator was never

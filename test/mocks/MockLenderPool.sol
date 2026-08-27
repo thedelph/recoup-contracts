@@ -30,6 +30,25 @@ contract MockLenderPool {
     /// @notice Principal this pool has out on loan. Book-keeping only, as on the real source.
     uint256 public outstandingPrincipal;
 
+    /// @notice The manager this pool says it answers to, and whether it will take a principal
+    ///         repayment from it.
+    /// @dev **Audit round 23, finding 1.** `CreditManager.flushPrincipalTo` now asks a parked
+    ///      source to take its money through `repayPrincipal`, and falls back to a bare push only
+    ///      for a source that no longer names this manager - which it establishes with a
+    ///      `creditManager()` staticcall. Until this pointer existed the mock could not be on
+    ///      either side of that question, so the fix's own branch was untestable against the only
+    ///      pool mock in the tree.
+    ///
+    ///      **Zero by default, and that is the safe default rather than an omission.** An address
+    ///      that answers `address(0)` is treated exactly like one that cannot answer at all: not
+    ///      ours, therefore bare-pushable, which is the pre-round-23 behaviour. So every fixture
+    ///      that never sets it keeps the shape it was written against, and a fixture that wants
+    ///      the pull path says so.
+    address public creditManager;
+    /// @notice Refuse `repayPrincipal` while still naming the manager. The state the fix refuses
+    ///         to pay by a route that would double-count, as opposed to the detached state it does.
+    bool public refusingPrincipal;
+
     error PoolRefuses();
 
     constructor(IERC20 usdc_) {
@@ -50,6 +69,14 @@ contract MockLenderPool {
 
     function setAbsorbCap(uint256 cap) external {
         absorbCap = cap;
+    }
+
+    function setCreditManager(address manager) external {
+        creditManager = manager;
+    }
+
+    function setRefusingPrincipal(bool value) external {
+        refusingPrincipal = value;
     }
 
     function socialiseLoss(uint256 amount) external returns (uint256 absorbed) {
@@ -103,6 +130,7 @@ contract MockLenderPool {
     ///      is never coming back, so a repayment can legitimately be larger than what is still
     ///      recorded as out on loan.
     function repayPrincipal(uint256 amount) external {
+        if (refusingPrincipal) revert PoolRefuses();
         outstandingPrincipal = amount > outstandingPrincipal ? 0 : outstandingPrincipal - amount;
         usdc.transferFrom(msg.sender, address(this), amount);
     }

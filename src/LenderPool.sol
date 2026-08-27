@@ -5,6 +5,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC4626, IERC20, IERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
@@ -132,7 +133,7 @@ import {ILenderPool} from "./interfaces/ILenderPool.sol";
 ///      bought. What is left below is what this contract does *beyond* the interface: its wiring
 ///      setters, its yield-stream freeze, and its pull-payment claim. See `ILenderPool`'s header
 ///      for the rule that decides which side a new event belongs on.
-contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
+contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     error NotCreditManager();
@@ -160,6 +161,19 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     error AssetsBelowMinimum(uint256 assets, uint256 minAssetsOut);
     /// @notice A bounded `withdraw` would have cost more shares than the caller said they would pay.
     error SharesAboveMaximum(uint256 shares, uint256 maxSharesIn);
+    /// @notice A bounded `deposit` minted fewer shares than the caller said they would accept.
+    error SharesBelowMinimum(uint256 shares, uint256 minShares);
+    /// @notice A bounded `mint` would have cost more assets than the caller said they would pay.
+    error AssetsAboveMaximum(uint256 assets, uint256 maxAssets);
+    /// @notice Shares were sent to this contract by a door that is not `requestWithdrawal`.
+    error EscrowIsNotAHolder();
+    /// @notice A pause switch was reached by an address that is neither the owner nor the guardian.
+    /// @dev Same name and arity as `CollateralVault`'s and `CreditManager`'s, deliberately. One role
+    ///      sits across the three contracts, and an operator reading a failed incident transaction
+    ///      should not have to work out which of three spellings they are looking at.
+    error NotOwnerOrGuardian();
+    /// @notice `setGuardian` refused a guardian equal to `owner()`.
+    error GuardianMustDifferFromOwner();
 
     // Everything this contract emits that `ILenderPool` describes is declared *there*, including
     // `YieldDistributed`, `Impaired`, `ImpairmentReleased`, `LossReservesSet` and the four queue
@@ -168,6 +182,13 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
 
     event CreditManagerSet(address indexed creditManager);
     event EpochHarvesterSet(address indexed epochHarvester);
+    /// @notice The guardian was installed, moved or cleared. Zero means the role is unfilled.
+    /// @dev **The name and the arity match `CollateralVault.GuardianSet` and
+    ///      `CreditManager.GuardianSet` on purpose**, which is the same match the vault's own
+    ///      comment records as deliberate. One role across three contracts is one event topic to
+    ///      subscribe to, and a written procedure that has to name three signatures for one act is
+    ///      a procedure somebody gets wrong during the incident.
+    event GuardianSet(address indexed guardian);
     event DepositCapSet(uint256 previous, uint256 current);
     /// @notice The stream stopped because the last share was burned; the remainder is held.
     /// @dev Local, not interface: `ILenderPool` promises that a delivered epoch reaches the share
@@ -207,8 +228,34 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      which is not a real barrier to a genuine pool.
     uint256 private constant MIN_SUPPLY_FOR_YIELD = (10 ** 3) * Config.BPS;
 
+    /// @dev The ceiling `totalPrincipalUnits` is renormalised back under. See `_renormaliseUnits`.
+    ///
+    ///      **Audit round 23, finding 7: the principal-unit quotient had no bound at all.** A loss
+    ///      lowers `netDeposits` and leaves the units alone, so `_deposit`'s issuance ratio
+    ///      `totalPrincipalUnits / netDeposits` only ever rises. Nine measured loss-and-recovery
+    ///      cycles took it past `type(uint256).max`, and `Math.mulDiv` then shut the deposit door
+    ///      of an immutable contract for good. A ceiling bounds the quotient rather than
+    ///      rate-limiting it, which is the difference between a fix and a delay.
+    ///
+    ///      Derived, not picked. Issuance is `mulDiv(assets, U, N)`, which carries the full 512-bit
+    ///      product, so the binding constraint is the aggregate `U + units` staying inside 256 bits.
+    ///      `units <= ceil(assets * U / N)` and `N >= 1` whenever `U != 0`, so the worst case is
+    ///      `assets * U`; `assets` is bounded by `depositCap`, itself bounded by
+    ///      `GLOBAL_BORROW_CAP_MAX` of 250,000e6, which is under `2**38` USDC-wei. `2**128 * 2**38`
+    ///      is `2**166`, leaving 90 bits above any single post-renormalisation issuance. Underneath,
+    ///      `2**127` of resolution is 38 decimal digits against a counter that never exceeds eleven,
+    ///      so the bits a shift destroys are far below one asset-wei of basis. Lower loses holder
+    ///      resolution on every shift; higher loses headroom above the aggregate.
+    uint256 private constant PRINCIPAL_UNIT_CEILING = 1 << 128;
+
     address public creditManager;
     address public epochHarvester;
+
+    /// @notice The second key that may halt lender entry. Zero means the role is unfilled, which is
+    ///         the shipped default.
+    /// @dev Go-live item G4, third contract. See `pause()` for why this switch is guardian-reachable
+    ///      when the vault's bond-deposit switch deliberately is not.
+    address public guardian;
 
     /// @notice Ceiling on cumulative lender deposits, in USDC.
     /// @dev Settable by the owner, which is a `TimelockController` in production. It lives here
@@ -370,9 +417,20 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     mapping(address account => uint256 generation) private _principalUnitGeneration;
     uint256 private _principalGeneration = 1;
 
-    /// @notice Total principal-accounting units in the current generation.
-    /// @dev Repeated near-total losses and recapitalisations can make this quotient grow quickly.
-    ///      The deposit cap makes ordinary values small, but no O(1) rescaling policy is claimed.
+    /// @dev The exponent every stored unit figure is quoted against. See `_renormaliseUnits`.
+    ///      Only ever rises, so `unitExponent - stamp` cannot underflow at any read site.
+    mapping(address account => uint256 exponent) private _principalUnitExponent;
+
+    /// @notice Cumulative binary renormalisation applied to the principal-unit ledger.
+    /// @dev A stored unit figure stamped at exponent `e` is worth `stored >> (unitExponent - e)`
+    ///      today. Public because a renormalisation is irreversible and destroys low-order bits of
+    ///      every holder's basis; an off-chain reader that caches unit figures needs to see it move.
+    uint256 public unitExponent;
+
+    /// @notice Total principal-accounting units in the current generation, at `unitExponent`.
+    /// @dev Repeated near-total losses and recapitalisations make this quotient grow quickly. It is
+    ///      bounded above by `PRINCIPAL_UNIT_CEILING`, which `_renormaliseUnits` restores after
+    ///      every issuance. Round 23's finding 7 is the measurement of what happens without one.
     uint256 public totalPrincipalUnits;
 
     /// @dev Queue cancellation and service must move the units recorded for that request, not the
@@ -381,12 +439,16 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     bool private _hasExactPrincipalUnitMove;
     uint256 private _exactPrincipalUnitsToMove;
 
+    /// @dev `principalUnitExponent` is appended last on purpose. A struct reordering ships a silent
+    ///      breaking change to anything that destructures positionally, which round 22 found the
+    ///      hard way.
     struct WithdrawalRequest {
         address owner;
         address receiver;
         uint256 shares;
         uint256 principalUnits;
         uint256 principalGeneration;
+        uint256 principalUnitExponent;
     }
 
     /// @dev Append-only. `queueHead` walks forward; serviced entries are left in place with zero
@@ -465,10 +527,71 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         depositCap = cap;
     }
 
+    /// @notice Install, move or clear the guardian (go-live item G4). Zero disables the role.
+    /// @dev Copied in shape from `CollateralVault.setGuardian`, including the refusal of
+    ///      `owner()` and the reason for it: a single address holding both roles is exactly the
+    ///      configuration the second key does not defend against. As there, the comparison is
+    ///      against the owner **at the time of the call**, so a later `transferOwnership` to the
+    ///      guardian collapses the pair - the G2 handover is such a transfer, so re-read the
+    ///      guardian after it. `DeployBase._assertWiring` is what re-reads it.
+    function setGuardian(address guardian_) external onlyOwner {
+        if (guardian_ == owner()) revert GuardianMustDifferFromOwner();
+        guardian = guardian_;
+        emit GuardianSet(guardian_);
+    }
+
+    /// @notice Halt new lender entry. Callable by the owner **or** the guardian.
+    /// @dev **Guardian-reachable, where the vault's bond-deposit switch deliberately is not, and
+    ///      the difference is the whole argument.** Audit round 27 refused a guardian-reachable
+    ///      pause next door because the vault case handed the guardian the borrower's *cure*: a
+    ///      borrower who cannot deposit bonds cannot climb out of a liquidation. Nothing here shuts
+    ///      a cure. `withdraw`, `redeem`, `requestWithdrawal`, `serviceQueue` and `claim` are all
+    ///      untouched by this switch and stay correct while it is on, so the worst a compromised
+    ///      guardian can do is cost the pool a few hours of inflow - against the harm it prevents,
+    ///      which audit round 25 measured as a lender depositing during an incident and taking the
+    ///      write-down that followed: **10,000.000000 redeemable in, 9,750.000000 out.** That
+    ///      asymmetry is what puts this switch on the fast key.
+    ///
+    ///      Nothing here freezes the yield stream or the clock. A pause that stopped accrual would
+    ///      be a change to the price every existing lender exits at, which is the opposite of
+    ///      leaving the exits correct.
+    function pause() external {
+        _requireOwnerOrGuardian();
+        _pause();
+    }
+
+    /// @dev `onlyOwner`, and not owner-or-guardian, for the reason `CollateralVault.unpause` gives:
+    ///      a compromised guardian must not be able to reopen the door during a live incident. The
+    ///      expensive direction of the two is reopening, and the timelock cost that carries is paid
+    ///      for by this pause never having shut an exit in the first place.
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @dev Reads `owner()` and `guardian` rather than taking either as an argument, so there is
+    ///      one place the rule is written. A zero `guardian` cannot match a caller, because
+    ///      `msg.sender` is never the zero address.
+    function _requireOwnerOrGuardian() private view {
+        if (msg.sender != owner() && msg.sender != guardian) revert NotOwnerOrGuardian();
+    }
+
     /// @notice Principal-accounting units carried by `account` in the current loss generation.
+    /// @dev Two lazy adjustments, in this order: the generation tag invalidates units a total loss
+    ///      wrote off, and `unitExponent` rescales what survives. Neither iterates over holders.
     function principalUnits(address account) public view returns (uint256) {
         if (_principalUnitGeneration[account] != _principalGeneration) return 0;
-        return _principalUnits[account];
+        return _scaleToCurrentExponent(_principalUnits[account], _principalUnitExponent[account]);
+    }
+
+    /// @dev Brings a figure stamped at `stamp` up to `unitExponent`. `unitExponent` only ever rises
+    ///      and every stamp is a value it once held, so the subtraction cannot underflow. A cumulative
+    ///      shift of 256 bits or more yields zero rather than reverting, which is `SHR`'s defined
+    ///      behaviour and the honest answer: a holder who has sat untouched through that many bits of
+    ///      renormalisation has no resolution left. They keep their shares and their money; what they
+    ///      lose is the cap-counter credit their principal was holding, which is the same thing the
+    ///      shift costs everyone, only taken all the way down.
+    function _scaleToCurrentExponent(uint256 units, uint256 stamp) private view returns (uint256) {
+        return units >> (unitExponent - stamp);
     }
 
     /// @notice The loss-adjusted, fungibly averaged principal carried by `account`'s shares.
@@ -931,7 +1054,16 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     ///      An exit debits the counter through the holder's own principal units in `_update`, not
     ///      through the assets it is paid. Debiting assets mixed yield into a principal counter and
     ///      ratcheted it down against a clamp that could not net it back up.
+    ///
+    ///      **A pause is reported here as a ZERO CAP and never as a revert**, and the sentence two
+    ///      paragraphs up is why: EIP-4626 requires this function to return zero when deposits are
+    ///      disabled, *including temporarily*, and forbids it from reverting under any condition.
+    ///      A revert here would not stop an integrator, it would break one - a router that reads
+    ///      this to size a deposit gets an unexplained failure in a view instead of a zero it knows
+    ///      how to handle. The refusal itself lives on `deposit` and `mint`, where a revert is
+    ///      what the standard expects; see `pause()`.
     function maxDeposit(address) public view override(ERC4626, IERC4626) returns (uint256) {
+        if (paused()) return 0;
         uint256 taken = netDeposits;
         uint256 cap = depositCap;
         return taken >= cap ? 0 : cap - taken;
@@ -1113,47 +1245,241 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @inheritdoc ERC4626
     /// @dev `nonReentrant` on the mutating ERC-4626 entry points, because USDC is an upgradeable
     ///      proxy on Base and a future hook on it would otherwise sit inside share accounting.
+    ///
+    ///      **`whenNotPaused` here as well as the zero cap in `maxDeposit`, and the pair is
+    ///      deliberate.** The zero cap alone would already refuse this deposit, because the line
+    ///      below reads `maxDeposit` - but it would refuse it as `DepositCapExceeded(assets, 0)`,
+    ///      which tells a lender the pool is full when the truth is that the pool is shut. The
+    ///      modifier runs first and says `EnforcedPause()` instead. OpenZeppelin's own error rather
+    ///      than a bespoke one, so the three contracts carrying this role refuse in one voice and
+    ///      the dApp's error union already knows the selector.
     function deposit(uint256 assets, address receiver)
         public
         override(ERC4626, IERC4626)
+        whenNotPaused
         nonReentrant
         returns (uint256) {
+        if (receiver == address(this)) revert EscrowIsNotAHolder();
         uint256 remaining = maxDeposit(receiver);
         if (assets > remaining) revert DepositCapExceeded(assets, remaining);
         return super.deposit(assets, receiver);
     }
 
+    /// @inheritdoc ERC4626
+    /// @dev The exact-share twin of `deposit` above, gated identically and for the same reasons.
     function mint(uint256 shares, address receiver)
         public
         override(ERC4626, IERC4626)
+        whenNotPaused
         nonReentrant
         returns (uint256) {
+        if (receiver == address(this)) revert EscrowIsNotAHolder();
         uint256 remaining = maxMint(receiver);
         if (shares > remaining) revert DepositCapExceeded(shares, remaining);
         return super.mint(shares, receiver);
     }
 
-    /// @dev Overridden for `nonReentrant` and for nothing else since the gate came out. Both of
-    ///      these used to open with the round-10 gate check and its own dedicated revert; what
-    ///      carries the loss now is the price they pay out on, because `super` routes through
-    ///      `previewWithdraw`/`previewRedeem` and those price on `exitAssets()`. There is
-    ///      deliberately no check of any kind left here - a refusal is what round 10 shipped and
-    ///      what the research overturned.
+    /// @notice Deposit, refusing to accept fewer than `minShares` shares in return.
+    /// @dev **The entry-side half of the bound audit round 20 put on the exits, and audit round 23
+    ///      finding 3 is why it is here.** PR #247 made the entry price a function of
+    ///      `pendingYield` and `yieldRate` - `_entryAssets()` adds a live stream's projected tail
+    ///      back on, so a newcomer pays for value the delivered cohort is owed. That was the right
+    ///      change and it is not undone here. What it also did was make the entry quote *steppable*
+    ///      by a stranger, and unlike the exits there was no door through which a caller could
+    ///      decline the step.
+    ///
+    ///      **Every writer of that basis sits behind a gate that checks no identity**, which is the
+    ///      finding. `distributeYield` is reached from `EpochHarvester.flushLenderYield()`;
+    ///      `recoverLoss` from `LiquidationAuction.workoutSettleAfterClose()` by way of
+    ///      `CreditManager.recoverWrittenDownLoss`; `repayPrincipal` from
+    ///      `CreditManager.settlePrincipal()`. All three raise `_entryAssets()`, which lowers the
+    ///      shares a fixed sum of USDC buys. MEASURED on the round-23 fixture: a 909 bps quote
+    ///      shortfall on one flush, with what the entrant lost and what the incumbent gained
+    ///      balancing to 1 wei, so this is a transfer between lenders and not an accounting
+    ///      artefact.
+    ///
+    ///      **The three are not equally exposed, and `EntryStepReachability.t.sol` is what measured
+    ///      that rather than reading it.** Driven end to end from an address with no role: the
+    ///      epoch leg is reachable and its size is the lender split of an epoch the farm produced,
+    ///      so a stranger picks the block and nothing else; the recovery leg is reachable *and*
+    ///      caller-sized, but `workoutSettleAfterClose` clamps to `min(amountUsdc, w.writtenDown)`
+    ///      and makes the caller fund it, so the step is bounded by the loss actually written down;
+    ///      and the principal leg is reachable as a *call* whose ordinary settlement moves this
+    ///      quote by nothing, because the cash in equals the principal off. The 9,090 bps figure in
+    ///      `LenderPoolEntryPricing.t.sol` is what this contract accepts from its own manager and
+    ///      is not a reachable step. `recoverLoss` genuinely carries no `YieldExceedsCapital`
+    ///      guard, deliberately; that is a fact about this boundary and not about the exposure.
+    ///
+    ///      **What #259 changed and what it did not.** #259 stopped the two non-epoch legs rating
+    ///      their money over the epoch accrual clock, so the *window* a stepped-in entrant then
+    ///      waits out is `Config.YIELD_STREAM_DURATION` on those two legs and only a genuine epoch
+    ///      drought still stretches it. It changed no amount: the size of the step through this
+    ///      door is the size of the arriving pot. So the bound is sized against the step, not
+    ///      against the window.
+    ///
+    ///      **Signature taken from EIP-5143**, which standardises exactly this pair, rather than
+    ///      invented to match the exits. The parameter names are the EIP's (`minShares`,
+    ///      `maxAssets`); the round-20 exit overloads predate the EIP and keep their own
+    ///      `minAssetsOut`/`maxSharesIn`, which is a naming difference and not an ABI one - the
+    ///      argument order of all four is the EIP's. `external` rather than the EIP's `public`
+    ///      because nothing in this tree calls them internally and the exits are `external` too;
+    ///      the selector is identical either way.
+    ///
+    ///      **Checked after execution rather than against a preview**, for the reason the redeem
+    ///      overload gives at length: the two agree today, and bounding what actually happened
+    ///      keeps that true without depending on it. The revert unwinds the transfer and the mint
+    ///      with everything else.
+    ///
+    ///      **Not a default and not a refusal.** The two-argument doors above are unchanged and
+    ///      still take whatever the book says, because ERC-4626 fixes their signatures. This is the
+    ///      door for a caller who has an opinion about the price.
+    ///
+    ///      **What this does NOT close, stated here because both live in this door.** Round-23
+    ///      finding 14 is about the *duration* an entrant sits at the #247 discount, and this bound
+    ///      cannot see it: the entry quote is a function of the size of the unreleased pot and not
+    ///      of the window it unwinds over, so the same pot delivered over five days and over a
+    ///      180-day drought mints the identical share count and passes the identical `minShares`.
+    ///      MEASURED in `LenderPoolEntryPricing.t.sol`: 4,545,454,545,495 shares either way
+    ///      against the same bound, and a five-day exit that forfeits 1 wei under the floor and
+    ///      303.819445 USDC under the drought, out of a 5,000.000000 entry. Finding 14 needs a
+    ///      duration bound or a shorter window, and neither is this.
+    function deposit(uint256 assets, address receiver, uint256 minShares)
+        external
+        returns (uint256 shares)
+    {
+        shares = deposit(assets, receiver);
+        if (shares < minShares) revert SharesBelowMinimum(shares, minShares);
+    }
+
+    /// @notice Mint exactly `shares`, refusing to pay more than `maxAssets` USDC for them.
+    /// @dev The exact-share half of the bound above. `previewMint` already quotes the cost;
+    ///      this is what lets a caller hold the quote to it. The step runs the other way on this
+    ///      door - a rising `_entryAssets()` makes a fixed share count cost *more* - so the
+    ///      comparison is inverted and the bound is a maximum, exactly as EIP-5143 specifies and
+    ///      as `withdraw`'s `maxSharesIn` does on the exit side.
+    ///
+    ///      See the bounded `deposit` above for the finding, the measured step, and for what this
+    ///      pair deliberately does not close.
+    function mint(uint256 shares, address receiver, uint256 maxAssets)
+        external
+        returns (uint256 assets)
+    {
+        assets = mint(shares, receiver);
+        if (assets > maxAssets) revert AssetsAboveMaximum(assets, maxAssets);
+    }
+
+    /// @notice Refuses shares sent straight to the pool. Use `requestWithdrawal`.
+    /// @dev **Audit round 23 finding 16.** This contract's own address is the withdrawal queue's
+    ///      escrow, and `_update` credits principal-accounting units to whoever receives shares.
+    ///      A share arriving here by any door other than `requestWithdrawal` therefore mints
+    ///      escrow units that no queue entry claims, and nothing can ever retire them: the only
+    ///      burn path out of escrow (`serviceQueue`) takes exactly the units the entry it is
+    ///      paying carries. The `netDeposits` those orphans hold is deposit-cap headroom that
+    ///      never comes back - the cap-BRICK direction, opposite to every residual finding 3
+    ///      discloses, so it cannot be netted off against them.
+    ///
+    ///      **MEASURED, and the ledger recorded only the first of these four doors.** From a
+    ///      10,000.000000 book: `transfer(this, 25)` and `transferFrom` each strand **1** unit;
+    ///      `deposit(1_000e6, this)` strands **1,000,000,000** units and 1,000.000000 of
+    ///      `netDeposits`, and `mint` the same. The bound of "one asset-wei per transaction" is a
+    ///      fact about the transfer door alone. The ERC-4626 doors are the same defect at
+    ///      arbitrary size, so all four are shut here rather than the two that were named.
+    ///
+    ///      Refusing rather than tolerating, because it is what buys the *detector*. The only
+    ///      candidate fix still standing for audit round 23's open finding on principal-unit
+    ///      growth turns `escrow units == sum of live request units` from an equality into a
+    ///      bounded inequality, which is a weaker detector for exactly this bug. With these doors
+    ///      shut the only route into escrow is `requestWithdrawal`, so that bound can be derived
+    ///      from the live entries themselves rather than picked as a slack constant large enough
+    ///      to make the suite pass.
+    ///
+    ///      Nothing legitimate is lost. `_requestWithdrawal` reaches escrow through the internal
+    ///      `_transfer`, which is below these doors and untouched, and so do the queue's own
+    ///      returns in `cancelWithdrawalRequest` and `serviceQueue`. A holder who genuinely wants
+    ///      to give shares away can still send them anywhere that is not this contract.
+    function transfer(address to, uint256 value) public override(ERC20, IERC20) returns (bool) {
+        if (to == address(this)) revert EscrowIsNotAHolder();
+        return super.transfer(to, value);
+    }
+
+    /// @dev The same door as `transfer`, and shut for the same reason.
+    function transferFrom(address from, address to, uint256 value)
+        public
+        override(ERC20, IERC20)
+        returns (bool)
+    {
+        if (to == address(this)) revert EscrowIsNotAHolder();
+        return super.transferFrom(from, to, value);
+    }
+
+    /// @dev Overridden for `nonReentrant`, and since audit round 25 finding 1 for one refusal.
+    ///      Both of these used to open with the round-10 gate check and its own dedicated revert;
+    ///      what carries the *loss* now is the price they pay out on, because `super` routes
+    ///      through `previewWithdraw`/`previewRedeem` and those price on `exitAssets()`. That
+    ///      gate is still gone and is not coming back: nothing here refuses an exit on grounds of
+    ///      solvency, timing or size, which is what round 10 shipped and what rounds 10/11's
+    ///      research overturned.
+    ///
+    ///      **What is refused is the escrow as `receiver`, and this is the mirror of a guard the
+    ///      entry side has had since round 23.** `_deposit` reverts `ZeroAmount` on an entry that
+    ///      mints nothing, and `_update`'s comment states the rule these four doors were found by:
+    ///      when a fix adds a guard, find its mirror. `deposit`, `mint`, `transfer`,
+    ///      `transferFrom` and `requestWithdrawal` all already refuse this address. These two did
+    ///      not, and neither did the two bounded overloads below, which reach the escrow through
+    ///      this pair and are shut by this line rather than by one of their own.
+    ///
+    ///      What went wrong without it, MEASURED on one `redeem(10_000e9, address(pool), bob)`
+    ///      from a 20,000.000000 book: `usdc.balanceOf(pool)` unchanged at 20,000.000000, the
+    ///      shares burned anyway, `totalSupply` halved, and `convertToAssets(1e9)` stepping
+    ///      1.000000 -> 1.999999 in that one call. The honest incumbent's stake went
+    ///      10,000.000000 -> 19,999.999999 and the caller's went to nothing.
+    ///
+    ///      **Three things make it the class rather than a caller's own mistake.** The first is
+    ///      the mirror above. The second is that the round-20 bound below cannot see it: the
+    ///      strictest bound expressible, `redeem(sh, address(pool), bob, previewRedeem(sh))`,
+    ///      *returns* 10,000.000000 and delivers 0, because the bound checks what the call
+    ///      returned and not what the caller received. A caller doing everything the contract
+    ///      offers to protect themselves is told the exit succeeded at the quoted price. The
+    ///      third is that the deposit-cap half is not self-harm at all: `_burnPrincipalUnits`
+    ///      debits `netDeposits` whether or not an asset left, so `netDeposits` went
+    ///      10,000.000000 -> 0 with the money still in the contract, `maxDeposit` came back to
+    ///      the full 25,000.000000 cap, and the next deposit left this pool holding
+    ///      35,000.000000 against a 25,000.000000 cap. That is the **opposite** direction to
+    ///      round-23 finding 16, which bricked the cap, so the two do not cancel - they widen the
+    ///      band from both ends.
+    ///
+    ///      **Not extraction, and audit round 25 finding 2 was refuted end to end on that point.**
+    ///      Driven from a stranger's address the PnL is -10,000.000001 and the incumbent's is
+    ///      +10,000.000000: redeeming to the escrow is a **donation**, where the fifth door
+    ///      `requestWithdrawal` shut was a hidden *subtraction* a stranger could time. It is
+    ///      refused because a door that silently converts an exit into a gift to everyone else is
+    ///      not a door, not because anybody profits by it.
+    ///
+    ///      Cost MEASURED on a clean build: `LenderPool` 16,159 -> 16,241 bytes, +82, exactly
+    ///      twice the +41 the same guard cost at the fifth door - two lines shutting four doors,
+    ///      because the bounded overloads delegate here.
+    ///
+    ///      Nothing legitimate is lost. Owner and receiver stay free to differ, which is what
+    ///      `invariant_usdcIsConserved` defends, and every address but this one is still a
+    ///      receiver.
     function withdraw(uint256 assets, address receiver, address owner)
         public
         override(ERC4626, IERC4626)
         nonReentrant
         returns (uint256)
     {
+        if (receiver == address(this)) revert EscrowIsNotAHolder();
         return super.withdraw(assets, receiver, owner);
     }
 
+    /// @dev The same door as `withdraw`, and shut for the same reason. See it for the measurement.
     function redeem(uint256 shares, address receiver, address owner)
         public
         override(ERC4626, IERC4626)
         nonReentrant
         returns (uint256)
     {
+        if (receiver == address(this)) revert EscrowIsNotAHolder();
         return super.redeem(shares, receiver, owner);
     }
 
@@ -1359,28 +1685,119 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev The rating rules, extracted so the principal leg can reuse them. All three were paid
     ///      for with real bugs on the borrower leg, and a second copy of them would be a second
     ///      chance to get one wrong.
+    ///
+    ///      **The rules are deliberately NOT the same on both legs, and audit round 23 is why.**
+    ///      Rule 1 reads `lastYieldDistributeAt`, and only a delivered epoch advances it (see the
+    ///      foot of this function, which is where that asymmetry was introduced). On the epoch leg
+    ///      that clock IS the accrual window of the money being rated, which is exactly what rule 1
+    ///      wants. On the other two legs - `repayPrincipal`'s surplus and `recoverLoss` - it is the
+    ///      time since some *other* money was last delivered, it describes nothing about the money
+    ///      in hand, and it grows every block the harvester is quiet. Four findings, one fact:
+    ///
+    ///        - round-22 finding 11: a recovery rated over the epoch clock, 388.888889 of
+    ///          400.000000 denied to an exiter;
+    ///        - round-23 finding 14: the same stretch decides how long a fresh depositor sits at
+    ///          the #247 entry discount, 8.10% permanent loss against a free control;
+    ///        - round-22 finding 6a: because rule 2 can only lengthen, every re-rate extends the
+    ///          tail - ten at twelve hours sent 191.773143 of a 550.000000 pot to insurance,
+    ///          matching `0.9^10` to eight figures and bounded by `1/e`;
+    ///        - round-23 finding 2, the Med/High: the two non-epoch legs are permissionlessly
+    ///          reachable for ONE asset-wei through `LiquidationAuction.workoutSettleAfterClose`,
+    ///          sixteen re-rates fit in one block, and with the epoch clock stale the tail decays
+    ///          at `1/t` instead of `exp(-t/D)` - 49.97% of a pot still withheld after six stream
+    ///          durations, 129x the control.
+    ///
+    ///      **Neither half of the answer is a refusal, and that is a hard requirement.** These legs
+    ///      carry money that has already left somewhere else: `repayPrincipal` is the only drain on
+    ///      `CreditManager`'s `owedToSource`, and `recoverLoss` is reached from the auction's exits
+    ///      of last resort. A gate that reverted would strand that money with no rescue, so both
+    ///      halves below only ever choose a *duration*. There is no new revert on this path, and
+    ///      `rate == 0` stays as unreachable as it was.
     /// @param isEpoch whether this is a delivered epoch, which owns the accrual clock, or a
     ///        surplus arriving from somewhere else, which must not touch it.
     function _rateStream(uint256 amount, bool isEpoch) private {
         // Crystallise the running stream before re-rating it, or the elapsed part of the old one
         // would be re-rated as though it had never been paid out.
         uint256 pot = unreleasedYield() + amount;
-
-        // 1. Pay out over at least as long as the pot took to accrue. A fixed window closes
-        //    same-block capture but not the general case: a pot representing sixty days of yield,
-        //    rated over five, hands eleven-twelfths of it to whoever is staked for those five days.
-        //    Windows stretch for ordinary reasons - a keeper outage, a run of declined zero-yield
-        //    epochs, or the gap before this pool is wired at all - and `flushLenderYield` is
-        //    permissionless, so the attacker picks the block.
-        uint256 elapsed = block.timestamp - lastYieldDistributeAt;
-        uint256 duration =
-            elapsed > Config.YIELD_STREAM_DURATION ? elapsed : Config.YIELD_STREAM_DURATION;
-
-        // 2. Never shorten a running stream. `elapsed` describes the accrual window of the *new*
-        //    money, but the pot also holds the unfinished tail of the previous stream, whose window
-        //    may have been far longer. Re-rating that tail over the new gap compresses it, which is
-        //    the same just-in-time capture reintroduced one epoch later.
         uint256 remaining = yieldStreamEndsAt > block.timestamp ? yieldStreamEndsAt - block.timestamp : 0;
+
+        uint256 duration;
+        if (isEpoch) {
+            // 1. Pay out over at least as long as the pot took to accrue. A fixed window closes
+            //    same-block capture but not the general case: a pot representing sixty days of
+            //    yield, rated over five, hands eleven-twelfths of it to whoever is staked for those
+            //    five days. Windows stretch for ordinary reasons - a keeper outage, a run of
+            //    declined zero-yield epochs, or the gap before this pool is wired at all - and
+            //    `flushLenderYield` is permissionless, so the attacker picks the block.
+            //
+            //    `EpochHarvester.harvest` holds this leg `Config.MIN_EPOCH_GAP` apart, which is the
+            //    reason the clock and the money still describe each other here.
+            uint256 elapsed = block.timestamp - lastYieldDistributeAt;
+            duration = elapsed > Config.YIELD_STREAM_DURATION ? elapsed : Config.YIELD_STREAM_DURATION;
+        } else {
+            // 1a. Money that does not own the accrual clock is not rated over it. The floor is what
+            //     rule 1 exists to guarantee and all this pool can honestly say about a lump it did
+            //     not watch accrue.
+            //
+            //     Together with rule 2 this is the *shortest* single window that never pays a wei
+            //     out faster than two separate streams would - the arriving amount over
+            //     `YIELD_STREAM_DURATION` and the running tail over its own remaining window.
+            //     Anything shorter is under the honest schedule somewhere in `[now, max(D, R)]`,
+            //     because a straight line to zero at `T` is below a convex two-ramp release for
+            //     every instant after `T`. Round 23 built the shorter version -
+            //     `if (!isEpoch && remaining != 0) duration = remaining` - measured it not inert,
+            //     and refuted it anyway: with an hour left on a stream it rated a 400.000000
+            //     recovery over 3,600 seconds. That is this bound being violated, and it is why
+            //     the floor below is `YIELD_STREAM_DURATION` and not `remaining`.
+            duration = Config.YIELD_STREAM_DURATION;
+
+            // 1b. **And the extension has to be paid for.** Rule 1a alone still lets a wei reset the
+            //     window: with `remaining < D` the whole pot is re-rated over a fresh `D` and the
+            //     tail decays `exp(-t/D)` under repeated pokes, which is finding 6a exactly. The
+            //     bound that closes it needs no parameter, because the stream states its own price:
+            //     extending the pot's window past where it already ends slows the payout, so allow
+            //     it only as far as the arriving money itself funds at the rate already running.
+            //     `pot / yieldRate` is `remaining + amount / rate` - the current end date, plus the
+            //     time the new money buys at the current speed.
+            //
+            //     Read as a property: **a non-epoch arrival can never reduce the release rate.** One
+            //     wei buys one wei's worth of extension. A griefer can only hold the tail back by
+            //     funding it at the rate it was already running, which is a subscription, not an
+            //     attack.
+            //
+            //     **What it costs, stated as measured rather than as hoped.** This clause is the one
+            //     place the window can come out SHORTER than the floor, and not only for dust: a
+            //     400.000000 recovery landing with an hour left on a 550.000000 stream is rated over
+            //     317,781 seconds, not 432,000. It binds whenever `amount < rate * (D - remaining)`,
+            //     and that threshold scales with the running rate rather than with anything small.
+            //     What is preserved is the payout RATE, which is the unit just-in-time capture is
+            //     measured in: a sandwicher's take is their share times the rate times the blocks
+            //     they hold, and the rate here never exceeds the greater of the rate already flowing
+            //     and the whole pot over a full floor. Neither of those is new exposure. MEASURED on
+            //     that fixture: a whole-window sandwich takes its 90.9% pro-rata slice of the
+            //     recovery either way, because that total is independent of the window; a one-hour
+            //     sandwich comes out 9 wei UP under this clause against 1.096162 DOWN under the
+            //     shipped rule, because #247's gross active-tail entry pricing charges for the tail
+            //     and an early exit forfeits it. `test/YieldStreamClock.t.sol` holds all four.
+            //
+            //     Skipped when nothing is running (`remaining == 0`): there is no rate to preserve,
+            //     `pot / yieldRate` would be measured against a finished stream's stale rate, and a
+            //     cold arrival must get the full floor anyway.
+            if (remaining != 0 && yieldRate != 0) {
+                uint256 funded = (pot * ACC_PRECISION) / yieldRate;
+                if (duration > funded) duration = funded;
+            }
+        }
+
+        // 2. Never shorten a running stream. The window above describes the accrual window of the
+        //    *new* money, but the pot also holds the unfinished tail of the previous stream, whose
+        //    window may have been far longer. Re-rating that tail over the new gap compresses it,
+        //    which is the same just-in-time capture reintroduced one epoch later.
+        //
+        //    **Last, and load-bearing for more than compression.** Rule 1b divides by a rate, and
+        //    a pot that has fully released against a still-future end date can floor `funded` to
+        //    zero; this line is what makes `duration >= 1` hold by construction on every path, and
+        //    therefore what keeps the division below safe.
         if (remaining > duration) duration = remaining;
 
         // 3. Rate the whole pot, not just `amount`. That is what rolls the previous stream's tail,
@@ -1402,6 +1819,11 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         // repayment write it would let anyone shorten the window the *next* epoch is rated over by
         // calling the permissionless `settlePrincipal` just before a harvest. That is round-11's
         // anti-just-in-time pin, reintroduced on the other leg by the fix for the step below it.
+        //
+        // Round 23 closed the other direction of the same asymmetry: the clock does not move on the
+        // non-epoch legs, and since this fix those legs no longer *read* it either. Both halves are
+        // needed. Writing it here would shorten the next epoch's window; reading it up there rated
+        // money over a window belonging to somebody else's money.
         if (isEpoch) lastYieldDistributeAt = block.timestamp;
     }
 
@@ -1438,6 +1860,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         netDeposits += assets;
         totalPrincipalUnits = totalUnits + units;
         _creditPrincipalUnits(receiver, units);
+
+        // Last, and the order is load-bearing. `units` was priced against the pre-entry exponent,
+        // so a shift applied before the credit would hand the receiver twice what they paid for.
+        _renormaliseUnits();
     }
 
     function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
@@ -1449,15 +1875,85 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         super._withdraw(caller, receiver, owner, assets, shares);
     }
 
+    /// @dev `units` is always quoted at the current `unitExponent`, so the holder's stored figure is
+    ///      normalised to that exponent and re-stamped before the addition. Normalising floors, and
+    ///      that floor is the whole cost of lazy renormalisation: see `_renormaliseUnits`.
     function _creditPrincipalUnits(address account, uint256 units) private {
         if (units == 0) return;
 
+        uint256 exponent = unitExponent;
         if (_principalUnitGeneration[account] != _principalGeneration) {
             _principalUnitGeneration[account] = _principalGeneration;
             _principalUnits[account] = units;
         } else {
-            _principalUnits[account] += units;
+            _principalUnits[account] =
+                _scaleToCurrentExponent(_principalUnits[account], _principalUnitExponent[account]) + units;
         }
+        _principalUnitExponent[account] = exponent;
+    }
+
+    /// @notice The value `totalPrincipalUnits` is renormalised back under.
+    /// @dev A function rather than a bare constant read, and `virtual` **solely so a test harness
+    ///      can lower it**. The bound `_renormaliseUnits` documents is `drift <= holders - 1`, and
+    ///      at the shipped ceiling a fuzzer cannot reach a single shift, so a bound measured only
+    ///      at `2**128` would be a statement about the fuzzer's reach and not about the rule. The
+    ///      design pass that specified this measured its drift on a patched copy of the source;
+    ///      a seam keeps the measurement in the tree where it can rot loudly instead.
+    ///
+    ///      `LenderPool` is deployed directly and nothing under `src/` inherits from it, so the
+    ///      production value is the constant and `test_thePrincipalUnitCeilingIsTheShippedValue`
+    ///      pins it. `public` rather than internal because an off-chain reader that has seen a
+    ///      `PrincipalUnitsRenormalised` log has no other way to know what triggered it; that costs
+    ///      one selector. `view` rather than `pure` only because an override cannot loosen state
+    ///      mutability, and the harness needs to move the ceiling between two calls in one trace.
+    function principalUnitCeiling() public view virtual returns (uint256) {
+        return PRINCIPAL_UNIT_CEILING;
+    }
+
+    /// @dev Divides the whole principal-unit ledger by a power of two in O(1), by moving the
+    ///      exponent every stored figure is read against rather than by touching any holder.
+    ///
+    ///      **Audit round 23, finding 7.** `totalPrincipalUnits / netDeposits` is the price
+    ///      `_deposit` issues at and nothing in the contract used to divide it back down except a
+    ///      total wipe, which is finding 6. Nine measured loss-and-recovery cycles - in which no
+    ///      lender was ever actually down anything - took the quotient past `type(uint256).max`,
+    ///      and `Math.mulDiv` reverted `Panic(0x11)` while `maxDeposit` still advertised room. On an
+    ///      immutable contract with no sweep that is the deposit door closed permanently.
+    ///
+    ///      A shift is not a generation roll. It destroys no basis and invalidates no holder: every
+    ///      figure in the ledger - the aggregate, every holder, every queue entry - is divided by
+    ///      the same power of two, so every ratio the contract actually consumes is unchanged.
+    ///      What it costs is low-order bits, and it costs them **unevenly**, because each figure is
+    ///      floored independently at the moment it is next read.
+    ///
+    ///      **So the storage identity `sum over holders == totalPrincipalUnits` becomes a bounded
+    ///      inequality, and the bound is `holders - 1`.** Derivation: with `D` the drift before a
+    ///      shift of `k`, `S` the sum of the reads and `h` the number of them,
+    ///      `floor((S+D)/2**k) - sum(floor(r_i/2**k)) <= D/2**k + h*(1 - 2**-k)`, which is under `h`
+    ///      whenever `D <= h - 1`, and `D` starts at zero. The aggregate therefore **over**-counts,
+    ///      never under-counts, which is the direction every subtraction against it needs: no
+    ///      holder's units can exceed it and no burn can underflow it. `principalBasis` therefore
+    ///      under-reports by `netDeposits * drift / totalPrincipalUnits`, and because
+    ///      `netDeposits <= totalPrincipalUnits` holds unconditionally that is bounded by the drift
+    ///      itself: **at most one asset-wei of cap headroom per credited holder**, the same order as
+    ///      the ceiling-rounding residuals round-22 finding 3 already discloses.
+    function _renormaliseUnits() private {
+        uint256 ceiling = principalUnitCeiling();
+        uint256 total = totalPrincipalUnits;
+        if (total < ceiling) return;
+
+        uint256 shift;
+        // Bit at a time rather than through a logarithm: the loop runs at most 128 times and only
+        // on the rare issuance that crosses the ceiling, and this contract's scarce resource is
+        // bytecode rather than the gas of a path that has never yet run on a live pool.
+        while (total >= ceiling) {
+            total >>= 1;
+            ++shift;
+        }
+
+        totalPrincipalUnits = total;
+        unitExponent += shift;
+        emit PrincipalUnitsRenormalised(shift, unitExponent, total);
     }
 
     function _stageExactPrincipalUnitMove(uint256 units) private {
@@ -1479,13 +1975,33 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     }
 
     /// @dev Removes `units` from the current generation and debits their marked-down principal.
-    ///      Ceiling is deliberate: flooring a partial path is the direction that lets residual
-    ///      principal accumulate against the deposit cap. Because unit issuance also rounds up, a
-    ///      post-loss entry and exit can loosen the cap by one asset unit. A separate no-loss
-    ///      boundary exists when a dust share ceil-moves one unit and then redeems for zero assets:
-    ///      this burn still removes that unit's one-asset-wei basis. The candidate records both
-    ///      bounded residuals rather than reversing into the cap-brick direction. A full-unit burn
-    ///      is exact against the remaining aggregate.
+    ///      Ceiling is deliberate **here**: this is the only one of the four roundings round-22
+    ///      finding 3 runs through whose floor genuinely strands principal, because the counter it
+    ///      writes is a single aggregate with nobody left holding the remainder. `N - ceil(N*u/U)`
+    ///      is `floor(N*(U-u)/U)`, so each partial burn leaves the counter at most one asset-wei
+    ///      below the honest remainder - the LOOSEN direction, bounded, disclosed, and still open.
+    ///      A full-unit burn is exact against the remaining aggregate.
+    ///
+    ///      **One of the three roundings that feed it has been flipped and the boundary it opened
+    ///      is closed.** `_update`'s share-to-unit move floors now, for the reason written at the
+    ///      site: its remainder stays with a live share balance, so nothing detaches, and the
+    ///      no-loss dust boundary that used to zero the counter is shut. `serviceQueue`'s
+    ///      partial-fill debit was flipped too and the flip was **refused on a measured sign
+    ///      change** - see that site. What is left of finding 3 at this line is one asset-wei per
+    ///      *burn*, and `serviceQueue` can buy one burn per call.
+    ///
+    ///      **NOT closable by a per-holder recorded basis**: after any realised loss the marked-down
+    ///      debit is strictly below what the holder admitted, so a cap at the recorded figure is
+    ///      INERT on exactly the paths that leak. MEASURED, and a recorded-basis cap built in the
+    ///      same tree moved the queue and merge/split figures by not one wei. See
+    ///      `LenderPoolUnitProvenance.t.sol`.
+    ///
+    ///      A post-loss one-asset-wei round trip still loosens the cap by one asset-wei, and that
+    ///      one **is** the recorded-basis boundary - the entry ceiling issues two units for 1.111
+    ///      units of admission and this line faithfully pays two back. Closing it costs a fourth
+    ///      per-holder mapping: MEASURED at +238 bytes and +11,385 gas on a warm ERC-20 transfer,
+    ///      +28,373 cold, and refused on that price until the four per-holder mappings are packed
+    ///      into one slot rather than added to.
     function _burnPrincipalUnits(uint256 units) private {
         uint256 totalUnits = totalPrincipalUnits;
         uint256 basis = units == totalUnits
@@ -1540,6 +2056,24 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
 
             uint256 heldUnits = principalUnits(from);
             uint256 movedUnits;
+            // **Floored, and audit round 22 finding 3's no-loss boundary is why it is not a
+            // ceiling.** Shares carry three more decimals than the assets the units are
+            // denominated in, so one share-wei is a thousandth of a unit and a ceiling always
+            // rounds it up to a whole one. MEASURED on the ceiling, from a ten-asset-wei book:
+            // transferring one share-wei ceil-moved one whole unit, that dust position then
+            // redeemed for zero assets because the exit conversion floors, and the unit burn
+            // still took one asset-wei off `netDeposits`. Ten cycles drove the counter from ten
+            // to zero with all ten assets still in the contract and `maxDeposit` back at the
+            // full cap - the LOOSEN direction, one asset-wei per completed boundary.
+            //
+            // Flooring closes it exactly rather than bounding it: the same trace now moves zero
+            // units, burns zero units and leaves the counter at ten. The direction that replaces
+            // it is not the brick it looks like. A floor under-moves, so the remainder stays with
+            // the **sender**, who still holds the shares it belongs to; and `value == fromBalance`
+            // above is still exact, so the last share out of any balance carries every unit left.
+            // Residual principal can therefore never detach from a live share balance, which is
+            // precisely what the ceiling allowed. `invariant_noPrincipalUnitsOutliveShares` is the
+            // standing check on that claim and both campaigns were run against this change.
             if (_hasExactPrincipalUnitMove) {
                 movedUnits = _exactPrincipalUnitsToMove;
                 _hasExactPrincipalUnitMove = false;
@@ -1547,11 +2081,15 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
             } else if (heldUnits != 0) {
                 movedUnits = value == fromBalance
                     ? heldUnits
-                    : Math.mulDiv(heldUnits, value, fromBalance, Math.Rounding.Ceil);
+                    : Math.mulDiv(heldUnits, value, fromBalance, Math.Rounding.Floor);
             }
 
             if (movedUnits != 0) {
+                // `heldUnits` came back from a normalising read, so what is written here is quoted
+                // at the current exponent and the stamp has to follow it. Missing this line hands
+                // the remainder a second shift it has already taken.
                 _principalUnits[from] = heldUnits - movedUnits;
+                _principalUnitExponent[from] = unitExponent;
                 if (to == address(0)) {
                     _burnPrincipalUnits(movedUnits);
                 } else {
@@ -1618,7 +2156,33 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         // Reducing here does not turn the counter into a valuation: a loss removes principal the
         // pool is holding, which is exactly what it measures. Yield and donations still move it by
         // nothing, which is what stops a donor closing the pool.
-        _reduceNetDeposits(absorbed);
+        //
+        // **Yield-first, and audit round 23 finding 6 is why it is not `_reduceNetDeposits(absorbed)`.**
+        // Debiting the counter by the whole loss charges principal for a loss the retained yield
+        // already covered. MEASURED on the shipped rule: two lenders at 5,000.000000 each, one
+        // epoch of 10,000.000000 released, the first lender out, then a 5,000.000000 loss - and
+        // `netDeposits` went to **zero** with 5,000.000001 of book still standing. That took the
+        // clamp below, which rolled the generation and handed the whole 25,000.000000 cap back
+        // over a pool that had never emptied; the refill then stood at 30,000.000001 against it.
+        // And it repeated with no further loss, because each cohort's full exit wiped the counter
+        // and re-gifted the cap to the next.
+        //
+        // The counter measures admitted principal the pool is **still holding**, so after a loss it
+        // is `min(N, what is left)`. `totalAssets() + unreleasedYield()` is that: delivered yield
+        // waiting on the clock is lender money and belongs in the cushion, and adding it back is
+        // also what makes the debit independent of where in a stream the loss lands - MEASURED
+        // identical at five points across one stream, where `totalAssets()` alone moved by the
+        // whole undelivered tail. `_poolBalance()` floors at zero, so in the one state where the
+        // two terms do not cancel this **over**-states the cushion and debits less, which is the
+        // cap-tightening direction and therefore the safe one.
+        //
+        // This makes the clamp's predicate honest: `netDeposits` now reaches zero only when the
+        // assets behind it have. **It must not ship without `_renormaliseUnits`** - MEASURED, it
+        // closes the counter-crush route to finding 7 and opens a crush-and-recover route on which
+        // the quotient multiplies by 2.5e10 per cycle.
+        uint256 cushion = totalAssets() + unreleasedYield();
+        uint256 admitted = netDeposits;
+        if (admitted > cushion) _reduceNetDeposits(admitted - cushion);
         emit LossSocialised(absorbed);
     }
 
@@ -1775,9 +2339,39 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev The shares move to this contract and stay outstanding. See the contract NatSpec for
     ///      why that matters: escrowed shares keep earning and keep taking losses, so queueing is
     ///      not an exit from risk, only a place in line.
+    ///
+    ///      **The fifth door, and audit round 24 found it after round-23 finding 16 shut four.**
+    ///      That finding shut every route by which a *share* could reach this address with no queue
+    ///      entry behind it: `transfer`, `transferFrom`, `deposit`, `mint`. This is the same class
+    ///      one field along - the escrow named as the **receiver** of a queue entry, which is the
+    ///      route by which the pool's own USDC ends up booked as owed to the pool.
+    ///
+    ///      What it does. `serviceQueue` burns the escrowed shares and writes
+    ///      `claimable[address(this)] += assetsOut`, so a real payout is set aside inside this
+    ///      contract's own balance. `_poolBalance()` subtracts `totalClaimable`, so `totalAssets`,
+    ///      `available`, `unreservedIdle`, `maxWithdraw` and `maxRedeem` all under-report from that
+    ///      moment. Then `claimFor(address(this))` is permissionless: it clears the entry and
+    ///      `safeTransfer`s the USDC to the address already holding it, so the balance does not move
+    ///      and the subtraction simply stops. The whole strand rejoins the share price **in one
+    ///      block, at an instant any stranger picks**.
+    ///
+    ///      MEASURED on the unguarded contract: `convertToAssets(1e9)` steps 1.000000 -> 1.999999 in
+    ///      a single block, and a stranger holding nothing before that block takes 5,999.999999 USDC
+    ///      out of it - the honest incumbent's loss to within 2 wei, with zero seconds of exposure.
+    ///
+    ///      Refused rather than tolerated, and refused **here** rather than at `claimFor`, for the
+    ///      reason the four doors above were: this is the only writer of `WithdrawalRequest.receiver`
+    ///      and so the only writer that can put this address into `claimable`. Shutting it makes
+    ///      `claimable[address(this)] == 0` a standing fact rather than a bound, which is what buys
+    ///      the detector. A guard at `claimFor` would leave the under-reporting half standing and
+    ///      spend bytecode defending a state that can no longer be created.
+    ///
+    ///      Nothing legitimate is lost. Owner and receiver stay free to differ - that split is what
+    ///      `invariant_usdcIsConserved` defends - and every address but this one is still a receiver.
     function _requestWithdrawal(uint256 shares, address receiver) private {
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
+        if (receiver == address(this)) revert EscrowIsNotAHolder();
         uint256 existing = _requestIndexPlusOne[msg.sender];
         if (existing != 0) revert AlreadyQueued(existing - 1);
 
@@ -1795,7 +2389,8 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
                 receiver: receiver,
                 shares: shares,
                 principalUnits: requestUnits,
-                principalGeneration: _principalGeneration
+                principalGeneration: _principalGeneration,
+                principalUnitExponent: unitExponent
             })
         );
         _requestIndexPlusOne[msg.sender] = index + 1;
@@ -1814,7 +2409,7 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
         uint256 index = indexPlusOne - 1;
         WithdrawalRequest storage request = _queue[index];
         uint256 shares = request.shares;
-        uint256 requestUnits = request.principalGeneration == _principalGeneration ? request.principalUnits : 0;
+        uint256 requestUnits = _liveRequestUnits(request);
 
         request.shares = 0;
         request.principalUnits = 0;
@@ -1858,14 +2453,72 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
     /// @dev The receiver pulls rather than the queue pushing, so an address that cannot take
     ///      delivery fails only its own claim instead of the whole queue's.
     function claim() external nonReentrant returns (uint256 amount) {
-        amount = claimable[msg.sender];
+        return _claim(msg.sender);
+    }
+
+    /// @notice Collect a named receiver's set-aside USDC **to that receiver**. Permissionless.
+    ///
+    /// @dev **Audit round 22, findings 12 and 17. This is the fourth member of the
+    ///      `msg.sender`-scoped-pot class `CreditManager.claimSurplusFor` was added for, and round
+    ///      21 swept that class in one commit minus this one member** - `claimSurplus`,
+    ///      `claimBounty` and `claimReward` all got their `*For` twin in #209 and the pool was
+    ///      outside that stream's files. Five agents found it independently in round 22, which is
+    ///      what a class swept minus one member looks like from the outside.
+    ///
+    ///      **WHICH HALF THIS CLOSES. Stated here rather than only in a pull request, because two
+    ///      agents built this function in round 22, measured OPPOSITE results, and both were
+    ///      right.** One measured it recovering 20,000.000000 to a receiver that had gone **mute**;
+    ///      the other measured it **inert** against a receiver that was **blocked**. Those are
+    ///      different preconditions, and the round-21 `*For` pattern closes exactly one of them:
+    ///
+    ///      - **CLOSED - the receiver cannot RE-ISSUE THE CALL.** Lost keys; a contract wallet
+    ///        whose pointer moved; a keeper behind an upgradeable proxy that no longer exposes a
+    ///        route to this function; an address that could never transact. The USDC is
+    ///        deliverable and nobody can ask for it. Anyone may now ask on the receiver's behalf.
+    ///        `test_claimFor_recoversMoneyFromAReceiverThatCannotCall` executes it.
+    ///      - **NOT CLOSED, and not closeable here - the receiver cannot RECEIVE.** A USDC
+    ///        blacklist on the receiver makes `safeTransfer` revert whoever initiates it, so this
+    ///        reverts in exactly the place `claim()` reverts, with the same error and argument. No
+    ///        `*For` can fix that: the failure is in the token and the destination is deliberately
+    ///        not chooseable. `test_claimFor_isInertAgainstAReceiverThatCannotReceive` asserts the
+    ///        inertness rather than leaving it to a paragraph. Pull-not-push already contains that
+    ///        failure to the one entry - see the `claimable` declaration for what the push version
+    ///        did, which was freeze the whole queue and, through `available()`, stop all borrowing.
+    ///
+    ///      **Destination not chooseable**, matching `claimSurplusFor`, `claimBountyFor`,
+    ///      `claimRewardFor` and `EpochHarvester.flushLenderYieldTo`: the caller chooses only
+    ///      *whether* the money moves, never *where*. It grants no authority over anybody's
+    ///      balance, and forcing a receiver to take their own USDC one block early is the same
+    ///      class of unsolicited help as `repayFor`.
+    ///
+    ///      **This does NOT close round-22 finding 12's headline, and that finding stays open.**
+    ///      The headline is that a *stranger's* free `serviceQueue` turns recoverable shares into
+    ///      unrecoverable cash: before servicing, the owner can `cancelWithdrawalRequest` and take
+    ///      the shares back; after it the money sits under the **receiver's** name, and owner and
+    ///      receiver need not be the same party. This widens who may pull that cash out. It does
+    ///      not give the owner back the ability to undo the conversion, and it does not stop a
+    ///      stranger choosing the moment. **A `*For` here would read like closure of a finding it
+    ///      half-touches.** The timing half is audit round 21's finding 7 and audit round 22's
+    ///      finding 12, both open: four candidates have now been built against it and every one
+    ///      fired a control this contract already relies on - see `available()` and this function's
+    ///      sibling refusal in `serviceQueue` for the two that pin it.
+    ///
+    ///      Reverts at zero rather than no-opping, so a caller cannot be told a strand was cleared
+    ///      when nothing moved.
+    function claimFor(address receiver) external nonReentrant returns (uint256 amount) {
+        if (receiver == address(0)) revert ZeroAddress();
+        return _claim(receiver);
+    }
+
+    function _claim(address receiver) private returns (uint256 amount) {
+        amount = claimable[receiver];
         if (amount == 0) revert NothingToClaim();
 
-        claimable[msg.sender] = 0;
+        claimable[receiver] = 0;
         totalClaimable -= amount;
 
-        emit WithdrawalClaimed(msg.sender, amount);
-        IERC20(asset()).safeTransfer(msg.sender, amount);
+        emit WithdrawalClaimed(receiver, amount);
+        IERC20(asset()).safeTransfer(receiver, amount);
     }
 
     /// @notice Pay out queued withdrawals in order, as far as idle USDC allows.
@@ -1970,8 +2623,7 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
                 // the *un-impaired* valuation, which is what "this can never be worth an asset-wei"
                 // actually means. Genuine dust still releases, because dust is worth nothing at
                 // either price.
-                uint256 dustRequestUnits =
-                    request.principalGeneration == _principalGeneration ? request.principalUnits : 0;
+                uint256 dustRequestUnits = _liveRequestUnits(request);
                 request.shares = 0;
                 request.principalUnits = 0;
                 queuedShares -= shares;
@@ -2065,10 +2717,18 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
             // **And the obvious contingent branch is not neutral, which is why it is still not
             // built.** Paying a queued lender their pro-rata share of the *unreserved* book now, at
             // the un-impaired price, leaves the un-impaired share price exactly unchanged and
-            // spreads the same reserve over a smaller remaining book: measured, every stayer's
-            // worst case falls by about 45%. That is a partial answer that moves a loss onto
-            // whoever stayed, which is the shape rounds 12, 13 and 14 each shipped and then
-            // deleted. Whatever gets built here has to answer that first.
+            // spreads the same reserve over a smaller remaining book: measured, a stayer's worst
+            // case gets WORSE, and what they keep falls by about 45% - 500.000000 becomes
+            // 272.727272. That is a partial answer that moves a loss onto whoever stayed, which is
+            // the shape rounds 12, 13 and 14 each shipped and then deleted. Whatever gets built
+            // here has to answer that first.
+            //
+            // **The direction above was stated BACKWARDS in this file and in two places in
+            // `test/LenderPoolExitPricing.t.sol` until 2026-08-22.** "The stayer's worst case falls
+            // by 45%" reads as the stayer being better off, and the measurement is the opposite.
+            // Audit round 21 filed the inversion, round 23 re-counted it as one surviving site,
+            // and there were three. Re-measured 2026-08-22 on the fixture that asserts it:
+            // 500.000000 becomes 272.727272.
             if (reserved) {
                 heldByReserve = true;
                 break;
@@ -2107,14 +2767,39 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
                 if (assetsOut == 0) break;
             }
 
-            uint256 requestUnits =
-                request.principalGeneration == _principalGeneration ? request.principalUnits : 0;
+            uint256 requestUnits = _liveRequestUnits(request);
+            // **The fourth of round-22 finding 3's roundings, and the ledger had attributed only
+            // three.** Ceiling here over-burns the entry's units on every partial fill and buys a
+            // fresh ceiling in `_burnPrincipalUnits` on top of it, so a sliced fill loosens the cap
+            // by up to one asset-wei per slice. MEASURED against the honest pro-rata debit: 400
+            // one-asset-wei fills over-debit the counter by **401**, 199 fills of 1.000003 by
+            // **123**, one equivalent fill by **2**. `serviceQueue` is permissionless, so how many
+            // slices an entry is paid in is nobody's choice but the caller's.
+            //
+            // **Flooring it was built, measured and REFUSED, and the refutation is the point.** It
+            // takes those three figures to 1, **-23** and 1: an order of magnitude smaller and
+            // **sign-unstable**, because on the middle trace the floor stops over-debiting and
+            // starts UNDER-debiting, which strands admitted principal against the cap. That is the
+            // brick direction, it is round-22 finding 3's own headline defect, and this contract
+            // refuses to trade a bounded loosening of known sign for a smaller error of unknown
+            // sign. Round-23 finding 12 chose this ceiling and its deterministic one-wei-wide test
+            // is what discriminates it; the four principal-unit invariants provably cannot.
+            //
+            // **Round-23 finding 12's stated reason is wrong on the sign and the choice survives
+            // anyway.** It says a floor here "lets residual principal accumulate against the cap.
+            // That is round-22 finding 3's cap-loosening direction." Residual principal accumulating
+            // leaves the counter HIGH, which is less headroom, not more: the floor is the brick
+            // direction and the ceiling is the loosening one. The conclusion is right for the
+            // opposite reason to the one written down.
             uint256 unitsToBurn = sharesToBurn == shares
                 ? requestUnits
                 : Math.mulDiv(requestUnits, sharesToBurn, shares, Math.Rounding.Ceil);
 
             request.shares = shares - sharesToBurn;
+            // `requestUnits` is a normalised read, so the remainder is quoted at today's exponent
+            // and the entry's stamp has to move with it. Same rule as `_update`'s holder remainder.
             request.principalUnits = requestUnits - unitsToBurn;
+            request.principalUnitExponent = unitExponent;
             queuedShares -= sharesToBurn;
             idle -= assetsOut;
 
@@ -2211,8 +2896,17 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, ReentrancyGuard {
 
     /// @notice Principal units still attached to a queue entry in the current loss generation.
     function queueEntryPrincipalUnits(uint256 index) external view returns (uint256) {
-        WithdrawalRequest storage request = _queue[index];
+        return _liveRequestUnits(_queue[index]);
+    }
+
+    /// @dev The one reader of a queue entry's principal units, and the reason it is a helper rather
+    ///      than the ternary it replaced. Four sites had to agree on the generation check; with the
+    ///      exponent they have to agree on two adjustments, and a grep for the ternary shape alone
+    ///      already missed one of the four once (`queueEntryPrincipalUnits` spelt it as an early
+    ///      return). Both adjustments are lazy: an entry stamped in a dead generation is worth
+    ///      nothing, and what survives is rescaled by whatever renormalisation has happened since.
+    function _liveRequestUnits(WithdrawalRequest storage request) private view returns (uint256) {
         if (request.principalGeneration != _principalGeneration) return 0;
-        return request.principalUnits;
+        return _scaleToCurrentExponent(request.principalUnits, request.principalUnitExponent);
     }
 }

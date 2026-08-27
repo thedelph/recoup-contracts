@@ -30,6 +30,33 @@ contract NAVOracle is INAVOracle, Ownable {
 
     event NAVPosted(uint256 nav, uint256 timestamp);
     event NAVPending(uint256 nav, uint256 confirmableAt);
+    /// @notice A post beyond budget arrived while a live pending already held the slot, so it was
+    ///         discarded. Nothing was stored, nothing was accepted, and the transaction succeeded.
+    /// @param nav The price that was thrown away. It is recorded here because it is recorded
+    ///        nowhere else: the `NAVPending` emitted alongside this carries the *stored* pair, by
+    ///        design, so without this event the chain holds no trace of what the keeper proposed.
+    /// @param slotFreeAt When the live pending stops holding the slot, after which the next
+    ///        out-of-budget post parks a fresh value. `cancelPendingNav` frees it sooner.
+    /// @dev **Audit round 26, follow-up item 7: `postNav` has three outcomes and only two had a
+    ///      name.** Write-once per review window is the round-13 fix that stopped a keeper
+    ///      restarting the confirmer's twelve hours at will, and its cost is this third outcome - a
+    ///      success that does nothing. It was invisible: the only tell was an `NAVPending`
+    ///      byte-identical to the previous one, which needs both logs and arithmetic to read.
+    ///
+    ///      **It is not hypothetical.** On the Base Sepolia oracle at 0x2adf6EFE, the post in block
+    ///      45763844 (2026-08-21 07:06:16 UTC) hit exactly this branch. The keeper called
+    ///      `postNav(2767109425)`, $27.671094; the slot held 2557149953, $25.571500, with
+    ///      `pendingConfirmableAt` at 1787252736 (2026-08-20 19:05:36 UTC) and therefore held until
+    ///      1787339136 inclusive, 2026-08-21 19:05:36 UTC. The receipt came back success, the only
+    ///      log was the earlier `NAVPending` pair re-emitted unchanged, and 2767109425 was stored
+    ///      nowhere and logged nowhere. The keeper read that as neither accepted nor pending and
+    ///      reported an unknown outcome.
+    ///
+    ///      An event and not a revert, deliberately. Reverting would fail loudly, and it would fail
+    ///      an honest keeper following a real correction on every run until the confirmer acts -
+    ///      which is the moment the second key most needs a working feed behind it. This costs one
+    ///      log and no control flow.
+    event NAVPostIgnored(uint256 nav, uint256 slotFreeAt);
     event NAVPendingCancelled(uint256 nav);
     event KeeperSet(address indexed keeper);
     event NavConfirmerSet(address indexed confirmer);
@@ -183,9 +210,16 @@ contract NAVOracle is INAVOracle, Ownable {
             // `materiallyDifferent` survives only as the expiry-independent half of the old
             // behaviour: it is no longer consulted here at all.
             materiallyDifferent; // silence: retained below for the event's benefit only
-            if (pending == 0 || block.timestamp > pendingConfirmableAt + Config.NAV_PENDING_EXPIRY) {
+            uint256 slotFreeAt = pendingConfirmableAt + Config.NAV_PENDING_EXPIRY;
+            if (pending == 0 || block.timestamp > slotFreeAt) {
                 pendingNav = nav;
                 pendingConfirmableAt = block.timestamp + Config.NAV_PENDING_DELAY;
+            } else {
+                // Audit round 26, follow-up item 7. The third outcome, said out loud. Nothing above
+                // ran, so `nav` is about to be dropped and the `NAVPending` below will repeat the
+                // pair the earlier post stored. See `NAVPostIgnored` for why this is an event and
+                // not a revert.
+                emit NAVPostIgnored(nav, slotFreeAt);
             }
             // The stored pair, not the posted value - an observer that saw `nav` here
             // would be reading a price this contract did not keep.

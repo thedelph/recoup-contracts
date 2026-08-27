@@ -340,21 +340,39 @@ contract GovernanceHandoverTest is Test {
 
     // ── what the handover costs, in executable form ──────────────────────────
 
-    /// @dev Today: pause is one transaction. This is the upside of the current EOA
+    /// @dev Today: a pause is one transaction per switch. This is the upside of the current EOA
     ///      owner and the reason deferring the timelock is defensible.
+    ///
+    ///      **This test used to pause the vault and assert `depositBonds` reverted.** It no longer
+    ///      does, because the deposit gate was split off the pause (audit round 25, finding 1) -
+    ///      `pause()` shuts `depositETH`, and the borrower's cure has its own owner-only switch.
+    ///      Both halves are asserted here so the change is visible from this file rather than
+    ///      only from `PausedMode.t.sol`.
     function test_pauseIsInstantUnderEoaOwner() public {
         vm.prank(admin);
         vault.pause();
 
+        // The cure is NOT shut by `pause()`, which is the whole point of the split.
         vm.prank(alice);
-        vm.expectRevert();
+        vault.depositBonds(100);
+        assertEq(vault.bondCount(alice), 100, "a pause does not shut the borrower's cure");
+
+        // Its own switch does, and it is one transaction too, while the owner is an EOA.
+        vm.prank(admin);
+        vault.setBondDepositsPaused(true);
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.BondDepositsArePaused.selector);
         vault.depositBonds(100);
     }
 
-    /// @dev And the cost of the flip: pause becomes a 48-hour advance notice, which is
-    ///      worse than useless in an incident. Deposits keep working for the entire
-    ///      wait. This is why a guardian role (pause = owner or guardian, unpause =
-    ///      owner only) has to land in the *same* change as the timelock, not after.
+    /// @dev And the cost of the flip: an owner pause becomes a 48-hour advance notice, which is
+    ///      worse than useless in an incident. `depositETH` keeps working for the entire wait.
+    ///
+    ///      **The sentence that used to end this docstring is spent.** It read that a guardian
+    ///      role "has to land in the *same* change as the timelock, not after". The guardian now
+    ///      exists - see `test_guardianPausesInstantlyUnderTimelock` below and go-live item G4 -
+    ///      so the constraint that remains is the other direction: **G2 must not ship without G4**,
+    ///      and G4 must not ship without the deposit split, which is why all three moved together.
     function test_pauseBecomesDelayedUnderTimelock() public {
         _handOver();
         bytes memory data = abi.encodeCall(CollateralVault.pause, ());
@@ -370,5 +388,47 @@ contract GovernanceHandoverTest is Test {
         vm.warp(block.timestamp + Config.ADMIN_TIMELOCK);
         _execute(address(vault), data);
         assertTrue(vault.paused());
+    }
+
+    /// @notice **Go-live item G4, and the reason it exists: the guardian keeps the pause instant
+    ///         after the handover makes the owner's pause a 48-hour operation.**
+    /// @dev Installed BEFORE `_handOver`, because `setGuardian` is `onlyOwner` and after the
+    ///      handover that is a scheduled operation too - so a protocol that hands over without a
+    ///      guardian has to wait 48 hours to acquire one. That ordering is the deploy script's
+    ///      job (`DeployBase._wire` calls `setGuardian` before `_handOver`) and it is asserted
+    ///      here because it is the kind of ordering that reads as arbitrary until it bites.
+    ///
+    ///      Note what the guardian deliberately CANNOT do, both asserted below: reopen the
+    ///      protocol, and reach the borrower's cure. The second is what makes handing this key
+    ///      out safe at all - `Config.ADMIN_TIMELOCK / Config.AUCTION_DURATION` is 8, so a
+    ///      guardian that could shut the cure would shut it for eight complete auction lifecycles
+    ///      on a mis-fire, at exactly the cost of malice.
+    function test_guardianPausesInstantlyUnderTimelock() public {
+        address guardian = makeAddr("guardian");
+        vm.prank(admin);
+        vault.setGuardian(guardian);
+        _handOver();
+
+        // One transaction, no schedule, no wait.
+        vm.prank(guardian);
+        vault.pause();
+        assertTrue(vault.paused(), "the guardian paused instantly under a 48-hour owner");
+
+        // And cannot undo it: `unpause` is owner-only, and the owner is now the timelock.
+        vm.prank(guardian);
+        vm.expectRevert();
+        vault.unpause();
+
+        // Nor reach the cure's switch, which stays behind the full 48 hours.
+        vm.prank(guardian);
+        vm.expectRevert();
+        vault.setBondDepositsPaused(true);
+        assertFalse(vault.bondDepositsPaused(), "the cure is out of the guardian's reach");
+
+        // So the borrower can still act while the guardian's pause stands.
+        vm.prank(alice);
+        vault.depositBonds(100);
+        assertEq(vault.bondCount(alice), 100, "the cure is open throughout a guardian pause");
+        assertTrue(vault.paused(), "and the pause never lifted to allow it");
     }
 }

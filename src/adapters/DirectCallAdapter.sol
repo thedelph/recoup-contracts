@@ -30,10 +30,13 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     error MintAmountMismatch(uint256 expected, uint256 actual);
     error ZeroAddress();
     error RenounceDisabled();
+    error NothingToFlush();
 
     event YieldRecipientSet(address indexed recipient);
     event HarvesterSet(address indexed harvester);
     event EmergencyUnstaked(address indexed to, uint256 amount);
+    event YieldParked(address indexed recipient, uint256 amount, uint256 totalOwed);
+    event YieldFlushed(address indexed recipient, uint256 amount);
 
     IDexFiBond public immutable bond;
     IDexFiFarm public immutable farm;
@@ -52,6 +55,36 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///         failed. Carried so the next successful claim reports it rather than the
     ///         money leaving the protocol's accounting silently.
     uint256 public unreportedYield;
+
+    /// @notice Farm yield that accrued while a given address was the yield recipient and which that
+    ///         address could not take when it was repointed away from. Payable to it forever.
+    /// @dev **Audit round 22, finding 4.** `setYieldRecipient` validated `!= address(0)` and nothing
+    ///      else, and what it carries is **gross** yield - the whole pot, before the 55/25/10/10
+    ///      split. The only protection was the best-effort drain below, which does nothing on
+    ///      precisely the condition the setter exists for: a blacklist, a pause. MEASURED:
+    ///      1,000.000000 gross accrued, the drain inert, and the next ordinary `depositBonds(1)` -
+    ///      **called by a lender, not the owner** - delivered the whole 1,000.000000 to the incoming
+    ///      address and 0 to the recipient that earned it, while `farmYieldDelivered` recorded it as
+    ///      delivered. CONTROL: a recipient able to receive means the drain works and nothing parks.
+    ///
+    ///      **The fix is copied from `EpochHarvester`, which parks per recipient twice.**
+    ///      `owedToPool` since round 11 and `owedProtocolFee` since round 21, each drained by a
+    ///      permissionless `flush...To(address)` that takes its destination from the mapping key.
+    ///      The reasoning transplants line for line, and `setProtocolFeeWallet` had already
+    ///      **rejected "drain first"** for the same pot one contract downstream: draining hands the
+    ///      outgoing recipient a veto over its own replacement, which is the trap this setter was
+    ///      built to escape. So the drain stays best-effort, and whatever it could not move is
+    ///      checkpointed here instead of being left free for the next sweep to hand onward.
+    ///
+    ///      A mapping cannot be summed and `_trySweepUsdc` sizes its transfer from this contract's
+    ///      raw balance, so `totalOwedToRecipients` exists beside it and that sweep subtracts it.
+    ///      Without that, a parked balance would be swept to the incoming recipient on the very
+    ///      next farm-touching call and still be owed here.
+    mapping(address => uint256) public owedToRecipient;
+
+    /// @notice Sum of `owedToRecipient`. The USDC sitting here that is not this contract's to
+    ///         forward - the same role `EpochHarvester.totalOwedToPools` plays one contract down.
+    uint256 public totalOwedToRecipients;
 
     /// @inheritdoc ICustodyAdapter
     /// @dev Monotonic, and the reason it can be trusted is that `_settleFarmPayout` is handed a
@@ -110,10 +143,26 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
     // ── Yield routing config (owner = governance timelock) ───────────────────
 
-    /// @dev Settles to the outgoing recipient before repointing. Rewards accrue
-    ///      continuously inside the farm, so a bare repoint hands an epoch of
-    ///      already-earned borrower/lender/insurance yield to the new address - and
-    ///      that is the *planned* Phase 3 handover, not just a malicious one.
+    /// @dev Settles to the outgoing recipient before repointing, and **checkpoints whatever the
+    ///      settlement could not deliver against that same recipient**. Rewards accrue continuously
+    ///      inside the farm, so a bare repoint hands an epoch of already-earned
+    ///      borrower/lender/insurance yield to the new address - and that is the *planned* Phase 3
+    ///      handover, not just a malicious one.
+    ///
+    ///      **Audit round 22, finding 4, and the full argument is on `owedToRecipient`.** The drain
+    ///      below is best-effort and therefore does nothing on exactly the condition this setter
+    ///      exists for; without the park, the yield it failed to deliver simply sat here as free
+    ///      balance until the next farm-touching call swept it to the incoming address. That call is
+    ///      an ordinary `depositBonds` by any lender, so the redirection did not even need the owner
+    ///      to make it happen twice.
+    ///
+    ///      **No precondition, deliberately, and no new failure mode.** The only branch below
+    ///      decides whether a park *happened*: the pointer moves on every call, in every state, and
+    ///      there is nothing here a stranger can flip to make it revert. Nor is the park a state
+    ///      anyone can be stuck in - `flushYieldTo` is permissionless and takes its destination from
+    ///      the mapping key. Both properties are lifted verbatim from
+    ///      `EpochHarvester.setProtocolFeeWallet`, which reached them by having the two obvious
+    ///      alternatives - drain first, or refuse while a backlog stands - fail on it first.
     function setYieldRecipient(address recipient) external onlyOwner {
         if (recipient == address(0)) revert ZeroAddress();
         address outgoing = yieldRecipient;
@@ -130,9 +179,54 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
             // sweep actually moved the money it was tracking.
             try this.claimFarmRewards() {} catch {}
             if (_trySweepUsdc() != 0) unreportedYield = 0;
+
+            // Read after the drain, exactly as `EpochHarvester.setLenderPool` reads its residue
+            // after the delivery attempt: what is still free is precisely the part the outgoing
+            // recipient could not take. Everything free here accrued while `outgoing` was wired -
+            // anything owed to an earlier recipient was parked by its own repoint and is excluded
+            // by `_freeBalance` - so the whole residue belongs to `outgoing`.
+            //
+            // The *whole* free balance, donations included, and that is not an oversight: the drain
+            // it replaces sends the whole free balance too, so this parks exactly what the outgoing
+            // recipient would have received had it been able to receive. A donation is a gift to the
+            // recipient rather than yield owed to borrowers, which is what `_settleFarmPayout`
+            // already says about the same dollars.
+            uint256 stranded = _freeBalance();
+            if (stranded != 0) {
+                // The carried counter goes with the money. Left standing it is a claim on a balance
+                // this contract can no longer forward, so the next successful sweep would report
+                // the parked amount to the vault as freshly delivered yield - the same reasoning
+                // that clears it on the successful branch above, for the opposite reason.
+                unreportedYield = 0;
+                owedToRecipient[outgoing] += stranded;
+                totalOwedToRecipients += stranded;
+                emit YieldParked(outgoing, stranded, totalOwedToRecipients);
+            }
         }
         yieldRecipient = recipient;
         emit YieldRecipientSet(recipient);
+    }
+
+    /// @notice Deliver a parked balance to the recipient it was parked for. Permissionless.
+    /// @dev The destination is the mapping key, never an argument, so this grants no authority over
+    ///      the money - only the timing of a transfer that address was always owed. Exactly
+    ///      `EpochHarvester.flushProtocolFeeTo`, which is the same shape one contract downstream.
+    ///
+    ///      **A hard `safeTransfer`, unlike the sweep.** The sweep is best-effort because a
+    ///      collateral exit must never be blockable by a token; nothing waits on this call, and a
+    ///      caller who explicitly asked for a flush wants to know it did not happen. Same split
+    ///      `EpochHarvester` draws between `harvest` and its two `flush` functions.
+    ///
+    ///      State is written before the transfer, so a token with a callback cannot re-enter into a
+    ///      second payment of the same balance. This contract has no reentrancy guard and does not
+    ///      need one for that reason.
+    function flushYieldTo(address recipient) external {
+        uint256 amount = owedToRecipient[recipient];
+        if (amount == 0) revert NothingToFlush();
+        owedToRecipient[recipient] = 0;
+        totalOwedToRecipients -= amount;
+        emit YieldFlushed(recipient, amount);
+        usdc.safeTransfer(recipient, amount);
     }
 
     /// @notice Pull pending farm rewards into this contract without forwarding them.
@@ -317,6 +411,15 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         // through has delivered nothing to the harvester yet, so counting it there would let the
         // harvester rate an epoch against money it has not received; `unreportedYield` carries the
         // amount instead and the next successful sweep counts it exactly once.
+        //
+        // **A parked balance is never counted here, and `flushYieldTo` does not count it either.**
+        // Audit round 22 measured this counter recording as delivered a 1,000.000000 epoch that the
+        // recipient never received, so under-counting is the direction to be wrong in. The cost of
+        // never counting it is bounded and small: `EpochHarvester` needs only
+        // `Config.MIN_EPOCH_FARM_YIELD` - one dollar - of subsequent farm delivery before an epoch
+        // that includes the flushed money can run, and the fund pays hundreds of dollars a week.
+        // Counting it at the flush instead would let a donation move this number, which is the one
+        // property round 11 built it for.
         farmYieldDelivered += swept;
     }
 
@@ -325,7 +428,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///         Zero when the transfer failed, which is the case the whole low-level
     ///         call exists to tolerate.
     function _trySweepUsdc() internal returns (uint256 swept) {
-        uint256 amount = usdc.balanceOf(address(this));
+        uint256 amount = _freeBalance();
         if (amount == 0) return 0;
         // Low-level call so a reverting transfer (pause/blacklist) cannot brick exits.
         // slither-disable-next-line unchecked-lowlevel
@@ -344,7 +447,26 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         // right for both failure shapes - a `false` return and a partial transfer - and
         // because measuring rather than trusting an external call is already the rule in
         // four other places here.
-        uint256 remaining = usdc.balanceOf(address(this));
+        // The *free* balance on both sides of the transfer, not the raw one. `totalOwedToRecipients`
+        // cannot move inside this call, so the delta is identical either way - but reading the raw
+        // balance here beside a free-balance `amount` above would be two different quantities in one
+        // subtraction, which is one refactor away from a wrong number.
+        uint256 remaining = _freeBalance();
         swept = ok && amount > remaining ? amount - remaining : 0;
+    }
+
+    /// @dev This contract's USDC less what is parked for a former recipient. Every path that moves
+    ///      USDC out of here reads this rather than `balanceOf`, so a park cannot be swept onward.
+    ///      `flushYieldTo` is the single exception and is the function that pays the park down.
+    ///
+    ///      Saturating rather than a bare subtraction. The two counters move together on every write
+    ///      and the park can only ever be a subset of the balance, so this can only underflow if the
+    ///      token itself takes money out of this contract - and an underflow here would revert
+    ///      `stake`, `unstake` and `mintBonds` alike, which is to say every collateral path. The
+    ///      whole point of the sweep being best-effort is that a token must never be able to do that.
+    function _freeBalance() private view returns (uint256) {
+        uint256 balance = usdc.balanceOf(address(this));
+        uint256 owed = totalOwedToRecipients;
+        return balance > owed ? balance - owed : 0;
     }
 }

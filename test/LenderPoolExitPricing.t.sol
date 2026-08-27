@@ -59,7 +59,8 @@ import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 ///      carry the claim, advance the cursor" - and
 ///      `test_payingAQueuedLenderEarlyWouldMoveTheMarkOntoWhoeverStays` measures why that is
 ///      larger than one pull request: the obvious version of it leaves the un-impaired share price
-///      exactly unchanged and cuts the worst case for everyone who stayed by 45%. Rounds 12, 13
+///      exactly unchanged and makes the worst case WORSE for everyone who stayed, cutting what a
+///      stayer keeps by 45.45% - 500.000000 becomes 272.727272. Rounds 12, 13
 ///      and 14 each shipped and then deleted a partial answer in this area, so it is measured and
 ///      reported rather than half-built.
 contract LenderPoolExitPricingTest is RiskParamsFixture {
@@ -504,9 +505,16 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
     ///      It is neutral on the price everybody quotes and not neutral on the price that matters
     ///      while a mark stands: the leaver removes only unreserved assets, so the reserve is
     ///      spread over a smaller remaining book and concentrates on whoever did not go. Measured
-    ///      on this fixture the stayer's worst case falls by about 45%. A partial answer that moves
-    ///      a loss onto the party who stayed is the shape rounds 12, 13 and 14 each shipped and
-    ///      then deleted, so this is reported rather than built.
+    ///      on this fixture, what a stayer KEEPS falls by 45.45% - 500.000000 becomes 272.727272 -
+    ///      so the stayer's worst case gets WORSE, not better. A partial answer that moves a loss
+    ///      onto the party who stayed is the shape rounds 12, 13 and 14 each shipped and then
+    ///      deleted, so this is reported rather than built.
+    ///
+    ///      **This said "the stayer's worst case falls by about 45%" until 2026-08-22**, which
+    ///      reads as the stayer being better off. The assertion in the body has always been
+    ///      `assertLt(stayerAfter, stayerBefore)`, so the prose contradicted the test directly
+    ///      beneath it. Round 21 filed the inversion; round 23 re-counted the surviving sites as
+    ///      one; there were three.
     function test_payingAQueuedLenderEarlyWouldMoveTheMarkOntoWhoeverStays() public {
         _borrowAndBreach();
         vm.prank(stranger);
@@ -540,5 +548,351 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         assertLt(stayerAfter, stayerBefore, "the early payment did not concentrate the mark");
         // At least a 40% cut. Measured on this fixture: 500.000000 becomes 272.727272, a 45.5% cut.
         assertLt(stayerAfter * 10, stayerBefore * 6, "the concentration was smaller than reported");
+    }
+
+    // ── 4. The duration lever, re-derived. Audit round 20's finding 2, reopened ──
+
+    /// @dev Stage round 20's finding 2: a breached position, a stranger's `liquidate`, and the
+    ///      whole of the leaver's stake parked in the withdrawal queue.
+    function _stageTheParkedMark() private returns (uint256 id, uint256 finishesAt) {
+        _borrowAndBreach();
+        vm.prank(stranger);
+        credit.liquidate(alice);
+        id = auction.auctionOf(alice);
+        (, uint96 startedAt,,,,,,) = auction.auctions(id);
+        finishesAt = uint256(startedAt) + Config.AUCTION_DURATION;
+        // Read before the prank. `vm.prank` is spent by the next call including a staticcall, and
+        // writing this as one statement charged the balance read to `leaver` and the withdrawal
+        // request to this test contract, which holds nothing. Seventh instance in this project.
+        uint256 held = pool.balanceOf(leaver);
+        vm.prank(leaver);
+        pool.requestWithdrawal(held, leaver);
+    }
+
+    function _queueShut() private returns (bool) {
+        try pool.serviceQueue(5) returns (uint256) {
+            return false;
+        } catch {
+            return true;
+        }
+    }
+
+    /// @notice `Config.WORKOUT_MAX_DURATION` is a floor under the freeze, not a ceiling over it.
+    /// @dev **This corrects round 20's finding 2 rather than restating it.** The finding is written
+    ///      as "one permissionless transaction at hour six buys fourteen days of frozen queue", and
+    ///      fourteen days reads as the bound. It is not. `CreditManager._impairmentFor` keys the
+    ///      mark on `workoutsOpenFor(borrower) != 0`, and the only statement that decrements that
+    ///      register is inside `closeWorkout` - which is permissionless, unrewarded and optional.
+    ///      So the constant sets the earliest instant a volunteer *may* end the freeze and nothing
+    ///      sets a latest one. Measured below at thirty days past the forced-close boundary, with
+    ///      the reserve unmoved.
+    ///
+    ///      This is audit round 19's critical 2 - "a reserve nobody releases" - one register over.
+    ///      Round 19 bounded the auction register with `Config.AUCTION_RESET_WINDOW`. Nothing
+    ///      bounds the workout register, because the bound it is given is a permission rather than
+    ///      an event.
+    ///
+    ///      Direction worth keeping: there is at least one party with a live incentive to make the
+    ///      call, which is why this is a correction and not a new critical. `closeWorkout` clears
+    ///      the borrower's residual debt and decrements the register that blocks them borrowing
+    ///      again, so the defaulter is the one actor who gains by ending it. Lenders gain by
+    ///      waiting, because the close is what turns a releasable mark into a realised loss.
+    function test_theWorkoutMarkIsBoundedBelowByTheConstantAndAboveByNothing() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        vm.warp(finishesAt);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+
+        assertTrue(_queueShut(), "the queue was open the instant the workout opened");
+        vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION - 1);
+        assertTrue(_queueShut(), "the queue reopened one second short of the forced close");
+        vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
+        assertTrue(_queueShut(), "the constant released the mark by itself at the boundary");
+        vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION + 30 days);
+        assertTrue(_queueShut(), "the constant released the mark by itself thirty days later");
+
+        uint256 heldOpen = pool.exitReserve();
+        assertGt(heldOpen, 0, "there was no reserve to hold open");
+
+        // Only the call ends it, and ending it is what makes the loss permanent.
+        assertEq(pool.lifetimeSocialisedLoss(), 0, "the loss was realised before the close");
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+        assertFalse(_queueShut(), "the forced close did not reopen the queue");
+        assertEq(pool.lifetimeSocialisedLoss(), heldOpen, "the close did not realise what was marked");
+    }
+
+    /// @notice The alternative to the workout is not a fill. It is a mark with no clock at all.
+    /// @dev Round 20's finding 2 prices `expireToWorkout` against a control that fills the lot at
+    ///      the same instant, and reads the difference as what the call costs. That control is the
+    ///      right one for the *loss* and the wrong one for the *duration*: a fill is not available
+    ///      to the caller of `expireToWorkout` and is not what happens if they decline. What
+    ///      happens if they decline is this. `auctionOf` is not cleared by a lapse - deliberately,
+    ///      see `CreditManager._impairmentFor` - so the mark stands with nothing counting down
+    ///      against it, and `expireToWorkout` is still the only legal move a year later.
+    ///
+    ///      So the call converts an unbounded mark into one with a floor under its end. Any
+    ///      candidate that makes the call rarer, harder or more expensive moves the protocol
+    ///      towards this state, which is the one the candidate was trying to avoid.
+    function test_decliningToExpireLeavesTheMarkWithNoClockAtAll() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        uint256 marked = pool.exitReserve();
+        assertGt(marked, 0, "the liquidation left no mark");
+
+        vm.warp(finishesAt + 1);
+        assertTrue(_queueShut(), "the lapse alone released the mark");
+        vm.warp(finishesAt + 365 days);
+        assertTrue(_queueShut(), "the mark released itself within a year");
+        assertEq(pool.exitReserve(), marked, "the mark decayed on its own");
+        assertEq(auction.workoutsOpenFor(alice), 0, "a workout opened without a caller");
+
+        // And the exit under study is still the only move.
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+        assertGt(auction.workoutsOpenFor(alice), 0, "expireToWorkout stopped being legal");
+    }
+
+    /// @notice What the free call forecloses is the re-strike, not the fill - and the fill it is
+    ///         measured against is unreachable one second later anyway.
+    /// @dev **This is the harm that survives measurement, and it is not a duration.** `bid` is
+    ///      legal while `block.timestamp <= startedAt + AUCTION_DURATION` and `expireToWorkout`
+    ///      from `>=`, so the two overlap for exactly one instant and are complements everywhere
+    ///      else. After that instant the lot is off the market entirely - `currentPrice` and `bid`
+    ///      both revert `AuctionLapsed` - until somebody pays gas for an unrewarded re-strike.
+    ///
+    ///      The control below re-strikes one second after the lapse and the lot clears the debt at
+    ///      the new floor with `lifetimeSocialisedLoss` at zero. The attack expires at the same
+    ///      instant, and `liquidate` then reverts `WorkoutAlreadyOpen` for the whole workout, so
+    ///      seven further attempts inside `Config.AUCTION_RESET_WINDOW` are gone. The delta is the
+    ///      whole debt, not a haircut on one lender.
+    function test_expiringAtTheFirstLapseForeclosesEveryRemainingRestrike() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        uint256 snap = vm.snapshotState();
+
+        // The lot is off the market the moment the window lapses, either way.
+        vm.warp(finishesAt + 1);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionLapsed.selector, id));
+        auction.currentPrice(id);
+
+        // CONTROL: re-strike, and the lot clears the debt at the new floor.
+        vm.prank(stranger);
+        credit.liquidate(alice);
+        (, uint96 restruckAt,,,,,,) = auction.auctions(id);
+        vm.warp(uint256(restruckAt) + Config.AUCTION_DURATION);
+        _realiseAtTheFloor(id);
+        assertEq(pool.exitReserve(), 0, "the re-struck fill left a reserve standing");
+        assertEq(pool.lifetimeSocialisedLoss(), 0, "the re-struck fill realised a loss");
+
+        vm.revertToState(snap);
+
+        // ATTACK: the same instant, expired instead. Every later attempt is refused.
+        vm.warp(finishesAt + 1);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.WorkoutAlreadyOpen.selector, alice));
+        vm.prank(stranger);
+        credit.liquidate(alice);
+
+        vm.warp(block.timestamp + Config.WORKOUT_MAX_DURATION);
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+        assertGt(pool.lifetimeSocialisedLoss(), 0, "the foreclosed path realised no loss");
+    }
+
+    /// @notice `bid` and `expireToWorkout` overlap for exactly one instant, and that instant is
+    ///         worth one tick of the decay curve.
+    /// @dev Pinned in both directions because the pair are complements and a change to either
+    ///      predicate has to state what it does to the other - the same rule
+    ///      `expireToWorkout`'s own dispatch is built on. The tick is the reason the obvious
+    ///      one-character fix here (`<` becomes `<=`, removing the overlap) is not worth its
+    ///      churn: measured on this fixture the last second of the curve is 0.990000 USDC on a
+    ///      6,732.000000 lot, 0.0147%, and a bidder who wants none of that risk bids a second
+    ///      earlier for that price.
+    function test_theBidAndExpireWindowsOverlapForExactlyOneInstant() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        uint256 snap = vm.snapshotState();
+
+        vm.warp(finishesAt - 1);
+        uint256 oneEarly = auction.currentPrice(id);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionStillRunning.selector, finishesAt));
+        auction.expireToWorkout(id);
+
+        vm.warp(finishesAt);
+        uint256 atFloor = auction.currentPrice(id);
+        vm.prank(stranger);
+        auction.expireToWorkout(id); // both legal, in one block
+        vm.revertToState(snap);
+
+        vm.warp(finishesAt + 1);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.AuctionLapsed.selector, id));
+        auction.currentPrice(id);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+
+        assertGt(oneEarly, atFloor, "the curve had stopped decaying before the boundary");
+        assertLt((oneEarly - atFloor) * 1_000, oneEarly, "the boundary tick is worth more than 0.1%");
+    }
+
+    /// @notice The freeze costs the queued lender it is measured on exactly nothing. Both routes
+    ///         out of it are worth the same to the wei.
+    /// @dev **This is the falsifier every duration candidate has to clear, and none of them do.**
+    ///      Round 20's finding 2 prices the freeze as "a 3.14% haircut for a loss the control
+    ///      shows would have been zero". The haircut is real and it is the mark's pro-rata share -
+    ///      `test_theCostOfLeavingUnderAMarkIsExactlyProRata` measures that. What it is *not* is a
+    ///      price of the *duration*: the lender who escapes at hour six and the lender who waits
+    ///      the whole workout out and is served by the queue finish holding the same value,
+    ///      because the mark is an exact forecast of the write-down the close performs. Whichever
+    ///      route they take, they end at their pro-rata share of what is left.
+    ///
+    ///      Both paths are valued at the same wall clock and both count cash plus what is still in
+    ///      hand, or the comparison would be measuring the clock rather than the price. Measured:
+    ///      500.000000 against 500.000000.
+    ///
+    ///      Consequence, and it is the reason the reopening of round 20's finding 2 ended in a
+    ///      refusal rather than a change: shortening or pricing the mark's duration transfers no
+    ///      value to the party the finding names. What the duration costs is liquidity timing,
+    ///      which is real and is not a loss.
+    function test_theFreezeCostsTheQueuedLenderNothingByEitherRoute() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        vm.warp(finishesAt);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+        uint256 snap = vm.snapshotState();
+
+        // PATH 1: take the escape `serviceQueue` names, at hour six, then hold.
+        vm.startPrank(leaver);
+        pool.cancelWithdrawalRequest();
+        pool.withdraw(pool.maxWithdraw(leaver), leaver, leaver);
+        vm.stopPrank();
+        vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+        vm.startPrank(leaver);
+        uint256 more = pool.maxWithdraw(leaver);
+        if (more != 0) pool.withdraw(more, leaver, leaver);
+        vm.stopPrank();
+        uint256 escapedEarly = usdc.balanceOf(leaver) + pool.previewRedeem(pool.balanceOf(leaver));
+
+        vm.revertToState(snap);
+
+        // PATH 2: wait the whole freeze out and be served by the queue.
+        vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+        pool.serviceQueue(5);
+        vm.prank(leaver);
+        pool.claim();
+        vm.startPrank(leaver);
+        uint256 rest = pool.maxWithdraw(leaver);
+        if (rest != 0) pool.withdraw(rest, leaver, leaver);
+        vm.stopPrank();
+        uint256 waitedItOut = usdc.balanceOf(leaver) + pool.previewRedeem(pool.balanceOf(leaver));
+
+        assertEq(escapedEarly, waitedItOut, "the duration moved value between the two routes out");
+        assertGt(escapedEarly, 0, "the fixture paid the lender nothing on either route");
+    }
+
+    /// @notice The caller who ends the sale process is paid for it, and a re-strike pays nothing.
+    /// @dev Round 20 records the attack as costing "zero capital". It is stronger than that:
+    ///      `expireToWorkout` resolves the parked bounty as **earned**, so the keeper who opened
+    ///      the auction collects `Config.LIQUIDATION_CALL_BOUNTY` the moment the workout opens.
+    ///      `start`'s re-strike branch resolves nothing, by design and correctly - the same
+    ///      auction is still open. The consequence is an incentive rather than a defect in either
+    ///      statement: the party owed the bounty is paid to end the sale process at the first
+    ///      lapse rather than to let the remaining attempts run.
+    ///
+    ///      Recorded rather than fixed. Withholding it was built and refuted when round 20's
+    ///      finding 2 was reopened: `resolveBounty(id, false)` refunds the borrower, which is audit
+    ///      round 19's finding, and the expiry is the one outcome the escrow was introduced for.
+    function test_theCallerWhoEndsTheSaleProcessIsPaidAndARestrikePaysNothing() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        uint256 snap = vm.snapshotState();
+
+        // A re-strike resolves nothing.
+        vm.warp(finishesAt + 1);
+        vm.prank(stranger);
+        credit.liquidate(alice);
+        assertEq(credit.bountyOwedTo(stranger), 0, "a re-strike paid the caller");
+
+        vm.revertToState(snap);
+
+        vm.warp(finishesAt + 1);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+        assertEq(
+            credit.bountyOwedTo(stranger),
+            Config.LIQUIDATION_CALL_BOUNTY,
+            "expiring to a workout did not pay the bounty"
+        );
+    }
+
+    /// @notice At `navPerBond() == 0` the exit of last resort is the ONLY exit, and it works.
+    /// @dev The guard on the candidate refused when round 20's finding 2 was reopened: gating
+    ///      `expireToWorkout` on `Config.AUCTION_RESET_WINDOW`, so the sale process has to exhaust
+    ///      before a workout may open. Built, and this is the falsifier it fired. With the oracle
+    ///      reporting zero, a re-strike reverts `NavUnset` and `cancel` reverts `StillLiquidatable`
+    ///      - a position with no collateral value is liquidatable at every threshold - so the gate
+    ///      would shut all three exits for forty-two hours on precisely the input the exit of last
+    ///      resort exists for.
+    ///
+    ///      Kept as an assertion rather than as a note, because the property is what makes the
+    ///      exit total and nothing else in the suite states it: `expireToWorkout` reads the oracle
+    ///      through `_vault.collateralValue` and must not begin to *depend* on it.
+    function test_atNavZeroTheWorkoutExitIsTheOnlyOneLeftAndItWorks() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        vm.warp(finishesAt + 1);
+        oracle.setNav(0);
+        uint256 snap = vm.snapshotState();
+
+        vm.prank(stranger);
+        vm.expectRevert(LiquidationAuction.NavUnset.selector);
+        credit.liquidate(alice);
+
+        // Partial, because `StillLiquidatable` carries an LTV in bps and a position with zero
+        // collateral value has no finite one. The selector is the assertion.
+        vm.expectPartialRevert(LiquidationAuction.StillLiquidatable.selector);
+        auction.cancel(id);
+
+        vm.revertToState(snap);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+        assertGt(auction.workoutsOpenFor(alice), 0, "the exit of last resort failed at nav zero");
+    }
+
+    /// @notice A DexFi tranche arriving inside their own quoted turnaround lands on an open
+    ///         workout and realises no loss at all.
+    /// @dev The guard on the other candidate refused at the same time: shortening
+    ///      `Config.WORKOUT_MAX_DURATION`. Built at two days, and this is the falsifier it fired -
+    ///      the forced close became reachable at forty-eight hours, socialised the whole debt, and
+    ///      the seventy-two hour tranche was then refused by `workoutSettle` and had to be relayed
+    ///      back through `workoutSettleAfterClose` by another volunteer.
+    ///
+    ///      `Config.WORKOUT_MAX_DURATION` is pinned to an off-chain process quoted at "48h+", and
+    ///      this is the assertion that says so in executable form. It is deliberately written
+    ///      against 72 hours rather than against the constant: a test that scales with the
+    ///      parameter cannot notice the parameter moving under the process.
+    function test_aSeventyTwoHourTrancheLandsOnAnOpenWorkoutAndRealisesNoLoss() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
+        vm.warp(finishesAt);
+        vm.prank(stranger);
+        auction.expireToWorkout(id);
+
+        vm.warp(finishesAt + 72 hours);
+        // The window is still open at DexFi's own quoted turnaround. This is the assertion a
+        // shortened `Config.WORKOUT_MAX_DURATION` goes red on.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationAuction.WorkoutStillRunning.selector, finishesAt + Config.WORKOUT_MAX_DURATION
+            )
+        );
+        auction.closeWorkout(id);
+
+        uint256 owedBefore = credit.currentDebtOf(alice);
+        usdc.mint(address(this), 400e6);
+        usdc.approve(address(auction), type(uint256).max);
+        auction.workoutSettle(id, 400e6);
+
+        assertLt(credit.currentDebtOf(alice), owedBefore, "the tranche did not pay down the debt");
+        assertEq(pool.lifetimeSocialisedLoss(), 0, "a loss was realised before the redemption landed");
     }
 }

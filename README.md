@@ -75,17 +75,24 @@ The pool is not approved to wire or fund. The current blockers are:
 | Finding | Summary |
 |---|---|
 | Round 22 F3 | Principal-cap accounting is only partly remediated; fungible share composition, dust boundaries and repeated-loss quotient growth remain |
-| Round 22 F11 | Non-epoch recovery cash can inherit an unrelated epoch clock |
-| Round 22 F6a | Re-rating a running stream can repeatedly extend its unreleased tail |
 | Round 22 F12 | Permissionless queue service can turn shares into a claim that its receiver cannot collect |
 | Round 21 F7 | An impaired queued withdrawal can over-reserve liquidity while being ineligible for service |
 
-**This table describes this source.** It also lags the working tree in ways that are not blockers but are defects live in the code you are reading: see [What this source does not yet contain](KNOWN_RISKS.md#what-this-source-does-not-yet-contain).
+**Two rows were removed in this sync, and removed because they are fixed rather than because they
+were reconsidered.** Round 22 F11 (non-epoch recovery cash inheriting an unrelated epoch clock) and
+Round 22 F6a (stream re-rating extending an unreleased tail) are closed by the round-23 remediation,
+which this source now contains and previously did not.
+
+**This table describes this source, and this source is now current.** The lag that previous
+revisions disclosed here - four round-22 fixes and the whole round-23 remediation absent from
+the published code - is closed by this sync. One property went with it: the published
+`CreditManager` no longer compiles to the bytecode deployed on Base Sepolia. See
+[What this source contains](KNOWN_RISKS.md#what-this-source-contains).
 
 Other material residual risks are Round 17's transaction-ordering window and F10's lack of
 historical loss-bearer entitlement. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) contains the launch-critical
-and material current risks, measured traces and go-live rules. Closing the five pool blockers is
-necessary but not sufficient for mainnet. The merged principal-accounting and entry-pricing changes
+and material current risks, measured traces and go-live rules. Closing the three remaining pool
+blockers is necessary but not sufficient for mainnet. The merged principal-accounting and entry-pricing changes
 also require a fresh internal follow-up review before Phase-4 wiring or funding; the pool remains
 empty and unwired in the meantime.
 

@@ -22,6 +22,14 @@
     "MockBond": "0x5e471466f21f7ad57990f58aee2e0e817c8fbfa6",
     "MockFarm": "0x203276cb4d823643448619f02d7f42dbabe8f11f"
   },
+  "libraries": {
+    "CreditWiring": {
+      "address": null,
+      "status": "LINKED BY THE TREE, NEVER DEPLOYED. A null address is a positive statement, not a gap: this library did not exist when the 2026-08-19 set was deployed, so there is nothing at this set for CreditManager to have been linked against. The bytecode gate reads this block, and a null here makes the CreditManager link a REPORTED condition instead of a hard failure - but only while CreditManager's own runtime length still diverges from the tree's. If it ever matches while this is null, the gate FAILS, because a CreditManager that is byte-compatible with a tree linking a library that does not exist is a contradiction in the record rather than drift.",
+      "onTheNextRedeploy": "forge script deploys an unlinked library automatically, as a CREATE2 through the deterministic deployer at 0x4e59b44847b379578588920cA78FbF26c0B4956C ahead of the contract that links it - so its address depends on the creation code and a zero salt rather than on a nonce, and is predictable before the broadcast. MEASURED on a disposable fork on 2026-08-26: the run emits 44 transactions against the 2026-08-19 run's 40, one of which is this library and three of which are the setGuardian calls that did not exist then. Copy the library's address in here, replacing the null, in the same edit that updates contracts. The gate then reads its runtime code like any other row and additionally verifies solc's call-protection word - the PUSH20 of the library's own address that its constructor patches in - against this address, which is the library confirming its own identity.",
+      "why": "CreditManager delegatecalls it, and its artifact carries six link offsets (2738, 8155, 14770, 14935, 19888, 20034 - read out of linkReferences, not counted by hand). The split was forced by EIP-170: the manager measured 24,512 bytes against a 24,576 limit before the move and measures 22,015 today."
+    }
+  },
   "mocksNote": "Fresh mocks. DeployTestnet builds its own MockUSDC/MockBond/MockFarm, so nothing carries over from 2026-08-03: the old seeded position lives on the old bond and the old vault.",
   "referralRegistryNote": "Carried over from the 2026-08-03 deployment. Its 1489-byte runtime predates the NON_BINDABLE tombstone guard and still exposes delegated registerFor; measured on 2026-08-20, registerFor(code, NON_BINDABLE) from a stranger succeeded. Current source fixes the broader design by deleting registerFor and requiring partner self-registration, but the registry is unused, holds no value and is not read by the protocol. The committed address remains defective; do not use it for referrals. Live replacement is disabled and unauthorised.",
   "referralRegistrySource": {

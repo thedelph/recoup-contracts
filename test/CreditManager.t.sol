@@ -745,6 +745,290 @@ contract CreditManagerTest is RiskParamsFixture {
         assertEq(credit.liquiditySource(), address(next));
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audit round 22, finding 5. A blacklisted liquidity source used to freeze the
+    // principal and the escape from it together.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev The state the finding is about, with no operator error in it: a full repayment, and a
+    ///      source that has since become unable to receive USDC. `repayPrincipal` ends in
+    ///      `safeTransferFrom(creditManager, address(this), amount)` on both implementations, and
+    ///      real USDC reverts on a blacklisted destination - which `MockUSDC` models precisely
+    ///      because, in its own words, "several paths exist purely to survive it".
+    function _repayIntoABlockedSource() private returns (uint256 owedHome) {
+        vm.startPrank(alice);
+        credit.borrow(500e6);
+        usdc.approve(address(credit), 500e6);
+        credit.repay(500e6);
+        vm.stopPrank();
+
+        owedHome = credit.pendingPrincipal();
+        assertEq(credit.totalDebt(), 0, "premise: the book is flat");
+        assertEq(owedHome, 500e6, "premise: the principal is waiting to go home");
+        usdc.setBlocked(address(liquidity), true);
+    }
+
+    /// @notice **The deadlock, measured.** The only drain of `pendingPrincipal` runs through the
+    ///         source pointer, and the only escape from the source pointer used to run through
+    ///         `pendingPrincipal`.
+    /// @dev MEASURED before the fix, on the real `TreasuryLiquiditySource` as `DeployBase` ships it:
+    ///      `settlePrincipal()` reverted `Blocked(treasury)`, `setLiquiditySource(other)` reverted
+    ///      `DebtOutstanding(0)` - reporting the clause it was not refused on - and `borrow(1)`
+    ///      reverted `Blocked(treasury)` as well, so the protocol could never lend through this
+    ///      manager again. Identical at +365 days. The ceiling is the whole outstanding book,
+    ///      because `CollateralVault.setCreditManager` requires `totalDebt == 0` and so a migration
+    ///      out requires every loan repaid into the broken manager first.
+    ///
+    ///      Neither of the two obvious patches was shipped, and both were measured inert first.
+    ///      A `try`/`catch` around the repay changes nothing: `pendingPrincipal` is decremented by a
+    ///      *measured balance delta*, so a source that refuses delivers 0 and the counter does not
+    ///      move either way. A selector probe on `setLiquiditySource` changes nothing **for this
+    ///      finding** either, because the break is dynamic - the source answered perfectly until
+    ///      Circle froze it.
+    ///
+    ///      🟥 **Read as a general refutation, that last sentence cost two rounds.** Round 27 item 2
+    ///      found `setLiquiditySource` probing nothing at all, and it was still open at round 28 as
+    ///      item 3. A *frozen* source and a *wrong pointer* are different failures: the second is
+    ///      wrong on the day it is written and is visible nowhere but the setter. There is a probe
+    ///      now (`CreditWiring.checkLiquiditySourceSwap`), and
+    ///      `test_R28_control_theProbeDoesNotReopenTheFrozenSourceFinding` in `SetterGuards.t.sol`
+    ///      pins that it does **not** refuse the complete-but-frozen source this test is about.
+    function test_R22_aBlockedSourceNoLongerFreezesThePrincipalAndTheEscapeTogether() public {
+        uint256 owedHome = _repayIntoABlockedSource();
+
+        // The drain still cannot run. That half is the token's doing and is not fixable here.
+        vm.expectRevert(abi.encodeWithSelector(MockUSDC.Blocked.selector, address(liquidity)));
+        credit.settlePrincipal();
+        assertEq(credit.pendingPrincipal(), owedHome, "the counter cannot be cleared");
+
+        // The escape does run now, and the undeliverable principal is checkpointed against the
+        // source that lent it rather than blocking the repoint.
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+        vm.prank(admin);
+        credit.setLiquiditySource(address(next));
+        assertEq(credit.liquiditySource(), address(next), "the repoint is still refused");
+        assertEq(credit.pendingPrincipal(), 0, "the counter did not move with the pointer");
+        assertEq(credit.owedToSource(address(liquidity)), owedHome, "not parked against the lender");
+        assertEq(credit.totalOwedToSources(), owedHome, "and the sum has to move with it");
+
+        // Lending works again through the new source, which is the whole point: before this the
+        // protocol could never lend through this manager again.
+        usdc.mint(admin, 10_000e6);
+        vm.startPrank(admin);
+        usdc.approve(address(next), 10_000e6);
+        next.fund(10_000e6);
+        next.setCreditManager(address(credit));
+        vm.stopPrank();
+        vm.prank(alice);
+        credit.borrow(1e6);
+        assertEq(credit.debtOf(alice), 1e6, "the protocol still cannot lend");
+
+        // And the parked principal goes home, permissionlessly, once the block lifts.
+        usdc.setBlocked(address(liquidity), false);
+        uint256 sourceBefore = usdc.balanceOf(address(liquidity));
+        vm.prank(makeAddr("stranger")); // no role at all
+        credit.flushPrincipalTo(address(liquidity));
+        emit log_named_uint(
+            "MEASURED principal recovered by the source that lent it", usdc.balanceOf(address(liquidity)) - sourceBefore
+        );
+        assertEq(usdc.balanceOf(address(liquidity)) - sourceBefore, owedHome, "the money never went home");
+        assertEq(credit.owedToSource(address(liquidity)), 0);
+        assertEq(credit.totalOwedToSources(), 0);
+    }
+
+    /// @notice The guard that is left reports the clause it was actually refused on.
+    /// @dev **A separate defect on the same line.** The guard used to read
+    ///      `if (totalDebt != 0 || pendingPrincipal != 0) revert DebtOutstanding(totalDebt)`, so a
+    ///      repoint refused for pending principal reported `DebtOutstanding(0)` - an operator told
+    ///      the book is not flat by a number saying it is. Every other two-clause guard in the file
+    ///      was deliberately split into distinct errors for exactly this reason. It is fixed by
+    ///      *removal* rather than by a second error: the pending-principal clause is the deadlock
+    ///      above, so what is left is one clause reporting its own quantity.
+    function test_R22_theSwapGuardReportsTheClauseItRefusedOn() public {
+        vm.prank(alice);
+        credit.borrow(500e6);
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.DebtOutstanding.selector, 500e6));
+        credit.setLiquiditySource(address(next));
+    }
+
+    /// @notice CONTROL: a source that can receive is settled, not parked. The ordinary migration is
+    ///         unchanged, and nothing accumulates in the checkpoint on the happy path.
+    function test_R22_control_aHealthySourceIsPaidRatherThanParked() public {
+        vm.startPrank(alice);
+        credit.borrow(500e6);
+        usdc.approve(address(credit), 500e6);
+        credit.repay(500e6);
+        vm.stopPrank();
+
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+        uint256 sourceBefore = usdc.balanceOf(address(liquidity));
+        vm.prank(admin);
+        credit.setLiquiditySource(address(next));
+
+        assertEq(usdc.balanceOf(address(liquidity)) - sourceBefore, 500e6, "the settle leg stopped running");
+        assertEq(credit.owedToSource(address(liquidity)), 0, "a healthy source was parked instead of paid");
+        assertEq(credit.totalOwedToSources(), 0);
+        assertEq(credit.pendingPrincipal(), 0);
+    }
+
+    /// @notice The parked balance is not free money: it stays spoken for, so the migration sweep
+    ///         cannot take it to the incoming manager as insurance.
+    function test_R22_parkedPrincipalIsSpokenForAgainstTheMigrationSweep() public {
+        uint256 owedHome = _repayIntoABlockedSource();
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+        vm.prank(admin);
+        credit.setLiquiditySource(address(next));
+        assertEq(credit.owedToSource(address(liquidity)), owedHome, "premise: parked");
+
+        // Detach, then sweep. The balance backing the park must survive it.
+        CreditManager fresh = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        vm.startPrank(admin);
+        vault.setCreditManager(address(fresh));
+        vm.expectRevert(CreditManager.ZeroAmount.selector);
+        credit.migrateReserves();
+        vm.stopPrank();
+        assertGe(usdc.balanceOf(address(credit)), owedHome, "the sweep took the parked principal");
+    }
+
+    // ── the flush against a source that keeps a principal book ───────────────
+    //
+    // **Audit round 23, finding 1, and the reason the defect survived a whole round is in this
+    // heading.** Every test above drives `flushPrincipalTo` against `TreasuryLiquiditySource`,
+    // the one source for which a bare push is harmless - its `outstandingPrincipal` is
+    // book-keeping nothing reads. MEASURED by the auditor: that was the *only* test of the
+    // function in the tree. A pool's counter is priced into `totalAssets()` and gates two
+    // repoints, so the same push leaves it counting the money twice, forever.
+
+    /// @dev The same park the round-22 tests build, with a source that keeps a real principal
+    ///      book on the funding leg instead of a treasury. `setCreditManager` is set here and
+    ///      nowhere else in this file: it is what makes the mock answer the question the flush now
+    ///      asks before it decides whether a bare push is safe.
+    function _parkAgainstAPoolThatFundedTheBook() internal returns (MockLenderPool pool) {
+        pool = _poolFundsTheBook();
+        pool.setCreditManager(address(credit));
+
+        vm.startPrank(alice);
+        credit.borrow(500e6);
+        usdc.approve(address(credit), 500e6);
+        credit.repay(500e6);
+        vm.stopPrank();
+        assertEq(credit.totalDebt(), 0, "premise: the book is flat");
+        assertEq(credit.pendingPrincipal(), 500e6, "premise: the principal is waiting to go home");
+        assertEq(pool.outstandingPrincipal(), 500e6, "premise: the pool still records the loan");
+
+        // The condition the park exists for, and the one round 22 measured on real USDC.
+        usdc.setBlocked(address(pool), true);
+        vm.expectRevert(abi.encodeWithSelector(MockUSDC.Blocked.selector, address(pool)));
+        credit.settlePrincipal();
+
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+        vm.prank(admin);
+        credit.setLiquiditySource(address(next));
+        assertEq(credit.owedToSource(address(pool)), 500e6, "premise: parked against the pool that lent it");
+        usdc.setBlocked(address(pool), false);
+    }
+
+    /// @notice **The finding.** A flush to a source that still answers to this manager goes through
+    ///         that source's own books, so the money and the counter move together.
+    /// @dev MEASURED before the fix, on the real Phase-4 wiring and against a `settlePrincipal`
+    ///      control: identical USDC delivered, `outstandingPrincipal` 500000000 against 0 and
+    ///      `totalAssets()` +500000000 against unchanged. The overstatement never comes down,
+    ///      because nothing else in the protocol can move that counter.
+    function test_R23_01_theFlushGoesThroughTheSourcesOwnBooks() public {
+        MockLenderPool pool = _parkAgainstAPoolThatFundedTheBook();
+        uint256 poolCashBefore = usdc.balanceOf(address(pool));
+
+        vm.prank(makeAddr("stranger")); // permissionless, exactly as before
+        credit.flushPrincipalTo(address(pool));
+
+        assertEq(usdc.balanceOf(address(pool)) - poolCashBefore, 500e6, "the money still goes home");
+        assertEq(pool.outstandingPrincipal(), 0, "DEFECT: the pool went on counting the same principal");
+        assertEq(credit.owedToSource(address(pool)), 0, "the park is spent");
+        assertEq(credit.totalOwedToSources(), 0, "and the sum with it");
+        assertEq(usdc.allowance(address(credit), address(pool)), 0, "no standing allowance");
+    }
+
+    /// @notice A source that still answers to this manager and refuses is TOLD, not paid by a route
+    ///         that would corrupt it - and the park survives the refusal intact.
+    /// @dev The re-park is the half that matters. `owedToSource` has one drain, no owner rescue and
+    ///      is excluded from `sweepFreeBalanceToInsurance`, so a fix that zeroed the entry and then
+    ///      failed to deliver would strand the money harder than the defect it replaced. Asserted
+    ///      on all three of the counter, the sum and the balance, because a revert alone would not
+    ///      distinguish "nothing happened" from "the state was rolled back for another reason".
+    function test_R23_01_aRefusingAttachedSourceIsRefusedRatherThanCorrupted() public {
+        MockLenderPool pool = _parkAgainstAPoolThatFundedTheBook();
+        pool.setRefusingPrincipal(true);
+        uint256 poolCashBefore = usdc.balanceOf(address(pool));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(CreditManager.PrincipalRefused.selector, address(pool), uint256(500e6))
+        );
+        vm.prank(makeAddr("stranger"));
+        credit.flushPrincipalTo(address(pool));
+
+        assertEq(credit.owedToSource(address(pool)), 500e6, "the park must survive a refusal");
+        assertEq(credit.totalOwedToSources(), 500e6, "and so must the sum");
+        assertEq(usdc.balanceOf(address(pool)), poolCashBefore, "nothing may leave on a refusal");
+        assertEq(pool.outstandingPrincipal(), 500e6, "and the source's own book is untouched");
+
+        // Retryable forever: the refusal is a state, not a verdict.
+        pool.setRefusingPrincipal(false);
+        vm.prank(makeAddr("stranger"));
+        credit.flushPrincipalTo(address(pool));
+        assertEq(usdc.balanceOf(address(pool)) - poolCashBefore, 500e6, "the retry must deliver");
+        assertEq(pool.outstandingPrincipal(), 0, "through the source's books, as before");
+    }
+
+    /// @notice CONTROL: the round-22 escape is intact. A source that has repointed away cannot run
+    ///         its own bookkeeping call, and the bare push is still what delivers it.
+    /// @dev This is the case the original `Not repayPrincipal` docstring was written about, and it
+    ///      is real - `TreasuryLiquiditySource.setCreditManager` carries no guard at all, so a
+    ///      detached treasury is one owner call away at any time. Without this control the fix
+    ///      above would be indistinguishable from one that simply refuses every hard case.
+    function test_R23_01_control_aDetachedSourceStillGetsTheBarePush() public {
+        uint256 owedHome = _repayIntoABlockedSource();
+        TreasuryLiquiditySource next = new TreasuryLiquiditySource(usdc, admin);
+        vm.startPrank(admin);
+        credit.setLiquiditySource(address(next));
+        // The outgoing treasury moves on. `repayPrincipal` from this manager is gone for good.
+        liquidity.setCreditManager(makeAddr("someOtherManager"));
+        vm.stopPrank();
+        usdc.setBlocked(address(liquidity), false);
+
+        uint256 sourceBefore = usdc.balanceOf(address(liquidity));
+        vm.prank(makeAddr("stranger"));
+        credit.flushPrincipalTo(address(liquidity));
+
+        assertEq(usdc.balanceOf(address(liquidity)) - sourceBefore, owedHome, "the escape stopped working");
+        assertEq(credit.owedToSource(address(liquidity)), 0, "and the park must still clear");
+        assertEq(credit.totalOwedToSources(), 0);
+    }
+
+    /// @notice CONTROL: an address that cannot answer `creditManager()` at all is treated as not
+    ///         ours, so a third-party source that never had the pointer keeps the round-22 escape.
+    /// @dev The fail-open direction of the probe, stated as a test rather than as a comment. An
+    ///      unset pointer and a missing one are the same answer by design - `address(0)` is not
+    ///      this manager, and neither is silence - so this is the branch every other fixture in
+    ///      the file, and every third-party source, lands on.
+    function test_R23_01_control_aSourceThatCannotAnswerIsStillPushedTo() public {
+        MockLenderPool pool = _parkAgainstAPoolThatFundedTheBook();
+        // Never told who its manager is, which is every other fixture in this file.
+        pool.setCreditManager(address(0));
+        pool.setRefusingPrincipal(true);
+        uint256 poolCashBefore = usdc.balanceOf(address(pool));
+
+        vm.prank(makeAddr("stranger"));
+        credit.flushPrincipalTo(address(pool));
+
+        assertEq(usdc.balanceOf(address(pool)) - poolCashBefore, 500e6, "the bare push must still run");
+        assertEq(credit.owedToSource(address(pool)), 0, "and clear the park");
+    }
+
     // ── withdrawal shares the borrow formula ─────────────────────────────────
 
     /// @dev The same position must be judged identically whether the LTV moves because
@@ -1111,7 +1395,7 @@ contract CreditManagerTest is RiskParamsFixture {
     /// @notice Lowering the per-account cap onto a live position does NOT reopen the un-armable
     ///         band, and this is where that is settled rather than argued about.
     /// @dev **The deferral this test was written for, moved out of a docstring and made to run.**
-    ///      The private planning notes asked the new setter to refuse a downward move of `PER_ACCOUNT_BORROW_CAP`
+    ///      The round-19 remediation asked the new setter to refuse a downward move of `PER_ACCOUNT_BORROW_CAP`
     ///      that "drops the band onto positions already open". Building it turned up two reasons
     ///      not to, and the second is the one that matters.
     ///

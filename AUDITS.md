@@ -7,9 +7,11 @@ named as accepted or deferred. Current open risks are tracked separately in
 This file is the historical record. Each round is an internal 12-agent adversarial review pass, and
 rounds are appended newest first.
 
-**This log currently stops at round nine; the protocol has completed twenty-two rounds.** The code,
-tests and `KNOWN_RISKS.md` reflect the later work. The remaining historical write-up is still to be
-added.
+**This log currently stops at round nine; the protocol has completed twenty-five rounds.** That
+count is adversarial review passes as this file defines them, one per round. Remediation passes
+are numbered on their own sequence and run higher; the two are different bases and are not
+interchangeable. The code, tests and `KNOWN_RISKS.md` reflect the later work. The remaining
+historical write-up is still to be added.
 
 ---
 

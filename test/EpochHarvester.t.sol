@@ -2,11 +2,13 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Config} from "../src/Config.sol";
 import {ProtocolFeeSplitter} from "../src/ProtocolFeeSplitter.sol";
+import {LenderPool} from "../src/LenderPool.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
 import {EpochHarvester} from "../src/EpochHarvester.sol";
@@ -232,12 +234,59 @@ contract EpochHarvesterTest is RiskParamsFixture {
         assertEq(usdc.balanceOf(feeWallet), toProtocol);
     }
 
-    // **The end-to-end lender-leg test is not in this repository yet.** It constructs a real
-    // `LenderPool`, has a lender deposit into it, and asserts that a flushed epoch lands as a
-    // higher share price rather than as loose USDC. It went when the pool was held back from
-    // publication; the pool was published on 2026-08-19 and this case has not been ported back.
-    // The delivery mechanism itself is still covered below by `AcceptingPool` and `ShortPool`,
-    // which is the part that is about this contract rather than about the pool.
+    /// @notice The lender leg reaching a real pool, which until 2026-08-10 nothing could do.
+    /// @dev `LenderPool` was the last `NotImplemented` stub, and every test of this path until now
+    ///      used a stand-in. Two audit rounds were spent on the deadlock that made the real thing
+    ///      unwirable, so the first thing worth asserting about the finished pool is simply that
+    ///      the wiring works end to end: an epoch accrues the lender share here, the flush delivers
+    ///      it, and it lands as a higher share price rather than as loose USDC.
+    ///
+    ///      Note the delivery is approve-and-call. A pool that implemented `distributeYield`
+    ///      without pulling would take nothing, `_tryDeliverLenderYield` would measure a zero
+    ///      balance delta, and the counter would correctly stay put - a silent no-op that looks
+    ///      exactly like success from the outside. That is why this asserts the pool's balance and
+    ///      share price rather than just that the call did not revert.
+    function test_flushLenderYield_reachesARealPoolAndRaisesItsSharePrice() public {
+        LenderPool pool = new LenderPool(IERC20(address(usdc)), admin);
+        vm.startPrank(admin);
+        pool.setEpochHarvester(address(harvester));
+        pool.setCreditManager(address(credit));
+        harvester.setLenderPool(address(pool));
+        vm.stopPrank();
+
+        // A lender has to exist, or there are no shares for a share price to be about.
+        address lender = makeAddr("lender");
+        usdc.mint(lender, 1_000e6);
+        vm.startPrank(lender);
+        usdc.approve(address(pool), 1_000e6);
+        uint256 shares = pool.deposit(1_000e6, lender);
+        vm.stopPrank();
+
+        uint256 priceBefore = pool.convertToAssets(shares);
+
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+
+        uint256 toLenders = (YIELD * Config.SPLIT_LENDER_BPS) / Config.BPS;
+        assertEq(harvester.pendingLenderYield(), toLenders, "accrued here first");
+
+        harvester.flushLenderYield();
+
+        assertEq(harvester.pendingLenderYield(), 0, "and delivered in full");
+        assertEq(usdc.balanceOf(address(pool)), 1_000e6 + toLenders, "the USDC is in the pool");
+
+        // Since round-10 finding 6 the epoch arrives at once and lands on the share price over
+        // `YIELD_STREAM_DURATION`. This test used to assert the whole of it on the line above the
+        // flush, which is the instantaneous step the finding was about.
+        assertEq(pool.pendingYield(), toLenders, "held out of the share price to start with");
+        assertEq(pool.totalAssets(), 1_000e6, "so no lender is richer in the delivery block");
+
+        skip(Config.YIELD_STREAM_DURATION);
+
+        assertEq(pool.totalAssets(), 1_000e6 + toLenders);
+        assertGt(pool.convertToAssets(shares), priceBefore, "which is what a lender actually earns");
+        assertEq(pool.totalSupply(), shares, "and it mints nobody any new shares");
+    }
 
     /// @notice The 80/20 with DexFi, proved through a real epoch rather than in isolation.
     /// @dev `ProtocolFeeSplitter` rests on one claim about this contract: that installing
@@ -1352,7 +1401,14 @@ contract EpochHarvesterTest is RiskParamsFixture {
         assertEq(harvester.epochCount(), 1, "the epoch ran on a movement-corroborated delivery");
         assertEq(harvester.lastCorroboratedYield(), YIELD, "and the watermark moved with it");
         assertEq(credit.lastDistributeAt(), at, "in the same block the money arrived - nothing delayed");
-        assertEq(harvester.lastHarvestAt(), 0, "the claim itself paid nothing, so the cooldown stays open");
+        // **This line used to assert `lastHarvestAt() == 0`, and audit round 22 finding 6b is that
+        // assertion.** The reasoning was that the claim itself paid nothing, so the cooldown should
+        // stay open - but the check at the top of `harvest` is unconditional, so a clock that only
+        // advances on a claim is a gate that is read and never written. An epoch ran here; it
+        // re-rated the borrower stream exactly as much as a claim-funded one would have; it consumes
+        // the cooldown. The property this test is actually about - no legitimate epoch delayed by a
+        // second - is the assertion above, and it is unchanged.
+        assertEq(harvester.lastHarvestAt(), at, "an accepted epoch has to consume the cooldown it is checked against");
 
         skip(Config.YIELD_STREAM_DURATION);
         credit.accrueYield();
@@ -1425,7 +1481,7 @@ contract EpochHarvesterTest is RiskParamsFixture {
         vm.startPrank(admin);
         fresh.setHarvester(address(harvester));
         vm.expectEmit(true, false, false, true, address(harvester));
-        emit EpochHarvester.CustodyAdapterSet(address(fresh), 0);
+        emit EpochHarvester.CorroborationWatermarkSeeded(address(fresh), 0);
         harvester.setCustodyAdapter(ICustodyAdapter(address(fresh)));
         vm.stopPrank();
 
@@ -1439,6 +1495,66 @@ contract EpochHarvesterTest is RiskParamsFixture {
 
         assertEq(harvester.epochCount(), 2, "the epoch ran through the new adapter");
         assertEq(harvester.lastCorroboratedYield(), PIN_COST, "against the new adapter's own counter");
+    }
+
+    /// @notice **Audit round 26, follow-up item 9.** One `eth_getLogs` topic filter catches both
+    ///         halves of the custody-adapter pointer pair, as `SetterGuards.t.sol` already asserts
+    ///         for the manager pointer and the auction pointer.
+    /// @dev The criterion is stated in the comment above `CollateralVault`'s three pointer events: a
+    ///      `topic0` is the event name AND its arity, so the watch that catches a pointer pair
+    ///      diverging is one whole-protocol filter on one signature, and an event that does not
+    ///      share that signature is invisible to it. Round 26 measured the criterion against its own
+    ///      three events and it scored two out of three. This harvester emitted
+    ///      `CustodyAdapterSet(address,uint256)` - the watermark rode along on it - against the
+    ///      vault's `CustodyAdapterSet(address)`, so the one pair with no assertion was also the one
+    ///      pair the filter could not see.
+    ///
+    ///      It is a real pair, not a name collision: `setCustodyAdapter` binds the incoming adapter
+    ///      to `creditManager.vault()`, and its own NatSpec records that an operator can still point
+    ///      this side at the previous adapter after a vault-side migration, which freezes the yield
+    ///      stream. That divergence is exactly what the watch exists to catch, and before this test
+    ///      it needed two filters and a reader who knew that.
+    ///
+    ///      The watermark did not disappear; it moved to `CorroborationWatermarkSeeded`, emitted in
+    ///      the same transaction. The second half of this test asserts that, so the split cannot be
+    ///      undone by quietly dropping the payload.
+    function test_R30_bothHoldersOfTheCustodyAdapterPointerShareOneTopic0() public {
+        bytes32 signature = keccak256("CustodyAdapterSet(address)");
+
+        // The vault refuses a repoint over a live stake, so an idle outgoing adapter is the only
+        // state in which its setter reaches its assignment at all.
+        vm.prank(alice);
+        vault.withdrawBonds(BONDS);
+
+        DirectCallAdapter incoming = new DirectCallAdapter(
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, address(harvester)
+        );
+        assertTrue(address(vault.custodyAdapter()) != address(incoming), "premise: this is a move");
+        assertTrue(address(harvester.custodyAdapter()) != address(incoming), "premise: this is a move");
+
+        vm.recordLogs();
+        vm.startPrank(admin);
+        vault.setCustodyAdapter(ICustodyAdapter(address(incoming)));
+        harvester.setCustodyAdapter(ICustodyAdapter(address(incoming)));
+        vm.stopPrank();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        bool fromVault;
+        bool fromHarvester;
+        bool watermarkSeeded;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == keccak256("CorroborationWatermarkSeeded(address,uint256)")) {
+                watermarkSeeded = true;
+                continue;
+            }
+            if (logs[i].topics[0] != signature) continue;
+            assertEq(logs[i].topics[1], bytes32(uint256(uint160(address(incoming)))), "wrong pointer logged");
+            if (logs[i].emitter == address(vault)) fromVault = true;
+            if (logs[i].emitter == address(harvester)) fromHarvester = true;
+        }
+        assertTrue(fromVault, "premise: the vault's move is visible to the shared filter");
+        assertTrue(fromHarvester, "the harvester's move is invisible to the shared filter");
+        assertTrue(watermarkSeeded, "the watermark payload was dropped rather than moved");
     }
 
     /// @notice Audit round 21's setter census: this pointer had no binding check at all, while its
@@ -1458,5 +1574,79 @@ contract EpochHarvesterTest is RiskParamsFixture {
         harvester.setCustodyAdapter(ICustodyAdapter(address(foreign)));
 
         assertEq(address(harvester.custodyAdapter()), address(adapter), "the pointer did not move");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audit round 22, finding 6b. The cooldown CHECK against the cooldown CLOCK.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev An epoch funded entirely through a bond movement: the deposit settles the whole adapter
+    ///      position, so the USDC is already here and `claimYield()` inside `harvest` finds nothing.
+    ///      `farmYieldDelivered` still moves, because the adapter measures the farm on every path,
+    ///      so the epoch clears the corroboration floor with `corroborated == 0`.
+    function _epochSweptByAStrangersDeposit(address who) private {
+        farm.setPendingYield(address(adapter), YIELD);
+        _deposit(who, 1);
+        assertEq(farm.pendingShare(address(adapter)), 0, "fixture: the claim would have found something");
+    }
+
+    /// @notice **The gate is checked unconditionally and used to be set conditionally, so it never
+    ///         closed.** `MIN_EPOCH_GAP` is 5 days; two epochs used to run an hour apart.
+    /// @dev MEASURED before the fix: two accepted epochs one hour apart against a `MIN_EPOCH_GAP`
+    ///      of 432,000 seconds, with `lastHarvestAt` reading **0** after both. The check at the top
+    ///      of `harvest` reads `lastHarvestAt`; the write at the bottom ran only when
+    ///      `corroborated != 0`, which is false whenever anything else touched the farm first - an
+    ///      ordinary `depositBonds` by any lender does it.
+    ///
+    ///      The reasoning that used to sit on that line said the narrower clock was "conservative",
+    ///      on the grounds that the corroboration floor above it is already a rate limit "no
+    ///      donation can pay for". The floor is `Config.MIN_EPOCH_FARM_YIELD` - one dollar - and a
+    ///      real farm produces that continuously, so it bounds nothing on the timescale the cooldown
+    ///      exists for. A gate that is read but not written is an open gate.
+    ///
+    ///      **This is only half of a pair.** The cooldown is what bounds how often the borrower
+    ///      stream is re-rated, and the damage a fast re-rate does lives in
+    ///      `LenderPool._rateStream`. Neither half is sufficient alone: this one shuts the door that
+    ///      makes the other reachable at will.
+    function test_R22_theCooldownClockAdvancesForEveryEpochTheCheckWouldRefuse() public {
+        _epochSweptByAStrangersDeposit(bob);
+        harvester.harvest();
+        assertEq(harvester.epochCount(), 1, "fixture: the first epoch did not run");
+        uint256 clock = harvester.lastHarvestAt();
+        emit log_named_uint("MEASURED cooldown clock after an epoch nobody claimed for", clock);
+        assertEq(clock, block.timestamp, "an accepted epoch left the gate open");
+
+        // One hour later, against a five-day cooldown.
+        skip(1 hours);
+        _epochSweptByAStrangersDeposit(makeAddr("carol"));
+        vm.expectRevert(
+            abi.encodeWithSelector(EpochHarvester.EpochGapNotElapsed.selector, clock + Config.MIN_EPOCH_GAP)
+        );
+        harvester.harvest();
+        assertEq(harvester.epochCount(), 1, "a second epoch ran inside the cooldown");
+
+        // And the gate opens on time rather than staying shut.
+        skip(Config.MIN_EPOCH_GAP);
+        harvester.harvest();
+        assertEq(harvester.epochCount(), 2, "the cooldown did not lift");
+        assertEq(harvester.lastHarvestAt(), block.timestamp, "and the clock did not move with it");
+    }
+
+    /// @notice CONTROL: the two states that must still NOT consume the cooldown.
+    /// @dev A zero-yield epoch and an uncorroborated one both return before the clock is written, so
+    ///      making the write unconditional on the accepted path cannot lock a real epoch out - which
+    ///      is the property round 10 and round 11 each needed, asserted here against the new write
+    ///      rather than against the old branch.
+    function test_R22_control_aDeclinedEpochStillConsumesNoCooldown() public {
+        // Nothing at all: a zero-yield epoch.
+        harvester.harvest();
+        assertEq(harvester.lastHarvestAt(), 0, "a zero-yield epoch consumed the cooldown");
+
+        // A donation: past `MIN_EPOCH_YIELD`, but the farm delivered nothing.
+        usdc.mint(address(this), 10e6);
+        usdc.transfer(address(harvester), 10e6);
+        harvester.harvest();
+        assertEq(harvester.epochCount(), 0, "the donated epoch ran");
+        assertEq(harvester.lastHarvestAt(), 0, "a donated epoch consumed the cooldown");
     }
 }

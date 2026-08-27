@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 
 import {Config} from "../src/Config.sol";
@@ -43,6 +44,14 @@ contract CreditHandler is Test {
     IRiskParams public riskParams;
     /// @notice The account that may move the risk parameters, so this handler can move them.
     address public riskParamsOwner;
+    /// @notice The account that may throw this manager's pause switch, so this handler can throw it.
+    /// @dev A field of its own rather than a reuse of `riskParamsOwner`, even though the two hold
+    ///      the same address in this fixture. They are different roles - one moves a parameter
+    ///      authority, the other halts new borrowing - and a fixture where a role coincidence is
+    ///      written down as an equality is how a suite quietly starts sending a privileged call
+    ///      from the wrong key when governance splits them. It is also the exact shape of the
+    ///      prank-ordering bug catalogued below: a wrong caller reads as an access-control finding.
+    address public creditOwner;
 
     address public harvester;
     address[3] public actors;
@@ -65,6 +74,20 @@ contract CreditHandler is Test {
     uint256 public principalSettlementsDone;
     uint256 public withdrawsDone;
     uint256 public withdrawsRefusedByLtv;
+    /// @notice Flips of this manager's `Pausable` switch, and borrows the switch actually refused.
+    /// @dev **Round 26 follow-up item 5 / round 28 item 6: `CreditManager.borrow` had no invariant
+    ///      campaign standing under it in the paused state.** It is one of exactly two
+    ///      `whenNotPaused` sites left in the protocol and this suite had no pause action at all,
+    ///      so every invariant here quantified over the unpaused state only.
+    ///
+    ///      Two counters rather than one, and the second is the load-bearing one. `pauseToggles`
+    ///      says the switch moved; `borrowsRefusedByThePause` says a borrow was *drawn while it was
+    ///      on and refused by it*, which is the difference between a state being reachable and a
+    ///      state being reached. `borrow`'s `catch` was bare before this and would have swallowed
+    ///      the refusal without trace. Both are read by
+    ///      `test_handlerCanReachEveryStateTheInvariantsCheck`, so neither is an unread ghost.
+    uint256 public pauseToggles;
+    uint256 public borrowsRefusedByThePause;
     /// @notice Borrows that actually withheld a liquidation bounty. Read by the reachability
     ///         tripwire, because a dust threshold set wrong would make the two bounty
     ///         invariants above pass over a quantity that is always zero.
@@ -100,6 +123,7 @@ contract CreditHandler is Test {
         TreasuryLiquiditySource liquidity_,
         IRiskParams riskParams_,
         address riskParamsOwner_,
+        address creditOwner_,
         address harvester_,
         address[3] memory actors_
     ) {
@@ -110,6 +134,7 @@ contract CreditHandler is Test {
         liquidity = liquidity_;
         riskParams = riskParams_;
         riskParamsOwner = riskParamsOwner_;
+        creditOwner = creditOwner_;
         harvester = harvester_;
         actors = actors_;
     }
@@ -159,21 +184,71 @@ contract CreditHandler is Test {
     ///      and the assertions were wrong.
     ///
     ///      A guard that binds at an event has to be asserted at that event.
-    ///      The pool's own invariant suite already does exactly this at the deposit, for the same
+    ///      `LenderPool.invariants.t.sol` already does exactly this at the deposit, for the same
     ///      reason, and the shape is copied from there including the live read of the ceiling.
-    ///      That suite went with the pool when it was held back and has not been ported back
-    ///      since the pool was published, so it is not here to compare against.
+    /// @dev **The `catch` is typed on one branch since round 28 item 6, and bare on the other.**
+    ///      Most refusals here are ordinary and various - the LTV ceiling, either cap, the bounty
+    ///      cliff, a stale NAV - so a typed `catch` over all of them would be a fixture fault
+    ///      waiting to happen. But `whenNotPaused` is the **first** modifier on `borrow`, so when
+    ///      the switch is on there is exactly one legal answer and anything else is a fixture
+    ///      fault. Reading `paused()` before the prank turns the bare `catch` into a typed one for
+    ///      precisely the case the pause campaign exists to cover, and counts it - a refusal that
+    ///      is swallowed is not evidence the branch was reached.
+    ///
+    ///      **The read is before the prank, and that ordering is not a style choice.** `vm.prank`
+    ///      is spent on the very next call including a staticcall, so `vm.prank(a); if
+    ///      (credit.paused())` would send `borrow` from this handler instead of from the actor.
+    ///      The same mistake on `VaultHandler.togglePause` produced **15,967 of 15,967 calls
+    ///      reverting `OwnableUnauthorizedAccount`**, which reads as an access-control finding
+    ///      rather than as a tooling error - which is what makes it expensive.
     function borrow(uint256 actorSeed, uint256 amount) external watched {
         address a = _actor(actorSeed);
         amount = bound(amount, 1, riskParams.perAccountBorrowCap());
         uint256 escrowBefore = credit.bountyEscrowOf(a);
+        bool shut = credit.paused();
         vm.prank(a);
         try credit.borrow(amount) {
             borrowCount++;
             if (credit.bountyEscrowOf(a) > escrowBefore) ++bountiesCharged;
             assertLe(credit.totalDebt(), riskParams.globalBorrowCap(), "a borrow crossed the global cap");
             assertLe(credit.debtOf(a), riskParams.perAccountBorrowCap(), "a borrow crossed the per-account cap");
-        } catch {}
+            assertFalse(shut, "a borrow landed against a paused manager");
+        } catch (bytes memory err) {
+            if (shut) {
+                assertEq(bytes4(err), Pausable.EnforcedPause.selector, "a paused borrow was refused by something else");
+                ++borrowsRefusedByThePause;
+            }
+        }
+    }
+
+    /// @notice Flip this manager's pause switch, both ways.
+    /// @dev **Round 26 follow-up item 5, closed as round 28 item 6.** `CollateralVault.borrow`'s
+    ///      sibling switch got a campaign in the round-26 remediation and this one did not: the
+    ///      note on `VaultHandler.togglePause` says outright that "`CreditManager.invariants.t.sol`
+    ///      has no pause action at all", so all seven invariants in this file were evaluated
+    ///      exclusively in the unpaused state. `borrow` is one of the two remaining
+    ///      `whenNotPaused` sites in the protocol and the pause is an operating mode the protocol
+    ///      is *expected* to sit in during an incident, not a corner.
+    ///
+    ///      **Reads `paused()` before the prank**, for the reason set out on `borrow` above.
+    ///
+    ///      **No `try`, on purpose**, matching its sibling: the branch picks whichever of the two
+    ///      calls is legal from the state it has just read, and `creditOwner` is the owner - which
+    ///      `unpause()` requires and `pause()` accepts - so this cannot revert. If it ever does,
+    ///      `invariant_theHandlerNeverDropsAFrame` should say so rather than a `catch` swallowing
+    ///      it.
+    ///
+    ///      Nothing else in this handler answers to the switch, which was checked rather than
+    ///      assumed: `whenNotPaused` appears on `borrow` and nowhere else in `CreditManager`, and
+    ///      `repay`, `settle`, `liquidate`, `settlePrincipal` and `claimSurplus` each carry a
+    ///      docstring saying why they are deliberately outside it. So no other action needed a
+    ///      `try` added for this, and the frame guard is what would have caught it if one had.
+    function togglePause() external watched {
+        bool isPaused = credit.paused();
+        vm.prank(creditOwner);
+        if (isPaused) credit.unpause();
+        else credit.pause();
+        ++pauseToggles;
     }
 
     /// @dev Moves the two borrow caps under a live book, which is the behaviour PR #189 introduced
@@ -442,7 +517,7 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         }
 
         handler = new CreditHandler(
-            usdc, oracle, vault, credit, liquidity, IRiskParams(address(riskParams)), admin, harvester, actors
+            usdc, oracle, vault, credit, liquidity, IRiskParams(address(riskParams)), admin, admin, harvester, actors
         );
         targetContract(address(handler));
     }
@@ -532,7 +607,7 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         assertGe(
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
+                + credit.totalOwedToSources() + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
                 + credit.totalBountyOwed()
         );
     }
@@ -550,9 +625,9 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
     /// false, and the choice was never between those two.
     ///
     /// They now sit in `CreditHandler.borrow`, asserted at the borrow, the way
-    /// the pool's own suite asserts its deposit cap at the deposit. **A guard that binds at an
-    /// event must be asserted at that event and never as a standing comparison against a mutable
-    /// ceiling.**
+    /// `LenderPool.invariants.t.sol` asserts its deposit cap at the deposit. **A guard that binds
+    /// at an event must be asserted at that event and never as a standing comparison against a
+    /// mutable ceiling.**
     ///
     /// They passed for as long as they did only because `setRiskParams` was a handler action in no
     /// campaign that had a live protocol behind it - so nothing anywhere quantified over "the
@@ -704,6 +779,38 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
 
         handler.moveCaps(Config.GLOBAL_BORROW_CAP_MAX, Config.MIN_BOUNTIED_DEBT * 2);
         assertEq(handler.capLoosenings(), 1, "no cap was ever raised");
+
+        // ── the paused operating mode ────────────────────────────────────────
+        //
+        // **Round 26 follow-up item 5, closed as round 28 item 6.** Until this commit the string
+        // `pause` did not appear in this file at all, so all seven invariants here were evaluated
+        // in the unpaused state only - and `borrow` is one of exactly two `whenNotPaused` sites
+        // left in the protocol.
+        //
+        // Both directions are driven, and the refusal is asserted on the handler's own counter
+        // rather than on `vm.expectRevert`. That distinction is the whole point: `expectRevert`
+        // would prove the modifier exists, which nobody doubts, while the counter proves the
+        // **campaign** can draw a borrow while the switch is on and see it refused. The bare
+        // `catch` this action used to carry would have swallowed exactly that.
+        uint256 refusalsBefore = handler.borrowsRefusedByThePause();
+        assertEq(refusalsBefore, 0, "premise: nothing has been refused by the pause yet");
+
+        handler.togglePause();
+        assertTrue(credit.paused(), "the toggle must reach the switch");
+
+        uint256 borrowsHeld = handler.borrowCount();
+        handler.borrow(2, Config.MIN_BOUNTIED_DEBT);
+        assertEq(handler.borrowCount(), borrowsHeld, "a borrow landed against a paused manager");
+        assertEq(handler.borrowsRefusedByThePause(), 1, "the pause refusal was never exercised");
+
+        // And the switch comes back off, so the campaign is not one-way. A `togglePause` that
+        // could only ever pause would leave every later action in this handler quantified over a
+        // permanently halted protocol, which is a narrower fixture rather than a wider one.
+        handler.togglePause();
+        assertFalse(credit.paused(), "the toggle must come back the other way");
+        handler.borrow(2, Config.MIN_BOUNTIED_DEBT);
+        assertEq(handler.borrowCount(), borrowsHeld + 1, "reopening must let borrowing through again");
+        assertEq(handler.pauseToggles(), 2, "both directions of the switch must be reachable");
 
         // `accumulatorRegressions` and `debtRoseWithNoBorrow` are deliberately NOT asserted here.
         // They are violation counters rather than coverage ghosts, so asserting them zero in a

@@ -6,11 +6,20 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {Config} from "../src/Config.sol";
 import {LenderPool} from "../src/LenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+
+/// @dev A wallet that can hold USDC and can never initiate a call: no functions, no fallback, no
+///      owner, no way out. This is the receiver `claimFor` exists for, and the one round 22
+///      measured it recovering 20,000.000000 from - lost keys, a contract wallet whose pointer
+///      moved, a keeper behind a proxy with no route left to `claim()`. It is deliberately NOT
+///      blocked on the token: being unable to ASK and being unable to RECEIVE are the two halves
+///      round 22 measured opposite answers on, and `claimFor` closes only the first.
+contract MuteWallet {}
 
 /// @dev Test token that moves a depositor's existing pool shares from inside the asset transfer.
 ///      Real USDC does not currently expose this hook, but the production token is upgradeable and
@@ -108,6 +117,55 @@ contract LenderPoolTest is Test {
     function _lend(uint256 amount) internal {
         vm.prank(creditManager);
         pool.lend(amount);
+    }
+
+    /// @dev Lend and write off until the pool holds nothing at all.
+    ///
+    ///      **Round-23 finding 6 is why this exists.** `socialiseLoss` used to debit the whole
+    ///      absorbed amount from `netDeposits`, so a single loss the size of the counter cleared it
+    ///      while the pool was still holding assets - which is the defect. The debit is now
+    ///      yield-first: the counter falls to what the pool no longer holds, so a *total* loss is
+    ///      one after which there is nothing left, and a fixture that wants one has to produce it.
+    ///
+    ///      One `lend` cannot reach the book, because `available()` withholds `RESERVE_RATIO_BPS`
+    ///      of `totalAssets()`. Each write-off lowers `totalAssets()` and therefore lowers that
+    ///      float, so lending and losing in turn converges geometrically and reaches exactly zero
+    ///      once the reserve floors below one asset-wei, which it does under seven asset-wei at the
+    ///      shipped ratio. The 64-round bound is slack on purpose; the loop exits on its own.
+    function _loseEverything() internal {
+        for (uint256 i = 0; i < 64; i++) {
+            uint256 lendable = pool.available();
+            if (lendable != 0) _lend(lendable);
+            uint256 exposure = pool.outstandingPrincipal();
+            if (exposure == 0) break;
+            vm.prank(creditManager);
+            pool.socialiseLoss(exposure);
+        }
+    }
+
+    /// @dev Write the pool down until every remaining asset is out on loan and nothing is idle.
+    ///      The caller finishes the job with one `socialiseLoss(outstandingPrincipal())`.
+    ///
+    ///      **MEASURED, and this is the whole reason the helper is split in two.** The queue has
+    ///      first call on liquidity: `available()` and `unreservedIdle()` both hold back
+    ///      `convertToAssets(queuedShares)` **ceiling-rounded**. So once an entry is standing,
+    ///      neither `lend` nor `redeem` can reach the last asset-wei, `_loseEverything` stalls a
+    ///      few wei short of empty, and under the yield-first debit the clamp therefore never
+    ///      fires. **A principal-generation roll is unreachable while a queue entry stands** - a
+    ///      fixture that wants one has to strand the residue as `outstandingPrincipal` first, which
+    ///      is what this does. `available()` withholds `RESERVE_RATIO_BPS` of `totalAssets()`, and
+    ///      that floors to zero once `totalAssets()` is under seven asset-wei, so the loop
+    ///      converges on a state with a live exposure and no idle at all.
+    function _lendDownToNothingIdle() internal {
+        for (uint256 i = 0; i < 64; i++) {
+            uint256 lendable = pool.available();
+            if (lendable != 0) _lend(lendable);
+            uint256 exposure = pool.outstandingPrincipal();
+            if (exposure == 0) break;
+            if (pool.totalAssets() == exposure) break; // nothing idle is left to reserve
+            vm.prank(creditManager);
+            pool.socialiseLoss(exposure);
+        }
     }
 
     // ── deposits and the cap ─────────────────────────────────────────────────
@@ -1291,14 +1349,19 @@ contract LenderPoolTest is Test {
     }
 
     /// @notice A total loss invalidates old units and the next deposit starts at par.
+    /// @dev **The fixture changed in round 23 and the assertions did not.** It used to donate
+    ///      2,000.000000 into the pool so one `lend` could reach the whole deposit, then socialise
+    ///      exactly `netDeposits` - and under the old whole-amount debit that cleared the counter
+    ///      while the donation was still sitting in the pool. That is round-23 finding 6, not a
+    ///      total loss, and the yield-first debit now leaves the counter at 2,000.000000 to say so.
+    ///      The repair is to make the loss genuinely total rather than to relax the assertion:
+    ///      `_loseEverything` drives `totalAssets()` to zero and the generation rolls on merit.
     function test_R22F3_totalLossStartsAFreshPrincipalGeneration() public {
         _deposit(alice, DEPOSIT);
         usdc.mint(address(pool), 2_000e6);
-        _lend(DEPOSIT);
+        _loseEverything();
 
-        vm.prank(creditManager);
-        assertEq(pool.socialiseLoss(DEPOSIT), DEPOSIT, "fixture: the whole admitted principal must be lost");
-
+        assertEq(pool.totalAssets(), 0, "fixture: a total loss is one that leaves nothing behind");
         assertEq(pool.netDeposits(), 0, "a total loss must clear admitted principal");
         assertEq(pool.totalPrincipalUnits(), 0, "a total loss must clear the active unit generation");
         assertEq(pool.principalUnits(alice), 0, "old shares must carry no basis after a total loss");
@@ -1313,6 +1376,15 @@ contract LenderPoolTest is Test {
     }
 
     /// @notice Principal units follow shares and merge additively at the receiver.
+    /// @dev **Floored, and the direction is load-bearing rather than incidental.** Shares carry
+    ///      three more decimals than the assets the units are denominated in, so a ceiling here
+    ///      rounded a one-share-wei transfer - a ten-thousandth of a ten-asset-wei position - up to
+    ///      a whole unit, and that detached unit could then be burned for zero assets while still
+    ///      debiting `netDeposits`. Round-22 finding 3's no-loss dust boundary was exactly that,
+    ///      and `LenderPoolUnitProvenance.t.sol` owns the executed trace and the closure.
+    ///
+    ///      Conservation is what this test is really for and it is unchanged: whatever the sender
+    ///      loses the receiver gains, to the wei, in either rounding direction.
     function test_R22F3_principalUnitsMoveAndMergeOnTransfer() public {
         _deposit(alice, DEPOSIT);
         _deposit(bob, 1_000e6);
@@ -1320,7 +1392,7 @@ contract LenderPoolTest is Test {
         uint256 aliceUnitsBefore = pool.principalUnits(alice);
         uint256 bobUnitsBefore = pool.principalUnits(bob);
         uint256 totalUnitsBefore = pool.totalPrincipalUnits();
-        uint256 movedUnits = Math.mulDiv(aliceUnitsBefore, 1, pool.balanceOf(alice), Math.Rounding.Ceil);
+        uint256 movedUnits = Math.mulDiv(aliceUnitsBefore, 1, pool.balanceOf(alice), Math.Rounding.Floor);
 
         vm.prank(alice);
         pool.transfer(bob, 1);
@@ -1430,20 +1502,161 @@ contract LenderPoolTest is Test {
         assertEq(pool.netDeposits(), aliceUnitsRemaining, "the cap must count only Alice's remaining principal");
     }
 
+    /// @notice A partial fill burns exactly the shares the cash it pays out can buy back, floored.
+    /// @dev **Audit round 25, finding 2: this branch was protected by nothing.** Flipping the
+    ///      `Math.Rounding.Floor` in `serviceQueue`'s partial-fill `_exitToShares(idle, ...)` to
+    ///      `Ceil` stayed green across all 58 `LenderPool` invariant evaluations and all 900
+    ///      deterministic tests - zero detection anywhere in a 993-test suite. This is the
+    ///      regression, and it was neuter-verified against exactly that flip and nothing else.
+    ///
+    ///      **The one wei donated below is the whole reason this test works, and it is a second
+    ///      finding sitting inside the first.** On the fixture's own round numbers - a
+    ///      10,000.000000 deposit into an empty pool, lent down to `Config.RESERVE_RATIO_BPS` of
+    ///      the book - the three quantities that decide the rounding are
+    ///
+    ///        idle = 1,500,000,000    s = totalSupply() + 10**3 = 10**13 + 1,000
+    ///                                a = exitAssets() + 1      = 10,000,000,001
+    ///
+    ///      and `idle * s` is an **exact** multiple of `a`. Floor and Ceil agree to the wei, so a
+    ///      partial fill built on those numbers cannot see the mutation however many times it is
+    ///      reached - which is why reaching the branch was never the whole problem. One wei of
+    ///      donation moves `a` to 10,000,000,002, leaves a remainder of 300, and separates the two
+    ///      roundings in **both** observable outputs: the shares burned and the USDC set aside.
+    ///      That exactness is asserted rather than described, in
+    ///      `test_theRoundNumberFixtureCannotSeeThePartialFillRounding` below, because a fixture
+    ///      that quietly stopped being exact would turn this test back into the thing it replaced.
+    ///
+    ///      **What would have to be true for this to pass without measuring anything.** Three
+    ///      things, and all three are asserted before the rounding is looked at: the fill not being
+    ///      partial at all (`remaining > 0`), nothing being serviced (`serviceQueue` returning 1),
+    ///      and the two roundings coinciding (`wouldBurnRoundedUp == expectedBurn + 1`). The last
+    ///      is the one this repo has been bitten by fifteen times and the only one that is
+    ///      invisible from the outcome.
+    function test_R25F2_aPartialFillBurnsOnlyWhatTheCashCanBuyBack() public {
+        uint256 shares = _deposit(alice, DEPOSIT);
+        assertEq(shares, 10 ** 13, "fixture: an empty pool prices at 10**3 shares per asset-wei");
+
+        // One wei, donated straight in, is what makes the exit ratio inexact. See the docstring.
+        usdc.mint(address(this), 1);
+        usdc.transfer(address(pool), 1);
+
+        // Lend before queueing, never after. `available()` subtracts what the queue is already
+        // owed, so a request placed first shrinks this lend to nothing and the fill comes out full
+        // rather than partial. That ordering is also why the invariant campaign reached this branch
+        // in 1 of 8 unseeded runs before round-26 remediation.
+        uint256 lent = pool.available();
+        assertEq(lent, 8_500_000_001, "fixture: the hot float is RESERVE_RATIO_BPS of the book");
+        _lend(lent);
+
+        uint256 idle = usdc.balanceOf(address(pool));
+        uint256 supplyBefore = pool.totalSupply();
+        uint256 exitAssetsBefore = pool.exitAssets();
+        assertEq(idle, 1_500_000_000, "fixture: the float left behind moved");
+
+        vm.prank(alice);
+        pool.requestWithdrawal(shares, alice);
+
+        // The prediction, **restated here rather than read back off the contract**. Asking the pool
+        // to convert `idle` for us would be the shape audit round 25 filed against
+        // `invariant_theStoredSetIsAlwaysLegal`: a function checked against its own output, which
+        // agrees with itself under every mutation. These are OZ's ERC-4626 terms written out, with
+        // `exitAssets()` in place of `totalAssets()` and `10**3` for the decimals offset.
+        uint256 s = supplyBefore + 10 ** 3;
+        uint256 a = exitAssetsBefore + 1;
+        uint256 expectedBurn = Math.mulDiv(idle, s, a, Math.Rounding.Floor);
+        uint256 wouldBurnRoundedUp = Math.mulDiv(idle, s, a, Math.Rounding.Ceil);
+        assertEq(expectedBurn, 1_499_999_999_850, "fixture: the floored share slice moved");
+        assertEq(
+            wouldBurnRoundedUp,
+            expectedBurn + 1,
+            "fixture: the two roundings coincide here, so this test cannot see the mutation it targets"
+        );
+
+        assertEq(pool.serviceQueue(1), 1, "the head must be serviced");
+
+        (,, uint256 remaining) = pool.queueEntry(0);
+        assertGt(remaining, 0, "fixture: the fill must be partial rather than a clearance");
+        uint256 burned = supplyBefore - pool.totalSupply();
+        assertEq(shares - remaining, burned, "every burned share must come off the entry that was paid");
+
+        // The property, first: the shares burned are worth no more, at the pre-burn exit price,
+        // than the cash that left. `burned * a <= idle * s`, expressed through the floored
+        // conversion so nothing can overflow.
+        assertLe(burned, expectedBurn, "the partial fill burned more shares than its cash can buy back");
+        // Then the pin, because the property alone still admits burning too few.
+        assertEq(burned, expectedBurn, "the partial fill burned a different slice than the floored conversion");
+        assertEq(pool.claimable(alice), 1_499_999_999, "the partial fill set aside a different amount");
+    }
+
+    /// @notice The round-number fixture cannot tell Floor from Ceil. This is why the test above
+    ///         donates one wei before it measures anything.
+    /// @dev Reaching a branch and being able to see inside it are different properties, and this
+    ///      file had the first without the second. The deterministic driver in
+    ///      `LenderPool.invariants.t.sol` has reached the partial-fill branch since it was written,
+    ///      and the Floor -> Ceil mutation survived it anyway, because on round numbers the two
+    ///      roundings are the same number.
+    ///
+    ///      This asserts that exactness directly, so it is a fact under test rather than a
+    ///      paragraph. If it ever goes red, `Config.RESERVE_RATIO_BPS`, `_decimalsOffset()` or
+    ///      `DEPOSIT` has moved and every literal in the sibling test above has to be re-derived -
+    ///      which is the correct outcome, since those literals are pinned to the same arithmetic.
+    function test_theRoundNumberFixtureCannotSeeThePartialFillRounding() public {
+        uint256 shares = _deposit(alice, DEPOSIT);
+        uint256 lent = pool.available();
+        assertEq(lent, 8_500_000_000, "fixture: 15% of a round 10,000.000000 book");
+        _lend(lent);
+
+        uint256 idle = usdc.balanceOf(address(pool));
+        uint256 s = pool.totalSupply() + 10 ** 3;
+        uint256 a = pool.exitAssets() + 1;
+
+        assertEq(
+            Math.mulDiv(idle, s, a, Math.Rounding.Floor),
+            Math.mulDiv(idle, s, a, Math.Rounding.Ceil),
+            "the round fixture has stopped being exact, so the sibling test's literals are stale"
+        );
+
+        // And the branch really is taken on these numbers, so the statement above is about the
+        // rounding rather than about reachability.
+        vm.prank(alice);
+        pool.requestWithdrawal(shares, alice);
+        assertEq(pool.serviceQueue(1), 1, "the head must be serviced");
+        (,, uint256 remaining) = pool.queueEntry(0);
+        assertGt(remaining, 0, "fixture: the fill must be partial rather than a clearance");
+        assertEq(
+            shares - remaining,
+            Math.mulDiv(idle, s, a, Math.Rounding.Floor),
+            "the burn must equal the floored conversion even where Ceil would give the same answer"
+        );
+    }
+
     /// @notice Stale queue requests cannot take units from a post-loss generation.
     function test_R22F3_staleQueueRequestsCannotTakeFreshPrincipalUnits() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         uint256 bobShares = _deposit(bob, DEPOSIT);
-        usdc.mint(address(pool), 4_000e6);
-        _lend(2 * DEPOSIT);
+
+        // **The fixture changed in round 23 and the assertions did not.** It used to donate
+        // 4,000.000000 into the pool so one `lend` could reach both deposits, then socialise
+        // exactly `netDeposits` - and under the old whole-amount debit that rolled the generation
+        // while the donation was still sitting in the pool. That is round-23 finding 6, not a total
+        // loss. Under the yield-first debit the roll has to be earned, so the write-down runs
+        // first, the entries are queued against a pool whose last asset is out on loan, and the
+        // final write-off is what rolls the generation. See `_lendDownToNothingIdle` for why the
+        // order cannot be the other way round.
+        _lendDownToNothingIdle();
 
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
         vm.prank(bob);
         pool.requestWithdrawal(bobShares, bob);
 
+        // Read first. An external staticcall in argument position spends the prank.
+        uint256 exposure = pool.outstandingPrincipal();
         vm.prank(creditManager);
-        assertEq(pool.socialiseLoss(2 * DEPOSIT), 2 * DEPOSIT, "fixture: the total loss must land");
+        pool.socialiseLoss(exposure);
+
+        assertEq(pool.totalAssets(), 0, "fixture: the total loss must leave nothing behind");
+        assertEq(pool.netDeposits(), 0, "fixture: the generation must roll on merit, not on finding 6");
 
         uint256 freshAssets = 1_000e6;
         uint256 carolShares = _deposit(carol, freshAssets);
@@ -1469,14 +1682,21 @@ contract LenderPoolTest is Test {
         assertEq(pool.principalUnits(carol), freshAssets, "Carol must recover her fresh-generation basis");
     }
 
-    /// @notice Known residual: a dust share split can loosen the cap without a realised loss.
-    /// @dev At par, the three-decimal virtual offset gives a ten-asset-wei deposit 10,000 share-wei
-    ///      and ten principal units. Transferring one share-wei ceil-moves one whole unit. That dust
-    ///      share then redeems for zero assets because the exit conversion floors, but its unit burn
-    ///      still removes one asset-wei from `netDeposits`. Ten executed cycles drive the counter
-    ///      from ten to zero while all ten assets remain. The error is gas-bound at one USDC
-    ///      micro-unit per completed boundary; it is not the original nonlinear 114-cycle ratchet.
-    function test_R22F3_knownResidual_noLossDustTransferThenZeroAssetRedeemErodesLinearly() public {
+    /// @notice CLOSED: a dust share split no longer loosens the cap without a realised loss.
+    /// @dev **This was round-22 finding 3's no-loss boundary and it is shut.** At par the
+    ///      three-decimal virtual offset gives a ten-asset-wei deposit 10,000 share-wei and ten
+    ///      principal units. Transferring one share-wei used to **ceil**-move a whole unit; that
+    ///      dust share then redeemed for zero assets because the exit conversion floors, and its
+    ///      unit burn still removed one asset-wei from `netDeposits`. Ten executed cycles drove the
+    ///      counter from ten to zero while all ten assets remained and `maxDeposit` returned to the
+    ///      full cap.
+    ///
+    ///      `_update` floors now, so the same trace moves no units at all and the counter does not
+    ///      move. The executed before-and-after, the brick-direction control, the two boundaries
+    ///      that stay open and the per-holder basis that was built and refused all live in
+    ///      `LenderPoolUnitProvenance.t.sol`. What is kept here is the shortest form of the
+    ///      closure, so the file that owns the rest of finding 3 still states it.
+    function test_R22F3_aDustTransferThenZeroAssetRedeemNoLongerErodesTheCap() public {
         uint256 aliceShares = _deposit(alice, 10);
         assertEq(aliceShares, 10_000, "fixture: the virtual offset must mint one thousand shares per asset-wei");
 
@@ -1487,18 +1707,17 @@ contract LenderPoolTest is Test {
             vm.prank(alice);
             pool.transfer(bob, 1);
 
-            assertEq(pool.principalUnits(bob), 1, "each dust split must ceil-move one principal unit");
-            assertEq(pool.previewRedeem(1), 0, "each one-share position must redeem for zero assets");
+            assertEq(pool.principalUnits(bob), 0, "a dust split must move no principal unit at all");
+            assertEq(pool.previewRedeem(1), 0, "fixture: each one-share position must redeem for zero assets");
 
             vm.prank(bob);
             uint256 assetsOut = pool.redeem(1, bob, bob);
 
-            uint256 remaining = 9 - i;
-            assertEq(assetsOut, 0, "each boundary must pay no assets");
-            assertEq(usdc.balanceOf(address(pool)), assetsBefore, "no asset may leave the pool");
-            assertEq(pool.totalPrincipalUnits(), remaining, "each zero-asset exit must burn exactly one unit");
-            assertEq(pool.netDeposits(), remaining, "each zero-asset exit must loosen the cap by one asset-wei");
-            assertEq(pool.maxDeposit(bob), headroomBefore + i + 1, "cap erosion must be linear across boundaries");
+            assertEq(assetsOut, 0, "fixture: each boundary must pay no assets");
+            assertEq(usdc.balanceOf(address(pool)), assetsBefore, "fixture: no asset may leave the pool");
+            assertEq(pool.totalPrincipalUnits(), 10, "a zero-asset exit must burn no units");
+            assertEq(pool.netDeposits(), 10, "a zero-asset exit must not loosen the cap");
+            assertEq(pool.maxDeposit(bob), headroomBefore, "cap headroom must not move when no asset moves");
         }
     }
 
@@ -2553,6 +2772,92 @@ contract LenderPoolTest is Test {
         assertApproxEqAbs(remaining, DEPOSIT - 3_000e6, 1, "and still owed the rest");
     }
 
+    /// @notice Audit round 23, finding 12. A partial fill rounds the unit debit UP, and this is the
+    ///         assertion that can tell which way it rounds.
+    ///
+    /// @dev **The four #246 principal-unit invariants do not discriminate this.** Measured in round
+    ///      23: flipping `serviceQueue`'s `unitsToBurn` ceiling to a floor leaves all four green at
+    ///      128,000 calls each, and **3 of 5 campaigns never reach a partial fill at all**.
+    ///      Re-measured here on 2026-08-22 against this tree: all 29 lender invariants, including
+    ///      the four, pass at `(runs: 256, calls: 128000, reverts: 0)` with the ceiling flipped to a
+    ///      floor - cache cleared, unseeded, one invocation - while the assertion below goes red one
+    ///      wei wide.
+    ///
+    ///      **And the campaign's own reach instrument is provably a coin flip.** Round 23's
+    ///      `invariant_A23_10_partialFillsNeverHappen` asserts `reached == 0`, so it FAILS when a
+    ///      partial fill is reached. It fired at run 161 on the round-23 baseline seed; on seed
+    ///      `0x55ccdadb2b3b9336f404ed80090349e8225ac8fe3d93db1cf925ba53bbfd0a4c`, one independent
+    ///      invocation with `cache/invariant` cleared, it did not fire in 256 runs at all. Eight of
+    ///      the nine sibling censuses in the same bundle still fire, so the instruments work; this
+    ///      one moved. **A zero from an unseeded campaign reads as proof of impossibility and is
+    ///      not.** A branch a campaign may never enter cannot be guarded by that campaign. This
+    ///      test enters it deterministically, which is why it exists at all.
+    ///
+    ///      **The premise is asserted before the property, and it is the whole test.** Ceil and
+    ///      floor differ by at most one unit, so on an exact ratio *both* rounding modes satisfy
+    ///      every assertion below and the test would pass against the defect it is named for. The
+    ///      `assertEq(ceil, floor + 1)` line is therefore load-bearing: it fails the fixture rather
+    ///      than the contract if the trace stops being one wei wide. Every queue test written
+    ///      before yield exists in this file inherits an exact 1000:1 ratio, which is exactly how
+    ///      this branch went unguarded.
+    ///
+    ///      **Why UP is the correct direction.** The residual entry keeps `requestUnits - unitsToBurn`.
+    ///      Rounding the debit down leaves the entry holding a unit whose principal has already left
+    ///      through the fill, and `_burnPrincipalUnits` debits `netDeposits` in proportion to units
+    ///      burned - so a floor here under-debits the deposit-cap counter on every partial fill and
+    ///      lets residual principal accumulate against the cap. That is round-22 finding 3's
+    ///      cap-loosening direction, reached through the queue instead of through the doors.
+    function test_R23F12_aPartialFillRoundsTheUnitDebitUp() public {
+        uint256 shares = _deposit(alice, DEPOSIT);
+        // The skip is load-bearing for the same reason it is two tests down: at the instant of
+        // delivery the ratio is still exactly 1000:1 and nothing here would be inexact.
+        _distributeYield(333_333_333);
+        skip(Config.YIELD_STREAM_DURATION);
+        _lend(pool.available());
+
+        vm.prank(alice);
+        pool.requestWithdrawal(shares, alice);
+
+        (,, uint256 entryShares) = pool.queueEntry(0);
+        uint256 entryUnits = pool.queueEntryPrincipalUnits(0);
+        uint256 totalUnitsBefore = pool.totalPrincipalUnits();
+        uint256 netDepositsBefore = pool.netDeposits();
+        assertGt(entryUnits, 0, "fixture: the entry carries no principal units to round");
+
+        _setIdleTo(3_000e6);
+        pool.serviceQueue(10);
+
+        (,, uint256 entrySharesAfter) = pool.queueEntry(0);
+        uint256 entryUnitsAfter = pool.queueEntryPrincipalUnits(0);
+        uint256 sharesBurned = entryShares - entrySharesAfter;
+        assertGt(entrySharesAfter, 0, "fixture: the fill was not partial, so no rounding happened");
+        assertGt(sharesBurned, 0, "fixture: nothing was filled");
+
+        uint256 roundedUp = Math.mulDiv(entryUnits, sharesBurned, entryShares, Math.Rounding.Ceil);
+        uint256 roundedDown = Math.mulDiv(entryUnits, sharesBurned, entryShares, Math.Rounding.Floor);
+
+        emit log_named_uint("R23F12 entry units before ", entryUnits);
+        emit log_named_uint("R23F12 entry shares before", entryShares);
+        emit log_named_uint("R23F12 shares burned      ", sharesBurned);
+        emit log_named_uint("R23F12 units burned       ", entryUnits - entryUnitsAfter);
+        emit log_named_uint("R23F12 ceiling            ", roundedUp);
+        emit log_named_uint("R23F12 floor              ", roundedDown);
+
+        // THE PREMISE. One wei wide, or this test cannot see the direction at all.
+        assertEq(roundedUp, roundedDown + 1, "fixture: the ratio is exact here, so this discriminates nothing");
+
+        assertEq(entryUnits - entryUnitsAfter, roundedUp, "the unit debit did not round up");
+        assertEq(entryUnitsAfter, entryUnits - roundedUp, "the residual entry kept a unit it no longer backs");
+        assertEq(
+            totalUnitsBefore - pool.totalPrincipalUnits(),
+            roundedUp,
+            "the aggregate unit counter moved by a different amount than the entry did"
+        );
+        // And the consequence the direction is chosen for: the cap counter is debited for the
+        // principal that actually left, never less.
+        assertGt(netDepositsBefore, pool.netDeposits(), "a partial fill did not debit the deposit-cap counter");
+    }
+
     function test_serviceQueue_clearsTheEntryAndTheHeadWhenFullyPaid() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _lend(pool.available());
@@ -2900,6 +3205,109 @@ contract LenderPoolTest is Test {
         pool.claim();
     }
 
+    // ── audit round 22, findings 12 and 17: the unswept `*For` member ────────
+    //
+    // Round 21 swept `claimSurplus`, `claimBounty` and `claimReward` into `*For` variants in one
+    // commit and stopped at the pool, which was outside that stream's files. Five agents found the
+    // gap independently in round 22. Two of them BUILT `claimFor` and measured OPPOSITE results,
+    // and both were right - so the pair of tests below is the finding's real answer: one measures
+    // the half that closes, one measures the half that does not, and neither is meaningful alone.
+
+    /// @dev Stage a serviced entry whose receiver is `receiver` and whose owner is `alice`, leaving
+    ///      `DEPOSIT` of USDC set aside under the receiver's name and the entry gone from the queue.
+    function _serviceInFavourOf(address receiver) internal returns (uint256 setAside) {
+        uint256 aliceShares = _deposit(alice, DEPOSIT);
+        _lend(pool.available());
+        vm.prank(alice);
+        pool.requestWithdrawal(aliceShares, receiver);
+        _setIdleTo(DEPOSIT);
+        pool.serviceQueue(10);
+        setAside = pool.claimable(receiver);
+        assertGt(setAside, 0, "fixture: nothing was set aside for the receiver");
+    }
+
+    /// @notice THE HALF `claimFor` CLOSES: a receiver that cannot re-issue the call.
+    /// @dev The receiver here is a contract with no functions and no fallback. It can hold USDC -
+    ///      an ERC-20 transfer does not call its destination - and it can never call `claim()`.
+    ///      Under `claim()` alone that money is stranded for the life of an immutable contract.
+    ///      A bystander with no relationship to the pool recovers it, **to the receiver**.
+    function test_claimFor_recoversMoneyFromAReceiverThatCannotCall() public {
+        address mute = address(new MuteWallet());
+        uint256 setAside = _serviceInFavourOf(mute);
+
+        // The control that makes this a measurement: the money really is unreachable first.
+        assertEq(usdc.balanceOf(mute), 0, "control: the receiver already held USDC");
+
+        address bystander = makeAddr("bystander");
+        vm.prank(bystander);
+        uint256 paid = pool.claimFor(mute);
+
+        assertEq(paid, setAside, "the reported figure is not what was set aside");
+        assertEq(usdc.balanceOf(mute), setAside, "the receiver was not paid");
+        assertEq(usdc.balanceOf(bystander), 0, "the caller took the money, so the destination IS chooseable");
+        assertEq(pool.claimable(mute), 0, "the set-aside counter was not cleared");
+        assertEq(pool.totalClaimable(), 0, "the aggregate counter drifted from the individual one");
+    }
+
+    /// @notice THE HALF `claimFor` DOES NOT CLOSE, and cannot: a receiver that cannot RECEIVE.
+    /// @dev Round 22's agents 01 and 12 measured opposite results on this same function because
+    ///      they used these two different preconditions. This test is the second one, asserted
+    ///      rather than argued: against a USDC blacklist the `*For` door reverts in **exactly** the
+    ///      place the receiver's own `claim()` reverts, with the same error and the same argument.
+    ///      The failure is in the token and the destination is deliberately not chooseable, so
+    ///      there is no version of this function that recovers it.
+    ///
+    ///      **Asserting the inertness is the point.** A `*For` sweep that is written up as closing
+    ///      round-22 finding 12 without this test reads like closure of a finding it half-touches.
+    function test_claimFor_isInertAgainstAReceiverThatCannotReceive() public {
+        address frozen = makeAddr("blacklistedReceiver");
+        uint256 setAside = _serviceInFavourOf(frozen);
+        usdc.setBlocked(frozen, true);
+
+        // The receiver's own door.
+        vm.prank(frozen);
+        vm.expectRevert(abi.encodeWithSelector(MockUSDC.Blocked.selector, frozen));
+        pool.claim();
+
+        // The permissionless door, identical.
+        address bystander = makeAddr("bystander");
+        vm.prank(bystander);
+        vm.expectRevert(abi.encodeWithSelector(MockUSDC.Blocked.selector, frozen));
+        pool.claimFor(frozen);
+
+        assertEq(pool.claimable(frozen), setAside, "the counter moved on a call that reverted");
+    }
+
+    /// @notice The owner's shares are gone by the time either door is tried, which is round-22
+    ///         finding 12's headline and is NOT closed by this sweep.
+    /// @dev Before servicing, `alice` could `cancelWithdrawalRequest` and take her shares back.
+    ///      After a stranger's free `serviceQueue` the shares are burned and the money sits under
+    ///      the **receiver's** name. `claimFor` widens who may pull that money out; it does not
+    ///      give the owner back the ability to undo the conversion. Recorded as an assertion so the
+    ///      next round reads the residual rather than the sweep.
+    function test_claimFor_doesNotRestoreTheOwnersCancelledPosition() public {
+        address frozen = makeAddr("blacklistedReceiver");
+        _serviceInFavourOf(frozen);
+        usdc.setBlocked(frozen, true);
+
+        assertEq(pool.balanceOf(alice), 0, "the owner still holds shares, so nothing was crystallised");
+        vm.prank(alice);
+        vm.expectRevert(LenderPool.NothingQueued.selector);
+        pool.cancelWithdrawalRequest();
+    }
+
+    function test_claimFor_refusesTheZeroAddress() public {
+        vm.expectRevert(LenderPool.ZeroAddress.selector);
+        pool.claimFor(address(0));
+    }
+
+    /// @dev Reverts at zero rather than no-opping, so a caller cannot be told a strand was cleared
+    ///      when nothing moved. Same rule as `claimSurplusFor` and `claimBountyFor`.
+    function test_claimFor_revertsWithNothingToClaim() public {
+        vm.expectRevert(LenderPool.NothingToClaim.selector);
+        pool.claimFor(alice);
+    }
+
     /// @dev Round 10. Money set aside for a serviced lender is still in the contract but is no
     ///      longer the pool's. Counting it would raise the share price by exactly the amount owed
     ///      to somebody else, on every fill.
@@ -3025,13 +3433,29 @@ contract LenderPoolTest is Test {
     ///      paragraph, because a prescribed fix that reads like success and moves nothing has now
     ///      cost this project eight rounds running.
     ///
-    ///      **This test asserts the DEFECT and must be inverted when the real fix lands.** The real
-    ///      fix is impaired-pricing plus serve-while-marked, which are one change and not two -
-    ///      round 13 removed impaired pricing precisely because `serviceQueue` refuses to pay while
-    ///      marked, so the reservation cannot self-liquidate and a released mark hands out the
-    ///      difference. Serving while marked realises losses at whatever the mark says, so it waits
-    ///      on the NAV oracle being anchored. Until then the two `assertEq`s below are a tripwire:
-    ///      whichever of them goes red says the shape changed.
+    ///      **This test asserts the DEFECT, and the fix it used to name has since been BUILT AND
+    ///      REFUTED. Do not restore that sentence.** It said the real fix is "impaired pricing plus
+    ///      serve-while-marked, which are one change", waiting only on the NAV anchor that #204
+    ///      shipped. Both halves were built on 2026-08-22 and each fires a control the tree already
+    ///      relies on:
+    ///
+    ///      - **Impaired pricing of the holdback restores audit round 12.** MEASURED: deepening a
+    ///        mark from 500.000000 to 4,000.000000 takes `available()` from 15,269.736842 to
+    ///        15,407.894736, so a markdown buys 138.157894 of lending capacity.
+    ///        `invariant_worseNewsNeverBuysMoreLending` is the shipped guard for exactly that.
+    ///      - **Serve-while-marked restores audit round 15 and IS round-22 finding 12.** MEASURED:
+    ///        a bystander's free `serviceQueue` burns a queued lender's whole 3,750,000,000,000
+    ///        escrowed shares for 563.230263 - 15.02% of the un-impaired claim, destroyed
+    ///        permanently at a stranger's chosen instant.
+    ///
+    ///      A third candidate, impaired pricing on the WITHDRAWAL door only, passes every control
+    ///      and all 29 lender invariants and is refuted by its own cost: a good-faith lender queued
+    ///      behind the parker goes from being paid **379.362500** to being paid **0**, while the
+    ///      parker at the head of the queue is barely touched. Audit round 21's finding 7 therefore
+    ///      stays open, with eight refuted candidates behind it rather than four.
+    ///
+    ///      Until something survives, the two `assertEq`s below are a tripwire: whichever of them
+    ///      goes red says the shape changed.
     function test_queueReservation_theGoldfinchClampIsInertHere() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
@@ -3316,6 +3740,245 @@ contract LenderPoolTest is Test {
         // CONTROL: the same pool still takes a deposit large enough to buy a share.
         vm.prank(bob);
         assertGt(pool.deposit(1e6, bob), 0, "a real deposit was refused as well");
+    }
+
+
+    // ── round-28 item 10 (round-25 A6 F4): the pool refuses entry while paused ──
+    //
+    // The pause shuts `deposit` and `mint` and nothing else. Every test below that touches an exit
+    // is there to hold that line: `withdraw`, `redeem`, `requestWithdrawal`, `serviceQueue` and
+    // `claim` must keep working, and keep working *correctly*, while the door is shut. That is the
+    // entire argument for putting this switch on the guardian's key rather than the owner's, so a
+    // change that closes an exit has not tightened this contract, it has invalidated the reasoning
+    // that let the fast key reach it.
+
+    /// @notice The measured harm, closed. A lender can no longer enter into a write-down they
+    ///         missed.
+    /// @dev **Audit round 25, finding 4, re-measured here rather than quoted.** The original
+    ///      measurement was a lender who deposited while the protocol was paused and watched their
+    ///      redeemable balance go **10,000.000000 -> 9,750.000000** when the loss the pause was
+    ///      called for landed. Both halves are asserted: the control shows the money genuinely
+    ///      moves that far, and the fixed path shows the entry is refused before it can.
+    function test_R25A6F4_aLenderCanNoLongerEnterIntoAWriteDownTheyMissed() public {
+        _deposit(alice, DEPOSIT);
+
+        // The incident. The guardian shuts the door; the loss has not landed yet.
+        vm.prank(admin);
+        pool.pause();
+
+        vm.prank(bob);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.deposit(DEPOSIT, bob);
+        assertEq(pool.balanceOf(bob), 0, "the entrant took an exposure the pause was called to stop");
+
+        // The control, on the same fixture: reopen, let the same lender in, land the same loss.
+        // 500.000000 against a 20,000.000000 book is 250 bps, which is the round-25 figure.
+        vm.prank(admin);
+        pool.unpause();
+        uint256 bobShares = _deposit(bob, DEPOSIT);
+        _lend(5_000e6);
+        vm.prank(creditManager);
+        pool.socialiseLoss(500e6);
+
+        assertEq(
+            pool.previewRedeem(bobShares),
+            9_750e6,
+            "the control must reproduce the measurement, or the test above proves nothing"
+        );
+    }
+
+    /// @notice The ERC-4626 trap. A paused pool reports a zero cap and never reverts in a view.
+    /// @dev EIP-4626 requires `maxDeposit` to return zero when deposits are disabled, **including
+    ///      temporarily**, and forbids it from reverting under any condition - the contract's own
+    ///      NatSpec above `maxDeposit` has recorded the no-revert half since audit round 11, which
+    ///      is why the deposit cap is stored locally instead of read from `RiskParams`. A pause
+    ///      expressed as a revert here would not stop an integrator, it would break one. Both views
+    ///      are asserted because `maxMint` delegates, and delegation is exactly the property a
+    ///      refactor removes without touching a line this test reads.
+    function test_G4_pauseIsAZeroCapInTheViewsAndNeverARevert() public {
+        assertGt(pool.maxDeposit(alice), 0, "fixture: the pool must be open before it is shut");
+        assertGt(pool.maxMint(alice), 0);
+
+        vm.prank(admin);
+        pool.pause();
+
+        assertEq(pool.maxDeposit(alice), 0, "maxDeposit must report a zero cap while paused");
+        assertEq(pool.maxMint(alice), 0, "maxMint must follow it to zero");
+
+        // And back, because a cap that never comes back is a different bug wearing this one's face.
+        vm.prank(admin);
+        pool.unpause();
+        assertEq(pool.maxDeposit(alice), pool.depositCap(), "the cap did not come back");
+    }
+
+    /// @notice The refusal names the pause, not the cap.
+    /// @dev **The nuance the zero cap alone gets wrong.** `deposit` reads `maxDeposit(receiver)`
+    ///      itself, so a zero cap would already refuse the call - as `DepositCapExceeded(assets, 0)`,
+    ///      which tells a lender the pool is full when the truth is that the pool is shut. Those are
+    ///      different facts with different responses: one says come back when someone leaves, the
+    ///      other says come back when the incident is over. `whenNotPaused` runs before the body and
+    ///      says `EnforcedPause()` instead. OpenZeppelin's own error rather than a bespoke one, so
+    ///      the three contracts carrying the guardian role refuse in one voice and the dApp's error
+    ///      union already carries the selector.
+    function test_G4_theRefusalNamesThePauseRatherThanTheCap() public {
+        vm.prank(admin);
+        pool.pause();
+
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.deposit(1e6, alice);
+
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.mint(1e9, alice);
+    }
+
+    /// @notice The two bounded EIP-5143 doors are shut too, and only because they delegate.
+    /// @dev They carry no gate of their own - they call the two-argument doors above and check a
+    ///      bound on the result - so they are covered for free. **Asserted rather than assumed**,
+    ///      for the reason the exit-side overloads are asserted in the invariant handler: delegation
+    ///      is a property of the bodies as written, and a refactor can take it away silently.
+    function test_G4_theBoundedEntryDoorsAreShutByDelegation() public {
+        vm.prank(admin);
+        pool.pause();
+
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.deposit(1e6, alice, 0);
+
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.mint(1e9, alice, type(uint256).max);
+    }
+
+    /// @notice The premise. A paused pool shuts no cure and strands nobody.
+    /// @dev **This is the test that makes the switch guardian-reachable.** Audit round 27 refused a
+    ///      guardian-reachable pause on `CollateralVault.depositBonds` because that one shut the
+    ///      borrower's cure. Here every exit stays open: the immediate ERC-4626 pair, the queue, the
+    ///      pull payment at the end of it, and the servicing walk a keeper drives. If a later change
+    ///      closes any of them this test goes red, and the right response is to reopen the exit
+    ///      rather than to edit the test - the fast key's reach is justified by this and by nothing
+    ///      else.
+    function test_G4_everyExitStaysOpenAndStaysCorrectWhilePaused() public {
+        // Three lenders under the 25,000.000000 cap, so the fixture is refused for nothing but the
+        // reason under test.
+        uint256 stake = 8_000e6;
+        uint256 aliceShares = _deposit(alice, stake);
+        _deposit(bob, stake);
+        uint256 carolShares = _deposit(carol, stake);
+
+        vm.prank(admin);
+        pool.pause();
+
+        // 1. The immediate pair, priced exactly as they would be with the door open.
+        uint256 quoted = pool.previewRedeem(aliceShares / 2);
+        vm.prank(alice);
+        uint256 paid = pool.redeem(aliceShares / 2, alice, alice);
+        assertEq(paid, quoted, "redeem was repriced by the pause");
+
+        uint256 assets = pool.maxWithdraw(bob);
+        assertGt(assets, 0, "maxWithdraw went to zero, which would be an exit shut by the pause");
+        vm.prank(bob);
+        pool.withdraw(assets, bob, bob);
+
+        // 2. The queue, and the pull payment at the end of it. Lend the float out first so the
+        //    request cannot simply be paid from idle - the queue is the exit that matters here.
+        _lend(pool.available());
+        vm.prank(carol);
+        pool.requestWithdrawal(carolShares, carol);
+        assertEq(pool.queuedShares(), carolShares, "a queued exit was refused while paused");
+
+        _repay(stake);
+        vm.prank(alice);
+        uint256 serviced = pool.serviceQueue(5);
+        assertGt(serviced, 0, "the servicing walk was shut by the pause");
+
+        uint256 owed = pool.claimable(carol);
+        assertGt(owed, 0, "the queue paid nothing");
+        uint256 heldBefore = usdc.balanceOf(carol);
+        vm.prank(carol);
+        pool.claim();
+        assertEq(usdc.balanceOf(carol) - heldBefore, owed, "the pull payment was shut by the pause");
+    }
+
+    // ── the role itself ──────────────────────────────────────────────────────
+
+    /// @notice The guardian may shut the door and may not reopen it.
+    /// @dev The asymmetry `CollateralVault` already carries, restated here because it is the half
+    ///      an implementation gets wrong by symmetry: a compromised guardian that could `unpause`
+    ///      would be able to reopen the pool in the middle of the incident the owner shut it for.
+    function test_G4_theGuardianMayShutTheDoorAndMayNotReopenIt() public {
+        address guardian = makeAddr("guardian");
+        vm.prank(admin);
+        pool.setGuardian(guardian);
+
+        vm.prank(guardian);
+        pool.pause();
+        assertTrue(pool.paused(), "the guardian could not reach the pause");
+
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, guardian));
+        pool.unpause();
+
+        vm.prank(admin);
+        pool.unpause();
+        assertFalse(pool.paused(), "the owner could not reopen the pool");
+    }
+
+    /// @notice With the role unfilled the switch is owner-only, and a stranger is refused.
+    /// @dev **One thing this deliberately does NOT assert, because it is not true under a
+    ///      cheatcode.** `_requireOwnerOrGuardian` reads an unfilled role as `address(0)`, and the
+    ///      comment it inherits from `CollateralVault` says a zero guardian cannot match a caller
+    ///      because `msg.sender` is never the zero address. That holds on chain and does not hold
+    ///      under `vm.prank(address(0))`, which pauses the pool - measured while writing this test.
+    ///      It is a property of the cheatcode rather than of the contract, and it is identical in
+    ///      `CollateralVault` and `CreditManager`, so it is recorded here rather than defended
+    ///      against with a check that would cost bytes and close nothing reachable.
+    function test_G4_pauseIsRefusedToAStrangerWhileTheRoleIsUnfilled() public {
+        assertEq(pool.guardian(), address(0), "fixture: the role must ship unfilled");
+
+        vm.prank(alice);
+        vm.expectRevert(LenderPool.NotOwnerOrGuardian.selector);
+        pool.pause();
+
+        // And an installed guardian does not widen it to a third party.
+        address guardian = makeAddr("guardian");
+        vm.prank(admin);
+        pool.setGuardian(guardian);
+        vm.prank(bob);
+        vm.expectRevert(LenderPool.NotOwnerOrGuardian.selector);
+        pool.pause();
+    }
+
+    /// @dev The configuration the second key does not defend against, refused. Checked against the
+    ///      owner **at the time of the call**, exactly as the vault's is, which is why
+    ///      `DeployBase._assertWiring` re-reads the pair after `_handOver`.
+    function test_G4_setGuardian_refusesTheOwnerAndIsOwnerOnly() public {
+        vm.prank(admin);
+        vm.expectRevert(LenderPool.GuardianMustDifferFromOwner.selector);
+        pool.setGuardian(admin);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pool.setGuardian(alice);
+    }
+
+    /// @dev Clearing the role is a legal act and must emit, or an operator watching the topic sees
+    ///      the key installed and never sees it withdrawn.
+    function test_G4_setGuardian_emitsOnInstallAndOnClear() public {
+        address guardian = makeAddr("guardian");
+
+        vm.expectEmit(true, false, false, false, address(pool));
+        emit LenderPool.GuardianSet(guardian);
+        vm.prank(admin);
+        pool.setGuardian(guardian);
+        assertEq(pool.guardian(), guardian);
+
+        vm.expectEmit(true, false, false, false, address(pool));
+        emit LenderPool.GuardianSet(address(0));
+        vm.prank(admin);
+        pool.setGuardian(address(0));
+        assertEq(pool.guardian(), address(0), "the role could not be withdrawn");
     }
 
     /// @dev `_poolBalance()` is private. Reconstructed from the three public reads it is made of,

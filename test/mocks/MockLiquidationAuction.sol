@@ -16,6 +16,11 @@ pragma solidity ^0.8.24;
 ///      Deliberately dumb otherwise: suites using this are testing the *gates*, and a
 ///      mock that ran a real auction would make their failures ambiguous.
 contract MockLiquidationAuction {
+    /// @dev The same four bytes `LiquidationAuction` reverts with. A custom error's selector is
+    ///      `keccak256` of its name and parameter types and carries no contract identity, so a
+    ///      redeclaration here is the same type on the wire.
+    error ZeroAddress();
+
     address public lastBorrower;
     address public lastCaller;
     uint256 public startCalls;
@@ -94,7 +99,28 @@ contract MockLiquidationAuction {
         openWorkoutCount = openWorkouts;
     }
 
+    /// @notice Mirrors the real contract's zero-address refusal, and audit round 26 is why.
+    /// @dev **This mock is duck-typed, so every clause the protocol probes for has to exist here or
+    ///      the mock stops standing in for the thing it mocks.** `CreditWiring.checkAuctionSwap`
+    ///      probes this selector by calling `start(address(0), address(0))` on the incoming pointer
+    ///      and reading the *shape* of the refusal - four bytes of error selector means the function
+    ///      is there, empty returndata means it is not. The real `LiquidationAuction.start` refuses a
+    ///      zero `borrower` or `caller` with `ZeroAddress()` before it writes anything, so the probe
+    ///      is free.
+    ///
+    ///      Without this clause the probe *succeeded* against this mock and opened an auction:
+    ///      MEASURED, `startCalls` read 2 rather than 1 after a single `liquidate`, `nextId` was one
+    ///      ahead, and `auctionOf[address(0)]` held an id no caller ever asked for. Two tests in
+    ///      `CreditManager.t.sol` went red on the counter, which is the mock reporting a liquidation
+    ///      it never opened - exactly what `auctionOf`'s own note above says must not happen.
+    ///
+    ///      The real contract's *first* clause, `msg.sender != creditManager` -> `NotCreditManager()`,
+    ///      is deliberately not mirrored. It would be a second, stricter refusal on a mock several
+    ///      fixtures drive directly and point away from the manager on purpose, and the probe needs
+    ///      only one four-byte answer to see the selector. This file is dumb by design; it is copied
+    ///      here to the depth the protocol actually inspects and no further.
     function start(address borrower, address caller) external returns (uint256 id) {
+        if (borrower == address(0) || caller == address(0)) revert ZeroAddress();
         lastBorrower = borrower;
         lastCaller = caller;
         startCalls++;

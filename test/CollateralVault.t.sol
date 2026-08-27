@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import {Config} from "../src/Config.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
@@ -126,12 +128,41 @@ contract CollateralVaultTest is RiskParamsFixture {
         vault.depositBonds(0);
     }
 
-    function test_depositBonds_pausable() public {
+    /// @dev **This test used to pause the vault and assert `depositBonds` reverted, on a bare
+    ///      `vm.expectRevert()`.** Both halves of that were worth changing. The behaviour is now
+    ///      the opposite - audit round 25, finding 1: `pause()` shuts `depositETH` and leaves
+    ///      the borrower's cure open, because a top-up by an indebted borrower can only lower
+    ///      LTV and `CreditManager.liquidate`'s docstring already stated the rule (*pause
+    ///      stops new risk, never resolution*). And a bare `expectRevert` passes on **any** revert,
+    ///      including one meaning the fixture broke, which is how a test can keep passing while
+    ///      measuring something else; both assertions below name a selector.
+    function test_depositBonds_isNotShutByThePause_onlyByItsOwnSwitch() public {
         vm.prank(admin);
         vault.pause();
+
         vm.prank(alice);
-        vm.expectRevert();
         vault.depositBonds(100);
+        assertEq(vault.bondCount(alice), 100, "the pause must not shut the cure");
+
+        vm.prank(admin);
+        vault.setBondDepositsPaused(true);
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.BondDepositsArePaused.selector);
+        vault.depositBonds(100);
+    }
+
+    /// @dev The sibling that did not change: `depositETH` is new exposure - it sends ETH into
+    ///      DexFi's mint - so it stays behind the contract-level pause and behind the switch the
+    ///      guardian may throw.
+    function test_depositETH_isStillShutByThePause() public {
+        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        vm.deal(alice, 1 ether);
+        vm.prank(admin);
+        vault.pause();
+
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vault.depositETH{value: 1 ether}(mintData);
     }
 
     // ── depositETH (signed mint, auto-stake) ─────────────────────────────────
@@ -154,6 +185,149 @@ contract CollateralVaultTest is RiskParamsFixture {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(DirectCallAdapter.ReceiverMustBeAdapter.selector, alice));
         vault.depositETH{value: 1 ether}(mintData);
+    }
+
+    // -- depositETH is a farm-touching path and must report what it flushes ---
+
+    /// @notice **Audit round 23, finding 22(a).** `depositETH` flushed protocol-wide farm yield and
+    ///         emitted nothing, where all four of its bond-count siblings emit `YieldHarvested`.
+    /// @dev MEASURED before the fix, on this fixture: 500.000000 reached `yieldSink` through one
+    ///      `depositETH` and the vault emitted **zero** `YieldHarvested` events; the identical flush
+    ///      through `depositBonds` emitted one. The mechanism is DexFi's auto-stake: `bond.mint`
+    ///      drives the reward pool's `depositForAccount` hook for the adapter, and a
+    ///      MasterChef-style pool settles the whole position's pending rewards on any deposit.
+    ///
+    ///      Counted out of the logs rather than asserted with `expectEmit`, and the emitted number
+    ///      is compared against the USDC that actually moved rather than against a literal. An
+    ///      `expectEmit` here would pass against an emit of the wrong figure in the wrong place,
+    ///      which is the failure mode an event test is most prone to.
+    function test_depositETH_reportsTheFarmYieldItFlushes() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        farm.setPendingYield(address(adapter), 500e6);
+
+        uint256 sinkBefore = usdc.balanceOf(yieldSink);
+        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        vm.deal(alice, 1 ether);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        vault.depositETH{value: 1 ether}(mintData);
+        (uint256 count, uint256 reported) = _yieldHarvested();
+
+        uint256 moved = usdc.balanceOf(yieldSink) - sinkBefore;
+        emit log_named_uint("MEASURED USDC flushed to the yield recipient by the mint", moved);
+        emit log_named_uint("MEASURED YieldHarvested events emitted by depositETH", count);
+        emit log_named_uint("MEASURED figure reported", reported);
+        assertEq(moved, 500e6, "premise: the epoch really does leave through this path");
+        assertEq(count, 1, "the path that moved it has to account for it");
+        assertEq(reported, moved, "and the reported figure is the money that moved, not a proxy");
+    }
+
+    /// @notice CONTROL - the same call with nothing pending reports nothing.
+    /// @dev Without this arm, an unconditional `emit YieldHarvested(0)` would satisfy the test
+    ///      above, which is exactly how an event assertion passes for the wrong reason. The four
+    ///      siblings all guard on `swept != 0` and this one must too.
+    function test_depositETH_reportsNothingWhenTheFarmSettlesNothing() public {
+        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        vm.deal(alice, 1 ether);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        vault.depositETH{value: 1 ether}(mintData);
+        (uint256 count,) = _yieldHarvested();
+
+        assertEq(usdc.balanceOf(yieldSink), 0, "premise: the farm settled nothing");
+        assertEq(count, 0, "a path that moved no yield must not claim it moved some");
+    }
+
+    /// @notice The reported figure is the amount **swept**, which is this call's farm payout plus
+    ///         anything a previous failed sweep carried - the same quantity `stake` and `unstake`
+    ///         return to the four siblings.
+    /// @dev This is the arm that separates the fix from the plausible near-miss. A version that
+    ///      reported only the farm's payout for this call would print 300.000000 while 800.000000
+    ///      left the protocol, which is the same class of unaccounted money the finding is about.
+    function test_depositETH_reportsTheCarriedYieldTheSweepFinallyDelivers() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        // A claim whose sweep cannot go through: 500.000000 is carried in `unreportedYield`.
+        farm.setPendingYield(address(adapter), 500e6);
+        usdc.setBlocked(yieldSink, true);
+        vm.prank(admin);
+        vault.harvestYield();
+        assertEq(adapter.unreportedYield(), 500e6, "premise: an undelivered epoch is carried");
+
+        usdc.setBlocked(yieldSink, false);
+        farm.setPendingYield(address(adapter), 300e6);
+
+        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        vm.deal(alice, 1 ether);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        vault.depositETH{value: 1 ether}(mintData);
+        (uint256 count, uint256 reported) = _yieldHarvested();
+
+        emit log_named_uint("MEASURED USDC delivered by this deposit", usdc.balanceOf(yieldSink));
+        emit log_named_uint("MEASURED figure reported", reported);
+        assertEq(usdc.balanceOf(yieldSink), 800e6, "the carried epoch left with this call's payout");
+        assertEq(count, 1);
+        assertEq(reported, 800e6, "the report is the sweep, not just this call's farm payout");
+    }
+
+    /// @notice A sweep that could not go through delivered nothing, so nothing is reported.
+    /// @dev The direction to be wrong in. `farmYieldDelivered` is the harvester's corroboration
+    ///      watermark, so over-reporting here would rate an epoch against money that never arrived -
+    ///      round 22's finding 4 in miniature. The ETH path inherits that property because it reads
+    ///      the same counter rather than the adapter's balance.
+    function test_depositETH_reportsNothingWhenTheSweepCannotGoThrough() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        farm.setPendingYield(address(adapter), 500e6);
+        usdc.setBlocked(yieldSink, true);
+
+        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        vm.deal(alice, 1 ether);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        vault.depositETH{value: 1 ether}(mintData);
+        (uint256 count,) = _yieldHarvested();
+
+        assertEq(usdc.balanceOf(yieldSink), 0, "premise: the recipient could not receive");
+        assertEq(usdc.balanceOf(address(adapter)), 500e6, "the money is still here, carried");
+        assertEq(count, 0, "and nothing claims it was delivered");
+    }
+
+    /// @notice CONTROL for the whole group - the sibling path this one was measured against.
+    function test_depositBonds_reportsTheSameFlush() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        farm.setPendingYield(address(adapter), 500e6);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        vault.depositBonds(10);
+        (uint256 count, uint256 reported) = _yieldHarvested();
+
+        assertEq(usdc.balanceOf(yieldSink), 500e6);
+        assertEq(count, 1, "CONTROL: the sibling path reports it");
+        assertEq(reported, 500e6);
+    }
+
+    /// @dev Counts `YieldHarvested` emitted **by the vault** and returns the last figure reported.
+    ///      Filtering on the emitter matters: a count that also picked up another contract's
+    ///      identically-named event would report the vault as accounting for a flush it ignored.
+    function _yieldHarvested() private returns (uint256 count, uint256 reported) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("YieldHarvested(uint256)");
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(vault)) continue;
+            if (logs[i].topics.length == 0 || logs[i].topics[0] != sig) continue;
+            count++;
+            reported = abi.decode(logs[i].data, (uint256));
+        }
     }
 
     // ── withdraw + LTV rule ──────────────────────────────────────────────────
@@ -595,6 +769,16 @@ contract CollateralVaultTest is RiskParamsFixture {
     ///
     ///      The test above steps around this by unblocking the sink one line before
     ///      the repoint. This one leaves it blocked, which is the real situation.
+    ///
+    ///      **Audit round 22, finding 4: the route out is right, the destination was not.**
+    ///      This test used to end by handing the whole trapped balance to `rescue` - an
+    ///      address the outgoing recipient had no relationship with - and called that "the
+    ///      trapped yield now has a route out". It is gross farm yield, earned before the
+    ///      repoint and owed to the recipient that earned it, and the drain that was meant
+    ///      to deliver it does nothing on precisely the condition this test sets up. So the
+    ///      money is now **parked against the outgoing recipient** and flushed to it,
+    ///      permissionlessly, once it can receive again. Both halves are asserted: the
+    ///      repoint still cannot be blocked, and the money still cannot be redirected.
     function test_adapter_canRepointAwayFromABlockedYieldRecipient() public {
         vm.prank(alice);
         vault.depositBonds(100);
@@ -614,12 +798,99 @@ contract CollateralVaultTest is RiskParamsFixture {
         adapter.setYieldRecipient(rescue);
         assertEq(adapter.yieldRecipient(), rescue, "repointed despite the block");
 
-        // And the trapped yield now has a route out.
+        // The drain could not run, so the money is checkpointed against the recipient that
+        // earned it rather than left free for the next sweep to hand to `rescue`.
+        assertEq(adapter.owedToRecipient(yieldSink), 500e6, "not parked against the earner");
+        assertEq(adapter.totalOwedToRecipients(), 500e6, "and the sum has to move with it");
+        assertEq(adapter.unreportedYield(), 0, "the carry counter is a claim on money now spoken for");
+
+        // A sweep after the repoint finds nothing free, which is the whole point.
         vm.prank(admin);
-        uint256 swept = vault.harvestYield();
-        assertEq(usdc.balanceOf(rescue), 500e6, "recovered in full");
-        assertEq(swept, 500e6, "and reported");
-        assertEq(adapter.unreportedYield(), 0);
+        assertEq(vault.harvestYield(), 0, "the parked balance was swept to the new recipient");
+        assertEq(usdc.balanceOf(rescue), 0, "and the new recipient took money it never earned");
+
+        // And the route out: permissionless, destination taken from the mapping key.
+        usdc.setBlocked(yieldSink, false);
+        vm.prank(alice); // no role at all
+        adapter.flushYieldTo(yieldSink);
+        assertEq(usdc.balanceOf(yieldSink), 500e6, "recovered in full, by the party that earned it");
+        assertEq(adapter.owedToRecipient(yieldSink), 0);
+        assertEq(adapter.totalOwedToRecipients(), 0);
+        assertEq(usdc.balanceOf(address(adapter)), 0, "and nothing is left stranded here");
+    }
+
+    /// @notice **Finding 4, the hazard the park closes.** The next ordinary deposit - made by a
+    ///         lender, not the owner - used to deliver the whole accrued epoch to whichever
+    ///         address the owner had just named.
+    /// @dev MEASURED before the fix: 1,000.000000 gross accrued, `setYieldRecipient(newSink)` with
+    ///      the outgoing recipient blacklisted so the drain is inert, then one `depositBonds(1)`
+    ///      delivers 1,000.000000 to `newSink` and 0 to the recipient that earned it - and
+    ///      `farmYieldDelivered`, the corroboration watermark the harvester rates epochs against,
+    ///      still recorded it as delivered.
+    ///
+    ///      CONTROL: the same sequence with the outgoing recipient able to receive parks nothing,
+    ///      because the drain works. That arm is
+    ///      `test_adapter_repointingYieldRecipientClearsTheCarriedCounter` above and is unchanged.
+    function test_adapter_aRepointCannotHandTheOutgoingRecipientsYieldToTheNextSink() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+
+        // A whole epoch of gross yield, stranded here because the recipient cannot receive.
+        farm.setPendingYield(address(adapter), 1_000e6);
+        usdc.setBlocked(yieldSink, true);
+        vm.prank(admin);
+        vault.harvestYield();
+        assertEq(usdc.balanceOf(address(adapter)), 1_000e6, "premise: the gross epoch is sitting here");
+        uint256 deliveredBefore = adapter.farmYieldDelivered();
+
+        address newSink = makeAddr("newSink");
+        vm.prank(admin);
+        adapter.setYieldRecipient(newSink);
+
+        // The lender deposit, which is what actually moved the money.
+        vm.prank(alice);
+        vault.depositBonds(1);
+
+        emit log_named_uint("MEASURED delivered to the incoming sink", usdc.balanceOf(newSink));
+        emit log_named_uint("MEASURED parked for the recipient that earned it", adapter.owedToRecipient(yieldSink));
+        assertEq(usdc.balanceOf(newSink), 0, "a lender's deposit paid the new sink the old one's epoch");
+        assertEq(adapter.owedToRecipient(yieldSink), 1_000e6, "the earner is not owed it");
+        assertEq(
+            adapter.farmYieldDelivered(),
+            deliveredBefore,
+            "the corroboration watermark counted money nobody received"
+        );
+    }
+
+    /// @notice The park is not a state anyone can be stuck in, and it is not a destination anyone
+    ///         can choose either.
+    function test_adapter_flushYieldToIsPermissionlessAndPaysOnlyTheMappingKey() public {
+        vm.prank(alice);
+        vault.depositBonds(100);
+        farm.setPendingYield(address(adapter), 300e6);
+        usdc.setBlocked(yieldSink, true);
+        vm.prank(admin);
+        vault.harvestYield();
+
+        address newSink = makeAddr("newSink");
+        vm.prank(admin);
+        adapter.setYieldRecipient(newSink);
+        assertEq(adapter.owedToRecipient(yieldSink), 300e6, "premise: parked");
+
+        // Nothing is owed to anybody else, and asking says so rather than paying zero.
+        vm.expectRevert(DirectCallAdapter.NothingToFlush.selector);
+        adapter.flushYieldTo(newSink);
+        vm.expectRevert(DirectCallAdapter.NothingToFlush.selector);
+        adapter.flushYieldTo(alice);
+
+        // A recipient that still cannot receive surfaces the failure rather than reporting
+        // success, matching `EpochHarvester.flushProtocolFeeTo`.
+        vm.expectRevert();
+        adapter.flushYieldTo(yieldSink);
+
+        usdc.setBlocked(yieldSink, false);
+        adapter.flushYieldTo(yieldSink);
+        assertEq(usdc.balanceOf(yieldSink), 300e6);
     }
 
     /// @dev A blocked recipient must not brick harvesting either - the yield carries

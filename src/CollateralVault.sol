@@ -21,8 +21,13 @@ import {IRiskParams} from "./interfaces/IRiskParams.sol";
 ///         ICustodyAdapter, so the direct-call vs Safe decision (pending the §14
 ///         whitelist answer) swaps the backend without touching balances here.
 /// @dev Bond units move depositor → adapter directly (one hop, so DexFi whitelisting
-///      the adapter alone is sufficient). Deposits pause with the contract; exits
-///      (withdraw/seize) intentionally never pause.
+///      the adapter alone is sufficient). Exits (withdraw/seize) intentionally never pause.
+///
+///      **The two deposit paths do NOT share a switch, and this sentence used to say they did.**
+///      `depositETH` pauses with the contract. `depositBonds` has its own owner-only switch,
+///      `bondDepositsPaused`, because it is the borrower's cure rather than new exposure - audit
+///      round 25, finding 1. See `guardian` for why the separation is what makes a guardian
+///      pause safe to hand out.
 contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard {
     error NotLiquidationAuction();
     error AdapterNotSet();
@@ -38,6 +43,16 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error AdapterVaultMismatch(address adapterVault);
     error NavStale();
     error RenounceDisabled();
+    /// @notice `pause()` accepts the owner or the guardian; this is neither.
+    error NotOwnerOrGuardian();
+    /// @notice The guardian exists to be a *second* key. One address holding both roles is the
+    ///         configuration the role does not defend against, so it is refused rather than
+    ///         allowed and documented. Same argument as `NAVOracle.KeysMustDiffer`.
+    error GuardianMustDifferFromOwner();
+    /// @notice Bond deposits are halted by their own switch. Distinct from `EnforcedPause`,
+    ///         which is what `depositETH` reverts, because the two are separately controlled
+    ///         and a caller has to be able to tell which door is shut.
+    error BondDepositsArePaused();
     error CreditManagerHasDebt(uint256 outstanding);
     error CreditManagerNotVirgin(address incoming);
     error CreditManagerVaultMismatch(address creditManagerVault);
@@ -53,6 +68,68 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error LiquidationAuctionNavOracleMismatch(address auctionNavOracle);
 
     event YieldHarvested(uint256 usdcAmount);
+
+    /// @notice The guardian key moved. Arity and name deliberately match `CreditManager`'s, so
+    ///         one whole-protocol `eth_getLogs` on this `topic0` sees both halves of the role -
+    ///         the same cross-contract-watch argument the wiring events below are written around.
+    event GuardianSet(address indexed guardian);
+
+    /// @notice The bond-deposit switch moved. A parameter rather than a pointer, and no second
+    ///         contract holds the other half of it, so it follows `LenderPool.DepositCapSet`'s
+    ///         shape (report the value) rather than the pointer events' `XSet(address indexed)`.
+    event BondDepositsPausedSet(bool paused);
+
+    // ── Wiring events (the round-24 remediation) ─────────────────────────────
+    //
+    // A group comment rather than three NatSpec blocks, because the reasoning is about the set:
+    // these three setters were, until this commit, the only `set*` functions anywhere in `src/`
+    // that moved a pointer silently, and this was the only deployed contract declaring no event
+    // but `YieldHarvested`. Deliberately no count in that sentence - the census behind it is
+    // `grep -rn "function set[A-Z]" src/ --include=*.sol` read against `grep -rn "event " src/`,
+    // re-derived per round, and nothing in CI derives it. `setCustodyAdapter`'s docstring below is
+    // this file's own record of what a written-down count does after two refactors.
+    //
+    // **The reason this is not cosmetic is that half of a divergence was unobservable.**
+    // `CreditManager.borrow` reverts `AuctionPointerMismatch` when this contract's
+    // `liquidationAuction` and the manager's disagree, and the manager emits `LiquidationAuctionSet`
+    // on its side of that pair while this contract emitted nothing on its own. An operator watching
+    // the protocol's logs saw the manager move and did not see the vault move, on the one contract
+    // in the graph that cannot be replaced and that holds every borrower's collateral. The same
+    // argument covers the other two pointers: `CreditManagerSet` here is the counterpart of the
+    // identically-named event on `LiquidationAuction`, `EpochHarvester`, `LenderPool` and
+    // `TreasuryLiquiditySource`, whose mutual agreement four separate wiring checks assert and which
+    // was visible from four of the five parties to it.
+    //
+    // **The signatures deliberately match the tree's rather than carrying the outgoing address too,
+    // and that is a decision against the more informative shape.** Every pointer-move event in this
+    // tree is `XSet(address indexed newValue)`; the only two setter events carrying a previous value
+    // are `LenderPool.DepositCapSet` and `RiskParams.RiskParamsSet`, and both report a *parameter*
+    // rather than a pointer, where no second contract holds the other half of the pair. An event's
+    // `topic0` is its name **and arity**, so a `CreditManagerSet(address,address)` here would sit
+    // under a different `topic0` from the `CreditManagerSet(address)` events it exists to be
+    // compared against - and one whole-protocol `eth_getLogs` filtered on that signature, which is
+    // exactly the watch that catches a divergence, would see the others and still not see the vault.
+    // That is this finding again in a quieter dress, so the cross-contract watch wins over the
+    // richer payload. `SetterGuards` asserts that shared `topic0` for both pointer pairs rather than
+    // leaving it as this comment's word. The outgoing address stays recoverable from this contract's
+    // own prior event, or from an `eth_call` one block back; that the pointer had moved at all was
+    // recoverable from nothing.
+    //
+    // **Audit round 26 measured this criterion against its own three events and it scored two out
+    // of three.** `CreditManagerSet(address)` is emitted in the one-argument form by five contracts
+    // and `LiquidationAuctionSet(address)` by two, both asserted in `SetterGuards`. The third had a
+    // counterpart the shared filter could not see: `EpochHarvester` emitted
+    // `CustodyAdapterSet(address,uint256)`, carrying the corroboration watermark it re-seeds, under
+    // a different `topic0` from this one - and the custody adapter is a real cross-contract pair,
+    // since the harvester binds its adapter to `creditManager.vault()` and repointing one side
+    // without the other freezes the yield stream. The exception was **refused**: a criterion that
+    // fails on a third of its own instances is not a rule, it is a habit. The harvester's payload
+    // moved to `CorroborationWatermarkSeeded`, emitted in the same transaction, and
+    // `EpochHarvester.t.sol` now asserts the shared filter for this pair as `SetterGuards` does for
+    // the other two. All three hold.
+    event CustodyAdapterSet(address indexed adapter);
+    event CreditManagerSet(address indexed creditManager);
+    event LiquidationAuctionSet(address indexed liquidationAuction);
 
     IDexFiBond public immutable bond;
 
@@ -89,6 +166,42 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///         what custody actually holds - without it there is no on-chain way to
     ///         notice the two have diverged.
     uint256 public totalBondCount;
+
+    /// @notice Go-live item G4. A second key that may `pause()` and may not `unpause()`.
+    /// @dev **Its reach is deliberately narrower than the owner's, and that asymmetry is the
+    ///      whole design rather than a detail.** `pause()` here shuts `depositETH`, which sends
+    ///      ETH into DexFi's mint and is new exposure. It does **not** shut `depositBonds`, which
+    ///      is the borrower's documented cure - `CreditManager.borrow` and
+    ///      `LiquidationAuction.start` both describe a borrower who re-collateralises with it,
+    ///      and a top-up by an indebted borrower can only lower LTV.
+    ///
+    ///      **The reason that separation is load-bearing rather than tidy.** After go-live item
+    ///      G2 the owner is a `Config.ADMIN_TIMELOCK` timelock, so an `unpause` is a 48-hour
+    ///      scheduled operation. `Config.ADMIN_TIMELOCK / Config.AUCTION_DURATION` is **8**, so if
+    ///      the guardian could shut the cure, one guardian transaction would shut it for eight
+    ///      complete auction lifecycles, and the cure would still be refused at the first block an
+    ///      unpause could execute. Audit round 25 measured that path end to end: 300 bonds kept
+    ///      against 0, 200 stranded in the wallet, and - wired for Phase 4 - 500.000000 of
+    ///      socialised loss against a control of 0. **A mis-fire costs exactly the same as
+    ///      malice**, which is what makes it a design question and not a key-management one.
+    ///      Confining the guardian to the risk-creating paths removes the lever by construction.
+    ///
+    ///      Zero is legal and disables the role. `setGuardian` refuses `owner()`.
+    address public guardian;
+
+    /// @notice The third switch: `depositBonds` alone, owner-only, independent of `paused()`.
+    /// @dev The gate exists because bonds deposited here are staked into DexFi's farm, and a
+    ///      compromised farm is precisely the scenario a pause is for - so ungating deposits
+    ///      outright was refused. What changes is **who** may close this door and how fast.
+    ///      Shutting a borrower's cure converts curable positions into losses, so it is an
+    ///      owner-level act. Under today's EOA owner that is one immediate transaction; under the
+    ///      G2 timelock it is a 48-hour scheduled one, and **that delay is the correct answer**,
+    ///      because nobody should be able to shut a borrower's cure without notice.
+    ///
+    ///      Consequence, recorded here because it is the cost of the split and go-live item G12
+    ///      names it: a full stop is now up to **three** transactions - this switch, `pause()`
+    ///      here, and `CreditManager.pause()`. None of the three consults the others.
+    bool public bondDepositsPaused;
 
     constructor(IDexFiBond bond_, INAVOracle navOracle_, IRiskParams riskParams_, address initialOwner)
         Ownable(initialOwner)
@@ -147,14 +260,57 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      reverted forever.
     ///
     ///      **What this probe does not check, said plainly rather than left to a count.** This
-    ///      contract calls six selectors bare on this pointer - `stake`, `unstake`, `claimYield`,
-    ///      `transferBonds`, `stakedBalance` and `mintBonds` - and four of them change state, so
-    ///      they cannot be probed by calling them. The probe below therefore covers **two of six**,
-    ///      and an adapter that answers both views and implements none of the four still installs
-    ///      and still bricks `depositBonds`. What it does close is the way back: an adapter that
-    ///      answers `stakedBalance()` at install answers it at the next repoint too, so the escape
-    ///      hatch survives the mistake even where the probe did not prevent it. That, and not the
-    ///      count, is the property worth having.
+    ///      contract calls **eight** selectors on this pointer, of which three are views - `vault`,
+    ///      `stakedBalance` and `farmYieldDelivered` - and five change state and so cannot be
+    ///      probed by calling them: `stake`, `mintBonds`, `unstake`, `transferBonds` and
+    ///      `claimYield`. The probe below therefore covers **two of eight**: two of the three
+    ///      views, and none of the five. An adapter that answers those two views and nothing else
+    ///      still installs, and then bricks `depositBonds`, `depositETH` and every exit.
+    ///
+    ///      **`farmYieldDelivered` is a view and is deliberately NOT probed, which is the one place
+    ///      this census is worth reading twice.** It is unprobed for the same reason the other two
+    ///      are probed - the probe is a sanity check on a pointer, not a conformance suite - but it
+    ///      is the newest call site and therefore the easiest to forget: `depositETH` reads it
+    ///      either side of the mint to report the yield that path flushes, so an adapter that
+    ///      answers `vault()` and `stakedBalance()` but not this one installs cleanly, leaves
+    ///      `depositBonds` working, and reverts only the ETH path. `EpochHarvester.setCustodyAdapter`
+    ///      does probe it at wiring time, so a fully wired deployment catches it there; a vault
+    ///      wired ahead of the harvester does not.
+    ///
+    ///      **Audit round 23, finding 22: this census used to say six, four and two-of-six, and
+    ///      all three were wrong because it omitted `vault` - the selector the body directly below
+    ///      calls, in the very probe the sentence is about.** It was corrected to seven, two and
+    ///      two-of-seven, which was right at that moment and was falsified in the same finding's
+    ///      own remediation: closing finding 22(a) gave `depositETH` a `farmYieldDelivered` call,
+    ///      so the sentence "the one interface member this contract never calls" survived roughly
+    ///      six hours. That is the third correction to this one paragraph and the reason the
+    ///      derivation is written down rather than the answer alone.
+    ///
+    ///      **Re-derive it, do not trust it.** MEASURED by grepping each of the eight names in
+    ///      `ICustodyAdapter` against this file:
+    ///      `grep -n "adapter\.\|current\.\|_adapter()\." src/CollateralVault.sol`, then
+    ///      discard the doc-comment lines. At the commit that wrote this paragraph that returns 15
+    ///      call sites over all eight members - `vault` 1, `stakedBalance` 3, `farmYieldDelivered`
+    ///      2, `stake` 1, `mintBonds` 1, `unstake` 3, `transferBonds` 3, `claimYield` 1 - so the
+    ///      census is now the whole of the interface rather than seven of its eight. A count that
+    ///      cannot count the list standing next to it is the strongest form of a comment asserting
+    ///      a mechanism the code does not have, and this one docstring has now shipped three - see
+    ///      the paragraph below, which was stale in the other direction. Nothing in CI derives this
+    ///      count; the grep above is the whole of the check.
+    ///
+    ///      "Bare" is true of every site except one: the `stakedBalance` read inside
+    ///      `_outgoingStake` is wrapped in `try`/`catch`, which is round 21's fix and the reason
+    ///      the sentence that follows had to be rewritten too.
+    ///
+    ///      What the probe does close is the way back, and **the guarantee is stronger than this
+    ///      docstring used to claim**. It said "an adapter that answers `stakedBalance()` at
+    ///      install answers it at the next repoint too, so the escape hatch survives" - which
+    ///      made the escape contingent on the outgoing adapter still answering. Since
+    ///      `_outgoingStake` catches, it is not contingent on anything: an outgoing adapter that
+    ///      cannot answer at all reads as idle and is repointed away from. That sentence was
+    ///      written before the `catch` existed and was left standing after it, which is the same
+    ///      defect as the count above pointing the other way. That, and not the count, is the
+    ///      property worth having.
     ///
     ///      Bare rather than `try`/`catch` with an error of its own, following `LiquidationAuction
     ///      .setCreditManager`'s `totalBountyParked()` probe: this path is `onlyOwner`, so failing
@@ -175,6 +331,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         // slither-disable-next-line unused-return
         adapter.stakedBalance();
         custodyAdapter = adapter;
+        emit CustodyAdapterSet(address(adapter));
     }
 
     /// @dev The manager-pointer twin of `_outgoingStake`. See the `totalDebt` call site in
@@ -316,6 +473,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
             revert CreditManagerNotVirgin(creditManager_);
         }
         creditManager = creditManager_;
+        emit CreditManagerSet(creditManager_);
     }
 
     /// @dev Both structural siblings guard their live state; this one did not, and the
@@ -352,6 +510,25 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         } catch {}
     }
 
+    /// @dev **Audit round 25, finding F4: this setter deliberately does NOT probe `start`, and
+    ///      the decision is measured rather than assumed.** That finding is about a fifth selector
+    ///      the protocol calls bare on the auction pointer, and it notes correctly that a stub
+    ///      missing `start` installs through *both* setters. It does not follow that both owe the
+    ///      probe. `start` is called on `CreditManager.liquidationAuction` and on nothing else -
+    ///      this contract never calls it, and uses its own copy of the pointer only as a
+    ///      `msg.sender` comparison in `seize`, `reassign` and `creditLiquidationProceeds`. With
+    ///      the probe on the manager's setter (`CreditWiring.checkAuctionSwap`) the manager's
+    ///      pointer can never name an address that cannot answer `start`, and the bare call has
+    ///      nowhere left to land.
+    ///
+    ///      MEASURED, `test_R25_theVaultOnlyInstallIsDiagnosableAndRecoverableInOneOperation`:
+    ///      with the stub installed here alone, `liquidate` stops at `AuctionPointerMismatch`
+    ///      naming both pointers - the ordinary migration-window state, refused **by name** rather
+    ///      than with the empty returndata the finding measured - and one call to this setter puts
+    ///      it back, after which the position liquidates. A second copy of the probe would buy a
+    ///      marginally earlier refusal on an already-recoverable state, at the price of a second
+    ///      enumeration of the auction's call set that can drift from the first. This codebase has
+    ///      already paid twice for two lists that were meant to agree and did not.
     function setLiquidationAuction(address liquidationAuction_) external onlyOwner {
         if (liquidationAuction_ == address(0)) revert ZeroAddress();
         address current = liquidationAuction;
@@ -400,14 +577,51 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         if (incomingNav != address(navOracle)) revert LiquidationAuctionNavOracleMismatch(incomingNav);
 
         liquidationAuction = liquidationAuction_;
+        emit LiquidationAuctionSet(liquidationAuction_);
     }
 
-    function pause() external onlyOwner {
+    /// @notice Install or clear the guardian (go-live item G4). Zero disables the role.
+    /// @dev Refuses `owner()` for the reason `GuardianMustDifferFromOwner` gives: a single
+    ///      address holding both roles is the configuration the second key does not defend
+    ///      against. Note this is checked against the owner **at the time of the call** - a later
+    ///      `transferOwnership` to the guardian's address would collapse them, and the G2
+    ///      handover is exactly such a transfer, so re-read the guardian after it.
+    function setGuardian(address guardian_) external onlyOwner {
+        if (guardian_ == owner()) revert GuardianMustDifferFromOwner();
+        guardian = guardian_;
+        emit GuardianSet(guardian_);
+    }
+
+    /// @notice Halt or resume `depositBonds` alone. Owner only - never the guardian.
+    /// @dev See `bondDepositsPaused` for why this switch is separate and why the guardian may
+    ///      not reach it.
+    function setBondDepositsPaused(bool paused_) external onlyOwner {
+        bondDepositsPaused = paused_;
+        emit BondDepositsPausedSet(paused_);
+    }
+
+    /// @notice Halt `depositETH`. Callable by the owner **or** the guardian.
+    /// @dev Deliberately does not touch `bondDepositsPaused`, and there is no combined switch,
+    ///      because a combined one would hand the guardian the borrower's cure through the back
+    ///      door - which is the whole thing this split exists to prevent.
+    function pause() external {
+        _requireOwnerOrGuardian();
         _pause();
     }
 
+    /// @dev `onlyOwner`, and not owner-or-guardian, on purpose: a compromised guardian must not
+    ///      be able to reopen the protocol during a live incident. That is the more expensive
+    ///      direction of the two, and the 48-hour cost it carries under the G2 timelock is paid
+    ///      for by the pause never having shut a cure in the first place.
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /// @dev Reads `owner()` and `guardian` rather than taking either as an argument, so there is
+    ///      one place the rule is written. A zero `guardian` cannot match a caller, because
+    ///      `msg.sender` is never the zero address.
+    function _requireOwnerOrGuardian() private view {
+        if (msg.sender != owner() && msg.sender != guardian) revert NotOwnerOrGuardian();
     }
 
     /// @dev Renouncing would permanently disable all wiring and the pause switch.
@@ -418,7 +632,13 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     // ── ICollateralVault ─────────────────────────────────────────────────────
 
     /// @inheritdoc ICollateralVault
-    function depositBonds(uint256 amount) external whenNotPaused nonReentrant {
+    /// @dev **Gated by `bondDepositsPaused`, NOT by `whenNotPaused`** - audit round 25, finding 1.
+    ///      This is the borrower's cure, and it used to sit behind the same switch as `depositETH`.
+    ///      `CreditManager.sol`'s own liquidation docstring states the rule this broke: *pause
+    ///      stops new risk, never resolution - the same rule that keeps `repay` open*. A top-up by
+    ///      an indebted borrower can only lower LTV.
+    function depositBonds(uint256 amount) external nonReentrant {
+        if (bondDepositsPaused) revert BondDepositsArePaused();
         ICustodyAdapter adapter = _adapter();
         if (amount == 0) revert ZeroAmount();
 
@@ -445,19 +665,60 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     /// @dev Slither reentrancy-benign: bondCount is written after the external mint
     ///      because the minted amount cannot be known before it; guarded by
     ///      nonReentrant and the adapter is immutable protocol code.
+    ///
+    /// @dev **Audit round 23, finding 22(a): the fifth farm-touching path, and the only silent one.**
+    ///      `depositBonds`, `withdrawBonds`, `seize` and `disposeTo` each end with
+    ///      `if (swept != 0) emit YieldHarvested(swept)`, and `depositBonds`' own comment says why:
+    ///      "unreported, an epoch of everyone's yield could be pushed out through the deposit path
+    ///      with nothing accounting for it." That argument applies here verbatim and nobody applied
+    ///      it. MEASURED before this fix, on the shipped fixture: a pending 500.000000 settled to
+    ///      the yield recipient through one `depositETH` and this contract emitted **zero**
+    ///      `YieldHarvested` events, while the identical flush through `depositBonds` emitted one.
+    ///
+    ///      **The mechanism, measured rather than assumed.** `mintBonds` decodes DexFi's signed
+    ///      payload and calls `bond.mint`, which mints into the reward pool and drives its
+    ///      `depositForAccount` hook for the adapter. The farm is MasterChef-style, so that hook is
+    ///      a deposit and settles the *whole adapter position's* pending rewards - every borrower's
+    ///      yield, not this depositor's share. `DirectCallAdapter.mintBonds` measures its own USDC
+    ///      balance across `bond.mint` and hands the delta to `_settleFarmPayout`, which forwards
+    ///      it to `yieldRecipient`. So the money leaves on this path exactly as it does on the
+    ///      other four.
+    ///
+    ///      **Where the figure comes from, and why it is not an approximation.**
+    ///      `ICustodyAdapter.mintBonds` returns the minted bond count and discards the swept amount
+    ///      by design, so there is no return value to report - which is what made this the one path
+    ///      with nothing to emit. The delta of `farmYieldDelivered()` across the mint is the same
+    ///      quantity the siblings emit, not a proxy for it: `_settleFarmPayout` adds exactly its
+    ///      own `swept` return to that counter on the branch where the sweep went through, and adds
+    ///      nothing on the branch where it did not - which is the correct answer for a failed sweep,
+    ///      because a carried `unreportedYield` has delivered nothing yet and is reported in full by
+    ///      the later claim that does deliver it. The counter is per-adapter, `onlyVault` on every
+    ///      writing path and this call is `nonReentrant`, so nothing else can move it inside the
+    ///      measured window. It is documented monotonic; an adapter that decrements it reverts here,
+    ///      which is the right outcome for a custody backend that has broken its own interface.
+    ///
+    ///      This makes `farmYieldDelivered` the eighth `ICustodyAdapter` selector this contract
+    ///      calls - see `setCustodyAdapter`'s census, which had to be re-derived for it.
     // slither-disable-next-line reentrancy-benign
     function depositETH(bytes calldata mintData) external payable whenNotPaused nonReentrant {
         ICustodyAdapter adapter = _adapter();
         if (msg.value == 0) revert ZeroAmount();
 
+        // Read either side of the mint and nothing else, so the delta is this call's sweep and
+        // cannot pick up a settlement some other path performed.
+        uint256 deliveredBefore = adapter.farmYieldDelivered();
         // Mint via DexFi's keeper-signed payload; bonds auto-stake for the adapter.
         uint256 amount = adapter.mintBonds{value: msg.value}(mintData);
+        uint256 swept = adapter.farmYieldDelivered() - deliveredBefore;
         if (amount == 0) revert NothingMinted();
 
         _settlePosition(msg.sender);
         bondCount[msg.sender] += amount;
         totalBondCount += amount;
         emit ETHDeposited(msg.sender, msg.value, amount);
+
+        // Last, as on all four siblings: the deposit is the event, the flush is the footnote.
+        if (swept != 0) emit YieldHarvested(swept);
     }
 
     /// @inheritdoc ICollateralVault
