@@ -31,6 +31,46 @@ jobs:
           # remapping rather than a missing checkout flag.
           submodules: recursive
 
+      # Seven paths exist only in this repository. They have no counterpart in the working tree
+      # this source is ported from, so a wholesale copy of that tree over this one deletes six of
+      # them and takes the published risk disclosure in README.md with it.
+      #
+      # Nothing checked that until now. The last sync's safety rested entirely on the person doing
+      # it remembering, which is the shape this project has recorded four times.
+      #
+      # Two honest limits, stated rather than left to be found:
+      #
+      #  - Listing `.github/workflows/ci.yml` here is close to vacuous, because if that file is
+      #    deleted this job does not run and nothing fails. It is named anyway so the set lives in
+      #    one place; the gap it leaves cannot be closed from inside CI and needs a branch
+      #    protection rule requiring this check.
+      #  - This proves the files EXIST. It does not prove their contents are current, and all
+      #    three of AUDITS.md, KNOWN_RISKS.md and REVIEW.md carried stale figures into the last
+      #    sync. No detector in either repository reads them.
+      #
+      # First step in the job deliberately: it costs a second and it should fail before a
+      # multi-minute toolchain install and test run, not after one.
+      - name: Public-only files survived the sync
+        run: |
+          missing=""
+          for f in .github/workflows/ci.yml .gitignore .gitmodules AUDITS.md KNOWN_RISKS.md LICENSE REVIEW.md; do
+            [ -f "$f" ] || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "These paths exist only in this repository and are gone:$missing"
+            echo "A wholesale copy from the private working tree deletes them. Restore them rather"
+            echo "than re-deriving them - they have no counterpart there to copy from."
+            exit 1
+          fi
+          if ! grep -q '^## Activation blockers and residual risks' README.md; then
+            echo "README.md has lost its '## Activation blockers and residual risks' section."
+            echo "That section is the published disclosure of what still blocks the LenderPool, and"
+            echo "the private repo's contracts/README.md - which shares only the H1 with this file -"
+            echo "does not contain it. It cannot be recovered by copying."
+            exit 1
+          fi
+          echo "All seven public-only paths present, and README.md still carries its disclosure."
+
       - uses: foundry-rs/foundry-toolchain@v1
 
       - name: Show versions
