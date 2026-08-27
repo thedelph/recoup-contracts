@@ -87,17 +87,40 @@ the lender cannot recover the burned shares or redirect the claim.
 A delegated claim only solves the first case. The design must also handle an asset-level rejection or
 avoid irreversible service before collectability is known.
 
-### Round 21 F7: impaired queues can over-reserve liquidity
+### Round 21 F7: a queued withdrawal reserves cash against a claim on the whole book
 
-The pool reserves queued shares at an un-impaired value while separately refusing to service the
-queue during impairment. In the measured trace, a request representing 15.8% of the book reduced an
-unqueued lender's `maxWithdraw` from 3,567.125000 USDC to zero while the request's economic
-entitlement was 563.230263 USDC. `available()` can reach zero and halt borrowing.
+The pool values a queued exit against the **whole book**, outstanding loans included, and then
+subtracts that figure from **cash alone**. The over-reservation is therefore the pool's leverage,
+`totalAssets()` over cash, and it is present with nothing impaired anywhere in the system.
 
-The request is free, revocable and continues earning. Four partial mitigations were measured and
-rejected. The lock also measured 3.00x with both `totalImpairment` and `exitReserve()` at zero, so
-impairment-aware reservation alone is not a solution. Impaired pricing and service-while-marked also
-moved in opposite directions in the measured fixture. The design remains unresolved.
+Measured at six leverages from 1.50x to 6.00x, with total impairment, the exit reserve and the live
+auction count all asserted at zero on both sides of every request: **the multiple tracks leverage
+exactly at every point.** A holder of a fixed tenth of the book locks 15% of the cash at 1.50x and
+**60% at 6.00x**.
+
+Two consequences, both of which get **cheaper as leverage rises**:
+
+| Consequence | Claim required, as a fraction of the book | At 6.00x |
+|---|---|---|
+| Every other lender's `maxWithdraw` goes to zero | `1 / leverage` | 16.67% |
+| All borrowing halts | `1 / leverage - 0.15` | **1.67%** |
+
+At 6.00x a lender holding five sixths of the pool is taken to zero by one free, revocable request
+from the holder of the other sixth. The second threshold reaches zero at 6.667x, where the 15% hot
+float alone has consumed the cash and no queue is needed to halt lending at all.
+
+The request is free, revocable and continues earning. Fifteen candidate fixes were built and refused
+across five audit rounds. **Every one of them changed the exit reserve, and neither of the two
+functions that compute this reservation reads it** - so they are refutations of those fifteen
+mechanisms and are not evidence about the design. A fix has to change the two functions that
+subtract a book-priced claim from cash. The design remains unresolved and this remains an activation
+blocker.
+
+**An earlier revision of this section reported the lock as 3.00x at zero impairment.** That figure
+was the queued claim divided by idle cash in one fixture, not an over-reservation multiple; the same
+fixture's multiple is 6.00x. It is corrected here rather than quietly replaced, because the previous
+wording understated the exposure and named impairment as the trigger when the only precondition is
+that the pool is levered.
 
 A related accepted exposure is the permissionless workout transition. Once an auction expires, any
 caller can move it into workout and hold the full-debt impairment, and therefore the queue, for up to

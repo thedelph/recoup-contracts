@@ -76,7 +76,7 @@ The pool is not approved to wire or fund. The current blockers are:
 |---|---|
 | Round 22 F3 | Principal-cap accounting is only partly remediated; fungible share composition, dust boundaries and repeated-loss quotient growth remain |
 | Round 22 F12 | Permissionless queue service can turn shares into a claim that its receiver cannot collect |
-| Round 21 F7 | An impaired queued withdrawal can over-reserve liquidity while being ineligible for service |
+| Round 21 F7 | A queued withdrawal is valued against the whole book but reserved out of cash, so it over-reserves by the pool's leverage; at 6.00x, 1.67% of the book halts all borrowing |
 
 **Two rows were removed in this sync, and removed because they are fixed rather than because they
 were reconsidered.** Round 22 F11 (non-epoch recovery cash inheriting an unrelated epoch clock) and
