@@ -3,13 +3,15 @@ pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
+import {MockLockdown} from "./MockLockdown.sol";
+
 /// @notice 6-decimal USDC stand-in for unit tests and Base Sepolia (PRD §8).
 /// @dev Also models real USDC's blacklist, because several paths exist purely to
 ///      survive it: the adapter's sweep is best-effort so a blocked recipient cannot
 ///      brick a collateral exit, and `unreportedYield` only ever becomes non-zero when
 ///      that sweep fails. Without a way to make a transfer fail, none of that is
 ///      reachable from a test.
-contract MockUSDC is ERC20 {
+contract MockUSDC is ERC20, MockLockdown {
     mapping(address => bool) public blocked;
 
     /// @notice Transfers to `account` return `false` instead of reverting or moving.
@@ -34,16 +36,16 @@ contract MockUSDC is ERC20 {
     }
 
     /// @notice Make transfers to or from `account` revert, as USDC's blacklist does.
-    function setBlocked(address account, bool value) external {
+    function setBlocked(address account, bool value) external gated {
         blocked[account] = value;
     }
 
     /// @notice Make transfers to `account` return false, moving nothing, without reverting.
-    function setSilentlyFails(address account, bool value) external {
+    function setSilentlyFails(address account, bool value) external gated {
         silentlyFails[account] = value;
     }
 
-    function transfer(address to, uint256 value) public override returns (bool) {
+    function transfer(address to, uint256 value) public virtual override returns (bool) {
         if (silentlyFails[to]) return false;
         return super.transfer(to, value);
     }

@@ -231,8 +231,8 @@ library CreditWiring {
     ///      statements ahead of their probe; keeping those and adding the tag would have let a body
     ///      that never asked the question hand back the word that says it did.
     ///
-    ///      **COST, measured on a clean `out/` and built one member at a time**, because the carry
-    ///      item's estimate of "about +28 bytes per site" is a hypothesis and it is out by a factor
+    ///      **COST, measured on a clean `out/` and built one member at a time**, because the
+    ///      inherited estimate of "about +28 bytes per site" is a hypothesis and it is out by a factor
     ///      of two in one direction and by its sign in another. From `CreditManager` 21,566:
     ///
     ///      - `pullPrincipal` alone: **21,622** (+56). One private call site covers all three
@@ -362,7 +362,7 @@ library CreditWiring {
     ///      on the non-`bestEffort` branch of `pullPrincipal` below, which is the branch
     ///      `settlePrincipal` takes. `available()` is called from nowhere in `src/` - it is
     ///      advertised as advisory for keepers and the UI - so it is **not** probed, on the same
-    ///      rule that leaves `ILenderPool.exitAssets` and `queuePosition` out of the list in
+    ///      rule that leaves `ILenderPool.exitAssets` and `withdrawalRequest` out of the list in
     ///      `checkLenderPoolSwap`. Three members, two reached, two bare, two probed.
     ///
     ///      **Both probes read the SHAPE of the failure, not its success**, which is what makes
@@ -493,8 +493,10 @@ library CreditWiring {
         // Lower stakes than the auction probe and deliberately so: the two drains reach this pool
         // through `_setImpairment`, which `try`s both legs, so a pool that cannot answer strands
         // the bulk sweep rather than bricking repayment. Worth refusing at wiring time anyway,
-        // because the sweep is the only bounded way to clear a stale mark and a frozen queue is
-        // what a stale mark costs.
+        // because the sweep is the only bounded way to clear a stale mark. Under controller-scoped
+        // requests a stale mark no longer freezes a global queue, but it does leave every live
+        // request quoting against a stale-low exit price until its controller refuses through
+        // `minAssetsOut` or somebody refreshes the mark.
         //
         // **Audit round 22, finding 21: the list was one selector long and the file had already
         // said, three rounds running, that it should be every selector called bare.** The comment
@@ -507,10 +509,11 @@ library CreditWiring {
         // with no error to diagnose it by.
         //
         // Counted from the type rather than from the diff, which is round 22's own headline lesson.
-        // `ILenderPool` has thirteen members. Eleven are reached from `src/`; `exitAssets` and
-        // `queuePosition` are not called by this contract at all. Of those eleven, eight sit inside
-        // a `try`/`catch` and three are called bare - `impairedBorrowerCount`, `impairedBorrowerAt`
-        // and `recoverLoss` - so the probe list below is exactly the bare three.
+        // `ILenderPool` declares twenty-two callable members of its own. Eleven are reached from
+        // `src/`; the other eleven are controller-facing request functions or external views not
+        // referenced by protocol source. Of the eleven reached members, eight sit inside a
+        // `try`/`catch` and three are called bare: `impairedBorrowerCount`, `impairedBorrowerAt`
+        // and `recoverLoss`. The probe list below therefore remains exactly the bare three.
         //
         // **The probe reads the SHAPE of the failure, not its success, and that is what makes the
         // last two probeable at all.** A contract with no matching selector and no fallback reverts

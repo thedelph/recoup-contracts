@@ -105,8 +105,11 @@ contract AccrueModel {
 contract AccrualFloorShapesTest is Test {
     uint256 internal constant BONDS = 100;
 
+    /// @dev These long-loop shape proofs measure accounting, not gas. Keep metering off so
+    ///      Foundry's synthetic transaction ceiling cannot shorten the requested cadence.
     function _run(AccrueModel.Mode mode, uint256 pot, uint256 duration, uint256 gap, uint256 window)
         internal
+        noGasMetering
         returns (uint256 distributed)
     {
         AccrueModel m = new AccrueModel(mode);

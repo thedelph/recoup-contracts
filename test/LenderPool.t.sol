@@ -13,6 +13,11 @@ import {Config} from "../src/Config.sol";
 import {LenderPool} from "../src/LenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
+interface ICanonicalCashPoolView {
+    function depositCapUsage() external view returns (uint256);
+    function unmanagedSurplus() external view returns (uint256);
+}
+
 /// @dev A wallet that can hold USDC and can never initiate a call: no functions, no fallback, no
 ///      owner, no way out. This is the receiver `claimFor` exists for, and the one round 22
 ///      measured it recovering 20,000.000000 from - lost keys, a contract wallet whose pointer
@@ -119,13 +124,19 @@ contract LenderPoolTest is Test {
         pool.lend(amount);
     }
 
+    function _depositCapUsage(LenderPool target) internal view returns (uint256) {
+        return ICanonicalCashPoolView(address(target)).depositCapUsage();
+    }
+
+    function _unmanagedSurplus(LenderPool target) internal view returns (uint256) {
+        return ICanonicalCashPoolView(address(target)).unmanagedSurplus();
+    }
+
     /// @dev Lend and write off until the pool holds nothing at all.
     ///
-    ///      **Round-23 finding 6 is why this exists.** `socialiseLoss` used to debit the whole
-    ///      absorbed amount from `netDeposits`, so a single loss the size of the counter cleared it
-    ///      while the pool was still holding assets - which is the defect. The debit is now
-    ///      yield-first: the counter falls to what the pool no longer holds, so a *total* loss is
-    ///      one after which there is nothing left, and a fixture that wants one has to produce it.
+    ///      A total loss fixture must remove the recognized shareholder book rather than merely
+    ///      move or donate raw tokens. Canonical cash makes unsolicited transfers inert, so this
+    ///      helper repeatedly lends and writes off only recognized liquidity until NAV reaches zero.
     ///
     ///      One `lend` cannot reach the book, because `available()` withholds `RESERVE_RATIO_BPS`
     ///      of `totalAssets()`. Each write-off lowers `totalAssets()` and therefore lowers that
@@ -183,20 +194,20 @@ contract LenderPoolTest is Test {
         assertEq(pool.decimals(), usdc.decimals() + 3);
     }
 
-    /// @dev The classic ERC-4626 first-depositor attack. With a zero decimals offset the attacker
-    ///      mints one wei of shares, donates to inflate the price, and the victim's deposit rounds
-    ///      to zero shares. The offset is what makes that uneconomic, and this is the case that
-    ///      would prove it gone.
-    function test_firstDepositorCannotRoundTheSecondOneToNothing() public {
+    /// @dev Unsolicited USDC is not shareholder cash. It therefore cannot move the entry price or
+    ///      amplify the classic ERC-4626 first-depositor attack.
+    function test_firstDepositorDonationCannotRoundTheSecondOneToNothing() public {
         vm.prank(alice);
         pool.deposit(1, alice);
 
-        // Donate straight to the contract, bypassing `deposit`, which is the attack.
+        uint256 quoteBefore = pool.previewDeposit(1_000e6);
         usdc.mint(address(pool), 1_000e6);
 
         uint256 bobShares = _deposit(bob, 1_000e6);
+        assertEq(bobShares, quoteBefore, "a donation changed the entry quote");
         assertGt(bobShares, 0, "second depositor must not be rounded out of the pool");
         assertGt(pool.convertToAssets(bobShares), 0);
+        assertEq(_unmanagedSurplus(pool), 1_000e6, "donation was recognized as shareholder cash");
     }
 
     function test_depositCapIsEnforcedAndTracksTotalAssets() public {
@@ -252,9 +263,7 @@ contract LenderPoolTest is Test {
         vm.prank(admin);
         vm.expectRevert(
             abi.encodeWithSelector(
-                LenderPool.DepositCapTooLarge.selector,
-                Config.GLOBAL_BORROW_CAP_MAX + 1,
-                Config.GLOBAL_BORROW_CAP_MAX
+                LenderPool.DepositCapTooLarge.selector, Config.GLOBAL_BORROW_CAP_MAX + 1, Config.GLOBAL_BORROW_CAP_MAX
             )
         );
         pool.setDepositCap(Config.GLOBAL_BORROW_CAP_MAX + 1);
@@ -322,9 +331,7 @@ contract LenderPoolTest is Test {
         assertEq(pool.available(), DEPOSIT - reserve);
 
         vm.prank(creditManager);
-        vm.expectRevert(
-            abi.encodeWithSelector(LenderPool.InsufficientLiquidity.selector, DEPOSIT, DEPOSIT - reserve)
-        );
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.InsufficientLiquidity.selector, DEPOSIT, DEPOSIT - reserve));
         pool.lend(DEPOSIT);
     }
 
@@ -551,7 +558,7 @@ contract LenderPoolTest is Test {
         vm.prank(bob);
         uint256 assetsIn = pool.mint(maxShares, bob);
         assertLe(assetsIn, maxAssets, "mint execution crossed the remaining asset cap");
-        assertLe(pool.netDeposits(), pool.depositCap(), "mint crossed the deposit cap");
+        assertLe(_depositCapUsage(pool), pool.depositCap(), "mint crossed the deposit cap");
     }
 
     /// @notice A live impairment changes exits, not the gross price of entering an active stream.
@@ -574,25 +581,36 @@ contract LenderPoolTest is Test {
         assertEq(pool.previewDeposit(1_000e6), expectedEntry, "entry omitted the active tail");
     }
 
-    /// @notice A frozen backlog is not a cohort pot and remains outside entry pricing.
-    /// @dev With no live release rate, the next depositor must see the ordinary ERC-4626 price.
-    ///      The next delivered epoch re-rates the frozen money and establishes its cohort then.
-    function test_F10_frozenBacklogKeepsEntryPreviewsOnReleasedAssets() public {
+    /// @notice A frozen backlog still belongs to the non-zero cohort that received it.
+    /// @dev Stopping the clock below the safe release floor does not make the pot free to a new
+    ///      entrant. Deposit and mint price the whole backed tail, and cap usage counts it once.
+    function test_F10_frozenBacklogRemainsInEntryPricingForItsLiveCohort() public {
         uint256 incumbentShares = _deposit(alice, DEPOSIT);
         _distributeYield(500e6);
-        skip(1 days);
 
         vm.prank(alice);
-        pool.redeem(incumbentShares, alice, alice);
+        pool.redeem(incumbentShares - 1, alice, alice);
         assertEq(pool.yieldRate(), 0, "fixture: the tail did not freeze");
         assertGt(pool.unreleasedYield(), 0, "fixture: there is no frozen backlog");
+        assertEq(pool.totalSupply(), 1, "fixture: the incumbent cohort disappeared");
 
         uint256 assets = 1_000e6;
-        assertEq(pool.previewDeposit(assets), pool.convertToShares(assets), "frozen yield entered the deposit price");
-
+        uint256 entryAssets = pool.totalAssets() + pool.unreleasedYield();
         uint256 virtualShares = 10 ** uint256(pool.decimals() - usdc.decimals());
-        uint256 shares = assets * virtualShares;
-        assertEq(pool.previewMint(shares), pool.convertToAssets(shares), "frozen yield entered the mint price");
+        uint256 expectedShares =
+            Math.mulDiv(assets, pool.totalSupply() + virtualShares, entryAssets + 1, Math.Rounding.Floor);
+        assertEq(pool.previewDeposit(assets), expectedShares, "deposit omitted the frozen cohort tail");
+        assertLt(pool.previewDeposit(assets), pool.convertToShares(assets), "frozen tail became free to entry");
+
+        uint256 shares = expectedShares;
+        uint256 expectedAssets =
+            Math.mulDiv(shares, entryAssets + 1, pool.totalSupply() + virtualShares, Math.Rounding.Ceil);
+        assertEq(pool.previewMint(shares), expectedAssets, "mint omitted the frozen cohort tail");
+        assertEq(
+            _depositCapUsage(pool),
+            pool.totalAssets() + pool.unreleasedYield(),
+            "frozen cohort tail was excluded from cap usage"
+        );
     }
 
     /// @notice A lender already present when an epoch is delivered participates in that epoch.
@@ -637,43 +655,29 @@ contract LenderPoolTest is Test {
         assertGt(pool.previewRedeem(incumbentShares), DEPOSIT + 599e6, "re-rating diluted the delivered cohort");
     }
 
-    /// @dev Unreleased yield must not outlive the shareholders it was meant for. With the stream
-    ///      still running against a zero supply, the remainder would keep landing in `totalAssets`
-    ///      and the next depositor - minting against the virtual shares alone - would own all of
-    ///      it outright. That is the same just-in-time capture, reachable by waiting.
-    function test_stream_freezesWhenTheLastShareIsBurnedRatherThanBecomingAWindfall() public {
-        uint256 shares = _deposit(alice, DEPOSIT);
-        _distributeYield(500e6);
-        skip(1 days);
+    /// @dev Unreleased yield must not outlive the shareholders it was meant for. Merely freezing
+    ///      a zero-supply tail lets the next deposit and epoch recycle it into a fresh cohort.
+    ///      The terminal burn instead de-recognises the residual while leaving raw cash isolated.
+    function test_stream_finalBurnPermanentlyDerecognisesTheOrphanedTail() public {
+        uint256 shares = _deposit(alice, 10_000);
+        assertEq(shares, 10 ** 3 * Config.BPS, "fixture: deposit did not mint the minimum supply");
+        _distributeYield(10_000);
+        assertEq(pool.pendingYield(), 10_000, "fixture: epoch did not create the exact tail");
 
         vm.prank(alice);
-        pool.redeem(shares, alice, alice);
+        uint256 paid = pool.redeem(shares, alice, alice);
+        assertEq(paid, 10_000, "final incumbent did not receive the released book");
         assertEq(pool.totalSupply(), 0, "the last share is gone");
+        assertEq(usdc.balanceOf(address(pool)), 10_000, "tail cash did not remain physically present");
+        assertEq(pool.pendingYield(), 0, "orphaned tail remained recyclable");
+        assertEq(pool.yieldRate(), 0, "empty pool retained a live stream");
+        assertEq(_depositCapUsage(pool), 0, "orphaned tail retained cap usage");
+        assertEq(_unmanagedSurplus(pool), 10_000, "orphaned tail was not isolated");
 
-        uint256 frozen = pool.unreleasedYield();
-        assertGt(frozen, 0, "the rest of the epoch is still owed to lenders");
-        assertEq(pool.yieldRate(), 0, "and stopped releasing when it stopped having owners");
-        // Rounding on the way out favours the pool, so a wei or two can be left behind. It must be
-        // dust and nothing more - a windfall here would be the whole unreleased remainder.
-        assertLe(pool.totalAssets(), 1, "no windfall sitting in the share price");
-
-        skip(30 days);
-        assertEq(pool.unreleasedYield(), frozen, "time alone hands it to nobody");
-        assertLe(pool.totalAssets(), 1);
-
-        address late = makeAddr("late");
-        usdc.mint(late, DEPOSIT);
-        vm.startPrank(late);
-        usdc.approve(address(pool), type(uint256).max);
-        uint256 lateShares = pool.deposit(DEPOSIT, late);
-        vm.stopPrank();
-
-        assertApproxEqAbs(pool.previewRedeem(lateShares), DEPOSIT, 1, "arriving late is not a windfall");
-
-        // The next epoch folds the frozen remainder into a fresh stream, so it is not stranded -
-        // it is earned by holding through that stream, which is the point.
-        _distributeYield(100e6);
-        assertEq(pool.pendingYield(), frozen + 100e6, "the whole pot is re-rated, not just the new money");
+        _deposit(bob, 10_000);
+        _distributeYield(10_000);
+        assertEq(pool.pendingYield(), 10_000, "fresh cohort inherited the old tail");
+        assertEq(_unmanagedSurplus(pool), 10_000, "fresh activity re-recognised the old pot");
     }
 
     function test_distributeYield_isHarvesterOnly() public {
@@ -751,13 +755,14 @@ contract LenderPoolTest is Test {
     ///      `outstandingPrincipal`, so routing a recovery through it would have reduced the pool's
     ///      recorded lending for money nobody repaid - deferring the gain behind the surviving book
     ///      and breaking `outstandingPrincipal == pendingPrincipal + totalDebt` on the manager.
-    function test_recoverLoss_doesNotMoveOutstandingPrincipalOrNetDeposits() public {
+    function test_recoverLoss_doesNotMoveOutstandingPrincipalAndCountsTheActiveGain() public {
         _deposit(alice, DEPOSIT);
         _lend(4_000e6);
         vm.prank(creditManager);
         pool.socialiseLoss(1_000e6);
 
         uint256 principalBefore = pool.outstandingPrincipal();
+        uint256 usageBefore = _depositCapUsage(pool);
         uint256 headroomBefore = pool.maxDeposit(alice);
 
         usdc.mint(creditManager, 600e6);
@@ -767,13 +772,13 @@ contract LenderPoolTest is Test {
         vm.stopPrank();
 
         assertEq(pool.outstandingPrincipal(), principalBefore, "no loan was re-recognised");
-        assertEq(pool.maxDeposit(alice), headroomBefore, "and the cap moved by nothing, as yield does");
+        assertEq(_depositCapUsage(pool), usageBefore + 600e6, "active recovery was not counted");
+        assertEq(pool.maxDeposit(alice), headroomBefore - 600e6, "recovery headroom drift");
     }
 
-    /// @notice Below the share floor it is frozen into the pot rather than raising nobody's price.
-    /// @dev Verbatim the rule `repayPrincipal`'s surplus uses. Rating a stream into an empty pool
-    ///      is a windfall for the next depositor rather than a payment to anyone.
-    function test_recoverLoss_freezesIntoThePotWhileThePoolIsTooSmall() public {
+    /// @notice A zero-supply recovery has no shareholder cohort and stays unmanaged permanently.
+    /// @dev Only the part immediately curing a senior claim deficit may remain recognised.
+    function test_recoverLoss_withZeroSupplyBecomesUnmanagedSurplus() public {
         assertEq(pool.totalSupply(), 0, "premise: nobody to raise the price of");
 
         usdc.mint(creditManager, 600e6);
@@ -782,9 +787,15 @@ contract LenderPoolTest is Test {
         pool.recoverLoss(600e6);
         vm.stopPrank();
 
-        assertEq(pool.pendingYield(), 600e6, "held, not rated");
-        assertEq(pool.yieldRate(), 0, "and the stream stays frozen");
-        assertEq(pool.totalAssets(), 0, "so no share price moved");
+        assertEq(pool.pendingYield(), 0, "zero-supply recovery remained recyclable");
+        assertEq(pool.yieldRate(), 0, "zero-supply recovery started a stream");
+        assertEq(pool.totalAssets(), 0, "zero-supply recovery entered shareholder NAV");
+        assertEq(_depositCapUsage(pool), 0, "zero-supply recovery consumed cap");
+        assertEq(_unmanagedSurplus(pool), 600e6, "zero-supply recovery was not isolated");
+
+        _deposit(alice, DEPOSIT);
+        assertEq(pool.totalAssets(), DEPOSIT, "fresh entrant inherited a historical recovery");
+        assertEq(_unmanagedSurplus(pool), 600e6, "entry re-recognised historical recovery");
     }
 
     function test_recoverLoss_isCreditManagerOnly() public {
@@ -801,11 +812,8 @@ contract LenderPoolTest is Test {
     // ── audit round 11 ───────────────────────────────────────────────────────
 
     /// @notice A donation to the empty pool used to close it to lenders forever.
-    /// @dev `maxDeposit` was sized from `totalAssets()`, which reads a raw `balanceOf`. With
-    ///      `totalSupply()` at zero there is no share to redeem that would bring the balance back
-    ///      under the cap, and this contract has no sweep and no owner rescue - so the only
-    ///      recovery was a redeploy plus three re-wirings, against a pool the deploy script ships
-    ///      in exactly this state.
+    /// @dev Canonical cash excludes raw transfers from NAV, cap usage and entry pricing. The raw
+    ///      balance remains observable as unmanaged surplus, but it cannot close or enrich the pool.
     function test_maxDeposit_survivesADonationToTheEmptyPool() public {
         assertEq(pool.totalSupply(), 0, "the deploy script ships it empty");
         assertEq(pool.maxDeposit(alice), pool.depositCap());
@@ -815,24 +823,32 @@ contract LenderPoolTest is Test {
 
         assertEq(pool.maxDeposit(alice), pool.depositCap(), "a stranger closed the pool");
         assertGt(pool.maxMint(alice), 0);
+        assertEq(pool.totalAssets(), 0, "a donation entered shareholder NAV");
+        assertEq(_depositCapUsage(pool), 0, "a donation consumed cap usage");
+        assertEq(_unmanagedSurplus(pool), pool.depositCap(), "the donation was not isolated");
 
         // And the pool still actually works.
         uint256 shares = _deposit(alice, DEPOSIT);
         assertGt(shares, 0);
+        assertEq(pool.totalAssets(), DEPOSIT, "the depositor inherited unmanaged surplus");
+        assertEq(_depositCapUsage(pool), DEPOSIT, "only admitted cash must consume the cap");
     }
 
-    /// @dev The cap counts lender capital admitted, not the pool's valuation, so withdrawing frees
-    ///      room again and yield does not consume it.
-    function test_maxDeposit_countsCapitalInNotValuation() public {
+    /// @dev The cap follows the internally accounted entry book. Recognized active yield consumes
+    ///      headroom, and the complete exit releases the recognized book again.
+    function test_maxDeposit_countsTheRecognizedEntryBook() public {
         uint256 shares = _deposit(alice, DEPOSIT);
+        assertEq(_depositCapUsage(pool), DEPOSIT, "deposit usage");
         assertEq(pool.maxDeposit(bob), pool.depositCap() - DEPOSIT);
 
         _distributeYield(500e6);
+        assertEq(_depositCapUsage(pool), DEPOSIT + 500e6, "active yield must enter cap usage");
         skip(Config.YIELD_STREAM_DURATION);
-        assertEq(pool.maxDeposit(bob), pool.depositCap() - DEPOSIT, "yield must not eat the cap");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - DEPOSIT - 500e6, "recognized yield headroom");
 
         vm.prank(alice);
         pool.redeem(shares, alice, alice);
+        assertEq(_depositCapUsage(pool), 0, "complete exit left cap usage behind");
         assertEq(pool.maxDeposit(bob), pool.depositCap(), "leaving must free the room");
     }
 
@@ -981,14 +997,14 @@ contract LenderPoolTest is Test {
         pool.releaseImpairment(bob);
     }
 
-    /// @notice **`serviceQueue` pays the un-impaired price or it pays nobody.** It can never pay a
+    /// @notice Controller service uses the live exit price and an atomic execution floor.
     ///         marked-down one, and this calls it rather than reading a view about it.
     ///
     /// @dev **This replaces `test_impairment_theQueueIsPaidAtTheImpairedPrice`, which audit round
-    ///      16 found asserted a view.** That test impaired and then read `queuePosition`, so it
-    ///      passed identically against a `serviceQueue` that pays nobody - which, since audit round
+    ///      16 found asserted a view.** That test impaired and then read the former positional view, so it
+    ///      passed identically against a settlement path that pays nobody - which, since audit round
     ///      15 keyed the refusal on the standing reserve, is the behaviour. It was named in
-    ///      `serviceQueue`'s own NatSpec as the thing that pinned the claim, and the claim had
+    ///      the old settlement NatSpec as the thing that pinned the claim, and the claim had
     ///      stopped being true. **Read a test's name as a claim and check that its verb appears in
     ///      the body.**
     ///
@@ -998,51 +1014,38 @@ contract LenderPoolTest is Test {
     ///      satisfiable by a broken implementation: a queue that refuses forever passes the first,
     ///      and a queue that pays the marked price passes the second.
     ///
-    ///      `queuePosition` is still checked, but as what it is - a quote for the lender, not a
+    ///      `withdrawalRequest` is checked as a quote for the controller, not a
     ///      statement about what the queue will pay. Round 16's undesigned consequence is visible
     ///      right here: the quote falls, and the money that eventually arrives does not.
-    function test_impairment_theQueueIsPaidTheUnimpairedPriceOrNothing() public {
+    function test_impairment_theControllerChoosesWhetherToAcceptTheMarkedPrice() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(pool.available());
 
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        uint256 unimpairedOwed = pool.convertToAssets(shares);
-        (, uint256 quotedBefore) = pool.queuePosition(alice);
+        (,,, uint256 serviceableBefore, uint256 quotedBefore) = pool.withdrawalRequest(alice);
 
         _impair(carol, 2_000e6);
         assertGt(pool.exitReserve(), 0, "fixture: a reserve must actually be standing");
+        (,,, uint256 serviceableAfter, uint256 quotedAfter) = pool.withdrawalRequest(alice);
+        assertEq(serviceableAfter, serviceableBefore, "the cash-funded share maximum moved with the mark");
+        assertLt(quotedAfter, quotedBefore, "the execution quote must carry the mark");
 
-        // The quote a lender is shown does fall, which is what the old test measured.
-        (, uint256 quotedAfter) = pool.queuePosition(alice);
-        assertLt(quotedAfter, quotedBefore, "the quote must carry the mark");
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, alice, bob));
+        pool.serviceWithdrawalRequest(alice, serviceableAfter, 0);
+        assertEq(pool.claimable(alice), 0, "a stranger crystallised the marked request");
 
-        // And the queue refuses to act on it, naming the reserve as the reason.
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(10);
-        assertEq(pool.claimable(alice), 0, "nothing may be set aside at a marked-down price");
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, quotedAfter, quotedBefore));
+        pool.serviceWithdrawalRequest(alice, serviceableAfter, quotedBefore);
+        assertEq(pool.claimable(alice), 0, "a failed floor changed the claim");
 
-        // Once the mark comes off, the entry is serviced - and the identity that makes the
-        // impaired branch dead is asserted directly, because it is the whole finding: with nothing
-        // reserved, the exit price *is* the plain price, so the arithmetic below the break has no
-        // reachable state in which it differs.
-        _impair(carol, 0);
-        assertEq(pool.exitReserve(), 0, "releasing must leave nothing reserved");
-        assertEq(pool.exitAssets(), pool.totalAssets(), "and with nothing reserved the two prices are one");
-
-        uint256 idle = usdc.balanceOf(address(pool));
-        assertGt(idle, 0, "fixture: there must be cash to pay with");
-        assertLt(idle, unimpairedOwed, "fixture: fully lent, so this is a partial fill");
-
-        assertEq(pool.serviceQueue(10), 1, "the entry must be serviced once nothing is reserved");
-        assertEq(pool.claimable(alice), idle, "every available cent goes to the head of the queue");
-
-        // The burn matched the un-impaired price: what is left owed is the entry less what was
-        // paid, valued the same way. A fill priced off a marked-down book would have burned more
-        // shares for the same cash and left less standing.
-        (, uint256 stillOwed) = pool.queuePosition(alice);
-        assertEq(stillOwed, unimpairedOwed - idle, "the fill was priced off the un-impaired book");
+        vm.prank(alice);
+        uint256 paid = pool.serviceWithdrawalRequest(alice, serviceableAfter, quotedAfter);
+        assertEq(paid, quotedAfter, "controller service did not use the marked exit price");
+        assertEq(pool.claimable(alice), quotedAfter, "marked service was not set aside");
     }
 
     /// @notice The pool cannot be marked down for a loss it is provably unable to absorb.
@@ -1072,10 +1075,6 @@ contract LenderPoolTest is Test {
         _impair(bob, 4_000e6);
         assertEq(pool.exitReserve(), 1_000e6, "the reserve stops at what is actually out on loan");
     }
-
-
-
-
 
     /// @notice A yield backlog cannot be streamed into a pool that holds a cent.
     /// @dev Audit round 13. `MIN_SUPPLY_FOR_YIELD` is a *share* threshold, and its own NatSpec puts
@@ -1145,21 +1144,13 @@ contract LenderPoolTest is Test {
         assertEq(pool.insuranceCover(), 0, "nor the cover that stood in front of it");
     }
 
-    /// @notice A realised loss must not consume deposit-cap headroom for good.
-    /// @dev Audit round 12. `netDeposits` was incremented at the entry price and decremented only
-    ///      by assets actually withdrawn, and `socialiseLoss` never touched it - so capital
-    ///      written off went on counting against the cap forever, because it never leaves as a
-    ///      withdrawal. `LenderPool` is immutable with no sweep and no rescue, so enough realised
-    ///      losses close it to deposits permanently. The same permanent-brick shape round 11 found
-    ///      through a donation, reachable here through ordinary operation.
-    ///
-    ///      Driven at the cap rather than at a comfortable figure, because the harm is a boundary:
-    ///      at any smaller deposit the ratchet is real but invisible.
-    function test_netDeposits_fallsWithARealisedLossSoTheCapDoesNotRatchetShut() public {
+    /// @notice A realised loss frees exactly the destroyed portion of deposit-cap usage.
+    function test_depositCapUsage_fallsWithARealisedLossSoTheCapDoesNotRatchetShut() public {
         uint256 cap = pool.depositCap();
         usdc.mint(alice, cap);
         vm.prank(alice);
         pool.deposit(cap, alice);
+        assertEq(_depositCapUsage(pool), cap, "fixture: the recognized book must start full");
         assertEq(pool.maxDeposit(bob), 0, "fixture: the pool must start full");
 
         _lend(pool.available());
@@ -1169,75 +1160,61 @@ contract LenderPoolTest is Test {
         uint256 absorbed = pool.socialiseLoss(lost);
         assertEq(absorbed, lost, "fixture: the loss must actually land against principal");
 
-        // The money is gone. The pool now holds less than the cap, so it must be able to take
-        // replacement capital - that is the entire point of a cap on principal admitted.
-        assertEq(pool.netDeposits(), cap - lost, "destroyed capital must stop counting against the cap");
+        assertEq(_depositCapUsage(pool), cap - lost, "destroyed capital must stop counting against the cap");
         assertEq(pool.maxDeposit(bob), lost, "and the headroom it freed must be usable");
 
         usdc.mint(bob, lost);
         vm.prank(bob);
         pool.deposit(lost, bob);
         assertGt(pool.balanceOf(bob), 0, "a replacement lender must be able to get in");
+        assertEq(_depositCapUsage(pool), cap, "replacement cash was not counted exactly once");
     }
 
-    /// @notice Yield must not erode the deposit-cap counter at the ERC-4626 door.
-    /// @dev Audit round 21, finding 8. `_deposit` credits `netDeposits` in **principal** and every
-    ///      exit used to debit it in **assets paid out**, which once the pool has earned is that
-    ///      lender's principal plus their share of every epoch of yield. The floor-at-zero clamp
-    ///      makes the difference a one-way ratchet, so the counter walks down while the principal
-    ///      it is supposed to measure stays in the pool - and `maxDeposit` re-opens headroom that
-    ///      was never freed. Measured at the shipped code: one 4,000e6 epoch over a 20,000e6 book
-    ///      leaves the counter at 8,000.000000 with 10,000.000000 of Bob's principal still in.
-    ///
-    ///      Driven with two lenders on purpose: the one who leaves must not carry the other's
-    ///      headroom out with them.
-    function test_netDeposits_isNotErodedByYieldAtTheErc4626Door() public {
+    /// @notice An ERC-4626 exit frees exactly the recognized cash it pays after yield.
+    function test_depositCapUsage_debitsTheExactErc4626PayoutAfterYield() public {
         _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _distributeYield(4_000e6);
+        assertEq(_depositCapUsage(pool), 2 * DEPOSIT + 4_000e6, "active yield was not counted");
         skip(Config.YIELD_STREAM_DURATION + 1);
-        assertEq(pool.netDeposits(), 2 * DEPOSIT, "fixture: yield must not move the counter up");
 
         uint256 shares = pool.balanceOf(alice);
-        uint256 paid = pool.previewRedeem(shares);
+        uint256 usageBefore = _depositCapUsage(pool);
         vm.prank(alice);
-        pool.redeem(shares, alice, alice);
+        uint256 paid = pool.redeem(shares, alice, alice);
 
         assertGt(paid, DEPOSIT, "fixture: the exit must actually carry yield out with it");
-        assertEq(pool.netDeposits(), DEPOSIT, "the leaver must debit their exact remaining principal");
-        assertEq(pool.maxDeposit(bob), pool.depositCap() - DEPOSIT, "and the cap must free exactly one seat");
+        assertEq(_depositCapUsage(pool), usageBefore - paid, "exit did not debit the exact cash paid");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - _depositCapUsage(pool), "headroom drift");
     }
 
-    /// @notice The same rule at the queue door, which is a second writer, not the same one.
-    /// @dev Round 21 recorded that this fix **cannot be validated by subclassing**: `_withdraw` is
-    ///      not `virtual` and `_reduceNetDeposits` is `private`. Had it been subclassable the
-    ///      natural fix would have closed the ERC-4626 door above and left this one open while
-    ///      reading like closure. Two doors, two assertions, and neither one implies the other.
-    function test_netDeposits_isNotErodedByYieldAtTheQueueDoor() public {
+    /// @notice Request service is a second exit writer and frees usage when cash becomes claimable.
+    function test_depositCapUsage_debitsTheExactRequestClaimAfterYield() public {
         _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _distributeYield(4_000e6);
         skip(Config.YIELD_STREAM_DURATION + 1);
 
         uint256 shares = pool.balanceOf(alice);
+        uint256 usageBefore = _depositCapUsage(pool);
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        pool.serviceQueue(4);
+        uint256 requestQuote = pool.previewRedeem(shares);
+        vm.prank(alice);
+        uint256 claimed = pool.serviceWithdrawalRequest(alice, shares, requestQuote);
 
-        assertEq(pool.balanceOf(address(pool)), 0, "fixture: the queue entry must have been paid in full");
-        assertEq(pool.netDeposits(), DEPOSIT, "the queue door must debit the exact same principal");
+        assertEq(pool.balanceOf(address(pool)), 0, "fixture: the request must have been paid in full");
+        assertEq(claimed, requestQuote, "service departed from its quote");
+        assertEq(pool.claimable(alice), claimed, "service did not reserve the claim");
+        assertEq(_depositCapUsage(pool), usageBefore - claimed, "request service cap debit drift");
+
+        uint256 usageAfterService = _depositCapUsage(pool);
+        _claim(alice);
+        assertEq(_depositCapUsage(pool), usageAfterService, "claim debited usage twice");
     }
 
-    /// @notice The measured headline: a rotating lender must not be able to walk the counter to
-    ///         zero while the pool is still holding a full book.
-    /// @dev Round 21 MEASURED, on the shipped code: two epochs of a lender who deposits, waits out
-    ///      the stream and leaves drive `netDeposits` to **0** while `totalAssets()` is
-    ///      40,000.000003 and `maxDeposit` reports the **full 100,000e6 cap** - the pool would
-    ///      accept 140,000e6 of book under a 100,000e6 ceiling. `depositCap` is a yield control,
-    ///      not a solvency one, so the harm is dilution of the realised yield this product refuses
-    ///      to project rather than insolvency; it is still the one mechanism limiting how much
-    ///      lender capital competes for a fixed borrow book, silently limiting nothing.
-    function test_netDeposits_doesNotRatchetToZeroUnderARotatingLender() public {
+    /// @notice Repeated entry, yield and exit track the recognized book without a hidden ratchet.
+    function test_depositCapUsage_tracksTheRecognizedBookUnderARotatingLender() public {
         vm.prank(admin);
         pool.setDepositCap(100_000e6);
 
@@ -1245,6 +1222,7 @@ contract LenderPoolTest is Test {
         usdc.mint(carol, anchor);
         vm.prank(carol);
         pool.deposit(anchor, carol);
+        uint256 expectedUsage = anchor;
 
         address rotator = makeAddr("rotator");
         for (uint256 epoch = 0; epoch < 2; epoch++) {
@@ -1253,157 +1231,132 @@ contract LenderPoolTest is Test {
             usdc.approve(address(pool), type(uint256).max);
             pool.deposit(anchor, rotator);
             vm.stopPrank();
+            expectedUsage += anchor;
+            assertEq(_depositCapUsage(pool), expectedUsage, "deposit transition drift");
 
             _distributeYield(10_000e6);
+            expectedUsage += 10_000e6;
+            assertEq(_depositCapUsage(pool), expectedUsage, "yield transition drift");
             skip(Config.YIELD_STREAM_DURATION + 1);
 
-            // Read the balance BEFORE the prank: an external view in argument position spends it,
-            // and the redeem then runs as this test contract instead of the rotator.
             uint256 out = pool.balanceOf(rotator);
             vm.prank(rotator);
-            pool.redeem(out, rotator, rotator);
+            uint256 assetsOut = pool.redeem(out, rotator, rotator);
+            expectedUsage -= assetsOut;
+            assertEq(_depositCapUsage(pool), expectedUsage, "exit transition drift");
+            assertEq(pool.maxDeposit(bob), pool.depositCap() - expectedUsage, "headroom transition drift");
         }
-
-        emit log_named_uint("netDeposits", pool.netDeposits());
-        emit log_named_uint("totalAssets", pool.totalAssets());
-        emit log_named_uint("maxDeposit ", pool.maxDeposit(bob));
-
-        assertEq(pool.netDeposits(), anchor, "only the anchor lender's principal must remain");
-        assertEq(pool.maxDeposit(bob), pool.depositCap() - anchor, "the cap must free exactly the vacated seats");
     }
 
-    /// @notice A lender entering above par and leaving immediately cannot consume cap headroom.
-    /// @dev Audit round 22 finding 3. A global share-ratio debit records less principal than this
-    ///      lender supplied because their shares were minted after yield raised the price. Their own
-    ///      principal units remain exact, so the round trip leaves both the anchor and headroom
-    ///      unchanged.
-    function test_R22F3_aboveParRoundTripPreservesPrincipalAndHeadroom() public {
+    /// @notice An above-par round trip changes usage only by its net recognized cash flow.
+    function test_R22F3_aboveParRoundTripTracksExactCashAndHeadroom() public {
+        vm.prank(admin);
+        pool.setDepositCap(50_000e6);
+
         _deposit(alice, DEPOSIT);
         _distributeYield(2_000e6);
         skip(Config.YIELD_STREAM_DURATION + 1);
 
         uint256 assets = 15_000e6;
         usdc.mint(bob, assets - DEPOSIT);
-        uint256 netBefore = pool.netDeposits();
-        uint256 headroomBefore = pool.maxDeposit(bob);
+        uint256 usageBefore = _depositCapUsage(pool);
 
         vm.prank(bob);
         uint256 shares = pool.deposit(assets, bob);
-        assertEq(pool.principalBasis(bob), assets, "the entrant must carry exactly what they supplied");
+        assertEq(_depositCapUsage(pool), usageBefore + assets, "entry did not add exact cash");
 
         vm.prank(bob);
-        pool.redeem(shares, bob, bob);
+        uint256 assetsOut = pool.redeem(shares, bob, bob);
 
         assertEq(pool.balanceOf(bob), 0, "the entrant must have completed the round trip");
-        assertEq(pool.principalUnits(bob), 0, "no principal units may outlive the shares");
-        assertEq(pool.netDeposits(), netBefore, "a round trip must not move admitted principal");
-        assertEq(pool.maxDeposit(bob), headroomBefore, "a round trip must not consume cap headroom");
+        assertEq(_depositCapUsage(pool), usageBefore + assets - assetsOut, "round-trip cash flow drift");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - _depositCapUsage(pool), "round-trip headroom drift");
     }
 
-    /// @notice The original 114-cycle cap ratchet no longer moves admitted principal.
-    /// @dev One asset-wei per cycle is the audit's measured total cost. The above-par fixture keeps
-    ///      every entry on the share-ratio boundary that made the old global debit drift upward.
-    function test_R22F3_original114CycleRatchetNoLongerMovesTheCap() public {
+    /// @notice Every one-wei rotation is accounted from actual cash in and actual cash out.
+    function test_R22F3_original114CycleRatchetTracksExactCash() public {
         _deposit(alice, DEPOSIT);
         _distributeYield(2_000e6);
         skip(Config.YIELD_STREAM_DURATION + 1);
 
-        uint256 netBefore = pool.netDeposits();
-        uint256 headroomBefore = pool.maxDeposit(bob);
+        uint256 expectedUsage = _depositCapUsage(pool);
 
         for (uint256 i = 0; i < 114; i++) {
             vm.prank(bob);
             uint256 shares = pool.deposit(1, bob);
+            expectedUsage += 1;
             vm.prank(bob);
-            pool.redeem(shares, bob, bob);
+            uint256 assetsOut = pool.redeem(shares, bob, bob);
+            expectedUsage -= assetsOut;
+            assertEq(_depositCapUsage(pool), expectedUsage, "one-wei rotation drift");
         }
 
         assertEq(pool.balanceOf(bob), 0, "the rotating account must finish every cycle empty");
-        assertEq(pool.netDeposits(), netBefore, "114 cycles must not move admitted principal");
-        assertEq(pool.maxDeposit(bob), headroomBefore, "114 cycles must not consume cap headroom");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - expectedUsage, "114-cycle headroom drift");
     }
 
-    /// @notice Replacement capital does not inherit a loss and survives an older lender's exit.
-    /// @dev A raw per-holder basis is insufficient here. The old lender's recorded deposit predates
-    ///      the loss, so debiting that raw amount would clamp `netDeposits` to zero and erase the new
-    ///      lender's replacement capital from the cap. Principal units mark the old cohort down and
-    ///      issue the replacement cohort at the post-loss ratio.
-    function test_R22F3_replacementCapitalSurvivesTheLossCohortsExit() public {
+    /// @notice Replacement cash remains in cap usage after the pre-loss lender exits.
+    function test_R22F3_replacementCashSurvivesTheLossCohortsExit() public {
         _deposit(alice, DEPOSIT);
         _lend(1_000e6);
 
         vm.prank(creditManager);
         assertEq(pool.socialiseLoss(1_000e6), 1_000e6, "fixture: the loss must land");
+        assertEq(_depositCapUsage(pool), DEPOSIT - 1_000e6, "loss transition drift");
 
-        _deposit(bob, 1_000e6);
-        assertEq(pool.netDeposits(), DEPOSIT, "replacement capital must refill only the realised loss");
+        uint256 bobShares = _deposit(bob, 1_000e6);
+        assertEq(_depositCapUsage(pool), DEPOSIT, "replacement cash must refill only the realised loss");
 
         uint256 aliceShares = pool.balanceOf(alice);
         vm.prank(alice);
-        pool.redeem(aliceShares, alice, alice);
+        uint256 aliceOut = pool.redeem(aliceShares, alice, alice);
 
-        assertEq(pool.principalUnits(alice), 0, "the old cohort must leave no units behind");
-        assertEq(pool.netDeposits(), 1_000e6, "the replacement lender's principal must remain admitted");
-        assertEq(pool.principalBasis(bob), 1_000e6, "the replacement lender must keep their full basis");
-        assertEq(pool.maxDeposit(bob), pool.depositCap() - 1_000e6, "the cap must still count the replacement");
+        assertEq(_depositCapUsage(pool), DEPOSIT - aliceOut, "old-cohort exit removed the wrong cash");
+        assertGt(pool.convertToAssets(bobShares), 0, "replacement lender lost its position");
+        assertEq(pool.maxDeposit(bob), pool.depositCap() - _depositCapUsage(pool), "replacement headroom drift");
     }
 
-    /// @notice A total loss invalidates old units and the next deposit starts at par.
-    /// @dev **The fixture changed in round 23 and the assertions did not.** It used to donate
-    ///      2,000.000000 into the pool so one `lend` could reach the whole deposit, then socialise
-    ///      exactly `netDeposits` - and under the old whole-amount debit that cleared the counter
-    ///      while the donation was still sitting in the pool. That is round-23 finding 6, not a
-    ///      total loss, and the yield-first debit now leaves the counter at 2,000.000000 to say so.
-    ///      The repair is to make the loss genuinely total rather than to relax the assertion:
-    ///      `_loseEverything` drives `totalAssets()` to zero and the generation rolls on merit.
-    function test_R22F3_totalLossStartsAFreshPrincipalGeneration() public {
+    /// @notice A total recognized loss leaves donations inert and the next deposit starts fresh.
+    function test_R22F3_totalLossStartsAFreshCanonicalCashBook() public {
         _deposit(alice, DEPOSIT);
         usdc.mint(address(pool), 2_000e6);
         _loseEverything();
 
         assertEq(pool.totalAssets(), 0, "fixture: a total loss is one that leaves nothing behind");
-        assertEq(pool.netDeposits(), 0, "a total loss must clear admitted principal");
-        assertEq(pool.totalPrincipalUnits(), 0, "a total loss must clear the active unit generation");
-        assertEq(pool.principalUnits(alice), 0, "old shares must carry no basis after a total loss");
+        assertEq(_depositCapUsage(pool), 0, "a total loss must clear recognized usage");
+        assertEq(_unmanagedSurplus(pool), 2_000e6, "the donation was laundered into the book");
 
         usdc.mint(alice, 1_000e6);
         _deposit(alice, 1_000e6);
 
-        assertEq(pool.netDeposits(), 1_000e6, "new principal must start at par");
-        assertEq(pool.totalPrincipalUnits(), 1_000e6, "only the new generation may count");
-        assertEq(pool.principalUnits(alice), 1_000e6, "stale units must be replaced rather than merged");
-        assertEq(pool.principalBasis(alice), 1_000e6, "the new generation must reconstruct the new principal");
+        assertEq(pool.totalAssets(), 1_000e6, "the new depositor inherited the donation");
+        assertEq(_depositCapUsage(pool), 1_000e6, "new cash must start a fresh recognized book");
+        assertEq(_unmanagedSurplus(pool), 2_000e6, "the old donation stopped being inert");
     }
 
-    /// @notice Principal units follow shares and merge additively at the receiver.
-    /// @dev **Floored, and the direction is load-bearing rather than incidental.** Shares carry
-    ///      three more decimals than the assets the units are denominated in, so a ceiling here
-    ///      rounded a one-share-wei transfer - a ten-thousandth of a ten-asset-wei position - up to
-    ///      a whole unit, and that detached unit could then be burned for zero assets while still
-    ///      debiting `netDeposits`. Round-22 finding 3's no-loss dust boundary was exactly that,
-    ///      and `LenderPoolUnitProvenance.t.sol` owns the executed trace and the closure.
-    ///
-    ///      Conservation is what this test is really for and it is unchanged: whatever the sender
-    ///      loses the receiver gains, to the wei, in either rounding direction.
-    function test_R22F3_principalUnitsMoveAndMergeOnTransfer() public {
+    /// @notice Share transfers change ownership but are neutral to canonical cash and the cap.
+    function test_R22F3_shareTransfersAreNeutralToCanonicalCash() public {
         _deposit(alice, DEPOSIT);
         _deposit(bob, 1_000e6);
 
-        uint256 aliceUnitsBefore = pool.principalUnits(alice);
-        uint256 bobUnitsBefore = pool.principalUnits(bob);
-        uint256 totalUnitsBefore = pool.totalPrincipalUnits();
-        uint256 movedUnits = Math.mulDiv(aliceUnitsBefore, 1, pool.balanceOf(alice), Math.Rounding.Floor);
+        uint256 aliceBefore = pool.balanceOf(alice);
+        uint256 bobBefore = pool.balanceOf(bob);
+        uint256 usageBefore = _depositCapUsage(pool);
+        uint256 assetsBefore = pool.totalAssets();
+        uint256 supplyBefore = pool.totalSupply();
 
         vm.prank(alice);
         pool.transfer(bob, 1);
 
-        assertEq(pool.principalUnits(alice), aliceUnitsBefore - movedUnits, "the sender must lose the rounded units");
-        assertEq(pool.principalUnits(bob), bobUnitsBefore + movedUnits, "the receiver must merge the rounded units");
-        assertEq(pool.totalPrincipalUnits(), totalUnitsBefore, "a transfer must conserve principal units");
+        assertEq(pool.balanceOf(alice), aliceBefore - 1, "sender share debit");
+        assertEq(pool.balanceOf(bob), bobBefore + 1, "receiver share credit");
+        assertEq(pool.totalSupply(), supplyBefore, "transfer changed supply");
+        assertEq(pool.totalAssets(), assetsBefore, "transfer changed NAV");
+        assertEq(_depositCapUsage(pool), usageBefore, "transfer changed cap usage");
     }
 
-    /// @notice A token callback cannot move basis for shares that have not been minted yet.
-    function test_R22F3_depositCreditsPrincipalAfterTheAssetTransferHook() public {
+    /// @notice A token callback that transfers old shares cannot double-count a new deposit.
+    function test_R22F3_depositCountsCanonicalCashOnceAcrossAnAssetTransferHook() public {
         ShareTransferHookUSDC hookedUsdc = new ShareTransferHookUSDC();
         LenderPool fresh = new LenderPool(IERC20(address(hookedUsdc)), admin);
 
@@ -1414,103 +1367,126 @@ contract LenderPoolTest is Test {
         fresh.approve(address(hookedUsdc), type(uint256).max);
         vm.stopPrank();
 
+        uint256 aliceSharesBefore = fresh.balanceOf(alice);
+        uint256 supplyBefore = fresh.totalSupply();
+        uint256 usageBefore = _depositCapUsage(fresh);
         uint256 sharesMoved = fresh.balanceOf(alice) / 2;
         hookedUsdc.arm(fresh, alice, bob, sharesMoved);
 
         vm.prank(alice);
-        fresh.deposit(DEPOSIT, alice);
+        uint256 sharesMinted = fresh.deposit(DEPOSIT, alice);
 
         assertTrue(hookedUsdc.hookRan(), "fixture: the asset-transfer hook must have run");
-        assertEq(fresh.principalUnits(bob), DEPOSIT / 2, "the callback may move only half the old basis");
-        assertEq(
-            fresh.principalUnits(alice), DEPOSIT + DEPOSIT / 2, "the new deposit must remain with its minted shares"
-        );
-        assertEq(fresh.totalPrincipalUnits(), 2 * DEPOSIT, "the callback must not create or destroy units");
-        assertEq(fresh.netDeposits(), 2 * DEPOSIT, "the callback must not move admitted principal");
+        assertEq(fresh.balanceOf(bob), sharesMoved, "callback transferred the wrong old shares");
+        assertEq(fresh.balanceOf(alice), aliceSharesBefore - sharesMoved + sharesMinted, "new shares changed owner");
+        assertEq(fresh.totalSupply(), supplyBefore + sharesMinted, "callback changed minted supply");
+        assertEq(_depositCapUsage(fresh), usageBefore + DEPOSIT, "deposit cash was not counted exactly once");
     }
 
-    /// @notice Queue escrow moves, returns and finally burns the same principal units.
-    function test_R22F3_queueEscrowUsesTheTokenHookForPrincipal() public {
+    /// @notice Queue escrow and cancellation are usage-neutral; service debits the exact claim.
+    function test_R22F3_requestEscrowTracksSharesAndExactCash() public {
         uint256 shares = _deposit(alice, DEPOSIT);
-        uint256 queued = shares / 2;
-        uint256 queuedUnits = Math.mulDiv(DEPOSIT, queued, shares, Math.Rounding.Ceil);
+        uint256 requested = shares / 2;
+        uint256 usageBefore = _depositCapUsage(pool);
 
         vm.prank(alice);
-        pool.requestWithdrawal(queued, alice);
-        assertEq(pool.principalUnits(address(pool)), queuedUnits, "escrow must receive the queued units");
-        assertEq(pool.principalUnits(alice), DEPOSIT - queuedUnits, "the lender must release the queued units");
+        pool.requestWithdrawal(requested, alice);
+        assertEq(pool.balanceOf(address(pool)), requested, "escrow must receive the requested shares");
+        assertEq(pool.balanceOf(alice), shares - requested, "the lender kept requested shares");
+        assertEq(_depositCapUsage(pool), usageBefore, "request creation changed cap usage");
 
         vm.prank(alice);
         pool.cancelWithdrawalRequest();
-        assertEq(pool.principalUnits(address(pool)), 0, "cancellation must empty the escrow basis");
-        assertEq(pool.principalUnits(alice), DEPOSIT, "cancellation must restore the lender's basis");
+        assertEq(pool.balanceOf(address(pool)), 0, "cancellation must empty escrow");
+        assertEq(pool.balanceOf(alice), shares, "cancellation must restore shares");
+        assertEq(_depositCapUsage(pool), usageBefore, "cancellation changed cap usage");
 
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        pool.serviceQueue(10);
+        uint256 requestQuote = pool.previewRedeem(shares);
+        vm.prank(alice);
+        uint256 assetsOut = pool.serviceWithdrawalRequest(alice, shares, requestQuote);
 
-        assertEq(pool.principalUnits(address(pool)), 0, "the queue burn must consume the escrow units");
-        assertEq(pool.totalPrincipalUnits(), 0, "a full exit must consume every principal unit");
-        assertEq(pool.netDeposits(), 0, "a full exit must release all deposit-cap principal");
+        assertEq(pool.balanceOf(address(pool)), 0, "request service left escrow shares");
+        assertEq(pool.totalSupply(), 0, "full service left live shares");
+        assertEq(pool.claimable(alice), assetsOut, "service did not create the fixed claim");
+        assertEq(_depositCapUsage(pool), usageBefore - assetsOut, "service cap debit drift");
     }
 
-    /// @notice Shared escrow preserves each request's basis even when share prices differ.
-    /// @dev Alice enters at par and Bob enters after yield doubles the price, so their units per
-    ///      share differ. A partial fill, cancellation and later full fill must each use the units
-    ///      recorded for that request rather than the pool's blended escrow ratio.
-    function test_R22F3_queuePreservesHeterogeneousPrincipalProvenance() public {
+    /// @notice Shared escrow preserves independent controller requests at different entry prices.
+    function test_R22F3_requestsRemainIndependentAcrossDifferentEntryPrices() public {
+        vm.prank(admin);
+        pool.setDepositCap(50_000e6);
+
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _distributeYield(DEPOSIT);
         skip(Config.YIELD_STREAM_DURATION + 1);
         uint256 bobShares = _deposit(bob, DEPOSIT);
 
         _lend(25_000e6);
+        uint256 usageBeforeRequests = _depositCapUsage(pool);
 
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
         vm.prank(bob);
         pool.requestWithdrawal(bobShares, bob);
+        assertEq(pool.balanceOf(address(pool)), aliceShares + bobShares, "shared escrow lost shares");
+        assertEq(_depositCapUsage(pool), usageBeforeRequests, "request creation changed cap usage");
 
-        assertEq(pool.queueEntryPrincipalUnits(0), DEPOSIT, "Alice's request must record her basis");
-        assertEq(pool.queueEntryPrincipalUnits(1), DEPOSIT, "Bob's request must record his basis");
+        {
+            (uint256 bobId, address bobReceiver, uint256 bobStoredBefore,,) = pool.withdrawalRequest(bob);
+            uint256 aliceService = pool.maxRequestRedeem(alice);
+            uint256 usageBeforeAliceService = _depositCapUsage(pool);
+            vm.prank(alice);
+            uint256 aliceClaim = pool.serviceWithdrawalRequest(alice, aliceService, 0);
+            (,, uint256 aliceSharesRemaining,,) = pool.withdrawalRequest(alice);
+            (uint256 bobIdAfter, address bobReceiverAfter, uint256 bobStoredAfter,,) = pool.withdrawalRequest(bob);
+            assertGt(aliceSharesRemaining, 0, "fixture: Alice must retain a live remainder");
+            assertEq(_depositCapUsage(pool), usageBeforeAliceService - aliceClaim, "Alice service cap debit drift");
+            assertEq(bobIdAfter, bobId, "Alice changed Bob's request id");
+            assertEq(bobReceiverAfter, bobReceiver, "Alice changed Bob's receiver");
+            assertEq(bobStoredAfter, bobStoredBefore, "Alice changed Bob's shares");
 
-        pool.serviceQueue(1);
-        (,, uint256 aliceSharesRemaining) = pool.queueEntry(0);
-        uint256 aliceUnitsRemaining = pool.queueEntryPrincipalUnits(0);
-        uint256 aliceSharesBurned = aliceShares - aliceSharesRemaining;
-        uint256 aliceUnitsBurned = Math.mulDiv(DEPOSIT, aliceSharesBurned, aliceShares, Math.Rounding.Ceil);
-        assertEq(
-            aliceUnitsRemaining,
-            DEPOSIT - aliceUnitsBurned,
-            "the partial fill must burn the request's ceiling-rounded unit slice"
-        );
-        assertLt(aliceUnitsRemaining, DEPOSIT, "fixture: Alice must be partially serviced");
-        assertGt(aliceUnitsRemaining, 0, "fixture: Alice must retain a live remainder");
-
-        vm.prank(alice);
-        pool.cancelWithdrawalRequest();
-        assertEq(pool.principalUnits(alice), aliceUnitsRemaining, "cancellation must return Alice's exact remainder");
-        assertEq(pool.principalUnits(address(pool)), DEPOSIT, "only Bob's exact request may remain in escrow");
-        assertEq(pool.queueEntryPrincipalUnits(1), DEPOSIT, "Alice's cancellation must not dilute Bob's basis");
+            uint256 usageBeforeAliceCancel = _depositCapUsage(pool);
+            vm.prank(alice);
+            pool.cancelWithdrawalRequest();
+            assertEq(pool.balanceOf(alice), aliceSharesRemaining, "cancel did not return Alice's remainder");
+            assertEq(_depositCapUsage(pool), usageBeforeAliceCancel, "Alice cancel changed cap usage");
+        }
 
         _repay(25_000e6);
-        pool.serviceQueue(1);
+        {
+            uint256 bobService = pool.maxRequestRedeem(bob);
+            assertGt(bobService, 0, "fixture: Bob's request must be serviceable");
+            assertLt(bobService, bobShares, "fixture: virtual-offset rounding must leave a remainder");
+            uint256 bobQuote = pool.previewRedeem(bobService);
+            uint256 usageBeforeBobService = _depositCapUsage(pool);
+            vm.prank(bob);
+            uint256 bobClaim = pool.serviceWithdrawalRequest(bob, bobService, bobQuote);
 
-        assertEq(pool.principalUnits(address(pool)), 0, "servicing Bob must empty the escrow basis");
-        assertEq(pool.principalUnits(bob), 0, "Bob's full exit must consume his exact basis");
-        assertEq(pool.totalPrincipalUnits(), aliceUnitsRemaining, "only Alice's cancelled remainder may stay active");
-        assertEq(pool.netDeposits(), aliceUnitsRemaining, "the cap must count only Alice's remaining principal");
+            (,, uint256 bobSharesRemaining,,) = pool.withdrawalRequest(bob);
+            assertEq(bobSharesRemaining, bobShares - bobService, "Bob's service burned the wrong shares");
+            assertEq(bobClaim, bobQuote, "Bob service departed from its quote");
+            assertEq(_depositCapUsage(pool), usageBeforeBobService - bobClaim, "Bob service cap debit drift");
+
+            uint256 usageBeforeBobCancel = _depositCapUsage(pool);
+            vm.prank(bob);
+            pool.cancelWithdrawalRequest();
+            assertEq(pool.balanceOf(bob), bobSharesRemaining, "cancel did not return Bob's remainder");
+            assertEq(pool.balanceOf(address(pool)), 0, "cancelling Bob must empty shared escrow");
+            assertEq(_depositCapUsage(pool), usageBeforeBobCancel, "Bob cancel changed cap usage");
+        }
     }
 
     /// @notice A partial fill burns exactly the shares the cash it pays out can buy back, floored.
     /// @dev **Audit round 25, finding 2: this branch was protected by nothing.** Flipping the
-    ///      `Math.Rounding.Floor` in `serviceQueue`'s partial-fill `_exitToShares(idle, ...)` to
+    ///      `Math.Rounding.Floor` in the cash-funded gross share conversion to
     ///      `Ceil` stayed green across all 58 `LenderPool` invariant evaluations and all 900
     ///      deterministic tests - zero detection anywhere in a 993-test suite. This is the
     ///      regression, and it was neuter-verified against exactly that flip and nothing else.
     ///
-    ///      **The one wei donated below is the whole reason this test works, and it is a second
-    ///      finding sitting inside the first.** On the fixture's own round numbers - a
+    ///      **The one wei of fully released recognized yield below is the whole reason this test
+    ///      works.** On the fixture's own round numbers - a
     ///      10,000.000000 deposit into an empty pool, lent down to `Config.RESERVE_RATIO_BPS` of
     ///      the book - the three quantities that decide the rounding are
     ///
@@ -1520,76 +1496,48 @@ contract LenderPoolTest is Test {
     ///      and `idle * s` is an **exact** multiple of `a`. Floor and Ceil agree to the wei, so a
     ///      partial fill built on those numbers cannot see the mutation however many times it is
     ///      reached - which is why reaching the branch was never the whole problem. One wei of
-    ///      donation moves `a` to 10,000,000,002, leaves a remainder of 300, and separates the two
-    ///      roundings in **both** observable outputs: the shares burned and the USDC set aside.
+    ///      released yield moves `a` to 10,000,000,002, leaves a remainder of 300, and separates
+    ///      the two roundings in **both** observable outputs: shares burned and USDC set aside.
     ///      That exactness is asserted rather than described, in
     ///      `test_theRoundNumberFixtureCannotSeeThePartialFillRounding` below, because a fixture
     ///      that quietly stopped being exact would turn this test back into the thing it replaced.
     ///
     ///      **What would have to be true for this to pass without measuring anything.** Three
     ///      things, and all three are asserted before the rounding is looked at: the fill not being
-    ///      partial at all (`remaining > 0`), nothing being serviced (`serviceQueue` returning 1),
+    ///      partial at all (`remaining > 0`), nothing being serviced,
     ///      and the two roundings coinciding (`wouldBurnRoundedUp == expectedBurn + 1`). The last
     ///      is the one this repo has been bitten by fifteen times and the only one that is
     ///      invisible from the outcome.
-    function test_R25F2_aPartialFillBurnsOnlyWhatTheCashCanBuyBack() public {
+    function test_R25F2_aPartialServiceBurnsOnlyTheGrossSharesItsCashCanFund() public {
         uint256 shares = _deposit(alice, DEPOSIT);
-        assertEq(shares, 10 ** 13, "fixture: an empty pool prices at 10**3 shares per asset-wei");
-
-        // One wei, donated straight in, is what makes the exit ratio inexact. See the docstring.
-        usdc.mint(address(this), 1);
-        usdc.transfer(address(pool), 1);
-
-        // Lend before queueing, never after. `available()` subtracts what the queue is already
-        // owed, so a request placed first shrinks this lend to nothing and the fill comes out full
-        // rather than partial. That ordering is also why the invariant campaign reached this branch
-        // in 1 of 8 unseeded runs before round-26 remediation.
-        uint256 lent = pool.available();
-        assertEq(lent, 8_500_000_001, "fixture: the hot float is RESERVE_RATIO_BPS of the book");
-        _lend(lent);
+        _distributeYield(1);
+        skip(Config.YIELD_STREAM_DURATION + 1);
+        _lend(pool.available());
 
         uint256 idle = usdc.balanceOf(address(pool));
         uint256 supplyBefore = pool.totalSupply();
-        uint256 exitAssetsBefore = pool.exitAssets();
-        assertEq(idle, 1_500_000_000, "fixture: the float left behind moved");
+        uint256 assetsBefore = pool.totalAssets();
 
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
 
-        // The prediction, **restated here rather than read back off the contract**. Asking the pool
-        // to convert `idle` for us would be the shape audit round 25 filed against
-        // `invariant_theStoredSetIsAlwaysLegal`: a function checked against its own output, which
-        // agrees with itself under every mutation. These are OZ's ERC-4626 terms written out, with
-        // `exitAssets()` in place of `totalAssets()` and `10**3` for the decimals offset.
-        uint256 s = supplyBefore + 10 ** 3;
-        uint256 a = exitAssetsBefore + 1;
-        uint256 expectedBurn = Math.mulDiv(idle, s, a, Math.Rounding.Floor);
-        uint256 wouldBurnRoundedUp = Math.mulDiv(idle, s, a, Math.Rounding.Ceil);
-        assertEq(expectedBurn, 1_499_999_999_850, "fixture: the floored share slice moved");
-        assertEq(
-            wouldBurnRoundedUp,
-            expectedBurn + 1,
-            "fixture: the two roundings coincide here, so this test cannot see the mutation it targets"
-        );
+        uint256 requestCash = Math.mulDiv(idle, shares, supplyBefore, Math.Rounding.Floor);
+        uint256 expectedBurn = Math.mulDiv(requestCash, supplyBefore + 10 ** 3, assetsBefore + 1, Math.Rounding.Floor);
+        uint256 wouldBurnRoundedUp =
+            Math.mulDiv(requestCash, supplyBefore + 10 ** 3, assetsBefore + 1, Math.Rounding.Ceil);
+        assertEq(wouldBurnRoundedUp, expectedBurn + 1, "fixture does not distinguish floor from ceiling");
+        assertEq(pool.maxRequestRedeem(alice), expectedBurn, "cash-funded share maximum");
 
-        assertEq(pool.serviceQueue(1), 1, "the head must be serviced");
-
-        (,, uint256 remaining) = pool.queueEntry(0);
-        assertGt(remaining, 0, "fixture: the fill must be partial rather than a clearance");
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, expectedBurn, 0);
+        (,, uint256 remaining,,) = pool.withdrawalRequest(alice);
         uint256 burned = supplyBefore - pool.totalSupply();
-        assertEq(shares - remaining, burned, "every burned share must come off the entry that was paid");
-
-        // The property, first: the shares burned are worth no more, at the pre-burn exit price,
-        // than the cash that left. `burned * a <= idle * s`, expressed through the floored
-        // conversion so nothing can overflow.
-        assertLe(burned, expectedBurn, "the partial fill burned more shares than its cash can buy back");
-        // Then the pin, because the property alone still admits burning too few.
-        assertEq(burned, expectedBurn, "the partial fill burned a different slice than the floored conversion");
-        assertEq(pool.claimable(alice), 1_499_999_999, "the partial fill set aside a different amount");
+        assertEq(shares - remaining, burned, "every burned share must come off Alice's request");
+        assertEq(burned, expectedBurn, "service burned a different gross-funded slice");
     }
 
     /// @notice The round-number fixture cannot tell Floor from Ceil. This is why the test above
-    ///         donates one wei before it measures anything.
+    ///         recognizes and releases one wei of yield before it measures anything.
     /// @dev Reaching a branch and being able to see inside it are different properties, and this
     ///      file had the first without the second. The deterministic driver in
     ///      `LenderPool.invariants.t.sol` has reached the partial-fill branch since it was written,
@@ -1600,49 +1548,34 @@ contract LenderPoolTest is Test {
     ///      paragraph. If it ever goes red, `Config.RESERVE_RATIO_BPS`, `_decimalsOffset()` or
     ///      `DEPOSIT` has moved and every literal in the sibling test above has to be re-derived -
     ///      which is the correct outcome, since those literals are pinned to the same arithmetic.
-    function test_theRoundNumberFixtureCannotSeeThePartialFillRounding() public {
+    function test_theRoundNumberFixtureCannotSeeTheRequestMaximumRounding() public {
         uint256 shares = _deposit(alice, DEPOSIT);
-        uint256 lent = pool.available();
-        assertEq(lent, 8_500_000_000, "fixture: 15% of a round 10,000.000000 book");
-        _lend(lent);
-
+        _lend(pool.available());
         uint256 idle = usdc.balanceOf(address(pool));
-        uint256 s = pool.totalSupply() + 10 ** 3;
-        uint256 a = pool.exitAssets() + 1;
 
-        assertEq(
-            Math.mulDiv(idle, s, a, Math.Rounding.Floor),
-            Math.mulDiv(idle, s, a, Math.Rounding.Ceil),
-            "the round fixture has stopped being exact, so the sibling test's literals are stale"
-        );
-
-        // And the branch really is taken on these numbers, so the statement above is about the
-        // rounding rather than about reachability.
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        assertEq(pool.serviceQueue(1), 1, "the head must be serviced");
-        (,, uint256 remaining) = pool.queueEntry(0);
-        assertGt(remaining, 0, "fixture: the fill must be partial rather than a clearance");
+        uint256 requestCash = Math.mulDiv(idle, shares, pool.totalSupply(), Math.Rounding.Floor);
+        uint256 s = pool.totalSupply() + 10 ** 3;
+        uint256 a = pool.totalAssets() + 1;
         assertEq(
-            shares - remaining,
-            Math.mulDiv(idle, s, a, Math.Rounding.Floor),
-            "the burn must equal the floored conversion even where Ceil would give the same answer"
+            Math.mulDiv(requestCash, s, a, Math.Rounding.Floor),
+            Math.mulDiv(requestCash, s, a, Math.Rounding.Ceil),
+            "round fixture has stopped being exact"
         );
+
+        uint256 serviceShares = pool.maxRequestRedeem(alice);
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, serviceShares, 0);
+        (,, uint256 remaining,,) = pool.withdrawalRequest(alice);
+        assertGt(remaining, 0, "fixture: service must be partial");
+        assertEq(shares - remaining, serviceShares, "service did not burn the reported maximum");
     }
 
-    /// @notice Stale queue requests cannot take units from a post-loss generation.
-    function test_R22F3_staleQueueRequestsCannotTakeFreshPrincipalUnits() public {
+    /// @notice Stale zero-value requests cannot mutate a fresh controller's request or cap usage.
+    function test_R22F3_staleRequestsCannotMutateAFreshCanonicalCashRequest() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         uint256 bobShares = _deposit(bob, DEPOSIT);
-
-        // **The fixture changed in round 23 and the assertions did not.** It used to donate
-        // 4,000.000000 into the pool so one `lend` could reach both deposits, then socialise
-        // exactly `netDeposits` - and under the old whole-amount debit that rolled the generation
-        // while the donation was still sitting in the pool. That is round-23 finding 6, not a total
-        // loss. Under the yield-first debit the roll has to be earned, so the write-down runs
-        // first, the entries are queued against a pool whose last asset is out on loan, and the
-        // final write-off is what rolls the generation. See `_lendDownToNothingIdle` for why the
-        // order cannot be the other way round.
         _lendDownToNothingIdle();
 
         vm.prank(alice);
@@ -1650,52 +1583,39 @@ contract LenderPoolTest is Test {
         vm.prank(bob);
         pool.requestWithdrawal(bobShares, bob);
 
-        // Read first. An external staticcall in argument position spends the prank.
         uint256 exposure = pool.outstandingPrincipal();
         vm.prank(creditManager);
         pool.socialiseLoss(exposure);
-
-        assertEq(pool.totalAssets(), 0, "fixture: the total loss must leave nothing behind");
-        assertEq(pool.netDeposits(), 0, "fixture: the generation must roll on merit, not on finding 6");
+        assertEq(pool.totalAssets(), 0, "fixture: total loss");
+        assertEq(_depositCapUsage(pool), 0, "fixture: recognized book must be empty");
 
         uint256 freshAssets = 1_000e6;
         uint256 carolShares = _deposit(carol, freshAssets);
         vm.prank(carol);
         pool.requestWithdrawal(carolShares, carol);
-
-        assertEq(pool.principalUnits(address(pool)), freshAssets, "only the fresh request may carry active units");
-        assertEq(pool.queueEntryPrincipalUnits(0), 0, "Alice's old request must be stale");
-        assertEq(pool.queueEntryPrincipalUnits(1), 0, "Bob's old request must be stale");
-        assertEq(pool.queueEntryPrincipalUnits(2), freshAssets, "Carol's request must own every fresh unit");
+        (uint256 carolId, address carolReceiver, uint256 carolStoredBefore,,) = pool.withdrawalRequest(carol);
+        uint256 usageBeforeCancels = _depositCapUsage(pool);
 
         vm.prank(alice);
         pool.cancelWithdrawalRequest();
         vm.prank(bob);
         pool.cancelWithdrawalRequest();
 
-        assertEq(pool.principalUnits(address(pool)), freshAssets, "stale cancellations must not take Carol's units");
-        assertEq(pool.queueEntryPrincipalUnits(2), freshAssets, "Carol's request provenance must survive");
+        (uint256 carolIdAfter, address carolReceiverAfter, uint256 carolStoredAfter,,) = pool.withdrawalRequest(carol);
+        assertEq(carolIdAfter, carolId, "stale cancellation changed Carol's request id");
+        assertEq(carolReceiverAfter, carolReceiver, "stale cancellation changed Carol's receiver");
+        assertEq(carolStoredAfter, carolStoredBefore, "stale cancellation changed Carol's shares");
+        assertEq(pool.balanceOf(address(pool)), carolShares, "stale cancellation took fresh escrow shares");
+        assertEq(_depositCapUsage(pool), usageBeforeCancels, "stale cancellation changed cap usage");
 
         vm.prank(carol);
         pool.cancelWithdrawalRequest();
-        assertEq(pool.principalUnits(address(pool)), 0, "the fresh cancellation must empty active escrow units");
-        assertEq(pool.principalUnits(carol), freshAssets, "Carol must recover her fresh-generation basis");
+        assertEq(pool.balanceOf(address(pool)), 0, "fresh cancel must empty escrow");
+        assertEq(pool.balanceOf(carol), carolShares, "Carol must recover her fresh shares");
+        assertEq(_depositCapUsage(pool), usageBeforeCancels, "fresh cancellation changed cap usage");
     }
 
-    /// @notice CLOSED: a dust share split no longer loosens the cap without a realised loss.
-    /// @dev **This was round-22 finding 3's no-loss boundary and it is shut.** At par the
-    ///      three-decimal virtual offset gives a ten-asset-wei deposit 10,000 share-wei and ten
-    ///      principal units. Transferring one share-wei used to **ceil**-move a whole unit; that
-    ///      dust share then redeemed for zero assets because the exit conversion floors, and its
-    ///      unit burn still removed one asset-wei from `netDeposits`. Ten executed cycles drove the
-    ///      counter from ten to zero while all ten assets remained and `maxDeposit` returned to the
-    ///      full cap.
-    ///
-    ///      `_update` floors now, so the same trace moves no units at all and the counter does not
-    ///      move. The executed before-and-after, the brick-direction control, the two boundaries
-    ///      that stay open and the per-holder basis that was built and refused all live in
-    ///      `LenderPoolUnitProvenance.t.sol`. What is kept here is the shortest form of the
-    ///      closure, so the file that owns the rest of finding 3 still states it.
+    /// @notice A dust share split and zero-asset redeem cannot move cap usage.
     function test_R22F3_aDustTransferThenZeroAssetRedeemNoLongerErodesTheCap() public {
         uint256 aliceShares = _deposit(alice, 10);
         assertEq(aliceShares, 10_000, "fixture: the virtual offset must mint one thousand shares per asset-wei");
@@ -1707,7 +1627,6 @@ contract LenderPoolTest is Test {
             vm.prank(alice);
             pool.transfer(bob, 1);
 
-            assertEq(pool.principalUnits(bob), 0, "a dust split must move no principal unit at all");
             assertEq(pool.previewRedeem(1), 0, "fixture: each one-share position must redeem for zero assets");
 
             vm.prank(bob);
@@ -1715,37 +1634,34 @@ contract LenderPoolTest is Test {
 
             assertEq(assetsOut, 0, "fixture: each boundary must pay no assets");
             assertEq(usdc.balanceOf(address(pool)), assetsBefore, "fixture: no asset may leave the pool");
-            assertEq(pool.totalPrincipalUnits(), 10, "a zero-asset exit must burn no units");
-            assertEq(pool.netDeposits(), 10, "a zero-asset exit must not loosen the cap");
+            assertEq(_depositCapUsage(pool), 10, "a zero-asset exit must not loosen the cap");
             assertEq(pool.maxDeposit(bob), headroomBefore, "cap headroom must not move when no asset moves");
         }
     }
 
-    /// @notice Known residual: after a loss, quotient rounding can loosen the cap by one asset-wei.
-    /// @dev The candidate remains a partial remediation until this boundary has transferable
-    ///      fractional provenance. The error is one USDC micro-unit per completed round trip, not
-    ///      the original nonlinear ratchet that closed the whole cap in 114 cycles.
-    function test_R22F3_knownResidual_postLossDustRoundTripErodesOneAssetWei() public {
-        uint256 aliceShares = _deposit(alice, 10);
+    /// @notice A post-loss dust round trip follows its exact cash transitions.
+    function test_R22F3_postLossDustRoundTripTracksExactCash() public {
+        uint256 aliceShares = _deposit(alice, 10_000);
         assertGt(aliceShares, 0, "fixture: Alice must receive shares");
         _lend(1);
 
         vm.prank(creditManager);
         assertEq(pool.socialiseLoss(1), 1, "fixture: the one-wei loss must land");
-        assertEq(pool.netDeposits(), 9, "fixture: nine admitted asset-wei must remain");
+        assertEq(_depositCapUsage(pool), 9_999, "fixture: the loss must reduce canonical cash by one wei");
 
         uint256 bobShares = _deposit(bob, 1);
+        assertEq(_depositCapUsage(pool), 10_000, "dust deposit was not counted");
         vm.prank(bob);
-        pool.redeem(bobShares, bob, bob);
+        uint256 assetsOut = pool.redeem(bobShares, bob, bob);
 
-        assertEq(pool.netDeposits(), 8, "known residual: the round trip loosens the cap by one asset-wei");
+        assertEq(_depositCapUsage(pool), 10_000 - assetsOut, "dust exit cap debit drift");
     }
 
-    /// @notice Known residual: merging differently priced lots makes their basis fungibly average.
-    /// @dev Exact lot provenance cannot survive an additive ERC-20 merge and a later split in one
-    ///      scalar balance. This path requires the caller to keep the blended anchor position; it
-    ///      does not reproduce the original near-free fresh-account round trip.
-    function test_R22F3_knownResidual_mergeAndSplitAveragesPrincipalBasis() public {
+    /// @notice Merging and splitting differently priced shares remains neutral to canonical cash.
+    function test_R22F3_mergeAndSplitAreNeutralUntilCashActuallyLeaves() public {
+        vm.prank(admin);
+        pool.setDepositCap(50_000e6);
+
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _distributeYield(2_000e6);
         skip(Config.YIELD_STREAM_DURATION + 1);
@@ -1753,40 +1669,26 @@ contract LenderPoolTest is Test {
         uint256 bobAssets = 15_000e6;
         usdc.mint(bob, bobAssets - DEPOSIT);
         uint256 bobShares = _deposit(bob, bobAssets);
+        uint256 usageBeforeTransfers = _depositCapUsage(pool);
 
         vm.prank(bob);
         pool.transfer(alice, bobShares);
         vm.prank(alice);
         pool.transfer(bob, bobShares);
 
-        uint256 bobBasisAfterBlend = pool.principalBasis(bob);
-        assertLt(bobBasisAfterBlend, bobAssets, "fixture: the split must average Bob's basis downward");
+        assertEq(pool.balanceOf(alice), aliceShares, "the split changed the anchor shares");
+        assertEq(pool.balanceOf(bob), bobShares, "the split changed Bob's shares");
+        assertEq(_depositCapUsage(pool), usageBeforeTransfers, "share merge or split changed cap usage");
 
         vm.prank(bob);
-        pool.redeem(bobShares, bob, bob);
+        uint256 assetsOut = pool.redeem(bobShares, bob, bob);
 
         assertEq(pool.balanceOf(alice), aliceShares, "the anchor shares must remain invested");
-        assertGt(pool.netDeposits(), DEPOSIT, "known residual: averaged basis remains on the anchor position");
-        assertEq(
-            pool.netDeposits(),
-            DEPOSIT + bobAssets - bobBasisAfterBlend,
-            "the residual must equal the basis moved onto the anchor"
-        );
+        assertEq(_depositCapUsage(pool), usageBeforeTransfers - assetsOut, "exit removed anything but cash paid");
     }
 
-    /// @notice CONTROL for the other direction: the round-21 fix must not ratchet the counter UP.
-    /// @dev Debiting pro-rata instead of at the assets paid moves the error the other way, and the
-    ///      other way is the permanent brick rounds 11 and 12 both landed on - a counter that grows
-    ///      past `depositCap` closes an immutable pool to deposits for good. It does not, and the
-    ///      reason is structural rather than lucky: an exit scales `netDeposits` and `totalAssets()`
-    ///      by the same factor, so it cannot raise their ratio, a deposit adds the same amount to
-    ///      both, and yield only raises the denominator. `netDeposits <= totalAssets()` therefore
-    ///      survives arbitrarily many rotations.
-    ///
-    ///      **This assertion also holds on the pre-fix code**, by a much slacker margin, so it is a
-    ///      guard on the fix's own direction rather than evidence the fix works - the three tests
-    ///      above are that. Kept because nothing else in the suite bounds this counter from above.
-    function test_netDeposits_neverExceedsTheBookUnderRepeatedRotation() public {
+    /// @notice Matured recognized cash and NAV remain identical through repeated rotations.
+    function test_depositCapUsage_matchesTheMatureBookUnderRepeatedRotation() public {
         vm.prank(admin);
         pool.setDepositCap(100_000e6);
 
@@ -1810,12 +1712,9 @@ contract LenderPoolTest is Test {
             vm.prank(rotator);
             pool.redeem(held, rotator, rotator);
 
-            assertLe(pool.netDeposits(), pool.totalAssets(), "the counter claimed more principal than the book holds");
+            assertEq(_depositCapUsage(pool), pool.totalAssets(), "mature recognized book drift");
             assertGt(pool.maxDeposit(carol), 0, "the pool must not have closed itself to deposits");
         }
-
-        emit log_named_uint("after 10 rotations: netDeposits", pool.netDeposits());
-        emit log_named_uint("after 10 rotations: totalAssets", pool.totalAssets());
     }
 
     /// @notice Marking the book down must never raise what the pool will lend.
@@ -1870,62 +1769,36 @@ contract LenderPoolTest is Test {
     ///      `totalAssets()` is all principal, a full markdown takes `exitAssets()` to zero, and
     ///      every queued entry values at `owed == 0`.
     ///
-    ///      At that point `serviceQueue`'s dust-release branch runs - above the `idle == 0` break,
+    ///      The former shared settlement walk then took its dust-release branch,
     ///      deliberately, so that cash-free progress still happens when the pool is fully lent -
     ///      and treats "worth zero at today's exit price" as permanently worthless. One
     ///      permissionless call hands the whole queue back and whoever re-queues first takes the
     ///      head. A markdown is temporary; losing your place is not.
-    function test_impairment_deepMarkdownDoesNotEvictTheQueue() public {
+    function test_impairment_deepMarkdownLeavesTheRequestCancellable() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(pool.available());
 
-        // Bob is not queued, so `unreservedIdle()` is the whole float and `maxWithdraw` will hand
-        // it over. This is the drain the round-12 trace used.
         uint256 bobsMax = pool.maxWithdraw(bob);
-        assertGt(bobsMax, 0, "fixture: there must be a float to drain");
         vm.prank(bob);
         pool.withdraw(bobsMax, bob, bob);
-        assertEq(usdc.balanceOf(address(pool)), 0, "fixture: the pool must be holding nothing");
+        assertEq(usdc.balanceOf(address(pool)), 0, "fixture: pool cash");
 
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
-        (uint256 placeBefore,) = pool.queuePosition(alice);
-
-        // A markdown big enough to take the whole book to zero at the exit price.
         _impair(carol, type(uint128).max);
-        assertEq(pool.exitAssets(), 0, "fixture: this is the full-markdown state");
+        assertEq(pool.exitAssets(), 0, "fixture: full markdown");
+        assertEq(pool.maxRequestRedeem(alice), 0, "cash-free request reports serviceable shares");
 
-        // Nothing is payable and nothing is permanently worthless, so there is genuinely no work
-        // to do. Refusing is the honest answer; the old behaviour "made progress" by emptying the
-        // queue.
-        //
-        // The reserve is what stops the walk here, and the pool being empty would stop it one
-        // branch later - so this asserts the reserve refusal specifically. Two honest reasons
-        // holding at once is exactly the case the old single error could not describe.
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(10);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, alice, bob));
+        pool.serviceWithdrawalRequest(alice, 1, 0);
+        assertEq(pool.balanceOf(address(pool)), aliceShares, "stranger changed escrow");
 
-        assertEq(pool.balanceOf(alice), 0, "the queued shares must stay escrowed, not be handed back");
-        assertEq(pool.balanceOf(address(pool)), aliceShares, "the pool still holds them");
-        (uint256 placeAfter,) = pool.queuePosition(alice);
-        assertEq(placeAfter, placeBefore, "a temporary markdown must not cost a lender their place");
-        assertEq(pool.queuedShares(), aliceShares, "and the entry must still be live");
-
-        // And the place is worth keeping: once the mark comes off and the principal comes home,
-        // the same entry pays out. Without this half the test would pass just as well against a
-        // pool that had frozen the queue permanently, which is the other way to fail this.
-        vm.prank(creditManager);
-        pool.releaseImpairment(carol);
-
-        uint256 out = pool.outstandingPrincipal();
-        vm.prank(creditManager);
-        usdc.approve(address(pool), out);
-        vm.prank(creditManager);
-        pool.repayPrincipal(out);
-
-        pool.serviceQueue(10);
-        assertGt(pool.claimable(alice), 0, "the entry it kept must still be payable afterwards");
+        vm.prank(alice);
+        pool.cancelWithdrawalRequest();
+        assertEq(pool.balanceOf(alice), aliceShares, "controller could not recover marked shares");
+        assertEq(pool.queuedShares(), 0, "cancel left a live request");
     }
 
     /// @notice The same refusal, with money in the pool. **This is the state nothing covered.**
@@ -1946,57 +1819,34 @@ contract LenderPoolTest is Test {
     ///      The refusal protects the entry from being crystallised at nothing, and it stalls
     ///      everybody behind it for as long as the mark stands. Both halves are asserted, because a
     ///      test that asserted only the protection would read as though the branch were settled.
-    function test_impairment_aMarkedDownHeadIsRefusedEvenWithCashInThePool() public {
+    function test_impairment_zeroValueRequestNeedsTheControllersExplicitZeroFloor() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(pool.available());
 
         uint256 bobsMax = pool.maxWithdraw(bob);
-        assertGt(bobsMax, 0, "fixture: there must be a float to drain");
         vm.prank(bob);
         pool.withdraw(bobsMax, bob, bob);
-
-        // One wei back in, which is the whole difference from the test above.
         _setIdleTo(1);
-        assertEq(usdc.balanceOf(address(pool)), 1, "fixture: the pool must be holding something");
 
-        // A quarter, and the size is load-bearing. `owed` is `shares * (exitAssets + 1) /
-        // (supply + 1000)` and this fixture leaves `exitAssets` at the one wei of idle, so a head
-        // holding half the supply or more values at exactly one wei rather than at nothing - which
-        // is a different branch and a different open finding, recorded separately. A quarter floors
-        // to zero, which is the refusal this test is about.
-        uint256 queued = aliceShares / 4;
+        uint256 requested = aliceShares / 4;
         vm.prank(alice);
-        pool.requestWithdrawal(queued, alice);
-        (uint256 placeBefore,) = pool.queuePosition(alice);
-
+        pool.requestWithdrawal(requested, alice);
         _impair(carol, type(uint128).max);
+        assertEq(pool.previewRedeem(requested), 0, "fixture: marked request value");
+        assertGt(pool.convertToAssets(requested), 0, "fixture: gross request value");
 
-        // The premises, stated so the branch cannot be entered by accident later: the head is worth
-        // nothing at the exit price, it is worth something un-impaired, and there is cash.
-        assertEq(pool.previewRedeem(queued), 0, "fixture: the head must value at zero to exit");
-        assertGt(pool.convertToAssets(queued), 0, "fixture: and at something un-impaired");
-        assertGt(pool.exitReserve(), 0, "fixture: a reserve must actually be standing");
+        uint256 maximum = pool.maxRequestRedeem(alice);
+        if (maximum != 0) {
+            vm.prank(alice);
+            vm.expectRevert(abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, 0, 1));
+            pool.serviceWithdrawalRequest(alice, maximum, 1);
+        }
+        assertEq(pool.balanceOf(address(pool)), requested, "floor failure burned marked shares");
 
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(10);
-
-        // The protection.
-        assertEq(pool.balanceOf(alice), aliceShares - queued, "the queued shares must stay escrowed");
-        assertEq(pool.queuedShares(), queued, "the entry must still be live");
-        (uint256 placeAfter,) = pool.queuePosition(alice);
-        assertEq(placeAfter, placeBefore, "a temporary markdown must not cost a lender their place");
-
-        // And the cost, which is the open half: the money is there and the queue cannot reach it.
-        assertEq(pool.claimable(alice), 0, "nothing was paid out");
-        assertEq(usdc.balanceOf(address(pool)), 1, "and the cash sat there unused");
-
-        // Released, it pays. Without this the test would read as well against a permanent freeze.
-        vm.prank(creditManager);
-        pool.releaseImpairment(carol);
-        _setIdleTo(pool.totalAssets());
-        pool.serviceQueue(10);
-        assertGt(pool.claimable(alice), 0, "the entry it kept must still be payable afterwards");
+        vm.prank(alice);
+        pool.cancelWithdrawalRequest();
+        assertEq(pool.balanceOf(alice), aliceShares, "marked request was not cancellable");
     }
 
     /// @notice **One wei of idle must not turn a protected position into a total loss.**
@@ -2018,32 +1868,28 @@ contract LenderPoolTest is Test {
     ///      The head has to be worth at least half the supply for `owed` to round to one rather
     ///      than to zero, which is why this is a whole position rather than the quarter the sibling
     ///      queues. That is not an obstacle to an attacker: it is the lender with the most to lose.
-    function test_impairment_aMarkedDownHeadIsNotBurnedInFullForOneWeiOfIdle() public {
+    function test_impairment_oneWeiQuoteCannotBypassTheControllersFloor() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(pool.available());
-
         uint256 bobsMax = pool.maxWithdraw(bob);
         vm.prank(bob);
         pool.withdraw(bobsMax, bob, bob);
-        _setIdleTo(1);
+        _setIdleTo(2);
 
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
-
         _impair(carol, type(uint128).max);
+        uint256 maximum = pool.maxRequestRedeem(alice);
+        uint256 quote = pool.previewRedeem(maximum);
+        assertGt(maximum, 0, "fixture: no shares reach the execution-floor check");
+        assertEq(quote, 0, "fixture: marked service quote is nonzero");
 
-        // The premise, and it is the finding: the entry values at one wei, not at zero, so the
-        // dust guard never sees it.
-        assertEq(pool.previewRedeem(aliceShares), 1, "fixture: the head must value at exactly one wei");
-        assertGt(pool.convertToAssets(aliceShares), 1e6, "fixture: and be worth real money un-impaired");
-
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(10);
-
-        assertEq(pool.queuedShares(), aliceShares, "a whole position was crystallised for one wei");
-        assertEq(pool.claimable(alice), 0, "and paid out at a price that values it at nothing");
-        assertEq(pool.balanceOf(address(pool)), aliceShares, "the escrow must still hold the entry");
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, quote, 2));
+        pool.serviceWithdrawalRequest(alice, maximum, 2);
+        assertEq(pool.queuedShares(), aliceShares, "floor failure crystallised the position");
+        assertEq(pool.claimable(alice), 0, "floor failure made a claim");
     }
 
     /// @notice The manager-facing writers cannot revert, whatever they are handed.
@@ -2354,48 +2200,22 @@ contract LenderPoolTest is Test {
     ///      Joining and cancelling both stay open - neither was ever the hazard - and what a queued
     ///      lender is actually paid is the same marked-down number an immediate exit would have
     ///      handed them.
-    function test_exit_queueingDuringALiquidationBuysNoBetterPrice() public {
+    function test_exit_requestingDuringALiquidationBuysNoBetterPrice() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(4_000e6);
-
         _impair(carol, 2_000e6);
 
-        // Joining and cancelling both stay open, and neither was ever the hazard - a gate on
-        // `requestWithdrawal` would have left a lender unable even to take their place in line.
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        assertEq(pool.queuedShares(), shares, "queueing must stay available");
+        uint256 serviceable = pool.maxRequestRedeem(alice);
+        uint256 requestPrice = pool.previewRedeem(serviceable);
+        assertLt(requestPrice, pool.convertToAssets(serviceable), "fixture: request is not marked");
 
         vm.prank(alice);
-        pool.cancelWithdrawalRequest();
-        assertEq(pool.queuedShares(), 0, "and so must cancelling");
-
-        // What the front door would pay, read at the moment she commits rather than earlier. A new
-        // deposit between the two would legitimately move it: an entrant pays the un-impaired price
-        // and so subsidises the mark, which is `test_impairment_anEntrantCannotBuyTheDiscount`.
-        uint256 immediatePrice = pool.previewRedeem(shares);
-        assertLt(immediatePrice, DEPOSIT, "the fixture must have something marked for this to mean anything");
-
-        // **Audit round 16: the queue now buys no service at all while a reserve stands**, so it
-        // certainly buys no better price. Restated rather than softened - the claim in the name is
-        // stronger under the new refusal, not weaker, and asserting the refusal is what keeps it a
-        // test of the queue rather than of the front door.
-        vm.prank(alice);
-        pool.requestWithdrawal(shares, alice);
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(1);
-
-        // The mark comes off, and only then does the queue pay. What it pays is the point: the
-        // price she would have got at the front door at the moment she committed is the floor she
-        // never fell below, and the release is what restores it.
-        vm.prank(creditManager);
-        pool.releaseImpairment(carol);
-        pool.serviceQueue(1);
-        vm.prank(alice);
-        pool.claim();
-
-        assertGe(usdc.balanceOf(alice), immediatePrice, "waiting in the queue paid worse than leaving would have");
+        uint256 paid = pool.serviceWithdrawalRequest(alice, serviceable, requestPrice);
+        assertEq(paid, requestPrice, "request service escaped the live mark");
+        assertEq(pool.claimable(alice), requestPrice, "marked payout was not set aside");
     }
 
     /// @notice Finding 7 stated as the property it protects, rather than as its implementation.
@@ -2468,7 +2288,7 @@ contract LenderPoolTest is Test {
     /// @notice Audit round 11's composite, which is the path a gate could never have covered.
     /// @dev The finding-7 gate was put on `withdraw`, `redeem`, `maxWithdraw` and `maxRedeem` - the
     ///      complete set of ERC-4626 exits and not the complete set of ways USDC leaves the pool.
-    ///      `requestWithdrawal`, `serviceQueue` and `claim` are all permissionless and compose in
+    ///      request creation, settlement and claim used to compose without controller authority in
     ///      one transaction, so a lender could join the queue and pay themselves out at the pre-loss
     ///      price in the block the auction opened. Worse than the door that had been shut: servicing
     ///      draws on `_poolBalance()` where `redeem` is bounded by `unreservedIdle()`, so the queue
@@ -2478,79 +2298,52 @@ contract LenderPoolTest is Test {
     ///      pricing over gating: the composite gets a lender more liquidity, never a better price.
     ///      A gate has to enumerate every door and this one was missed; the price is on the
     ///      valuation every door shares.
-    function test_exit_cannotBeSelfServicedOutOfTheQueueAtAnUnimpairedPrice() public {
+    function test_exit_controllerServiceCannotTakeTheUnimpairedPrice() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(6_000e6);
-
         _impair(carol, 3_000e6);
 
-        uint256 impairedPrice = pool.previewRedeem(aliceShares);
-        uint256 unimpairedPrice = pool.convertToAssets(aliceShares);
-        assertLt(impairedPrice, unimpairedPrice, "fixture: the two prices must diverge, or this proves nothing");
-
-        // The composite, in the order and with the callers an attacker would use. Every one of
-        // these is permissionless and they fit in a single transaction.
-        //
-        // **The conclusion changed in audit round 16 and the property did not.** This used to
-        // assert the composite *paid the impaired price*. Since the refusal moved onto its cause,
-        // the composite pays nothing at all while a reserve stands, so the claim in the name holds
-        // a fortiori rather than differently. The assertion is restated rather than deleted,
-        // because "cannot exit at the pre-loss price" and "cannot exit" are different facts and the
-        // second one is what the code now says.
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(1);
-        assertEq(pool.claimable(alice), 0, "the composite set aside money while a reserve stood");
+        uint256 serviceable = pool.maxRequestRedeem(alice);
+        uint256 impairedPrice = pool.previewRedeem(serviceable);
+        uint256 unimpairedPrice = pool.convertToAssets(serviceable);
+        assertLt(impairedPrice, unimpairedPrice, "fixture: prices do not diverge");
 
-        // And the front door, which is the exit that stays open: it pays the impaired price, so
-        // there is no route out at the un-impaired one either way. Without this half the test would
-        // read as well against a pool that had frozen every exit, which is the mechanism audit
-        // round 10 shipped and audit round 11 took apart.
         vm.prank(alice);
-        pool.cancelWithdrawalRequest();
-        uint256 exitable = pool.maxRedeem(alice);
-        assertGt(exitable, 0, "the front door must stay open, or this is a freeze rather than a price");
-        vm.prank(alice);
-        pool.redeem(exitable, alice, alice);
-
-        assertLt(usdc.balanceOf(alice), unimpairedPrice, "a lender walked out at the pre-loss price");
-        assertLe(usdc.balanceOf(alice), impairedPrice, "and never above what the impaired book allows");
+        uint256 paid = pool.serviceWithdrawalRequest(alice, serviceable, impairedPrice);
+        assertEq(paid, impairedPrice, "controller service did not pay the exit price");
+        assertLt(paid, unimpairedPrice, "controller service escaped at the gross price");
     }
 
     /// @dev The other half: someone already queued before the liquidation opened is marked down
     ///      like everybody else. Their shares stay outstanding and stay exposed while they wait,
     ///      which is the promise the whole queue design rests on - and it is a promise about the
     ///      valuation, so it survived the mechanism change underneath it.
-    function test_exit_anAlreadyQueuedLenderIsMarkedDownLikeEveryoneElse() public {
+    function test_exit_anExistingRequestIsMarkedDownLikeEveryoneElse() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
         _lend(6_000e6);
 
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
-        (, uint256 owedBefore) = pool.queuePosition(alice);
+        (,,, uint256 serviceableBefore, uint256 owedBefore) = pool.withdrawalRequest(alice);
 
         _impair(carol, 3_000e6);
+        (,,, uint256 serviceableAfter, uint256 owedAfter) = pool.withdrawalRequest(alice);
+        assertEq(serviceableAfter, serviceableBefore, "mark changed the cash-funded share maximum");
+        assertApproxEqAbs(owedAfter, owedBefore - 1_050e6, 2, "request did not carry its pro-rata mark");
 
-        (, uint256 owedAfter) = pool.queuePosition(alice);
-        // Two equal holders, a 3,000 mark: alice's half is 1,500.
-        assertApproxEqAbs(owedAfter, owedBefore - 1_500e6, 1, "waiting in line did not carry the mark");
-
-        // The loss then actually lands and the mark comes off. What she is paid must not move:
-        // the estimate was right, so recognising it changes nothing for her.
         vm.startPrank(creditManager);
         pool.socialiseLoss(3_000e6);
         pool.releaseImpairment(carol);
         vm.stopPrank();
+        assertApproxEqAbs(pool.previewRedeem(serviceableAfter), owedAfter, 2, "realised loss repriced the request");
 
-        pool.serviceQueue(5);
         vm.prank(alice);
-        pool.claim();
-
-        assertApproxEqAbs(usdc.balanceOf(alice), owedAfter, 2, "the price she waited at is not the price she got");
-        assertApproxEqAbs(usdc.balanceOf(alice), DEPOSIT - 1_500e6, 2, "alice bore her half");
+        pool.serviceWithdrawalRequest(alice, serviceableAfter, owedAfter - 2);
+        assertApproxEqAbs(pool.claimable(alice), owedAfter, 2, "service did not preserve the marked price");
     }
 
     /// @notice The credit manager can be an address with no code at all.
@@ -2608,7 +2401,10 @@ contract LenderPoolTest is Test {
 
         vm.prank(alice);
         fresh.requestWithdrawal(shares / 2, alice);
-        fresh.serviceQueue(1);
+        uint256 serviceable = fresh.maxRequestRedeem(alice);
+        uint256 requestQuote = fresh.previewRedeem(serviceable);
+        vm.prank(alice);
+        fresh.serviceWithdrawalRequest(alice, serviceable, requestQuote);
         vm.prank(alice);
         fresh.claim();
 
@@ -2650,7 +2446,7 @@ contract LenderPoolTest is Test {
 
     // ── withdrawals: the queue ───────────────────────────────────────────────
 
-    function test_requestWithdrawal_escrowsSharesAndRecordsAPosition() public {
+    function test_requestWithdrawal_escrowsSharesAndRecordsAControllerRequest() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _lend(pool.available());
 
@@ -2660,32 +2456,35 @@ contract LenderPoolTest is Test {
         assertEq(pool.balanceOf(alice), 0, "shares moved to escrow");
         assertEq(pool.balanceOf(address(pool)), shares);
         assertEq(pool.queuedShares(), shares);
-        assertEq(pool.totalSupply(), shares, "and are still outstanding");
+        assertEq(pool.totalSupply(), shares, "escrowed shares remain outstanding");
 
-        (uint256 index, uint256 remaining) = pool.queuePosition(alice);
-        assertEq(index, 0, "first in line");
-        assertEq(remaining, DEPOSIT);
+        (uint256 requestId, address receiver, uint256 storedShares, uint256 serviceable, uint256 assets) =
+            pool.withdrawalRequest(alice);
+        assertEq(requestId, 1, "first request id");
+        assertEq(receiver, alice, "fixed receiver");
+        assertEq(storedShares, shares, "stored shares");
+        assertEq(serviceable, pool.maxRequestRedeem(alice), "serviceable shares");
+        assertEq(assets, pool.previewRedeem(serviceable), "serviceable assets");
     }
 
     /// @dev **The reason escrowed shares stay live.** Burning at request time would let a lender
     ///      who sees trouble queue, stop being exposed, and leave the loss to whoever stayed -
     ///      which is exactly the incentive that turns a wobble into a run.
-    function test_queuedLendersTakeTheirShareOfALossLikeEveryoneElse() public {
+    function test_requestedLendersTakeTheirShareOfALossLikeEveryoneElse() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         uint256 bobShares = _deposit(bob, DEPOSIT);
         _lend(pool.available());
 
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
-
-        (, uint256 owedBefore) = pool.queuePosition(alice);
+        uint256 owedBefore = pool.previewRedeem(aliceShares);
 
         vm.prank(creditManager);
         pool.socialiseLoss(2_000e6);
 
-        (, uint256 owedAfter) = pool.queuePosition(alice);
-        assertLt(owedAfter, owedBefore, "queueing is a place in line, not an exit from risk");
-        assertEq(owedAfter, pool.convertToAssets(bobShares), "and it is the same damage bob takes");
+        uint256 owedAfter = pool.previewRedeem(aliceShares);
+        assertLt(owedAfter, owedBefore, "requesting became an exit from risk");
+        assertEq(owedAfter, pool.convertToAssets(bobShares), "requested and unrequested holders took different damage");
     }
 
     /// @dev Equally, they keep earning while they wait. The symmetry is the point: escrow is not
@@ -2694,23 +2493,19 @@ contract LenderPoolTest is Test {
     ///      arrives on a clock rather than in a step, and this test says so in both directions:
     ///      waiting in the queue is not an exit from the stream, and it is not early access to it
     ///      either.
-    function test_queuedLendersKeepEarningWhileTheyWait() public {
+    function test_requestedLendersKeepEarningWhileTheyWait() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _lend(pool.available());
 
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        (, uint256 owedBefore) = pool.queuePosition(alice);
+        uint256 owedBefore = pool.previewRedeem(shares);
 
         _distributeYield(1_000e6);
-
-        (, uint256 owedAtDelivery) = pool.queuePosition(alice);
-        assertEq(owedAtDelivery, owedBefore, "no step at the moment of delivery, for them either");
+        assertEq(pool.previewRedeem(shares), owedBefore, "yield stepped at delivery for a request");
 
         skip(Config.YIELD_STREAM_DURATION);
-
-        (, uint256 owedAfter) = pool.queuePosition(alice);
-        assertGt(owedAfter, owedBefore);
+        assertGt(pool.previewRedeem(shares), owedBefore, "request shares stopped earning");
     }
 
     function test_requestWithdrawal_refusesASecondOne() public {
@@ -2719,177 +2514,120 @@ contract LenderPoolTest is Test {
 
         vm.startPrank(alice);
         pool.requestWithdrawal(shares / 2, alice);
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.AlreadyQueued.selector, 0));
+        (uint256 requestId,,,,) = pool.withdrawalRequest(alice);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.AlreadyQueued.selector, requestId));
         pool.requestWithdrawal(shares / 2, alice);
         vm.stopPrank();
     }
 
     /// @dev PRD §6.4: the queue cannot be jumped.
-    function test_serviceQueue_paysInOrderAndCannotBeJumped() public {
+    function test_requestsHaveNoOrderAndOneControllerCannotMutateAnother() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         uint256 bobShares = _deposit(bob, DEPOSIT);
         _lend(pool.available());
-
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
         vm.prank(bob);
         pool.requestWithdrawal(bobShares, bob);
+        _setIdleTo(2 * DEPOSIT);
 
-        (uint256 aliceIndex,) = pool.queuePosition(alice);
-        (uint256 bobIndex,) = pool.queuePosition(bob);
-        assertEq(aliceIndex, 0);
-        assertEq(bobIndex, 1);
+        (uint256 aliceId, address aliceReceiver, uint256 aliceBefore,,) = pool.withdrawalRequest(alice);
+        uint256 bobMaximum = pool.maxRequestRedeem(bob);
+        vm.prank(bob);
+        pool.serviceWithdrawalRequest(bob, bobMaximum, 0);
 
-        // Only enough comes back for the first of them.
-        _setIdleTo(DEPOSIT);
-        pool.serviceQueue(10);
-
-        assertEq(pool.claimable(alice), DEPOSIT, "the head was paid");
-        assertEq(pool.claimable(bob), 0, "and the queue was not jumped");
-        _claim(alice);
-        assertEq(usdc.balanceOf(alice), DEPOSIT, "and the payout is collectable");
-
-        (uint256 bobIndexNow,) = pool.queuePosition(bob);
-        assertEq(bobIndexNow, 0, "bob is now next");
+        (uint256 aliceIdAfter, address aliceReceiverAfter, uint256 aliceAfter,,) = pool.withdrawalRequest(alice);
+        assertEq(aliceIdAfter, aliceId, "Bob changed Alice's request id");
+        assertEq(aliceReceiverAfter, aliceReceiver, "Bob changed Alice's receiver");
+        assertEq(aliceAfter, aliceBefore, "Bob changed Alice's stored shares");
+        assertGt(pool.claimable(bob), 0, "Bob could not choose his own service timing");
     }
 
     /// @dev PRD §6.4: partial fills. One large request must not block every small one behind it
     ///      until it can be paid in full.
-    function test_serviceQueue_partiallyFillsTheHeadRatherThanStalling() public {
+    function test_serviceWithdrawalRequest_partiallyServicesWithoutStalling() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _lend(pool.available());
-
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
 
         _setIdleTo(3_000e6);
-        pool.serviceQueue(10);
+        uint256 serviceable = pool.maxRequestRedeem(alice);
+        uint256 quoted = pool.previewRedeem(serviceable);
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, serviceable, quoted);
 
         _claim(alice);
-        assertEq(usdc.balanceOf(alice), 3_000e6);
-        (uint256 index, uint256 remaining) = pool.queuePosition(alice);
-        assertEq(index, 0, "still at the head");
-        assertApproxEqAbs(remaining, DEPOSIT - 3_000e6, 1, "and still owed the rest");
+        assertApproxEqAbs(usdc.balanceOf(alice), 3_000e6, 1, "cash-funded service payout");
+        (,, uint256 remainingShares,,) = pool.withdrawalRequest(alice);
+        assertGt(remainingShares, 0, "partial service cleared the whole request");
+        assertApproxEqAbs(pool.previewRedeem(remainingShares), DEPOSIT - 3_000e6, 2, "remaining request value");
     }
 
-    /// @notice Audit round 23, finding 12. A partial fill rounds the unit debit UP, and this is the
-    ///         assertion that can tell which way it rounds.
-    ///
-    /// @dev **The four #246 principal-unit invariants do not discriminate this.** Measured in round
-    ///      23: flipping `serviceQueue`'s `unitsToBurn` ceiling to a floor leaves all four green at
-    ///      128,000 calls each, and **3 of 5 campaigns never reach a partial fill at all**.
-    ///      Re-measured here on 2026-08-22 against this tree: all 29 lender invariants, including
-    ///      the four, pass at `(runs: 256, calls: 128000, reverts: 0)` with the ceiling flipped to a
-    ///      floor - cache cleared, unseeded, one invocation - while the assertion below goes red one
-    ///      wei wide.
-    ///
-    ///      **And the campaign's own reach instrument is provably a coin flip.** Round 23's
-    ///      `invariant_A23_10_partialFillsNeverHappen` asserts `reached == 0`, so it FAILS when a
-    ///      partial fill is reached. It fired at run 161 on the round-23 baseline seed; on seed
-    ///      `0x55ccdadb2b3b9336f404ed80090349e8225ac8fe3d93db1cf925ba53bbfd0a4c`, one independent
-    ///      invocation with `cache/invariant` cleared, it did not fire in 256 runs at all. Eight of
-    ///      the nine sibling censuses in the same bundle still fire, so the instruments work; this
-    ///      one moved. **A zero from an unseeded campaign reads as proof of impossibility and is
-    ///      not.** A branch a campaign may never enter cannot be guarded by that campaign. This
-    ///      test enters it deterministically, which is why it exists at all.
-    ///
-    ///      **The premise is asserted before the property, and it is the whole test.** Ceil and
-    ///      floor differ by at most one unit, so on an exact ratio *both* rounding modes satisfy
-    ///      every assertion below and the test would pass against the defect it is named for. The
-    ///      `assertEq(ceil, floor + 1)` line is therefore load-bearing: it fails the fixture rather
-    ///      than the contract if the trace stops being one wei wide. Every queue test written
-    ///      before yield exists in this file inherits an exact 1000:1 ratio, which is exactly how
-    ///      this branch went unguarded.
-    ///
-    ///      **Why UP is the correct direction.** The residual entry keeps `requestUnits - unitsToBurn`.
-    ///      Rounding the debit down leaves the entry holding a unit whose principal has already left
-    ///      through the fill, and `_burnPrincipalUnits` debits `netDeposits` in proportion to units
-    ///      burned - so a floor here under-debits the deposit-cap counter on every partial fill and
-    ///      lets residual principal accumulate against the cap. That is round-22 finding 3's
-    ///      cap-loosening direction, reached through the queue instead of through the doors.
-    function test_R23F12_aPartialFillRoundsTheUnitDebitUp() public {
+    /// @notice A deterministic partial service frees exactly the cash made claimable.
+    function test_R23F12_aPartialServiceDebitsCapUsageByTheExactClaim() public {
         uint256 shares = _deposit(alice, DEPOSIT);
-        // The skip is load-bearing for the same reason it is two tests down: at the instant of
-        // delivery the ratio is still exactly 1000:1 and nothing here would be inexact.
         _distributeYield(333_333_333);
         skip(Config.YIELD_STREAM_DURATION);
         _lend(pool.available());
 
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-
-        (,, uint256 entryShares) = pool.queueEntry(0);
-        uint256 entryUnits = pool.queueEntryPrincipalUnits(0);
-        uint256 totalUnitsBefore = pool.totalPrincipalUnits();
-        uint256 netDepositsBefore = pool.netDeposits();
-        assertGt(entryUnits, 0, "fixture: the entry carries no principal units to round");
+        (,, uint256 entryShares,,) = pool.withdrawalRequest(alice);
 
         _setIdleTo(3_000e6);
-        pool.serviceQueue(10);
+        uint256 sharesToService = pool.maxRequestRedeem(alice);
+        uint256 quoted = pool.previewRedeem(sharesToService);
+        uint256 usageBefore = _depositCapUsage(pool);
+        uint256 claimsBefore = pool.totalClaimable();
+        uint256 rawBefore = usdc.balanceOf(address(pool));
+        vm.prank(alice);
+        uint256 assetsOut = pool.serviceWithdrawalRequest(alice, sharesToService, quoted);
 
-        (,, uint256 entrySharesAfter) = pool.queueEntry(0);
-        uint256 entryUnitsAfter = pool.queueEntryPrincipalUnits(0);
-        uint256 sharesBurned = entryShares - entrySharesAfter;
-        assertGt(entrySharesAfter, 0, "fixture: the fill was not partial, so no rounding happened");
-        assertGt(sharesBurned, 0, "fixture: nothing was filled");
+        (,, uint256 entrySharesAfter,,) = pool.withdrawalRequest(alice);
 
-        uint256 roundedUp = Math.mulDiv(entryUnits, sharesBurned, entryShares, Math.Rounding.Ceil);
-        uint256 roundedDown = Math.mulDiv(entryUnits, sharesBurned, entryShares, Math.Rounding.Floor);
-
-        emit log_named_uint("R23F12 entry units before ", entryUnits);
-        emit log_named_uint("R23F12 entry shares before", entryShares);
-        emit log_named_uint("R23F12 shares burned      ", sharesBurned);
-        emit log_named_uint("R23F12 units burned       ", entryUnits - entryUnitsAfter);
-        emit log_named_uint("R23F12 ceiling            ", roundedUp);
-        emit log_named_uint("R23F12 floor              ", roundedDown);
-
-        // THE PREMISE. One wei wide, or this test cannot see the direction at all.
-        assertEq(roundedUp, roundedDown + 1, "fixture: the ratio is exact here, so this discriminates nothing");
-
-        assertEq(entryUnits - entryUnitsAfter, roundedUp, "the unit debit did not round up");
-        assertEq(entryUnitsAfter, entryUnits - roundedUp, "the residual entry kept a unit it no longer backs");
-        assertEq(
-            totalUnitsBefore - pool.totalPrincipalUnits(),
-            roundedUp,
-            "the aggregate unit counter moved by a different amount than the entry did"
-        );
-        // And the consequence the direction is chosen for: the cap counter is debited for the
-        // principal that actually left, never less.
-        assertGt(netDepositsBefore, pool.netDeposits(), "a partial fill did not debit the deposit-cap counter");
+        assertGt(entrySharesAfter, 0, "fixture: service was not partial");
+        assertEq(entryShares - entrySharesAfter, sharesToService, "service burned the wrong request slice");
+        assertEq(assetsOut, quoted, "service departed from its quote");
+        assertGt(assetsOut, 0, "fixture: service made no claim");
+        assertEq(_depositCapUsage(pool), usageBefore - assetsOut, "partial service cap debit drift");
+        assertEq(pool.totalClaimable(), claimsBefore + assetsOut, "partial service claim drift");
+        assertEq(usdc.balanceOf(address(pool)), rawBefore, "service transferred claim cash early");
     }
 
-    function test_serviceQueue_clearsTheEntryAndTheHeadWhenFullyPaid() public {
+    function test_serviceWithdrawalRequest_deletesTheRequestWhenFullyPaid() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _lend(pool.available());
-
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
         _setIdleTo(DEPOSIT);
-        pool.serviceQueue(10);
+
+        uint256 requestQuote = pool.previewRedeem(shares);
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, shares, requestQuote);
 
         assertEq(pool.queuedShares(), 0);
-        assertEq(pool.queueHead(), 1);
         assertEq(pool.balanceOf(address(pool)), 0, "escrow emptied");
-        assertEq(pool.totalSupply(), 0, "and the shares burned");
-
-        (uint256 index, uint256 remaining) = pool.queuePosition(alice);
-        assertEq(index, 0);
+        assertEq(pool.totalSupply(), 0, "shares burned");
+        (uint256 requestId, address receiver, uint256 remaining, uint256 serviceable, uint256 assets) =
+            pool.withdrawalRequest(alice);
+        assertEq(requestId, 0);
+        assertEq(receiver, address(0));
         assertEq(remaining, 0);
+        assertEq(serviceable, 0);
+        assertEq(assets, 0);
     }
 
     /// @dev The test above passes for a reason that has nothing to do with the queue: the first
     ///      deposit mints `S = 1000 * A`, so `(A+1)/(S+1000)` is exactly 1/1000 and both of
-    ///      `serviceQueue`'s conversions are lossless. Every queue test in this file inherits that
+    ///      request service's conversions are lossless. Every request test in this file inherits that
     ///      alignment. One epoch of yield destroys it, and yield is the pool's normal operation -
     ///      so the aligned case is the special one and it is the only case being tested.
     ///
     ///      With the ratio inexact, `convertToAssets` then `convertToShares` both floor, so the
     ///      shares burned come back short of the shares owed and the entry never reaches zero.
-    function test_serviceQueue_clearsTheEntryWhenTheShareRatioIsNotExact() public {
+    function test_serviceWithdrawalRequest_clearsAnInexactShareRatio() public {
         uint256 shares = _deposit(alice, DEPOSIT);
-        // The skip is load-bearing, not tidiness: since finding 6 the epoch lands on a clock, and
-        // at the instant of delivery the share ratio is still exactly 1000:1. Without it this test
-        // sets up none of the inexactness it is named for and passes on the wrong premise.
         _distributeYield(333_333_333);
         skip(Config.YIELD_STREAM_DURATION);
         _lend(pool.available());
@@ -2897,26 +2635,25 @@ contract LenderPoolTest is Test {
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
         _setIdleTo(pool.totalAssets());
-        pool.serviceQueue(10);
-
-        assertEq(pool.queuedShares(), 0, "a dust residual left the entry live");
-        assertEq(pool.queueHead(), 1, "the head never advanced past a fully paid lender");
-        assertEq(pool.balanceOf(address(pool)), 0, "escrow emptied");
-
-        // And the mapping released them, so they are not locked out of ever queueing again.
+        uint256 quoted = pool.previewRedeem(shares);
         vm.prank(alice);
-        vm.expectRevert(LenderPool.NothingQueued.selector);
+        pool.serviceWithdrawalRequest(alice, shares, quoted);
+
+        assertEq(pool.queuedShares(), 0, "an inexact residual left the request live");
+        assertEq(pool.balanceOf(address(pool)), 0, "escrow emptied");
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.WithdrawalRequestNotFound.selector, alice));
         pool.cancelWithdrawalRequest();
     }
 
     /// @dev The consequence, and the reason the entry above matters beyond one lender's tidiness.
     ///      An entry that cannot be cleared is at the head forever. `convertToAssets(residual)`
     ///      floors to zero, so servicing must release and step past it: otherwise everyone behind
-    ///      is blocked, `serviceQueue` reverts for good, and because `queuedShares` never returns
+    ///      is blocked, the former shared settlement reverted for good, and because `queuedShares` never returned
     ///      to zero, `available()` is pinned at zero and the pool can never lend again.
     ///
     ///      **This test could not enter the branch it is named for until audit round 15, and it
-    ///      would have passed against a `serviceQueue` with the dust branch deleted entirely.**
+    ///      would have passed with the former dust branch deleted entirely.**
     ///      Observed, not argued: deleting `if (convertToAssets(shares) != 0) break;` leaves the
     ///      old version green. It queued two lenders holding whole positions and funded both, so
     ///      no entry was ever worth zero and no release ever ran. The dust is now real and is
@@ -2926,40 +2663,21 @@ contract LenderPoolTest is Test {
     ///      about a thousand shares to the asset-wei, so any conversion of one share floors to
     ///      nothing. Asserted rather than assumed, so a change to the offset fails here loudly
     ///      instead of quietly retiring the branch.
-    function test_serviceQueue_dustAtTheHeadIsReleasedAndTheQueueMovesOn() public {
+    function test_dustRequestIsIsolatedAndCancellable() public {
         _deposit(alice, DEPOSIT);
-        uint256 bobShares = _deposit(bob, DEPOSIT);
-        // See the sibling test above: the epoch has to land before the ratio is inexact.
-        _distributeYield(333_333_333);
-        skip(Config.YIELD_STREAM_DURATION);
-        _lend(pool.available());
-
-        // Dust at the head, and a whole position behind it. Alice goes first with one share-wei.
-        assertEq(pool.convertToAssets(1), 0, "one share-wei is not dust here - the fixture ratio moved");
+        uint256 before = pool.balanceOf(alice);
         vm.prank(alice);
         pool.requestWithdrawal(1, alice);
-        vm.prank(bob);
-        pool.requestWithdrawal(bobShares, bob);
-        assertEq(pool.queueHead(), 0, "fixture: the dust must be the head");
+        assertEq(pool.maxRequestRedeem(alice), 0, "one share-wei is unexpectedly cash funded");
 
-        uint256 aliceHeldBefore = pool.balanceOf(alice);
-        _setIdleTo(pool.totalAssets());
-        pool.serviceQueue(10);
-
-        // The release half, which had no assertion anywhere before audit round 15: the shares go
-        // back to their owner rather than being burned for nothing, and the request is cleared so
-        // the lender is not locked out of ever queueing again.
-        assertEq(pool.balanceOf(alice), aliceHeldBefore + 1, "the dust was not handed back to its owner");
         vm.prank(alice);
-        vm.expectRevert(LenderPool.NothingQueued.selector);
-        pool.cancelWithdrawalRequest();
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.ServiceSharesExceedMaximum.selector, 1, 0));
+        pool.serviceWithdrawalRequest(alice, 1, 0);
 
-        // And the walk did not stop on it.
-        assertGt(pool.claimable(bob), 0, "the lender behind the dust was never paid");
-        assertEq(pool.queuedShares(), 0, "the queue never emptied");
-        assertEq(pool.queueHead(), 2, "the head did not advance past both entries");
-        _claim(bob);
-        assertGt(pool.available(), 0, "the pool can never lend again");
+        vm.prank(alice);
+        pool.cancelWithdrawalRequest();
+        assertEq(pool.balanceOf(alice), before, "dust cancellation did not return the share");
+        assertEq(pool.queuedShares(), 0, "dust request stayed live");
     }
 
     /// @dev Cancelled entries consume `maxEntries` as they are stepped over, so a call can spend
@@ -2972,44 +2690,20 @@ contract LenderPoolTest is Test {
     ///      fit in a block and the queue is shut permanently.
     ///
     ///      Found by the invariant suite, which reached it in nine calls.
-    function test_serviceQueue_budgetSpentOnCancelledEntriesStillMakesProgress() public {
-        // Three lenders inside the 25,000e6 deposit cap, so a third of it each rather than DEPOSIT.
-        uint256 each = 8_000e6;
-        uint256 aliceShares = _deposit(alice, each);
-        uint256 bobShares = _deposit(bob, each);
-        uint256 carolShares = _deposit(carol, each);
-        _lend(pool.available());
-
-        // Alice at the head, then two husks behind her, then Carol.
-        vm.prank(alice);
-        pool.requestWithdrawal(aliceShares, alice);
-        vm.prank(bob);
-        pool.requestWithdrawal(bobShares, bob);
-        vm.prank(bob);
-        pool.cancelWithdrawalRequest();
-        vm.prank(bob);
-        pool.requestWithdrawal(bobShares, bob);
-        vm.prank(bob);
-        pool.cancelWithdrawalRequest();
-        vm.prank(carol);
-        pool.requestWithdrawal(carolShares, carol);
-
-        _setIdleTo(pool.totalAssets());
-
-        // Pays Alice and stops on budget, leaving the head sitting on the first husk.
-        pool.serviceQueue(1);
-        assertEq(pool.claimable(alice), each, "alice should have been paid");
-        assertEq(pool.queueHead(), 1, "the head should have advanced onto the first husk");
-
-        // A budget of one now buys one husk-step and no payment. It must still commit that step.
-        pool.serviceQueue(1);
-        assertEq(pool.queueHead(), 2, "the husk step was rolled back");
-
-        // Which means repeated bounded calls always get there in the end.
-        pool.serviceQueue(1);
-        pool.serviceQueue(1);
-        assertEq(pool.claimable(carol), each, "carol was stranded behind the husks");
-        assertEq(pool.queuedShares(), 0, "the queue never emptied");
+    function test_repeatedCancelAndRequestDoesNotCreateSharedHusks() public {
+        uint256 shares = _deposit(alice, DEPOSIT);
+        uint256 priorId;
+        for (uint256 i = 0; i < 4; i++) {
+            vm.prank(alice);
+            pool.requestWithdrawal(shares, alice);
+            (uint256 requestId,,,,) = pool.withdrawalRequest(alice);
+            assertGt(requestId, priorId, "request id did not advance");
+            priorId = requestId;
+            vm.prank(alice);
+            pool.cancelWithdrawalRequest();
+        }
+        assertEq(pool.queuedShares(), 0, "cancel cycle left requested shares");
+        assertEq(pool.balanceOf(alice), shares, "cancel cycle lost shares");
     }
 
     /// @dev The queue has first call on every dollar. A pool that lends out money it already owes
@@ -3032,42 +2726,40 @@ contract LenderPoolTest is Test {
 
     /// @dev A lender whose shares are escrowed with no way back would be stranded exactly when the
     ///      queue cannot clear, which is the situation the queue exists for.
-    function test_cancel_returnsTheSharesAndTheQueuePosition() public {
+    function test_cancelReturnsSharesAndAllowsANewRequestId() public {
         uint256 shares = _deposit(alice, DEPOSIT);
-        // Half, not all: lending everything leaves idle sitting exactly on the reserve, so
-        // `available()` would be zero after the cancel for that reason rather than because of the
-        // queue, and the assertion below would prove nothing.
         _lend(pool.available() / 2);
 
-        vm.startPrank(alice);
+        vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
+        (uint256 firstId,,,,) = pool.withdrawalRequest(alice);
+        vm.prank(alice);
         pool.cancelWithdrawalRequest();
-        vm.stopPrank();
 
         assertEq(pool.balanceOf(alice), shares);
         assertEq(pool.queuedShares(), 0);
-        assertEq(pool.available() > 0, true, "and the pool can lend again");
+        assertGt(pool.available(), 0, "pool did not reopen after cancel");
 
-        // And they may re-queue, losing their place, which is the honest price of changing mind.
         vm.prank(alice);
         pool.requestWithdrawal(shares, alice);
-        (uint256 index,) = pool.queuePosition(alice);
-        assertEq(index, 0);
+        (uint256 secondId, address receiver, uint256 storedShares,,) = pool.withdrawalRequest(alice);
+        assertGt(secondId, firstId, "request id was reused");
+        assertEq(receiver, alice, "new fixed receiver");
+        assertEq(storedShares, shares, "new stored shares");
     }
 
-    function test_cancel_revertsWithNothingQueued() public {
+    function test_cancelRevertsWithNoControllerRequest() public {
         vm.prank(alice);
-        vm.expectRevert(LenderPool.NothingQueued.selector);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.WithdrawalRequestNotFound.selector, alice));
         pool.cancelWithdrawalRequest();
     }
 
     /// @dev A cancelled entry is left in place with zero shares so indices stay stable in events.
     ///      Servicing has to step over it rather than stop at it.
-    function test_serviceQueue_stepsOverACancelledEntry() public {
+    function test_cancelledRequestCannotBlockAnotherController() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         uint256 bobShares = _deposit(bob, DEPOSIT);
         _lend(pool.available());
-
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
         vm.prank(bob);
@@ -3076,58 +2768,56 @@ contract LenderPoolTest is Test {
         pool.cancelWithdrawalRequest();
 
         _setIdleTo(DEPOSIT);
-        pool.serviceQueue(10);
-
-        assertEq(pool.claimable(bob), DEPOSIT, "bob was paid past the hole alice left");
+        uint256 bobMaximum = pool.maxRequestRedeem(bob);
+        vm.prank(bob);
+        pool.serviceWithdrawalRequest(bob, bobMaximum, 0);
+        assertGt(pool.claimable(bob), 0, "Alice's cancellation blocked Bob");
         assertEq(pool.claimable(alice), 0);
     }
 
-    function test_serviceQueue_isPermissionlessButBounded() public {
-        uint256 aliceShares = _deposit(alice, DEPOSIT);
-        uint256 bobShares = _deposit(bob, DEPOSIT);
-        _lend(pool.available());
+    function test_serviceRequiresControllerOrOptedInOperatorAndIsShareBounded() public {
+        uint256 shares = _deposit(alice, DEPOSIT);
+        vm.prank(alice);
+        pool.requestWithdrawal(shares, alice);
+        uint256 maximum = pool.maxRequestRedeem(alice);
+        address keeper = makeAddr("keeper");
+
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, alice, keeper));
+        pool.serviceWithdrawalRequest(alice, maximum, 0);
 
         vm.prank(alice);
-        pool.requestWithdrawal(aliceShares, alice);
-        vm.prank(bob);
-        pool.requestWithdrawal(bobShares, bob);
-        _setIdleTo(2 * DEPOSIT);
+        pool.setRequestOperator(keeper, true);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.ServiceSharesExceedMaximum.selector, maximum + 1, maximum));
+        pool.serviceWithdrawalRequest(alice, maximum + 1, 0);
 
-        vm.prank(makeAddr("a passing keeper"));
-        uint256 serviced = pool.serviceQueue(1);
-        assertEq(serviced, 1, "bounded by maxEntries");
-        assertEq(pool.claimable(bob), 0);
-
-        pool.serviceQueue(1);
-        assertEq(pool.claimable(bob), DEPOSIT);
-        _claim(bob);
-        assertEq(usdc.balanceOf(bob), DEPOSIT);
+        vm.prank(keeper);
+        pool.serviceWithdrawalRequest(alice, maximum, 0);
+        assertGt(pool.claimable(alice), 0, "approved operator could not service");
     }
 
     /// @dev Two different "nothing to do" states, and they are worth telling apart. An empty queue
     ///      means nobody is waiting; a queue with no idle USDC behind it means somebody is waiting
     ///      and the money has not come back yet. A keeper polling this needs to know which.
-    function test_serviceQueue_distinguishesAnEmptyQueueFromAnUnfundedOne() public {
-        vm.expectRevert(LenderPool.QueueIsEmpty.selector);
-        pool.serviceQueue(1);
-
-        uint256 shares = _deposit(alice, DEPOSIT);
-        _lend(pool.available());
+    function test_serviceDistinguishesMissingRequestFromAnUnfundedRequest() public {
         vm.prank(alice);
-        pool.requestWithdrawal(shares, alice);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.WithdrawalRequestNotFound.selector, alice));
+        pool.serviceWithdrawalRequest(alice, 1, 0);
 
-        // The reserve is still sitting here, so the first call does real work: a partial fill that
-        // takes the idle balance to zero.
-        uint256 paid = pool.serviceQueue(10);
-        assertEq(paid, 1);
-        // The USDC is still in the contract, but it is set aside for alice and is no longer the
-        // pool's to pay anyone else with - which is what `_poolBalance` exists to express.
-        assertEq(pool.totalClaimable(), usdc.balanceOf(address(pool)), "all of it is spoken for");
-        assertEq(pool.unreservedIdle(), 0, "idle drained into the partial fill");
+        _deposit(alice, DEPOSIT);
+        _lend(pool.available());
+        uint256 immediate = pool.maxWithdraw(alice);
+        vm.prank(alice);
+        pool.withdraw(immediate, alice, alice);
+        uint256 remainingShares = pool.balanceOf(alice);
+        vm.prank(alice);
+        pool.requestWithdrawal(remainingShares, alice);
+        assertEq(pool.maxRequestRedeem(alice), 0, "fixture request is funded");
 
-        // Now there is a queue and nothing to pay it with, which is the other state.
-        vm.expectRevert(LenderPool.NothingToService.selector);
-        pool.serviceQueue(1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.ServiceSharesExceedMaximum.selector, 1, 0));
+        pool.serviceWithdrawalRequest(alice, 1, 0);
     }
 
     /// @dev The invariant that has to survive every path above: escrowed shares are exactly the
@@ -3169,9 +2859,9 @@ contract LenderPoolTest is Test {
 
     /// @dev Round 10, finding 3. The payout used to be a push to a caller-chosen receiver from
     ///      inside the shared FIFO loop, so one entry naming a blacklisted address reverted every
-    ///      `serviceQueue` call forever - freezing every lender behind it and all lending with it.
+    ///      shared settlement call forever, freezing every lender behind it and all lending with it.
     ///      `MockUSDC` models the blacklist because real USDC on Base has one.
-    function test_serviceQueue_survivesAReceiverThatCannotBePaid() public {
+    function test_requestServiceSurvivesAReceiverThatCannotBePaid() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         uint256 bobShares = _deposit(bob, DEPOSIT);
         _lend(pool.available());
@@ -3181,20 +2871,19 @@ contract LenderPoolTest is Test {
         pool.requestWithdrawal(aliceShares, frozen);
         vm.prank(bob);
         pool.requestWithdrawal(bobShares, bob);
-
         usdc.setBlocked(frozen, true);
         _setIdleTo(2 * DEPOSIT);
 
-        // The queue drains regardless: nothing is pushed, so nothing can refuse delivery.
-        pool.serviceQueue(10);
-        assertEq(pool.queuedShares(), 0, "the queue was bricked by one entry");
-        assertEq(pool.claimable(bob), DEPOSIT, "the lender behind was never paid");
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, aliceShares, 0);
+        vm.prank(bob);
+        pool.serviceWithdrawalRequest(bob, bobShares, 0);
+        assertEq(pool.queuedShares(), 0, "blocked receiver stopped independent service");
+        assertEq(pool.claimable(bob), DEPOSIT, "Bob was not paid");
 
-        // Only the blocked receiver's own claim fails, and only when they try to take it.
         vm.prank(frozen);
         vm.expectRevert(abi.encodeWithSelector(MockUSDC.Blocked.selector, frozen));
         pool.claim();
-
         _claim(bob);
         assertEq(usdc.balanceOf(bob), DEPOSIT);
     }
@@ -3221,7 +2910,9 @@ contract LenderPoolTest is Test {
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, receiver);
         _setIdleTo(DEPOSIT);
-        pool.serviceQueue(10);
+        uint256 quoted = pool.previewRedeem(aliceShares);
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, aliceShares, quoted);
         setAside = pool.claimable(receiver);
         assertGt(setAside, 0, "fixture: nothing was set aside for the receiver");
     }
@@ -3281,18 +2972,18 @@ contract LenderPoolTest is Test {
     /// @notice The owner's shares are gone by the time either door is tried, which is round-22
     ///         finding 12's headline and is NOT closed by this sweep.
     /// @dev Before servicing, `alice` could `cancelWithdrawalRequest` and take her shares back.
-    ///      After a stranger's free `serviceQueue` the shares are burned and the money sits under
+    ///      After controller-authorized service the shares are burned and the money sits under
     ///      the **receiver's** name. `claimFor` widens who may pull that money out; it does not
     ///      give the owner back the ability to undo the conversion. Recorded as an assertion so the
     ///      next round reads the residual rather than the sweep.
-    function test_claimFor_doesNotRestoreTheOwnersCancelledPosition() public {
+    function test_claimForDoesNotRestoreACompletedControllerRequest() public {
         address frozen = makeAddr("blacklistedReceiver");
         _serviceInFavourOf(frozen);
         usdc.setBlocked(frozen, true);
 
-        assertEq(pool.balanceOf(alice), 0, "the owner still holds shares, so nothing was crystallised");
+        assertEq(pool.balanceOf(alice), 0, "owner still holds serviced shares");
         vm.prank(alice);
-        vm.expectRevert(LenderPool.NothingQueued.selector);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.WithdrawalRequestNotFound.selector, alice));
         pool.cancelWithdrawalRequest();
     }
 
@@ -3319,11 +3010,12 @@ contract LenderPoolTest is Test {
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
         _setIdleTo(2 * DEPOSIT);
-        pool.serviceQueue(10);
+        vm.prank(alice);
+        pool.serviceWithdrawalRequest(alice, aliceShares, 0);
 
-        uint256 priceAfterFill = pool.convertToAssets(bobShares);
+        uint256 priceAfterService = pool.convertToAssets(bobShares);
         _claim(alice);
-        assertEq(pool.convertToAssets(bobShares), priceAfterFill, "collecting moved the share price");
+        assertEq(pool.convertToAssets(bobShares), priceAfterService, "collecting moved the share price");
     }
 
     /// @dev Round 10, finding 4. With no shares outstanding the assets back only the virtual shares
@@ -3398,11 +3090,14 @@ contract LenderPoolTest is Test {
     /// @dev Servicing sets money aside rather than sending it, so a test that wants to see a
     ///      balance move has to collect it. That separation is the point of the pull: see the
     ///      `claimable` NatSpec on why a push let one entry block the whole queue.
-    function _serviceAndClaim(uint256 maxEntries, address[] memory receivers) internal {
-        pool.serviceQueue(maxEntries);
-        for (uint256 i = 0; i < receivers.length; i++) {
-            if (pool.claimable(receivers[i]) == 0) continue;
-            vm.prank(receivers[i]);
+    function _serviceAndClaim(uint256, address[] memory controllers) internal {
+        for (uint256 i = 0; i < controllers.length; i++) {
+            uint256 shares = pool.maxRequestRedeem(controllers[i]);
+            if (shares == 0) continue;
+            vm.prank(controllers[i]);
+            pool.serviceWithdrawalRequest(controllers[i], shares, 0);
+            if (pool.claimable(controllers[i]) == 0) continue;
+            vm.prank(controllers[i]);
             pool.claim();
         }
     }
@@ -3412,13 +3107,12 @@ contract LenderPoolTest is Test {
         pool.claim();
     }
 
-
     // ── the queue reservation, audit round 21 finding 7, OPEN ────────────────
 
     /// @notice The prescribed clamp on the queue reservation is INERT. Recorded, not shipped.
     /// @dev Audit round 21 finding 7: `unreservedIdle()` and `available()` hold back
     ///      `_convertToAssets(queuedShares, Ceil)` - the **un-impaired** valuation - while
-    ///      `serviceQueue` refuses entirely under a mark, so a lender who queues reserves a claim
+    ///      controller service executes at the live marked price, so a request reserves cash
     ///      they are forbidden to be paid, at a price they would never be paid at, and nothing
     ///      permissionless drains it. A parker holding 15.8% of the book made one free
     ///      `requestWithdrawal` and an unqueued lender's `maxWithdraw` went 3,567.125000 -> 0 for
@@ -3444,7 +3138,7 @@ contract LenderPoolTest is Test {
     ///        15,407.894736, so a markdown buys 138.157894 of lending capacity.
     ///        `invariant_worseNewsNeverBuysMoreLending` is the shipped guard for exactly that.
     ///      - **Serve-while-marked restores audit round 15 and IS round-22 finding 12.** MEASURED:
-    ///        a bystander's free `serviceQueue` burns a queued lender's whole 3,750,000,000,000
+    ///        a controller-authorized service burns only the requested share amount
     ///        escrowed shares for 563.230263 - 15.02% of the un-impaired claim, destroyed
     ///        permanently at a stranger's chosen instant.
     ///
@@ -3456,39 +3150,25 @@ contract LenderPoolTest is Test {
     ///
     ///      Until something survives, the two `assertEq`s below are a tripwire: whichever of them
     ///      goes red says the shape changed.
-    function test_queueReservation_theGoldfinchClampIsInertHere() public {
+    function test_requestReservationIsCashProRataAndLeavesTheOtherLenderAnExit() public {
         uint256 aliceShares = _deposit(alice, DEPOSIT);
         _deposit(bob, DEPOSIT);
-        // Lend the book down to the float, which is the state the queue exists for.
         _lend(pool.available());
 
-        uint256 victimBefore = pool.maxWithdraw(bob);
-        assertGt(victimBefore, 0, "control: the unqueued lender's door is open before the park");
-
+        uint256 idle = _poolBalanceFromPublicReads();
         vm.prank(alice);
         pool.requestWithdrawal(aliceShares, alice);
 
-        emit log_named_uint("F7 victim maxWithdraw before the park", victimBefore);
-        emit log_named_uint("F7 victim maxWithdraw after the park ", pool.maxWithdraw(bob));
-        emit log_named_uint("F7 unreservedIdle                    ", pool.unreservedIdle());
-        emit log_named_uint("F7 the parker reserved               ", _queueClaimCeil());
-        emit log_named_uint("F7 the pool actually holds           ", _poolBalanceFromPublicReads());
+        uint256 expectedReserve = Math.mulDiv(idle, aliceShares, pool.totalSupply(), Math.Rounding.Ceil);
+        assertEq(pool.queueCashReserve(), expectedReserve, "request reserve is not cash pro rata");
+        assertEq(pool.unreservedIdle(), idle - expectedReserve, "unreserved cash identity");
+        assertGt(pool.maxWithdraw(bob), 0, "one request zeroed the other lender's immediate exit");
 
-        // The harm, in one line: one free call by one lender zeroed a different lender's quote.
-        assertEq(pool.maxWithdraw(bob), 0, "the park did not shut the unqueued lender's door");
-
-        // ── the prescribed clamp, built ──────────────────────────────────────
-        uint256 idle = _poolBalanceFromPublicReads();
-        uint256 owed = _queueClaimCeil();
-        uint256 clampedReservation = owed < idle ? owed : idle;
-
-        assertEq(idle - clampedReservation, pool.unreservedIdle(), "the clamp moved unreservedIdle");
-        assertEq(
-            _availableUnderTheClamp(idle, clampedReservation),
-            pool.available(),
-            "the clamp moved available()"
-        );
-        assertGt(owed, idle, "fixture: the clamp must actually bind, or this proves nothing");
+        uint256 postRequestBook = pool.totalAssets() - expectedReserve;
+        uint256 postRequestFloat = (postRequestBook * Config.RESERVE_RATIO_BPS) / Config.BPS;
+        uint256 held = expectedReserve + postRequestFloat;
+        uint256 expectedAvailable = idle > held ? idle - held : 0;
+        assertEq(pool.available(), expectedAvailable, "post-request hot float identity");
     }
 
     // ── audit round 22 finding 2: the exit that empties the book ─────────────
@@ -3549,9 +3229,7 @@ contract LenderPoolTest is Test {
                 emit log_named_uint("R22F2 mark == principal, destroyed", valueBefore - conserved);
             }
             assertGe(
-                conserved + 2,
-                valueBefore,
-                "a mark somewhere in this range destroys book value that nobody realised"
+                conserved + 2, valueBefore, "a mark somewhere in this range destroys book value that nobody realised"
             );
 
             vm.revertToState(clean);
@@ -3625,9 +3303,9 @@ contract LenderPoolTest is Test {
     ///      shipped pair agreeing only to within two wei. Exact is the property, because it is the
     ///      identity that makes the reported maximum an executable bound rather than a quote.
     ///
-    ///      ERC-4626 also forbids any of the four from reverting. None of them makes an external
-    ///      call and every conversion is a `mulDiv` whose result is bounded by an input, so calling
-    ///      them here is the assertion.
+    ///      ERC-4626 also forbids any of the four from reverting. Their only external dependency is
+    ///      one gas-bounded asset-balance probe that maps failure to zero, and every conversion uses
+    ///      saturating arithmetic, so calling them here is the assertion.
     /// forge-config: default.fuzz.runs = 256
     function testFuzz_R22F2_theMaxViewsConformAcrossTheMarkRange(uint256 markSeed) public {
         _deposit(alice, DEPOSIT);
@@ -3666,9 +3344,7 @@ contract LenderPoolTest is Test {
     ///      price is an exact `10 ** offset` - which every deposit-only fixture is, including
     ///      `test_maxWithdrawReportsWhatCanActuallyBeTakenNow` - the two agree exactly, and so do
     ///      they whenever the caller's own balance is the binding term. On an inexact price with the
-    ///      idle cash binding, the derived figure is exactly **one wei lower** and never higher:
-    ///      8,304.579169 against 8,304.579170, found in six fuzz runs once a donation is in the
-    ///      fixture.
+    ///      idle cash binding, the derived figure can be exactly one wei lower and never higher.
     ///
     ///      **That wei is the conservative side of a disagreement the shipped pair already had, not
     ///      a new one.** Today `maxWithdraw` reports the full idle cash while `maxRedeem` reports
@@ -3682,24 +3358,17 @@ contract LenderPoolTest is Test {
     ///      share count whose payout exceeds the idle cash the pool actually holds. A maximum that
     ///      cannot be executed is a worse ERC-4626 defect than a maximum that is one wei short.
     /// forge-config: default.fuzz.runs = 256
-    function testFuzz_R22F2_theBoundIsInertWhileNothingIsReserved(
-        uint256 lentSeed,
-        uint256 heldSeed,
-        uint256 donationSeed
-    ) public {
+    function testFuzz_R22F2_theBoundIsInertWhileNothingIsReserved(uint256 lentSeed, uint256 heldSeed, uint256 yieldSeed)
+        public
+    {
         uint256 held = bound(heldSeed, 1e6, DEPOSIT);
         _deposit(alice, held);
         _deposit(bob, DEPOSIT);
 
-        // **Breaks the exact 1000:1 share ratio, and without this the test is far weaker than it
-        // reads.** A pool built only out of deposits sits at exactly `10 ** offset` shares per
-        // asset, and on that ratio every conversion here round-trips exactly - so a fuzz over
-        // deposit sizes alone reports inertness for an expression that is inert only on that one
-        // ratio. MEASURED: without this line an `assertEq` here passes 256 runs; with it the same
-        // `assertEq` fails on run six, at one wei. A donation is the shortest route to an inexact
-        // price, because `totalAssets()` reads a raw `balanceOf` - the same reachability
-        // `maxDeposit`'s NatSpec is written around.
-        usdc.mint(address(pool), bound(donationSeed, 0, DEPOSIT));
+        // Break the exact 1000:1 share ratio through recognized yield. Raw donations are excluded
+        // from canonical cash and therefore cannot be used as a pricing fixture.
+        _distributeYield(bound(yieldSeed, 1, DEPOSIT));
+        skip(Config.YIELD_STREAM_DURATION + 1);
 
         _lend(bound(lentSeed, 1, pool.available()));
 
@@ -3717,36 +3386,28 @@ contract LenderPoolTest is Test {
         );
     }
 
-    /// @notice A deposit may not mint zero shares.
-    /// @dev The poisoned end state this finding leads to, closed from the other side. Once the
-    ///      share price is high enough that a deposit rounds to nothing, `deposit` used to take the
-    ///      USDC and mint nothing for it - a silent, total loss for the depositor and a windfall for
-    ///      everyone already in. Reached here by the shortest honest route rather than through the
-    ///      crush: `totalAssets()` reads a raw `balanceOf`, so a donation moves the price without
-    ///      minting anything, which is the same donation `maxDeposit`'s NatSpec is written around.
-    ///
-    ///      `mint` is unaffected in practice - it is quoted in shares, so a caller asking for zero
-    ///      shares is the only way to reach this from that side, and refusing that is right too.
-    function test_R22F2_depositCannotMintZeroShares() public {
+    /// @notice A raw donation cannot raise the entry price or turn a valid deposit into zero shares.
+    function test_R22F2_donationCannotCreateAZeroShareDeposit() public {
         _deposit(alice, 1);
+        uint256 quoteBefore = pool.previewDeposit(1);
+        uint256 assetsBefore = pool.totalAssets();
+        uint256 usageBefore = _depositCapUsage(pool);
         usdc.mint(address(pool), 1_000e6);
 
-        assertEq(pool.previewDeposit(1), 0, "fixture: this deposit must be the zero-share one");
+        assertGt(quoteBefore, 0, "fixture: the deposit must mint shares");
+        assertEq(pool.previewDeposit(1), quoteBefore, "donation changed the entry price");
+        assertEq(pool.totalAssets(), assetsBefore, "donation changed NAV");
+        assertEq(_depositCapUsage(pool), usageBefore, "donation changed cap usage");
+        assertEq(_unmanagedSurplus(pool), 1_000e6, "donation was not isolated");
 
-        vm.expectRevert(LenderPool.ZeroAmount.selector);
         vm.prank(bob);
-        pool.deposit(1, bob);
-
-        // CONTROL: the same pool still takes a deposit large enough to buy a share.
-        vm.prank(bob);
-        assertGt(pool.deposit(1e6, bob), 0, "a real deposit was refused as well");
+        assertEq(pool.deposit(1, bob), quoteBefore, "execution departed from the donation-inert quote");
     }
-
 
     // ── round-28 item 10 (round-25 A6 F4): the pool refuses entry while paused ──
     //
     // The pause shuts `deposit` and `mint` and nothing else. Every test below that touches an exit
-    // is there to hold that line: `withdraw`, `redeem`, `requestWithdrawal`, `serviceQueue` and
+    // is there to hold that line: `withdraw`, `redeem`, `requestWithdrawal`, `serviceWithdrawalRequest` and
     // `claim` must keep working, and keep working *correctly*, while the door is shut. That is the
     // entire argument for putting this switch on the guardian's key rather than the owner's, so a
     // change that closes an exit has not tightened this contract, it has invalidated the reasoning
@@ -3860,8 +3521,6 @@ contract LenderPoolTest is Test {
     ///      rather than to edit the test - the fast key's reach is justified by this and by nothing
     ///      else.
     function test_G4_everyExitStaysOpenAndStaysCorrectWhilePaused() public {
-        // Three lenders under the 25,000.000000 cap, so the fixture is refused for nothing but the
-        // reason under test.
         uint256 stake = 8_000e6;
         uint256 aliceShares = _deposit(alice, stake);
         _deposit(bob, stake);
@@ -3870,35 +3529,30 @@ contract LenderPoolTest is Test {
         vm.prank(admin);
         pool.pause();
 
-        // 1. The immediate pair, priced exactly as they would be with the door open.
         uint256 quoted = pool.previewRedeem(aliceShares / 2);
         vm.prank(alice);
         uint256 paid = pool.redeem(aliceShares / 2, alice, alice);
-        assertEq(paid, quoted, "redeem was repriced by the pause");
+        assertEq(paid, quoted, "redeem was repriced by pause");
 
         uint256 assets = pool.maxWithdraw(bob);
-        assertGt(assets, 0, "maxWithdraw went to zero, which would be an exit shut by the pause");
         vm.prank(bob);
         pool.withdraw(assets, bob, bob);
 
-        // 2. The queue, and the pull payment at the end of it. Lend the float out first so the
-        //    request cannot simply be paid from idle - the queue is the exit that matters here.
         _lend(pool.available());
         vm.prank(carol);
         pool.requestWithdrawal(carolShares, carol);
-        assertEq(pool.queuedShares(), carolShares, "a queued exit was refused while paused");
-
         _repay(stake);
-        vm.prank(alice);
-        uint256 serviced = pool.serviceQueue(5);
-        assertGt(serviced, 0, "the servicing walk was shut by the pause");
 
-        uint256 owed = pool.claimable(carol);
-        assertGt(owed, 0, "the queue paid nothing");
+        uint256 serviceable = pool.maxRequestRedeem(carol);
+        uint256 requestQuote = pool.previewRedeem(serviceable);
+        vm.prank(carol);
+        uint256 serviced = pool.serviceWithdrawalRequest(carol, serviceable, requestQuote);
+        assertGt(serviced, 0, "request service was shut by pause");
+
         uint256 heldBefore = usdc.balanceOf(carol);
         vm.prank(carol);
         pool.claim();
-        assertEq(usdc.balanceOf(carol) - heldBefore, owed, "the pull payment was shut by the pause");
+        assertEq(usdc.balanceOf(carol) - heldBefore, serviced, "claim was shut by pause");
     }
 
     // ── the role itself ──────────────────────────────────────────────────────
@@ -3992,15 +3646,6 @@ contract LenderPoolTest is Test {
     /// @dev The un-impaired, ceiling-rounded claim the queue holds back. `convertToAssets` rounds
     ///      the other way, so the formula is restated here rather than approximated - a one-wei
     ///      difference would make the `assertEq`s above pass for the wrong reason.
-    function _queueClaimCeil() internal view returns (uint256) {
-        return Math.mulDiv(pool.queuedShares(), pool.totalAssets() + 1, pool.totalSupply() + 1_000, Math.Rounding.Ceil);
-    }
-
-    function _availableUnderTheClamp(uint256 idle, uint256 clampedReservation) internal view returns (uint256) {
-        uint256 spare = idle - clampedReservation;
-        uint256 float = (pool.totalAssets() * Config.RESERVE_RATIO_BPS) / Config.BPS;
-        return spare > float ? spare - float : 0;
-    }
 
     function _distributeYield(uint256 amount) internal {
         usdc.mint(harvester, amount);

@@ -1069,11 +1069,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // **Audit round 20 priced that last sentence, and it was expensive.** Once
         // `Config.AUCTION_RESET_WINDOW` has closed too, `cancel` was the *only* legal move on a
         // healed position, and this refusal was only the second of five things that then stood with
-        // no clock on any of them: the lender pool's mark and its withdrawal queue, this refusal,
-        // four wiring setters, and the collateral that did the healing. `expireToWorkout` now
-        // dispatches a healed position into the `cancel` body rather than reverting on it, so the
-        // state has an exit the docstrings actually name. This guard is unchanged and still needed:
-        // the exit is still a call somebody has to make.
+        // no clock on any of them: the lender pool's mark, the superseded FIFO design's global
+        // withdrawal refusal, this refusal, four wiring setters, and the collateral that did the
+        // healing. Controller-scoped requests no longer stop globally; the same standing mark now
+        // lowers their live execution quotes. `expireToWorkout` dispatches a healed position into
+        // the `cancel` body rather than reverting on it, so the state has an exit the docstrings
+        // actually name. This guard is unchanged and still needed: the exit is still a call
+        // somebody has to make.
         //
         // Refusing costs a borrower under auction nothing they are entitled to - they can still
         // repay their way out, which clears the auction on the next `cancel` or `expireToWorkout` -
@@ -1397,20 +1399,22 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      Phase 3 shortfall. Until this existed the counter was declared but never
     ///      written, which made one term of the solvency invariant vacuous.
     ///
-    ///      **Being permissionless gives the withdrawal queue's refusal a price, and the price is
-    ///      one wei.** `LenderPool.serviceQueue` stops while `exitReserve()` is non-zero, and a
-    ///      donation here is netted off that figure synchronously, so a stranger can switch the
-    ///      refusal off by covering the mark. Audit round 16 raised it and it is **not** an
-    ///      extraction, for a reason worth writing down as the invariant it actually is:
+    ///      **Audit round 16 priced this permissionless top-up against the superseded FIFO exit
+    ///      gate.** A one-wei donation could move `exitReserve()` to zero and switch the old global
+    ///      refusal off. Controller-scoped requests no longer stop at a non-zero reserve: they
+    ///      quote the live marked exit price, and only the controller or an approved operator may
+    ///      execute subject to `minAssetsOut`. A donation is still netted off the reserve
+    ///      synchronously and therefore raises that quote. It is **not** an extraction, for a
+    ///      reason worth writing down as the invariant it actually is:
     ///
     ///          exitReserve() == 0  implies  insuranceCover >= totalImpairment, or nothing is lent
     ///
-    ///      so at the moment the queue reopens, either the shortfall is provably absorbed by this
-    ///      fund or the pool has no exposure to absorb it with - and the un-impaired price the
-    ///      queue then pays is the correct one. The donor pays the whole mark to gain a fraction of
-    ///      it. **The safety rests on that inequality and not on the gate**, which is worth being
-    ///      explicit about because the commit that introduced the gate is titled for the truncation
-    ///      it replaced and the comments around it credit the gate.
+    ///      so when the reserve reaches zero, either the shortfall is provably absorbed by this
+    ///      fund or the pool has no exposure to absorb it with, and the un-impaired execution price
+    ///      is correct. The donor pays the whole mark to gain a fraction of it. **The safety rests
+    ///      on that inequality, controller authorization and the execution floor, not on the old
+    ///      gate**, which is worth being explicit about because the commit that introduced the
+    ///      gate is titled for the truncation it replaced and the historical comments credited it.
     function fundInsurance(uint256 amount) external nonReentrant {
         _requireNonZero(amount);
         insuranceFund += amount;
@@ -2263,12 +2267,14 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      learn which borrower to name was to replay `Impaired` logs off chain. The pool now
     ///      publishes the set and this walks it.
     ///
-    ///      What made it worth building rather than documenting is what a stale mark now costs.
-    ///      Audit round 15 keyed the withdrawal queue's refusal on `exitReserve() != 0`, which is
-    ///      sound and which turned every pre-existing stale mark from a wrong exit price into a
-    ///      total freeze of the queue. Executed: a debt of zero, 24,371 USDC of idle cash, and the
-    ///      queue shut. **Widening what a condition governs re-prices every latent defect that can
-    ///      reach it.**
+    ///      What made it worth building rather than documenting is what a stale mark costs. Under
+    ///      the superseded FIFO withdrawal design, audit round 15 keyed a global service refusal on
+    ///      `exitReserve() != 0` and turned every pre-existing stale mark from a wrong exit price
+    ///      into a total freeze. Historical execution: a debt of zero, 24,371 USDC of idle cash,
+    ///      and no request serviced. Controller-scoped requests remove that global refusal, but a
+    ///      stale-high mark still leaves every request quoting a stale-low exit price until the
+    ///      controller refuses through `minAssetsOut` or somebody refreshes it. **Widening what a
+    ///      condition governs re-prices every latent defect that can reach it.**
     ///
     ///      **Downward, and that is load-bearing rather than stylistic.** Releasing a mark
     ///      swap-pops the tail of the pool's set into the vacated slot. Walking upward would step
@@ -2281,13 +2287,14 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///
     ///      **The bound needs a cursor, and audit round 17 found it missing.** This used to restart
     ///      at `count - 1` on every call, so any `maxBorrowers` below `count` re-visited the same
-    ///      tail forever. Marks append, so the *oldest* mark - the one the clock has had longest to
-    ///      make stale, and therefore the one freezing the queue - sits nearest index 0 and was
-    ///      reached last or never. Executed: twenty-five consecutive `refreshImpairments(1)` calls
-    ///      each reported one refresh, changed nothing, and left `serviceQueue` reverting
-    ///      `QueueHeldByReserve` over 23,292 USDC of idle cash and one queued lender. Only a call
-    ///      spanning the whole set cleared it - which is the unbounded call the bound exists to
-    ///      avoid.
+    ///      tail forever. Marks append, so the *oldest* mark, the one the clock has had longest to
+    ///      make stale, sits nearest index 0 and was reached last or never. Under the superseded
+    ///      FIFO design that mark froze global service. Historical execution: twenty-five
+    ///      consecutive `refreshImpairments(1)` calls each reported one refresh, changed nothing,
+    ///      and left batch service refusing over 23,292 USDC of idle cash and one waiting lender.
+    ///      Under controller-scoped requests the equivalent stale state depresses the request's
+    ///      live quote instead. Only a call spanning the whole set cleared it, which is the
+    ///      unbounded call the bound exists to avoid.
     ///
     ///      The old NatSpec claimed "repeated bounded calls always make progress", reasoning that
     ///      each iteration either clears a mark or leaves a live one for later. A live tail entry
@@ -2350,9 +2357,10 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
             // `try`-swallowed, so a pool refusing all of them reported a full sweep. **Audit round
             // 19 found the same trace after that fix, through a different cause**: `impair` returns
             // early and *silently* when the figure has not changed, so the `try` succeeded and a
-            // no-op counted. Five calls, `refreshed = 1` each, zero `Impaired` events, `exitReserve`
-            // unmoved and the queue still shut on that mark - reported as work done to the one
-            // operator the refusal exists to direct.
+            // no-op counted. Five calls, `refreshed = 1` each, zero `Impaired` events and an
+            // unmoved `exitReserve`. The superseded FIFO design still had global service shut on
+            // that mark; controller-scoped requests still had stale-low quotes. Both traces were
+            // reported as work done to the operator this function exists to direct.
             //
             // The direction of the remaining error is worth stating: this can now under-report a
             // sweep that genuinely had nothing to do, and can never over-report one. An operator
@@ -2402,14 +2410,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///
     ///      What is true, and is the property worth relying on: absent a new `borrow` the debt is
     ///      monotonically non-increasing, so a caller choosing a later block can only lower the
-    ///      mark and *raise* the exit price. The residual is the other direction - a caller may
-    ///      decline to refresh and settle against a stale-high mark. **This used to say the queue's
-    ///      `minAssets` floor answered that, and audit round 14 deleted the floor**, so for two
-    ///      rounds this file cited a mechanism that does not exist and `LenderPool` documented the
-    ///      deletion a few screens away. The staleness is real, one-directional and currently
-    ///      unanswered; it is recorded as an open item rather than papered over here. State it as a
-    ///      direction, not as an absence: this is exactly the sort of claim
-    ///      `LenderPool.requestWithdrawal` was reading off this file.
+    ///      mark and *raise* the exit price. The residual is the other direction: a caller may
+    ///      decline to refresh and offer execution against a stale-high mark. The superseded FIFO
+    ///      API once had a `minAssets` floor and audit round 14 deleted it. Controller-scoped
+    ///      service now restores the protection as caller-chosen `minAssetsOut`: an authorized
+    ///      controller or operator can refuse an execution below that floor, but the request stays
+    ///      pending until the mark is refreshed or the controller accepts the live quote. The floor
+    ///      protects execution; this refresh path remains what corrects the stale price.
     ///
     ///      Recovery needs no branch of its own, and the reason is a disjointness claim rather than
     ///      an ordering one. A fill reduces `currentDebtOf` by the proceeds, and the auction's
@@ -2457,9 +2464,11 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
         // **Recovery already inside the auction, netted off before anyone can spend the un-netted
         // figure.** Audit round 15: `_bid` holds the pointer above set across the winner's ERC-1155
-        // callback so the mark cannot be released early, and a winning bidder used that standing
-        // mark to settle a queued lender through the permissionless `serviceQueue`, on auctions
-        // whose realised loss ended at zero.
+        // callback so the mark cannot be released early. Under the superseded FIFO API, a winning
+        // bidder used that standing mark to trigger permissionless batch service for another
+        // lender on auctions whose realised loss ended at zero. Controller-scoped service now
+        // requires the controller or an approved operator, but pre-callback recognition still
+        // ensures any authorized execution sees the recovery-adjusted mark.
         //
         // This is not a forecast and does not reintroduce one. It is USDC the auction has already
         // taken from the winner, measured as a balance delta, non-zero only between that payment
@@ -2500,10 +2509,11 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///         #159 moved the count from iterations to calls that landed. A landing on an unchanged
     ///         value is still not a refresh: `impair` returns early and silently when
     ///         `amount == previous`, so the `try` succeeded, this returned true, and the sweep told
-    ///         an operator it had refreshed a mark it had not touched - over a withdrawal queue
-    ///         frozen on that exact mark. The pool now says whether it wrote; this reports what it
-    ///         said rather than inferring it from a second read, which would be a new selector
-    ///         called bare on the pool pointer and would owe a probe in `setLenderPool`.
+    ///         an operator it had refreshed a mark it had not touched. Under the superseded FIFO
+    ///         design that exact mark froze global service; now it leaves controller request quotes
+    ///         stale-low. The pool says whether it wrote, so this reports what it said rather than
+    ///         inferring it from a second read, which would be a new selector called bare on the
+    ///         pool pointer and would owe a probe in `setLenderPool`.
     function _setImpairment(address borrower, uint256 amount) private returns (bool moved) {
         address pool = lenderPool;
         if (pool == address(0)) return false;
@@ -3132,11 +3142,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
         // **The mark is the debt, so it has to move when the debt does.** Audit round 13.
         //
         // The six notification sites were all auction transitions, derived from "how does a
-        // liquidation end". Repaying is not a transition and notifies nobody - and `repayFor` is
+        // liquidation end". Repaying is not a transition and notifies nobody, and `repayFor` is
         // permissionless, so a stranger can cure a liquidated borrower's debt entirely while the
-        // pool goes on reserving the whole of it. The permissionless `serviceQueue` then settles a
-        // queued lender against a shortfall that no longer exists, and a later `refreshImpairment`
-        // releases the mark into the share price of whoever stayed.
+        // pool goes on reserving the whole of it. Under the superseded FIFO API, permissionless
+        // batch service could then crystallise another lender against a shortfall that no longer
+        // existed. Controller-scoped service removes the stranger trigger, but an authorized
+        // controller or operator could still accept that stale marked quote before a later
+        // `refreshImpairment` released the mark into the share price of whoever stayed.
         //
         // `LiquidationAuction.workoutSettle` already refreshes on exactly this reasoning, for a
         // tranche that pays real debt down. This is the same event one contract over, and the set

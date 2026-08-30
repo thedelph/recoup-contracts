@@ -22,6 +22,18 @@
     "MockBond": "0x5e471466f21f7ad57990f58aee2e0e817c8fbfa6",
     "MockFarm": "0x203276cb4d823643448619f02d7f42dbabe8f11f"
   },
+  "lockState": {
+    "status": "OPEN - PRE-LOCKDOWN BYTECODE. NOT A GAP IN THE RECORD, A STATEMENT ABOUT THE CHAIN.",
+    "verifiedBy": "forge script script/AssertLocked.s.sol:AssertMockStackLocked --rpc-url base_sepolia",
+    "verifiedAtUtc": "2026-08-30T20:22:13Z",
+    "verifiedAtBlock": null,
+    "MockUSDC": { "admin": null, "operator": null, "lockAuthority": null },
+    "MockBond": { "admin": null, "operator": null, "lockAuthority": null },
+    "MockFarm": { "admin": null, "operator": null, "lockAuthority": null },
+    "note": "Every null here is a positive statement rather than an unknown, in the same sense as libraries.CreditWiring.address below. admin(), operator() and lockAuthority() REVERT on all three addresses above, because the deployed bytecode PREDATES the MockLockdown gate entirely. Measured 2026-08-30 by cast against Base Sepolia, and again by the entrypoint named in verifiedBy, which exits non-zero with PreLockdownBytecode. The deployed runtime sizes are 2385 / 5594 / 3136 against a tree at 2945 / 7657 / 4509, so the live stack is an older and strictly smaller generation. The practical consequence is that the mock CONFIGURATION surface on this deployment is open to any caller: setBlocked, setRewardPool, setWhitelisted, setPendingYield and setRevertOnWithdraw were all executed successfully from a role-less address. Worth naming specifically: setPendingYield forges the delivered-farm-yield counter, which is the counter the four-clean-epoch evidence is measured on.",
+    "whyThisRowExists": "The source in this repository added a lockdown gate to the mock stack and wired it into the deploy script. That mitigation is TREE-ONLY. It is not on the deployed contracts, and nothing on chain, in CI or in the off-chain jobs said so. This row says it, in the file a reader checks first, and it needed no redeploy to be true.",
+    "publicRecordCaveat": "This public record deliberately omits `deployer` and `operators` - see operatorsNote above, and read them from the contracts if you want them. The AssertLocked entrypoint resolves both from the deployment record, so run against a record that carries them, or pass RECOUP_KEEPER and compare the deployer against the chain by hand. That is a property of what this file publishes, not a defect in the script."
+  },
   "libraries": {
     "CreditWiring": {
       "address": null,

@@ -50,6 +50,17 @@ contract VaultHandler is Test {
     ///      creates and destroys nothing: every unit is in a wallet, in the farm, or with a winner,
     ///      and the right-hand side now names both sources those units can have come from.
     uint256 public ghostMintedByEth;
+    /// @notice Monotonic source for globally unique mock UUIDs and fresh attempt IDs.
+    /// @dev Every successful attempt needs its own receiver and therefore its own
+    ///      nonce-zero domain. Reusing the old literal `uuid: 1` would make the
+    ///      hardened mock reject every ETH mint after the first one.
+    /// @dev Deliberately `internal` and underscore-prefixed. A plainly-named public counter on a
+    ///      handler is swept as a coverage ghost and must be read by an invariant or a tripwire,
+    ///      and this one should not be: it is scratch state that records nothing worth asserting
+    ///      on. The ETH-mint coverage it could be mistaken for is already carried by
+    ///      `ethDepositsDone` and `ghostMintedByEth`, so naming it publicly would read as
+    ///      coverage that is not there.
+    uint256 internal _nextMintAttempt;
 
     /// @notice Coverage ghosts, distinct from the two mirrors above: those are
     ///         *quantities* and stay at zero whether an action never ran or ran and
@@ -81,6 +92,11 @@ contract VaultHandler is Test {
     uint256 public withdrawsDone;
     uint256 public withdrawsRefusedByLtv;
     uint256 public harvestsWithYield;
+    /// @notice Flips of the USDC blacklist on the adapter's yield recipient.
+    /// @dev Read by `test_handlerCanReachEveryStateTheInvariantsCheck`, which drives a blocked
+    ///      harvest and asserts `unreportedYield` actually became non-zero. The counter alone
+    ///      would only say the action ran; the state it is here to reach is the carry.
+    uint256 public yieldRecipientBlockToggles;
     uint256 public seizesDone;
     uint256 public reassignsDone;
 
@@ -174,11 +190,11 @@ contract VaultHandler is Test {
     ///
     ///      **The mint payload is built here rather than passed in**, because every field of it is
     ///      a constraint the adapter checks and a fuzzed one would only ever produce reverts the
-    ///      typed `catch` would then have to tolerate: `receiver` must be the adapter
-    ///      (`ReceiverMustBeAdapter`), `msg.value` must equal `paymentAmount` exactly
-    ///      (`PaymentMismatch`, strict on purpose - the bond burns any overpayment), and the minted
-    ///      count must match `amountNfts` (`MintAmountMismatch`). What is fuzzed is the only thing
-    ///      that changes the protocol's state: which actor deposits and how many units.
+    ///      typed `catch` would then have to tolerate: `receiver` must be the beneficiary-bound
+    ///      prediction, both signed and live receiver nonces must be zero, `msg.value` must equal
+    ///      `paymentAmount` exactly, and the minted count must match `amountNfts`. What is fuzzed is
+    ///      the only thing that changes the protocol's state: which actor deposits and how many
+    ///      units.
     ///
     ///      The deadline is a year out rather than an hour, because nothing in this handler warps
     ///      time today and a fixture that depends on that staying true is one `skip` away from
@@ -189,11 +205,13 @@ contract VaultHandler is Test {
         // 0.001 ETH a unit. Any strictly positive price does; what matters is that `msg.value` and
         // `paymentAmount` are the same number, which the adapter requires exactly.
         uint256 payment = units * 1e15;
+        uint256 attempt = ++_nextMintAttempt;
+        bytes32 attemptId = bytes32(attempt);
         bytes memory mintData = abi.encode(
             IDexFiBond.MintDataInput({
-                uuid: 1,
+                uuid: attempt,
                 nonce: 0,
-                receiver: address(adapter),
+                receiver: adapter.predictMintReceiver(a, attemptId),
                 amountNfts: units,
                 paymentAmount: payment,
                 deadline: block.timestamp + 365 days,
@@ -207,7 +225,7 @@ contract VaultHandler is Test {
         // other way round invites the next reader to put a `paused()` read there.
         vm.deal(a, payment);
         vm.prank(a);
-        try vault.depositETH{value: payment}(mintData) {
+        try vault.depositETH{value: payment}(attemptId, mintData) {
             ghostTotalBondCount += units;
             ghostMintedByEth += units;
             ++ethDepositsDone;
@@ -314,6 +332,38 @@ contract VaultHandler is Test {
         // A harvest of nothing exercises none of the adapter's USDC path, so it is not
         // evidence the path works. Only a non-zero one counts.
         if (got != 0) ++harvestsWithYield;
+    }
+
+    /// @notice Blacklist the adapter's yield recipient, and lift it again.
+    /// @dev **Without this action the adapter's USDC path is only ever exercised in its happy
+    ///      case, and `invariant_adapterHoldsNothingAtRest` was green for that reason rather
+    ///      than because the protocol has the property.** Audit round 34 found that no fuzz
+    ///      HANDLER in this repository could block a USDC recipient, so no campaign could
+    ///      reach either of the two states the adapter is *designed* to hold USDC in: the
+    ///      `unreportedYield` carry left behind when `_trySweepUsdc` cannot go through, and
+    ///      the round-22 `owedToRecipient` park. The old assertion `balanceOf(adapter) == 0`
+    ///      is false about the protocol and true about the fixture, which is the worst pair.
+    ///
+    ///      **Stated precisely, because the looser form is wrong.** `setBlocked` does appear in
+    ///      an invariant *file*: `LiquidationAuction.invariants.t.sol` uses it inside
+    ///      `test_R23_theParkedTermOfThisIdentityIsReachableAndTheHandlerCannotReachIt`, whose
+    ///      own name says what it is - a deterministic reachability test, not a fuzz action. The
+    ///      property that held before this action is the narrower one: no *handler* anywhere
+    ///      could block a recipient, so nothing the random walk could draw ever produced the
+    ///      state. "Zero invariant suites" would have been a claim about a grep.
+    ///
+    ///      `MockUSDC.blocked` reverts in `_update`, which is real USDC's blacklist shape and
+    ///      the one `_trySweepUsdc`'s raw `call` exists to tolerate, so the block reddens the
+    ///      accounting invariant and not the campaign: every collateral path stays open, which
+    ///      is the property the best-effort sweep was written for.
+    ///
+    ///      Both directions on purpose. A block that could never be lifted would leave the
+    ///      swept branch of `_settleFarmPayout` unreachable after the first flip, and the
+    ///      identity has to hold on the way back down as well as on the way up.
+    function toggleYieldRecipientBlock() external {
+        bool next = !usdc.blocked(adapter.yieldRecipient());
+        usdc.setBlocked(adapter.yieldRecipient(), next);
+        ++yieldRecipientBlockToggles;
     }
 
     /// @dev Asserts the gate and its complement together: a seize must succeed exactly
@@ -475,9 +525,40 @@ contract CollateralVaultInvariants is RiskParamsFixture {
         assertEq(staked, handler.ghostTotalBondCount(), "ghost mirror agrees");
     }
 
-    /// The adapter is a pass-through: it never holds USDC or loose bonds.
+    /// The adapter holds no loose bonds, and the USDC it holds is exactly what it is accounted
+    /// to hold - nothing more and nothing less.
+    /// @dev **This assertion used to be `balanceOf(adapter) == 0` and that was FALSE about the
+    ///      protocol.** `DirectCallAdapter` deliberately holds USDC at rest in two designed
+    ///      states: the `unreportedYield` carry `_settleFarmPayout` writes when a best-effort
+    ///      sweep cannot go through, and the round-22 `owedToRecipient` / `totalOwedToRecipients`
+    ///      park that `changeYieldRecipient` writes when the outgoing recipient cannot be paid.
+    ///      Both exist precisely so a blocked recipient cannot brick a collateral exit, so an
+    ///      invariant forbidding them contradicts the mechanism two other comments in this repo
+    ///      defend.
+    ///
+    ///      **It was green for a fixture reason, not a protocol reason, and audit round 34 found
+    ///      the reason.** No fuzz handler anywhere in this repository could block a USDC
+    ///      recipient - `MockUSDC.setBlocked` reached an invariant file only from a
+    ///      deterministic reachability test, never from a handler action - so neither designed
+    ///      state was reachable and a false statement passed 256 runs. `toggleYieldRecipientBlock`
+    ///      on the handler is what makes it reachable, and it ships in the same commit as this
+    ///      line on purpose: **the assertion and the action are one change.** Landing the stronger
+    ///      identity without the action would leave it exactly as unreached as the weak one, which
+    ///      is the shape that produced the original defect.
+    ///
+    ///      MEASURED, this fixture, unseeded:
+    ///        - blocking action + old assertion: RED in 6 calls, shrunk to 3, `no USDC at rest:
+    ///          1 != 0`;
+    ///        - blocking action + this assertion: green at the production 256 runs x 500 depth;
+    ///        - this assertion falsified on demand: a temporary handler action donating USDC
+    ///          straight to the adapter takes it RED again, so it is a real identity rather than
+    ///          a restatement of the balance.
     function invariant_adapterHoldsNothingAtRest() public view {
-        assertEq(usdc.balanceOf(address(adapter)), 0, "no USDC at rest");
+        assertEq(
+            usdc.balanceOf(address(adapter)),
+            adapter.totalOwedToRecipients() + adapter.unreportedYield(),
+            "USDC at rest must be exactly the park plus the carried unreported yield"
+        );
         assertEq(bond.bondBalance(address(adapter)), 0, "no loose bonds");
     }
 
@@ -558,6 +639,35 @@ contract CollateralVaultInvariants is RiskParamsFixture {
         handler.accrueYield(500e6);
         handler.harvest();
         assertEq(handler.harvestsWithYield(), 1, "harvested yield must be reachable");
+
+        // **The blocked-recipient carry, which no campaign in this repository could reach until
+        // audit round 34.** `invariant_adapterHoldsNothingAtRest` names `unreportedYield` on its
+        // right-hand side, so a run in which that term is always zero is checking a weaker
+        // statement than the one written down - the exact shape that let the old
+        // `balanceOf(adapter) == 0` stand for rounds while being false about the protocol.
+        //
+        // The counter is asserted *and* the state is, deliberately. `yieldRecipientBlockToggles`
+        // alone would only say the action ran; a blocked harvest that swept anyway would satisfy
+        // it and leave the carry term at zero. So the assertion below is on the adapter's own
+        // storage, and the harvest is driven through the block rather than around it.
+        handler.toggleYieldRecipientBlock();
+        assertEq(handler.yieldRecipientBlockToggles(), 1, "the USDC blacklist must be reachable");
+        handler.accrueYield(250e6);
+        handler.harvest();
+        assertGt(adapter.unreportedYield(), 0, "a blocked sweep must leave a carry to invariant on");
+        assertEq(
+            usdc.balanceOf(address(adapter)),
+            adapter.totalOwedToRecipients() + adapter.unreportedYield(),
+            "the accounted identity must hold while the carry is non-zero"
+        );
+
+        // And back down, or the swept branch of `_settleFarmPayout` is unreachable after the
+        // first flip and the identity is only ever checked in one direction.
+        handler.toggleYieldRecipientBlock();
+        assertEq(handler.yieldRecipientBlockToggles(), 2, "the blacklist must be liftable");
+        handler.accrueYield(1e6);
+        handler.harvest();
+        assertEq(adapter.unreportedYield(), 0, "lifting the block must let the carry sweep out");
 
         // The smallest debt past the liquidation threshold on 900 bonds.
         handler.setDebt(0, _debtAtThreshold(900, NAV) + 1);

@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, Vm} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {Config} from "../src/Config.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
@@ -51,6 +52,10 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant BONDS = 100;
     uint256 internal constant LENDER_DEPOSIT = 20_000e6;
+
+    /// @dev Cash left on hand after the borrow in the round-21 finding 7 sweep, held fixed across
+    ///      every data point so that leverage is the only variable.
+    uint256 internal constant SWEEP_CASH = 1_000e6;
 
     // ── the derived scenario figures ─────────────────────────────────────────
 
@@ -507,8 +512,8 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         );
     }
 
-    /// @notice **The withdrawal queue does not shut over a debt the yield stream has already paid
-    ///         off.** A cleared loan reserves nothing, and idle cash pays the queue.
+    /// @notice A stale mark cannot force a controller below their minimum after the yield stream
+    ///         has already paid the debt off. Refresh restores the un-impaired execution price.
     ///
     /// @dev Audit round 16, executed. `impairmentOf` is a photograph of `currentDebtOf`, which
     ///      decays continuously on the yield stream with no transaction to hang a refresh on.
@@ -516,25 +521,12 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///      exactly that refresh to `_repay` on the reasoning that "repayment is not a transition
     ///      and notifies nobody", and the identical reasoning applies to yield application.
     ///
-    ///      **Audit round 15's queue fix is what escalated this from a wrong price to a total
-    ///      freeze.** Before it, a stale-high mark mispriced an exit; after it, any non-zero
-    ///      `exitReserve()` stops the paying walk for everybody. Widening what a condition governs
-    ///      re-prices every latent defect that can reach it, and this one was not in that diff.
-    ///
-    ///      The premise is asserted rather than assumed, because the whole finding is that this is
-    ///      not a shortage: the debt is zero, the pool is holding cash, and the queue is shut
-    ///      anyway.
-    ///
-    ///      **What this test claims, precisely, and what it does not.** It does not claim the queue
-    ///      heals itself. `serviceQueue` walks a shared FIFO and must not make one lender's turn
-    ///      depend on a foreign contract answering, which is the rule this repo has now broken and
-    ///      re-learned three times. What it claims is that the stale mark is reachable and
-    ///      clearable by **anybody, in one bounded call, knowing no borrower address** - and that
-    ///      the refusal says which of the two refusals it is, so a caller who hits it knows what to
-    ///      do. Before this, the caller had to reconstruct the borrower from `Impaired` logs and
-    ///      then call a different contract, and `NothingToService` gave them no reason to think of
-    ///      doing either.
-    function test_impairment_doesNotFreezeTheQueueOverADebtTheStreamAlreadyCleared() public {
+    ///      The controller-scoped request removes the shared freeze. The remaining risk is local:
+    ///      a controller could settle against a stale mark unless their transaction carries a
+    ///      minimum. This test pins both halves. A stranger cannot choose the instant, and the
+    ///      controller's un-impaired minimum refuses atomically until one bounded refresh clears
+    ///      the stale mark without requiring a borrower address.
+    function test_impairment_refreshRestoresTheControllersMinimumAfterTheStreamClearsTheDebt() public {
         _lend(stranger, 4_000e6);
         uint256 shares = pool.balanceOf(stranger);
         vm.prank(stranger);
@@ -550,10 +542,23 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertGt(pool.exitReserve(), 0, "fixture: the stale mark must still be standing");
         assertGt(usdc.balanceOf(address(pool)), 0, "fixture: this must not be a genuine shortage");
 
-        // The refusal now names its cause. `NothingToService` said only "nothing happened", which
-        // is what a genuine shortage says too.
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(10);
+        uint256 serviceableBefore = pool.maxRequestRedeem(stranger);
+        uint256 markedQuote = pool.previewRedeem(serviceableBefore);
+        uint256 unmarkedMinimum = pool.convertToAssets(serviceableBefore);
+        assertGt(serviceableBefore, 0, "fixture: the request must be cash-serviceable");
+        assertGt(unmarkedMinimum, markedQuote, "fixture: the stale mark must move the execution price");
+
+        vm.prank(bidder);
+        vm.expectRevert(
+            abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, stranger, bidder)
+        );
+        pool.serviceWithdrawalRequest(stranger, serviceableBefore, 0);
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, markedQuote, unmarkedMinimum)
+        );
+        pool.serviceWithdrawalRequest(stranger, serviceableBefore, unmarkedMinimum);
 
         // One bounded, permissionless call, made by somebody who knows no borrower address and
         // reads no logs. This is the whole remedy.
@@ -561,8 +566,15 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         credit.refreshImpairments(8);
 
         assertEq(pool.totalImpairment(), 0, "the stale mark survived a sweep that could see it");
-        assertEq(pool.serviceQueue(10), 1, "idle cash, a cleared debt, and the queue still shut");
-        assertGt(pool.claimable(stranger), 0, "the queued lender was never paid");
+        uint256 serviceableAfter = pool.maxRequestRedeem(stranger);
+        uint256 refreshedQuote = pool.previewRedeem(serviceableAfter);
+        vm.prank(stranger);
+        assertEq(
+            pool.serviceWithdrawalRequest(stranger, serviceableAfter, refreshedQuote),
+            refreshedQuote,
+            "idle cash and a cleared debt did not service at the refreshed price"
+        );
+        assertGt(pool.claimable(stranger), 0, "the requesting lender was never paid");
     }
 
     /// @notice The impaired borrowers are enumerable on-chain, so clearing a stale mark never
@@ -615,8 +627,8 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///      Clearing the recognition once the callback is over tracks a mid-callback cure exactly,
     ///      because the mark is re-derived from `currentDebtOf` at every write. Freezing the debt as
     ///      it stood when the recovery was recognised does not: it would over-mark by whatever the
-    ///      callback repaid, inside the one frame where the permissionless `serviceQueue` is
-    ///      reachable - which is audit round 15 arriving back through its own fix.
+    ///      callback repaid, inside the one frame where a controller could quote or service their
+    ///      own request.
     ///
     ///      A real contract, not a prank. An EOA never receives `onERC1155Received`, and this repo
     ///      has twice been handed a passing proof that staged its state that way.
@@ -646,17 +658,15 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         );
     }
 
-    /// @notice **A winning bidder cannot spend the standing over-mark on somebody else either.**
+    /// @notice A winning bidder cannot service somebody else's request against the standing mark.
     /// @dev Audit round 15, executed three times independently by three agents. The test above
     ///      holds `auctionOf` set across the callback so the mark cannot be *released* early, and
-    ///      that is still right. What nothing stopped was the callback *paying a third party* at
-    ///      that mark: `LenderPool.serviceQueue` is permissionless, its `nonReentrant` is a
-    ///      different contract's guard, and the attacker supplies the very fill that releases the
-    ///      mark three statements later. Riskless, atomic, no price exposure.
+    ///      that is still right. The controller-scoped service call now rejects the bidder inside
+    ///      the callback, before the very fill that releases the mark completes.
     ///
     ///      **The damning part is the NAV this runs at.** `_navFloorShortOfDebt()` is the band
     ///      where the fill clears the loan outright, so `lifetimeSocialisedLoss` ends at zero: the
-    ///      queued lender is crystallised at a discount for a default that never happens, and the
+    ///      requesting lender would be crystallised at a discount for a default that never happens, and the
     ///      difference is shared out among everyone who stayed. Measured in that round at victim
     ///      -157.187500, attacker +52.395833, uninvolved holder +104.791666, summing to the wei.
     ///
@@ -669,12 +679,12 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///      benefits; that a lender was paid below what their shares were worth, on a liquidation
     ///      that lost nothing, is the defect either way. Asserting the payout would also have made
     ///      this pass against a fix that merely redistributed the take.
-    function test_impairment_aWinningBidderCannotSpendTheOverMarkOnAQueuedLender() public {
+    function test_impairment_aWinningBidderCannotServiceAnotherControllersRequest() public {
         address victim = makeAddr("victim");
         _lend(victim, 4_000e6);
 
         uint256 id = _openAuctionAt(_navFloorShortOfDebt());
-        _assertMarked("queue-servicing callback attack");
+        _assertMarked("request-servicing callback attack");
 
         uint256 victimShares = pool.balanceOf(victim);
         vm.prank(victim);
@@ -688,20 +698,35 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         uint256 price = auction.currentPrice(id);
         assertGt(price, credit.currentDebtOf(alice), "fixture: this fill must clear the debt");
 
-        QueueServicingBidder attacker = new QueueServicingBidder(pool);
+        RequestServicingBidder attacker = new RequestServicingBidder(pool, victim);
         _fund(address(attacker), price);
         vm.prank(address(attacker));
         auction.bid(id);
 
         assertTrue(attacker.ran(), "the callback never fired, so this test proves nothing");
-        assertGt(attacker.serviced(), 0, "the queue was never serviced from inside the callback");
+        assertEq(attacker.serviced(), 0, "the bidder serviced another controller's request");
+        assertEq(
+            attacker.refusal(),
+            LenderPool.UnauthorizedRequestOperator.selector,
+            "the callback refused for a reason other than controller authority"
+        );
         assertEq(pool.lifetimeSocialisedLoss(), 0, "fixture: this liquidation must lose nothing at all");
+        assertEq(pool.claimable(victim), 0, "the rejected callback still crystallised the victim's shares");
+        (,, uint256 requestSharesAfterAttack,,) = pool.withdrawalRequest(victim);
+        assertEq(requestSharesAfterAttack, victimShares, "the rejected callback changed the victim's request");
 
-        // One asset-wei of tolerance for the floor in `_exitToAssets`, and no more.
+        uint256 serviceable = pool.maxRequestRedeem(victim);
+        assertGt(serviceable, 0, "the recovered book left none of the request serviceable");
+        uint256 quote = pool.previewRedeem(serviceable);
+        vm.prank(victim);
+        pool.serviceWithdrawalRequest(victim, serviceable, quote);
+        (,, uint256 remainingRequestShares,,) = pool.withdrawalRequest(victim);
+
+        // One asset-wei of tolerance for the floor in the exit conversion, and no more.
         assertGe(
-            pool.claimable(victim) + 1,
+            pool.claimable(victim) + pool.previewRedeem(remainingRequestShares) + 1,
             worthBefore,
-            "a queued lender was paid below their shares' worth for a default that never happened"
+            "a requesting lender was paid below their shares' worth for a default that never happened"
         );
     }
 
@@ -716,7 +741,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         auction.bid(id);
     }
 
-    /// @dev The case the design doc got wrong. Its transition table says a bid covering the debt
+    /// @dev The case the design got wrong. Its transition table says a bid covering the debt
     ///      already notifies the manager through `creditLiquidationProceeds` - it does not, because
     ///      that call is skipped entirely when there is no penalty and no surplus to hand over, and
     ///      a fill landing exactly on the debt is precisely that state.
@@ -778,8 +803,8 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         // It used to assert the mark was still standing here, waiting for `closeWorkout` to clear
         // it - which is precisely the defect two agents reported: `repayFor` is permissionless, so
         // a stranger could cure a liquidated borrower's debt and leave the pool reserving all of it
-        // until somebody got round to closing the workout, with `serviceQueue` free to settle a
-        // queued lender against that phantom shortfall in the meantime.
+        // until somebody got round to closing the workout, leaving a controller to quote against
+        // that phantom shortfall in the meantime.
         _assertReleased("workout closed clean, cured by the repayment");
 
         auction.closeWorkout(id);
@@ -966,7 +991,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///
     ///      Measured on the tree before the fix, at every one of those four routes: `exitReserve`
     ///      unchanged at +365 days, `expireToWorkout` reverting `PositionNotLiquidatable`,
-    ///      `refreshImpairments` - the remedy `QueueHeldByReserve` sends a reader to - reporting
+    ///      `refreshImpairments` reporting
     ///      **0**, `openWorkoutCount` **0** so no forced-close clock was ever armed, `borrow`
     ///      refusing with `LiquidationOpen`, `vault.setCreditManager` refusing with
     ///      `AuctionHasLiveWork`, and `withdrawBonds` refusing the collateral that did the healing.
@@ -998,12 +1023,26 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertGt(credit.healthFactor(alice), Config.HEALTH_FACTOR_SCALE, "premise: and no longer liquidatable");
         assertGt(pool.exitReserve(), 0, "premise: and the mark must still be standing");
 
-        // A queued lender, so the release is observable as the thing that actually hurts.
+        // A controller request, so the release is observable in its transaction-local minimum.
         uint256 shares = pool.balanceOf(lender);
         vm.prank(lender);
         pool.requestWithdrawal(shares, lender);
-        vm.expectRevert();
-        pool.serviceQueue(5);
+        uint256 serviceableBefore = pool.maxRequestRedeem(lender);
+        uint256 markedQuote = pool.previewRedeem(serviceableBefore);
+        uint256 unmarkedMinimum = pool.convertToAssets(serviceableBefore);
+        assertGt(unmarkedMinimum, markedQuote, "fixture: the live mark did not move the request price");
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, lender, stranger)
+        );
+        pool.serviceWithdrawalRequest(lender, serviceableBefore, 0);
+
+        vm.prank(lender);
+        vm.expectRevert(
+            abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, markedQuote, unmarkedMinimum)
+        );
+        pool.serviceWithdrawalRequest(lender, serviceableBefore, unmarkedMinimum);
 
         // ONE call, by anyone, with no capital.
         uint256 before = usdc.balanceOf(stranger);
@@ -1017,8 +1056,14 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertEq(auction.openWorkoutCount(), 0, "a healed position must not be pushed into a workout");
         assertEq(usdc.balanceOf(stranger), before, "round 18: resolving a heal pays its caller nothing");
 
-        // The queue moves again, over the idle cash it was held off.
-        assertGt(pool.serviceQueue(5), 0, "the queue must reopen");
+        uint256 serviceableAfter = pool.maxRequestRedeem(lender);
+        uint256 releasedQuote = pool.previewRedeem(serviceableAfter);
+        vm.prank(lender);
+        assertEq(
+            pool.serviceWithdrawalRequest(lender, serviceableAfter, releasedQuote),
+            releasedQuote,
+            "the released mark did not restore controller service"
+        );
         assertGt(pool.claimable(lender), 0, "and the lender must actually be paid");
     }
 
@@ -1173,7 +1218,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///      collateral. The recovery reaches lenders when a bid actually pays it in.
     ///
     ///      The supersede transition still has to *happen* - it is a fifth way an auction ends and
-    ///      the design doc omits it entirely - so that is asserted through storage, separately from
+    ///      the design omits it entirely - so that is asserted through storage, separately from
     ///      the mark.
     function test_impairment_isUnmovedByASupersedeAtARecoveredNav() public {
         uint256 first = _openAuctionAt(_crashedNav());
@@ -1876,9 +1921,9 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///      auction then filled with `lifetimeSocialisedLoss` at zero - the protocol realised no
     ///      loss whatsoever - and the lender's residue was worth 19.496124 where the control's was
     ///      628.749999. `paid + residue` came to 19,390.746124 on a 20,000.000000 deposit: a
-    ///      **609.253876** hole with nothing on the other side of it. (The round's write-up calls
-    ///      that "exactly the whole debt", which is 628.750000. The measured figure is the debt less
-    ///      the 19.496124 the crushed residue is still worth, and it is what this test pins.)
+    ///      **609.253876** hole with nothing on the other side of it. (It is not the whole debt,
+    ///      which is 628.750000. The measured figure is that debt less the 19.496124 the crushed
+    ///      residue is still worth, and it is the measured figure this test pins.)
     ///
     ///      The assertion is the conservation identity, not the payout: what a lender takes out
     ///      plus what their residue is worth, once a liquidation that lost nothing has resolved,
@@ -1914,8 +1959,8 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         // every epoch's lender leg backs up behind one exit.
         assertGt(pool.totalSupply(), (10 ** 3) * Config.BPS, "one exit crushed the supply past the yield floor");
 
-        // **No assertion on `previewDeposit` here, and the reason is worth recording.** The round's
-        // write-up puts a zero-share deposit downstream of this crush. MEASURED on this fixture
+        // **No assertion on `previewDeposit` here, and the reason is worth recording.** A zero-share
+        // deposit is the obvious thing to expect downstream of this crush. MEASURED on this fixture
         // before the fix it returns **1**, not 0: 628.750000 of assets against 32 shares is a share
         // price near 20 USDC, and a whole dollar still buys one wei of share. The zero arrives only
         // at a deeper crush than this fixture reaches. An assertion here would therefore have been
@@ -1974,21 +2019,14 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertApproxEqAbs(paid + residue, LENDER_DEPOSIT, 2, "control: an un-marked exit must conserve");
     }
 
-    /// @notice Round 21 finding 7's over-reservation, pinned so this stream cannot be read as
-    ///         having touched it.
-    /// @dev **This is a pin, not a fix, and that finding is tracked separately.** Round 22 finding
-    ///      2 changes `maxWithdraw` and `maxRedeem`, and both changes are provably inert at
-    ///      `exitReserve() == 0`, because the un-impaired conversion they now use *is* the
-    ///      impaired one when nothing is reserved. So this measurement must read identically
-    ///      before and after. If it moves, the change reached further than intended.
+    /// @notice The regression that used to pin round 21 finding 7 now pins its replacement formula.
+    /// @dev The historical test name is retained so the old evidence remains discoverable. The old
+    ///      implementation priced a request against the whole book and subtracted that claim from
+    ///      cash. The same half-book request below used to reserve three times the idle balance and
+    ///      zero another lender. It now reserves exactly half the cash, independently of leverage.
     ///
-    ///      The state is asserted on both sides of the request so nobody can later mistake this for
-    ///      an impairment artefact: nothing is marked, nothing is reserved, and there is no live
-    ///      auction anywhere in the graph.
-    ///
-    ///      MEASURED: one free `requestWithdrawal` by a second lender reserves 3.00x the idle cash
-    ///      and takes an unqueued lender's `maxWithdraw` from 1,000.000000 to 0, and `available()`
-    ///      from 100.000000 to 0.
+    ///      The state is asserted on both sides so this cannot be mistaken for an impairment fix:
+    ///      nothing is marked, nothing is reserved for loss, and there is no live auction.
     function test_unreservedIdle_overReservationIsUnchangedByThisStream() public {
         // Down to a book small enough to state in whole dollars. Nothing is lent yet, so this is a
         // plain exit at par.
@@ -2015,22 +2053,215 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertEq(pool.maxWithdraw(lender), 1_000e6, "the unqueued lender can take the whole float");
         assertEq(pool.available(), 100e6, "and 100.000000 is still lendable behind the hot float");
 
-        uint256 claim = 3_000e6;
-        uint256 queuerShares = pool.convertToShares(claim);
+        uint256 cash = _poolBalanceFromPublicReads();
+        uint256 requestAssets = 3_000e6;
+        uint256 queuerShares = pool.convertToShares(requestAssets);
         vm.prank(queuer);
         pool.requestWithdrawal(queuerShares, queuer);
 
         _assertNothingIsReserved("after");
-        emit log_named_uint("R21F7 queue claim as a percentage of idle cash", (claim * 100) / 1_000e6);
-        assertEq(pool.maxWithdraw(lender), 0, "round 21 finding 7: the unqueued lender is zeroed");
-        assertEq(pool.available(), 0, "round 21 finding 7: and so is the lending book");
-        assertEq(pool.unreservedIdle(), 0, "round 21 finding 7: 3.00x of the idle cash is reserved");
+        uint256 reserve = _approvedQueueCashReserve();
+        uint256 postRequestFloat = _approvedPostRequestFloat(reserve);
+        uint256 held = reserve + postRequestFloat;
+        uint256 expectedAvailable = cash > held ? cash - held : 0;
+
+        assertEq(pool.queueCashReserve(), reserve, "R is the request's cash-proportional ownership");
+        assertEq(reserve, 500e6, "a half-book request reserves half the idle cash, not three times it");
+        assertEq(pool.unreservedIdle(), cash - reserve, "unreserved idle is cash minus R");
+        assertEq(pool.maxWithdraw(lender), cash - reserve, "the other lender retains the unreserved half");
+        assertEq(pool.available(), expectedAvailable, "available uses R plus the post-request float");
     }
 
     function _assertNothingIsReserved(string memory when) private view {
         assertEq(pool.totalImpairment(), 0, string.concat(when, ": nothing may be marked"));
         assertEq(pool.exitReserve(), 0, string.concat(when, ": nothing may be reserved"));
         assertEq(auction.liveAuctionCount(), 0, string.concat(when, ": no auction may be live"));
+    }
+
+    // ---- round-21 finding 7: the leverage sweep ------------------------------
+    //
+    // Audit round 21 finding 7 survived fifteen candidates because each moved impairment while the
+    // defect lived in the two cash readers below. The old code subtracted a book-priced claim from
+    // cash, so a fixed ownership share locked more cash as leverage rose. These controls preserve
+    // that history and assert the accepted repair: R is `ceil(idle * queuedShares / totalSupply)`,
+    // and the operational float is `floor((totalAssets - R) * 15%)`.
+    //
+    // `_assertNothingIsReserved` remains on both sides. It proves the new leverage independence is
+    // a property of the cash formula, not an impairment side effect.
+
+    /// @dev Cash on hand. `_poolBalance()` is private, so it is reconstructed from the three
+    ///      public reads it is made of - every ratio in the sweep is a ratio of this number.
+    function _poolBalanceFromPublicReads() internal view returns (uint256) {
+        uint256 balance = usdc.balanceOf(address(pool));
+        uint256 notOurs = pool.totalClaimable() + pool.unreleasedYield();
+        return balance > notOurs ? balance - notOurs : 0;
+    }
+
+    /// @dev The accepted cash-proportional request reserve, restated independently of the pool.
+    function _approvedQueueCashReserve() internal view returns (uint256) {
+        uint256 shares = pool.queuedShares();
+        if (shares == 0) return 0;
+        return Math.mulDiv(_poolBalanceFromPublicReads(), shares, pool.totalSupply(), Math.Rounding.Ceil);
+    }
+
+    /// @dev The accepted float after requested cash is removed from the book.
+    function _approvedPostRequestFloat(uint256 reserve) internal view returns (uint256) {
+        return Math.mulDiv(pool.totalAssets() - reserve, Config.RESERVE_RATIO_BPS, Config.BPS);
+    }
+
+    /// @dev Builds a book of exactly `book`, of which `queuerStake` belongs to a fresh queuer and
+    ///      the rest to `lender`, then borrows the difference so cash lands on `SWEEP_CASH`.
+    ///      Leverage is `book / SWEEP_CASH` and nothing else moves between data points.
+    ///
+    ///      **Two ceilings bound `book` at 6,000.000000 and both are asserted rather than
+    ///      assumed.** `LenderPool.lend` refuses a borrow larger than `available()`, which against
+    ///      an empty queue is `book - float`, so `book - SWEEP_CASH <= book - book * 1500 / 10000`
+    ///      forces `book <= SWEEP_CASH * BPS / RESERVE_RATIO_BPS`, i.e. leverage 6.667x. The
+    ///      per-account borrow cap binds first, at 5,000.000000. **The cap is deliberately not
+    ///      raised**: a changed risk parameter would be a second variable in a one-variable sweep,
+    ///      and six points are enough for a linear relation.
+    function _buildBookAt(uint256 book, uint256 queuerStake) internal returns (address queuer) {
+        uint256 borrowed = book - SWEEP_CASH;
+        assertLe(borrowed, riskParams.perAccountBorrowCap(), "sweep fixture: the borrow must fit the per-account cap");
+
+        // Down to the lender's share, at par: nothing is lent yet, so this is a plain exit.
+        vm.prank(lender);
+        pool.withdraw(LENDER_DEPOSIT - (book - queuerStake), lender, lender);
+
+        queuer = makeAddr("r21f7sweepQueuer");
+        _lend(queuer, queuerStake);
+        assertEq(pool.totalAssets(), book, "sweep fixture: the book is the stated size");
+
+        // Read the derivation before the prank. `vm.prank` is spent on the next call including a
+        // static one, so leaving this in argument position would run `borrow` as this contract.
+        uint256 borrowingPower = _maxBorrow(1_000, NAV);
+        assertGe(borrowingPower, borrowed, "sweep fixture: the collateral must support the borrow");
+        vm.prank(alice);
+        vault.depositBonds(900);
+        vm.prank(alice);
+        credit.borrow(borrowed);
+
+        assertEq(_poolBalanceFromPublicReads(), SWEEP_CASH, "sweep fixture: cash is held fixed");
+        assertEq(pool.totalAssets(), book, "sweep fixture: and the borrow does not move the book");
+        assertEq(pool.outstandingPrincipal(), borrowed, "sweep fixture: leverage comes from principal");
+    }
+
+    /// @notice A fixed ownership share reserves the same cash share from 1.50x through 6.00x.
+    /// @dev This is the sign-reversed version of the original sweep. A tenth of the book used to
+    ///      lock 15% through 60% of cash as leverage rose. Under R it locks exactly 10% throughout.
+    function test_r21f7_theCashLockScalesWithLeverageAtZeroImpairment() public {
+        uint256[6] memory books = [uint256(1_500e6), 2_000e6, 3_000e6, 4_000e6, 5_000e6, 6_000e6];
+
+        for (uint256 i = 0; i < books.length; i++) {
+            uint256 snap = vm.snapshotState();
+            _measureTheLockAt(books[i], SWEEP_STAKE_BPS);
+            vm.revertToState(snap);
+        }
+    }
+
+    /// @dev A tenth of the book, held constant across the sweep, so the queuer's ownership is not
+    ///      what changes between data points.
+    uint256 internal constant SWEEP_STAKE_BPS = 1_000;
+
+    /// @dev One data point of the sweep. Split out of the loop because the measurement needs more
+    ///      locals than a loop body has stack for, which is a compiler limit rather than a design
+    ///      choice - `--via-ir` would also fix it and would change how the whole suite compiles.
+    function _measureTheLockAt(uint256 book, uint256 stakeBps) internal {
+        address queuer = _buildBookAt(book, (book * stakeBps) / Config.BPS);
+        _assertNothingIsReserved("sweep before");
+
+        uint256 cash = _poolBalanceFromPublicReads();
+        uint256 leverageBps = Math.mulDiv(pool.totalAssets(), Config.BPS, cash);
+        assertEq(pool.unreservedIdle(), cash, "sweep: an empty queue reserves nothing at all");
+
+        // Read before the prank. `vm.prank` is spent on the next call INCLUDING a staticcall, so
+        // leaving this in argument position runs `requestWithdrawal` as this contract, which holds
+        // no shares - and the tell is a plausible ERC-20 revert rather than a tooling error.
+        uint256 queuerShares = pool.balanceOf(queuer);
+        vm.prank(queuer);
+        pool.requestWithdrawal(queuerShares, queuer);
+        _assertNothingIsReserved("sweep after");
+
+        uint256 lockedCash = cash - pool.unreservedIdle();
+        uint256 reserve = _approvedQueueCashReserve();
+        uint256 postRequestFloat = _approvedPostRequestFloat(reserve);
+        uint256 held = reserve + postRequestFloat;
+        uint256 expectedAvailable = cash > held ? cash - held : 0;
+
+        assertEq(pool.queueCashReserve(), reserve, "sweep: implementation matches cash-proportional R");
+        assertEq(lockedCash, reserve, "sweep: unreserved idle subtracts exactly R");
+        assertEq(pool.available(), expectedAvailable, "sweep: available uses the post-request float");
+
+        uint256 lockedCashBps = Math.mulDiv(lockedCash, Config.BPS, cash);
+        assertApproxEqAbs(lockedCashBps, stakeBps, 1, "a fixed stake locks the same cash share at every leverage");
+
+        emit log_named_uint("R21F7 sweep: leverage (bps)", leverageBps);
+        emit log_named_uint("R21F7 sweep: cash reserved by a 10pc holder (bps of cash)", lockedCashBps);
+    }
+
+    /// @notice A one-sixth request leaves roughly five-sixths of cash to every other lender.
+    /// @dev The old book-priced reservation zeroed the float at 6.00x. The accepted R formula makes
+    ///      the same request own one-sixth of cash, with only the specified ceiling wei in its favour.
+    function test_r21f7_theClaimThatZeroesEveryOtherLenderIsOneOverLeverage() public {
+        uint256 book = 6_000e6;
+        address queuer = _buildBookAt(book, book / 6);
+        _assertNothingIsReserved("threshold before");
+
+        uint256 cash = _poolBalanceFromPublicReads();
+        assertEq(Math.mulDiv(pool.totalAssets(), Config.BPS, cash), 60_000, "fixture: leverage is 6.00x");
+        assertEq(pool.maxWithdraw(lender), cash, "the unqueued lender can take the whole float");
+
+        uint256 requestShares = pool.balanceOf(queuer);
+        vm.prank(queuer);
+        pool.requestWithdrawal(requestShares, queuer);
+        _assertNothingIsReserved("threshold after");
+
+        uint256 reserve = _approvedQueueCashReserve();
+        uint256 expectedUnreserved = cash - reserve;
+        assertEq(pool.queueCashReserve(), reserve, "one-sixth request uses cash-proportional R");
+        assertEq(reserve, Math.mulDiv(cash, 1, 6, Math.Rounding.Ceil), "R is one-sixth of cash, ceiling rounded");
+        assertEq(pool.unreservedIdle(), expectedUnreserved, "roughly five-sixths of cash remains unreserved");
+        assertApproxEqAbs(expectedUnreserved, Math.mulDiv(cash, 5, 6), 1, "five-sixths remains to the wei");
+        assertEq(pool.maxWithdraw(lender), expectedUnreserved, "the five-sixths holder can execute against that cash");
+
+        emit log_named_uint(
+            "R21F7 fixed: one-sixth request reserve, bps of cash", Math.mulDiv(reserve, Config.BPS, cash)
+        );
+    }
+
+    /// @notice The former 166 bps request at 6.00x no longer halts borrowing.
+    /// @dev It used to subtract 100.000000 of book-priced claim beside a 900.000000 book float and
+    ///      consume all 1,000.000000 of cash. Now it reserves only its cash share, then calculates
+    ///      the 15% float on `totalAssets - R`. The exact formula and an executable lend are pinned.
+    function test_r21f7_theClaimThatHaltsBorrowingIsOneOverLeverageMinusTheFloat() public {
+        uint256 book = 6_000e6;
+        address queuer = _buildBookAt(book, book / 6);
+        _assertNothingIsReserved("halt before");
+
+        uint256 cash = _poolBalanceFromPublicReads();
+        assertEq(pool.available(), 100e6, "fixture: 100.000000 is lendable behind the float");
+
+        uint256 formerHaltAssets = 100e6;
+        uint256 formerHaltShares = pool.convertToShares(formerHaltAssets);
+        vm.prank(queuer);
+        pool.requestWithdrawal(formerHaltShares, queuer);
+        _assertNothingIsReserved("halt after");
+
+        uint256 reserve = _approvedQueueCashReserve();
+        uint256 postRequestFloat = _approvedPostRequestFloat(reserve);
+        uint256 expectedAvailable = cash - reserve - postRequestFloat;
+        assertEq(pool.queueCashReserve(), reserve, "former 166 bps claim reserves only its cash share");
+        assertEq(pool.available(), expectedAvailable, "available is idle minus R minus 15% of A minus R");
+        assertGt(expectedAvailable, 0, "the former 166 bps halt leaves lendable cash at 6.00x");
+
+        uint256 creditBalanceBefore = usdc.balanceOf(address(credit));
+        vm.prank(address(credit));
+        pool.lend(1e6);
+        assertEq(usdc.balanceOf(address(credit)), creditBalanceBefore + 1e6, "a borrow-sized lend executes after the request");
+
+        emit log_named_uint(
+            "R21F7 fixed: former halt request, bps of book", Math.mulDiv(formerHaltAssets, Config.BPS, book)
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2872,7 +3103,8 @@ contract CallbackBidder {
 /// @dev The cure is reachable and deliberately so: `repayFor` is permissionless and never pausable,
 ///      and no manager frame is open during `seize`. It exists here to tell apart a mark re-derived
 ///      from the live debt at every write from one frozen when the recovery was recognised - the
-///      second over-marks by exactly this cure, in the frame where `serviceQueue` is callable.
+///      second over-marks by exactly this cure, in the frame where a controller request can be
+///      quoted or serviced.
 ///
 ///      `repaid` is recorded so a cure that silently did nothing cannot read as a mark that
 ///      correctly did not move.
@@ -2920,29 +3152,37 @@ contract RepayingBidder {
     }
 }
 
-/// @notice A winning bidder that services the withdrawal queue from inside its own seize callback.
+/// @notice A winning bidder that attempts to service another controller's withdrawal request from
+///         inside its own seize callback.
 /// @dev The lot arrives before the debt is written down and before `auctionOf` is cleared, so for
 ///      the length of this frame the pool is still reserving the whole loan against every lender.
-///      `serviceQueue` is permissionless and the pool's own `nonReentrant` is a different
-///      contract's guard, so nothing here is re-entrancy in the sense the auction defends against:
-///      it is one permissionless call made at an instant the caller chose.
+///      The pool's own `nonReentrant` is a different contract's guard, so the callback reaches the
+///      service entry point. Controller authority, not incidental reentrancy, must reject it.
 ///
-///      Nothing is wrapped in `try`. A callback that silently swallowed its own failure would make
-///      the test pass for the wrong reason, and `ran`/`serviced` are asserted so a callback that
-///      did nothing cannot read as a callback that found nothing to do.
-contract QueueServicingBidder {
+///      The refusal is caught only so the auction can finish and prove the mark releases. The test
+///      asserts the exact selector, `ran` and zero service, so a callback that did nothing cannot
+///      read as an authorization success.
+contract RequestServicingBidder {
     LenderPool private immutable pool;
+    address private immutable controller;
 
     bool public ran;
     uint256 public serviced;
+    bytes4 public refusal;
 
-    constructor(LenderPool pool_) {
+    constructor(LenderPool pool_, address controller_) {
         pool = pool_;
+        controller = controller_;
     }
 
     function onERC1155Received(address, address, uint256, uint256, bytes calldata) external returns (bytes4) {
         ran = true;
-        serviced = pool.serviceQueue(1);
+        uint256 shares = pool.maxRequestRedeem(controller);
+        try pool.serviceWithdrawalRequest(controller, shares, 0) returns (uint256 assetsOut) {
+            serviced = assetsOut;
+        } catch (bytes memory reason) {
+            refusal = bytes4(reason);
+        }
         return this.onERC1155Received.selector;
     }
 

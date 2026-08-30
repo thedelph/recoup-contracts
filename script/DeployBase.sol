@@ -15,6 +15,7 @@ import {NAVOracle} from "../src/NAVOracle.sol";
 import {RiskParams} from "../src/RiskParams.sol";
 import {TreasuryLiquiditySource} from "../src/TreasuryLiquiditySource.sol";
 import {Config} from "../src/Config.sol";
+import {MintAttemptReceiver} from "../src/MintAttemptReceiver.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 import {ICollateralVault} from "../src/interfaces/ICollateralVault.sol";
 import {ICreditManager} from "../src/interfaces/ICreditManager.sol";
@@ -23,6 +24,16 @@ import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
 import {IRiskParams} from "../src/interfaces/IRiskParams.sol";
+
+/// @notice The read-only half of `MockLockdown`, declared here rather than imported.
+/// @dev `DeployBase` must not import `test/mocks/`: `WirePhase4` and `DeployReferral` inherit it
+///      too, and neither has any business pulling the mock stack into its compilation unit. Three
+///      selectors is the whole surface the post-condition below needs.
+interface IMockLockdownView {
+    function admin() external view returns (address);
+    function operator() external view returns (address);
+    function lockAuthority() external view returns (address);
+}
 
 /// @title DeployBase
 /// @notice The deployment sequence, extracted so local, testnet and mainnet all run
@@ -115,6 +126,15 @@ abstract contract DeployBase is Script {
     ///      Carries the owner because at 3am the operator needs to see WHICH address it refused -
     ///      the same reason `YieldRecipientCollision` and `OwnershipNotTransferred` carry theirs.
     error GuardianRequiredForContractOwner(address owner);
+    /// @notice A mock in the stack is still open to anybody.
+    error MockNotLocked(address mock);
+
+    /// @notice A mock is locked, but to the wrong second caller.
+    /// @dev Its own error rather than a reuse of `MockNotLocked`, because the two failures need
+    ///      different operator responses: `MockNotLocked` means re-run the deploy, this one means
+    ///      the stack is closed but the epoch job cannot write to it.
+    error MockOperatorWrong(address mock, address actual, address expected);
+
     error ProtocolFeeWalletRequired();
     error YieldRecipientCollision(address recipient, string collidesWith);
     error OwnershipNotTransferred(address contractAddr, address actualOwner);
@@ -256,11 +276,13 @@ abstract contract DeployBase is Script {
     /// @dev **For readers, and there is exactly one: `WirePhase4.assertOnly()`.** That function is
     ///      a post-condition report an operator runs to find out what a queued switchover actually
     ///      did, and its own docstring says it is deliberately ungated because "reading state
-    ///      changes nothing and an operator should never be discouraged from checking". Once
-    ///      `_validateParams` gained the contract-owner guardian rule, going through
-    ///      `_resolveParams` would have made that false: a deployment owned by a contract with no
-    ///      guardian named is precisely the state somebody would run the report to understand, and
-    ///      the report would have answered with a parameter error instead of the wiring.
+    ///      changes nothing and an operator should never be discouraged from checking". While the
+    ///      contract-owner guardian rule sat in `_validateParams`, going through `_resolveParams`
+    ///      would have made that false: a deployment owned by a contract with no guardian named is
+    ///      precisely the state somebody would run the report to understand, and the report would
+    ///      have answered with a parameter error instead of the wiring. That rule now lives on the
+    ///      deploy path, in `_validateNewDeployment`, so the escape this function provided is no
+    ///      longer the only one - but the reasoning above is unchanged and so is the caller.
     ///
     ///      **A zeroed struct is NOT a substitute and that was measured the hard way.**
     ///      `_assertPhase4Wiring` looks as though it ignores its `GovParams` - there is no
@@ -272,17 +294,36 @@ abstract contract DeployBase is Script {
     ///      Nothing else may use this. A deployment must go through `_resolveParams`, because the
     ///      rules are the point.
     function _readParams(address deployer) internal view returns (GovParams memory p) {
-        p.owner = _envOrAddress("RECOUP_OWNER", deployer);
+        // **Zero, like every other operator address, and the fallback to `deployer` lives in the
+        // local block below.** This key used to default to the broadcasting key on every
+        // chain, which made it the only operator address a real deployment could inherit rather
+        // than choose - and the inheritance was silent in both directions. `OwnerRequired()` was
+        // unreachable on every script path, because `deployer` is never zero. `_handOver` was
+        // skipped by `if (p.owner != deployer)`, so the deploying key kept all nine contracts,
+        // including `TreasuryLiquiditySource` behind an uncapped `onlyOwner withdraw` and
+        // `RiskParams`. And every `_requireOwner` post-condition then compared the chain against
+        // that same defaulted value, so the check that exists to catch a failed handover was
+        // asking `deployer == deployer` and certifying it.
+        //
+        // It also silently disarmed the contract-owner guardian rule: a defaulted owner is the
+        // broadcasting EOA, so `p.owner.code.length` is zero and that rule cannot fire either.
+        // Two rules disappeared together, and neither absence was visible from a green run.
+        p.owner = _envOrAddress("RECOUP_OWNER", address(0));
         p.yieldRecipient = _envOrAddress("RECOUP_YIELD_RECIPIENT", address(0));
         p.keeper = _envOrAddress("RECOUP_KEEPER", address(0));
         p.navConfirmer = _envOrAddress("RECOUP_NAV_CONFIRMER", address(0));
         p.protocolFeeWallet = _envOrAddress("RECOUP_PROTOCOL_FEE_WALLET", address(0));
-        // No local default, unlike the four above. Those default because a local run must need
+        // No local default, unlike every other member. Those default because a local run must need
         // zero setup; this one stays zero because an unfilled guardian is the correct default
         // everywhere, and inventing a local one would put a role in the logs that nobody chose.
         p.guardian = _envOrAddress("RECOUP_GUARDIAN", address(0));
 
         if (_isLocal()) {
+            // The deployer fallback, kept and confined. A local run must need zero setup, and
+            // locally the deploying key owning everything is the whole point rather than a
+            // capture. Off this branch an unnamed owner is now `address(0)` and `OwnerRequired()`
+            // is reachable, which is the only state in which that error means anything.
+            if (p.owner == address(0)) p.owner = deployer;
             if (p.yieldRecipient == address(0)) p.yieldRecipient = LOCAL_TREASURY;
             if (p.keeper == address(0)) p.keeper = LOCAL_KEEPER;
             if (p.navConfirmer == address(0)) p.navConfirmer = LOCAL_NAV_CONFIRMER;
@@ -304,26 +345,11 @@ abstract contract DeployBase is Script {
         if (p.guardian != address(0) && p.guardian == p.owner) revert GuardianMustDifferFromOwner();
         if (_isLocal()) return;
 
-        // **AFTER the local early-return, unlike the guardian/owner rule five lines up, and the
-        // difference between the two is the reason.** That one mirrors a rule `setGuardian`
-        // enforces in `src/`, so a local deploy breaking it would revert mid-wiring with no
-        // indication which of two roles was wrong. This one mirrors nothing in `src/`: it is a
-        // completeness rule about a real deployment's incident response, which is exactly the
-        // class the local branch relaxes.
-        //
-        // It is also not merely relaxed locally, it MUST be, and that was MEASURED rather than
-        // reasoned about. Under `forge test` the owner is routinely a contract with no guardian,
-        // and `test_localDefaultsDoNotPointAtTheDeployer` resolves `RECOUP_OWNER` all the way to
-        // the test contract through `_resolveParams` - it sets the other four keys to zero and
-        // deliberately leaves this one alone. Placed above the return, that test reverts in CI,
-        // where there is no `contracts/.env` to supply an EOA.
-        // `test_validate_theContractOwnerRuleIsRelaxedLocally` pins this placement, so an edit
-        // that moves it up fails under a name that says why instead of breaking something that
-        // looks unrelated.
-        if (p.guardian == address(0) && p.owner.code.length > 0) {
-            revert GuardianRequiredForContractOwner(p.owner);
-        }
-
+        // **The contract-owner guardian rule is NOT here, and `_validateNewDeployment` below says
+        // why.** It used to sit on this line. Everything left in this function is a rule about a
+        // set of addresses, true or false whenever you ask it; that one is a rule about the act of
+        // MAKING a deployment, and asking it of a deployment that already exists refuses an
+        // operation without offering any way to satisfy it.
         if (p.yieldRecipient == address(0)) revert YieldRecipientRequired();
         if (p.keeper == address(0)) revert KeeperRequired();
         if (p.navConfirmer == address(0)) revert NavConfirmerRequired();
@@ -346,6 +372,130 @@ abstract contract DeployBase is Script {
         // of that. See the note at the constructor call site.
         if (p.yieldRecipient == deployer) revert YieldRecipientCollision(p.yieldRecipient, "deployer");
         if (p.yieldRecipient == p.owner) revert YieldRecipientCollision(p.yieldRecipient, "owner");
+    }
+
+    /// @notice `_validateParams`, plus the one rule that is about MAKING a deployment rather than
+    ///         about a set of addresses. The deploy path uses this; nothing else may.
+    /// @dev **Why the guardian rule is here and not in `_validateParams`, stated as a direction and
+    ///      not as a preference.** The rule's own reasoning is that `_wire` calls `setGuardian`
+    ///      BEFORE `_handOver`, so once a deployment exists the only remaining route to a guardian
+    ///      is a `setGuardian` the new owner has to schedule - `Config.ADMIN_TIMELOCK` of waiting
+    ///      for the tool you need in order to respond to the failure. That is an argument about the
+    ///      moment a deployment is created, and it can only be acted on at that moment. It is the
+    ///      deploy path's rule, and it was living one level up.
+    ///
+    ///      **What that cost, and it is a deadlock rather than a weakness.** `_validateParams` is
+    ///      also a precondition of the Phase-4 switchover, through `_resolveParams` in
+    ///      `WirePhase4`'s `run()`, `queue()` and `executeQueued()`. Take a deployment made in the
+    ///      documented default - an EOA owner, `RECOUP_GUARDIAN` unset, which every line of this
+    ///      file argues is correct - and hand it to a timelock at G2. Now:
+    ///
+    ///        - `RECOUP_GUARDIAN` unset: the rule refuses, because the owner is a contract.
+    ///        - `RECOUP_GUARDIAN` set to anything: `_assertCoreGraph` refuses with
+    ///          `WiringIncomplete("vault.guardian")`, because the chain holds zero and no
+    ///          environment value can put a guardian onto a deployed contract.
+    ///
+    ///      No value of one variable satisfies two constraints that disagree, so the switchover was
+    ///      unreachable on the shape this repository ships. The amplifier is what makes it a
+    ///      HIGH rather than an inconvenience: `queuePause()` skips `_resolveParams`, so an
+    ///      operator shuts `borrow` and `depositETH` first and meets the wall afterwards, and the
+    ///      only scripted `unpause` is in the batch that cannot then be queued.
+    ///
+    ///      **The switchover loses nothing by this move**, which is the half worth checking rather
+    ///      than asserting. It still goes through `_resolveParams`, so every other rule -
+    ///      `OwnerRequired`, `GuardianMustDifferFromOwner`, the four required operators,
+    ///      `NavKeysMustDiffer` and both yield-recipient collisions - still applies to it. And the
+    ///      guardian is constrained there by something stronger than a parameter rule:
+    ///      `_assertCoreGraph` requires the deployed guardian to EQUAL `p.guardian` on all three
+    ///      contracts, so at switchover time the environment cannot claim a guardian the chain
+    ///      does not have, nor omit one it does. The alternative fix - dropping the switchover to
+    ///      `_readParams` - was rejected on exactly that comparison: it would have removed every
+    ///      one of the other rules from the switchover in order to fix one.
+    ///
+    ///      Relaxed locally for the same measured reason the rule always was: under `forge test`
+    ///      the owner is routinely a contract with no guardian, and `_readParams` resolves an
+    ///      unnamed `RECOUP_OWNER` to the deployer on the anvil chain id, which in this suite is a
+    ///      test contract. Enforced locally, CI turns red on fixtures that have nothing to do with
+    ///      incident response.
+    ///
+    ///      Zero runtime bytes, like everything else in this file: `DeployBase` is a script and is
+    ///      never deployed.
+    ///
+    /// @dev 🟥 **SAY WHAT THIS RULE IS NOT, because two runbooks read it as something it is not.**
+    ///      This is a DEPLOY-TIME SPEED BUMP and it is not the Gate-2 backstop. It refuses a FRESH
+    ///      DEPLOYMENT whose owner is already a contract and whose guardian is unset. It does not
+    ///      and cannot refuse the G2 handover, which is where the risk actually is: the handover is
+    ///      nine plain owner transactions with no script, so this function has no caller at the one
+    ///      moment the owner becomes a contract. An open finding from that round; the guardian-sequencing analysis
+    ///      still expects a revert here for the right verdict and a reason that stopped being true.
+    ///
+    /// @dev **The `> 0` predicate refuses an EIP-7702 delegated EOA, and that is deliberate.** A
+    ///      delegated EOA carries 23 bytes of code, `0xef0100` followed by the delegate address, so
+    ///      `code.length > 0` catches it. Relaxing to `> 23` to admit one was REFUSED on sign
+    ///      check: it is strictly more permissive, and 7702 delegation is revocable by the EOA at
+    ///      any time, so admitting it would let an owner that is a contract today be a bare key
+    ///      tomorrow with no guardian named. Keep `> 0`.
+    ///
+    ///      **23 is the single length at which the two predicates disagree**, so every other
+    ///      test in this repository passes under both and exactly one goes red if it is tried
+    ///      again: `test_R38_aDelegatedEoaOwnerIsRefusedAndTwentyThreeBytesIsTheBoundary` in
+    ///      `R36DeployPath.t.sol`. Measured: relaxing to `> 23` left 119 of 120 green across
+    ///      the five deploy-related suites, and that one red. It is the only thing in the tree
+    ///      that can see the change.
+    function _validateNewDeployment(GovParams memory p, address deployer) internal view {
+        _validateParams(p, deployer);
+        if (_isLocal()) return;
+
+        if (p.guardian == address(0) && p.owner.code.length > 0) {
+            revert GuardianRequiredForContractOwner(p.owner);
+        }
+    }
+
+    /// @notice Read the mock stack's lockdown back off whatever chain the caller is on.
+    /// @dev **Lifted out of `DeployTestnet` by round-39 remediation, and the lift is the fix for
+    ///      two findings rather than tidying.** `DeployLocal` had no such post-condition at all,
+    ///      so deleting its three `lockTo` calls was green in two independent audit streams; and
+    ///      the old copy read `admin()` only, so `usdc.lockTo(deployer, address(0))` and the bond
+    ///      equivalent were BOTH green while only the farm's operator was asserted anywhere.
+    ///      Round-38 neuters N18 and N19. Reading `operator()` on all three closes that.
+    ///
+    /// @dev 🟥 **This function verifies the PLAN, not the chain, whenever it is called from inside
+    ///      a `forge script` run.** `forge script` executes `run()` exactly once, in the simulation
+    ///      phase, before a single transaction is sent, so calling this after `vm.stopBroadcast()`
+    ///      places it after the broadcast in SOURCE ORDER only. Measured 3 of 3 against a local
+    ///      anvil: with the three `lockTo` transactions among those the node discarded, the script
+    ///      printed `ONCHAIN EXECUTION COMPLETE & SUCCESSFUL` and exited 0 while `admin()` was
+    ///      still zero on chain. **The thing that reads the real chain is
+    ///      `script/AssertLocked.s.sol`, run WITHOUT `--broadcast` after the deploy.** This
+    ///      function is the cheap in-run check that the script intended to lock; that one is the
+    ///      evidence that it did.
+    ///
+    /// @dev Takes addresses rather than mock types so this file never imports `test/mocks/`.
+    ///      Zero runtime bytes: `DeployBase` is a script and is never deployed.
+    function _assertMockStackLocked(
+        address usdc_,
+        address bond_,
+        address farm_,
+        address expectedAdmin,
+        address expectedOperator
+    ) internal view {
+        _assertOneMockLocked(usdc_, expectedAdmin, expectedOperator);
+        _assertOneMockLocked(bond_, expectedAdmin, expectedOperator);
+        _assertOneMockLocked(farm_, expectedAdmin, expectedOperator);
+    }
+
+    /// @dev Split out so the three calls above cannot drift into asserting different things about
+    ///      different mocks, which is exactly how the operator argument came to be checked on one
+    ///      of the three.
+    function _assertOneMockLocked(address mock, address expectedAdmin, address expectedOperator)
+        private
+        view
+    {
+        if (IMockLockdownView(mock).admin() != expectedAdmin) revert MockNotLocked(mock);
+        address actualOperator = IMockLockdownView(mock).operator();
+        if (actualOperator != expectedOperator) {
+            revert MockOperatorWrong(mock, actualOperator, expectedOperator);
+        }
     }
 
     // ── Deployment ───────────────────────────────────────────────────────────
@@ -376,11 +526,16 @@ abstract contract DeployBase is Script {
     ///      free of side effects, so a script that already resolved runs it twice and nothing
     ///      changes. The direction is strictly more refusing: no parameter set that was accepted
     ///      before is rejected now, and sets that were never checked are.
+    ///
+    ///      **`_validateNewDeployment`, which is a superset of it, and that function carries the
+    ///      argument.** This line is the only caller, on purpose: it is the only place in the
+    ///      repository where a deployment comes into existence, and the extra rule is about that
+    ///      act rather than about the addresses.
     function _deployProtocol(Externals memory e, GovParams memory p, address deployer)
         internal
         returns (Deployed memory d)
     {
-        _validateParams(p, deployer);
+        _validateNewDeployment(p, deployer);
 
         d.oracle = new NAVOracle(deployer);
         // Constructed before the three contracts that hold it, because they take it as an
@@ -1037,6 +1192,26 @@ abstract contract DeployBase is Script {
         address collateral = address(d.vault.bond());
         if (address(d.adapter.bond()) != collateral) revert WiringIncomplete("adapter.bond");
 
+        // The receiver implementation is created inside the adapter constructor, so it is not a
+        // separately owned or wired member of `Deployed`. It is still part of the immutable
+        // custody graph and must be checked and printed: every per-attempt clone delegates to it.
+        MintAttemptReceiver receiverImplementation = d.adapter.mintReceiverImplementation();
+        if (address(receiverImplementation).code.length == 0) {
+            revert WiringIncomplete("adapter.mintReceiverImplementation");
+        }
+        if (receiverImplementation.adapter() != address(d.adapter)) {
+            revert WiringIncomplete("mintReceiver.adapter");
+        }
+        if (address(receiverImplementation.bond()) != address(d.adapter.bond())) {
+            revert WiringIncomplete("mintReceiver.bond");
+        }
+        if (address(receiverImplementation.farm()) != address(d.adapter.farm())) {
+            revert WiringIncomplete("mintReceiver.farm");
+        }
+        if (address(receiverImplementation.usdc()) != address(d.adapter.usdc())) {
+            revert WiringIncomplete("mintReceiver.usdc");
+        }
+
         // **`adapter.vault` deliberately has NO line here, and the reason is a measurement rather
         // than an omission.** The back-pointer on the same edge looks like the obvious companion
         // to `vault.custodyAdapter` twenty lines up, and a `WiringIncomplete("adapter.vault")` was
@@ -1285,8 +1460,8 @@ abstract contract DeployBase is Script {
         console.log("navConfirmer      ", p.navConfirmer);
         if (p.guardian == address(0)) {
             // Zero is legal and is the shipped default under an EOA owner, so this is not a
-            // refusal - `_validateParams` owns the one case that is refusable, which is a contract
-            // owner. It is loud because it is the one parameter whose correct value flips silently:
+            // refusal - `_validateNewDeployment` owns the one case that is refusable, which is a
+            // contract owner at the moment a deployment is made. It is loud because it is the one parameter whose correct value flips silently:
             // right today, and "this protocol has no fast pause" the moment ownership moves to a
             // timelock, with nothing in between announcing the change. An operator reading a deploy
             // log has to be able to see which of those two deployments they just made.
@@ -1305,6 +1480,7 @@ abstract contract DeployBase is Script {
         for (uint256 i; i < ownables.length; ++i) {
             console.log(labels[i], ownables[i]);
         }
+        console.log("MintReceiver impl  ", address(d.adapter.mintReceiverImplementation()));
         console.log("Post-deploy: fund the liquidity source and bootstrap the NAV oracle.");
         // Printed because the deployment is deliberately incomplete: the LenderPool above is
         // deployed and knows who its manager is, and is wired into nothing that pays it or

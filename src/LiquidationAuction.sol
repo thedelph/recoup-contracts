@@ -281,22 +281,26 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///         started. Zero for an id that was never issued.
     /// @dev **Audit round 19, critical 2, and the whole point is that this one does not move.**
     ///      `Auction.startedAt` is reset by every re-strike, which is what makes the Dutch price
-    ///      restart - and is also what let an unfunded stranger keep a position live forever, six
-    ///      hours at a time, holding the lender pool's withdrawal queue shut. This is the clock the
-    ///      re-strike window is measured against, so re-striking cannot extend its own deadline.
-    ///      Written once, at open, and never again.
+    ///      restart and is also what let an unfunded stranger keep a position live forever, six
+    ///      hours at a time. Under the superseded FIFO withdrawal design, that held the lender
+    ///      pool's whole queue shut. Controller-scoped requests no longer stop globally, but the
+    ///      standing mark still lowers their live execution quotes. This is the clock the re-strike
+    ///      window is measured against, so re-striking cannot extend its own deadline. Written
+    ///      once, at open, and never again.
     mapping(uint256 => uint256) public firstOpenedAt;
 
     /// @inheritdoc ILiquidationAuction
     /// @dev **Non-zero only inside a `_bid` frame, and audit round 15 is why it exists.**
     ///
     ///      `_bid` holds `auctionOf` set across the winner's ERC-1155 callback on purpose, so the
-    ///      mark cannot be *released* early. What nothing stopped was the callback *spending* that
-    ///      standing mark on somebody else: `LenderPool.serviceQueue` is permissionless, its
-    ///      `nonReentrant` is a different contract's guard, and the attacker supplies the very fill
-    ///      that releases the mark three statements later. Riskless, atomic, and it fires on
-    ///      auctions where the realised loss ends at zero, so a queued lender was crystallised at a
-    ///      discount for a default that never happened.
+    ///      mark cannot be *released* early. Under the superseded FIFO API, the callback could
+    ///      *spend* that standing mark on somebody else through permissionless batch service. The
+    ///      attacker supplied the very fill that released the mark three statements later. It was
+    ///      riskless and atomic, and fired on auctions where the realised loss ended at zero, so a
+    ///      waiting lender was crystallised at a discount for a default that never happened.
+    ///      Controller-scoped service now requires the controller or an approved operator and
+    ///      carries `minAssetsOut`; this recovery record also ensures any authorized execution in
+    ///      the callback observes the recovery-adjusted mark.
     ///
     ///      The winner's payment is already inside this contract one statement before `seize` hands
     ///      them control, so the recovery is a **fact** by then rather than a forecast. Recording it
@@ -528,9 +532,10 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         //     claimant to overwrite. The keeper who opened the auction keeps the claim through
         //     every re-strike, whoever pays for them.
         //  2. Settling and re-opening bumped the liveness registers each lap and started a fresh
-        //     clock, so an attacker with no capital at all could keep a position live indefinitely
-        //     and hold the lender pool's whole withdrawal queue shut. `firstOpenedAt` does not move,
-        //     so the window below is a real deadline rather than one the attacker keeps extending.
+        //     clock, so an attacker with no capital at all could keep a position live indefinitely.
+        //     Under the superseded FIFO withdrawal design that held the lender pool's whole queue
+        //     shut; now it keeps controller request quotes marked down. `firstOpenedAt` does not
+        //     move, so the window below is a real deadline rather than one the attacker extends.
         //
         // Re-striking is still strictly better than the floor fill it replaces: the price restarts
         // at 100% of *current* NAV and decays again. What is no longer claimed is that it is
@@ -800,9 +805,11 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // set and nothing can observe this liquidation as resolved from inside it.
         //
         // **The round-12 note this replaces claimed that over-marking for one call frame "is the
-        // safe direction".** It is not, in general: an over-mark is only safe while every exit is
-        // self-initiated, and `serviceQueue` pays exits their owner did not initiate, which turns
-        // an over-mark into someone else's cash inside the same frame.
+        // safe direction".** It was not under the superseded FIFO API: permissionless batch service
+        // paid exits their owner did not initiate, which turned an over-mark into someone else's
+        // cash inside the same frame. Controller-scoped service now requires the controller or an
+        // approved operator and carries an execution floor. The recognition below remains what
+        // makes an authorized callback-time execution observe the recovery-adjusted mark.
         //
         // **The sentence that used to end that paragraph was false, and audit round 15 executed
         // the consequence three times.** It said the over-marking "is the thing the impairment
@@ -821,11 +828,12 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         a.settled = true;
 
         // **Recognise the recovery before the winner is handed control, not after.** Audit round 15
-        // executed the gap three times: holding `auctionOf` set across the callback stops the mark
-        // being released early, and stops nothing from being *spent* at it. The callback can call
-        // the permissionless `LenderPool.serviceQueue` and settle a queued lender against a
-        // shortfall that this very transaction is about to cover, on an auction whose realised loss
-        // ends at zero. See `recognisedRecoveryOf`.
+        // executed the gap three times under the superseded FIFO API: holding `auctionOf` set across
+        // the callback stopped the mark being released early, but permissionless batch service
+        // could still crystallise a waiting lender against a shortfall this transaction was about
+        // to cover, on an auction whose realised loss ended at zero. Controller-scoped service now
+        // requires the controller or an approved operator; pre-recognition also makes any
+        // authorized execution use the recovery-adjusted mark. See `recognisedRecoveryOf`.
         //
         // Measured as a delta across our own pull rather than trusting `price`, the same way
         // `_repay` measures what actually moved and for the same reason. Clamped at the write as
@@ -1029,9 +1037,9 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      so a stuck reserve is both visible and fixable by anybody.
     ///
     ///      **The call sites were derived from the storage the exits write, not from the
-    ///      interface.** Audit round 11 found the previous exit gate blind to the withdrawal queue
-    ///      precisely because its coverage had been enumerated from `IERC4626` rather than from the
-    ///      contract. Re-run this and expect hits in four functions - `_bid`, `_cancel`,
+    ///      interface.** Audit round 11 found the superseded FIFO exit gate blind to withdrawal
+    ///      requests precisely because its coverage had been enumerated from `IERC4626` rather than
+    ///      from the contract. Re-run this and expect hits in four functions - `_bid`, `_cancel`,
     ///      `expireToWorkout` and `closeWorkout`:
     ///
     ///          grep -nE "settled = true|liveAuctionCount--|delete auctionOf|status = WorkoutStatus|workoutsOpenFor\[[^]]+\](\+\+|--)" src/LiquidationAuction.sol
@@ -1056,10 +1064,12 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      `_bid`'s **pre-seize** recognition is the other, added with the round-15 fix. It fires
     ///      before any liveness register moves, which is the exact opposite of the rule below and
     ///      is the point of it: the winner's cash is in this contract by then, so the recovery is a
-    ///      fact, and it has to be netted off before the winner's ERC-1155 callback can spend the
-    ///      un-netted figure through the permissionless `LenderPool.serviceQueue`. Enumerating from
-    ///      the liveness registers alone would miss it, which is why this paragraph exists rather
-    ///      than a longer grep.
+    ///      fact, and it has to be netted off before the winner's ERC-1155 callback can expose an
+    ///      authorized controller request to the un-netted figure. The superseded FIFO API made
+    ///      that callback service permissionless; the current API restricts it to the controller or
+    ///      an approved operator and applies `minAssetsOut`. Enumerating from the liveness registers
+    ///      alone would still miss the pre-recognition site, which is why this paragraph exists
+    ///      rather than a longer grep.
     ///
     ///      Every *other* call site sits **after** the liveness registers are written, so the
     ///      refresh reads the state the transition left rather than the one it is leaving.

@@ -46,23 +46,24 @@ import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 ///      is the assertion that would have caught it.
 ///
 ///      **3. What a leaver actually gives up is their pro-rata share of the mark, to the wei.**
-///      Round 20's finding 2 reports a "3.14% haircut" as the price of escaping a frozen queue.
+///      Round 20's finding 2 reports a "3.14% haircut" as the price of escaping a frozen request.
 ///      `test_theCostOfLeavingUnderAMarkIsExactlyProRata` shows that figure is the mark's own share
 ///      of the book and nothing else - the leaver takes exactly the fraction of the loss their
 ///      shares represent. `CreditManager._impairmentFor` documents that as the intended direction
 ///      of the whole-debt mark. It is a real cost to a leaver and it is not a penalty for having
-///      queued.
+///      requested an exit.
 ///
-///      **What is deliberately NOT here: a fix for the queue freeze.** One free permissionless
-///      `expireToWorkout` converts a six-hour mark into a fourteen-day one and `serviceQueue`
-///      refuses for all of it. `serviceQueue`'s own comment names the answer - "retire the node,
-///      carry the claim, advance the cursor" - and
-///      `test_payingAQueuedLenderEarlyWouldMoveTheMarkOntoWhoeverStays` measures why that is
-///      larger than one pull request: the obvious version of it leaves the un-impaired share price
-///      exactly unchanged and makes the worst case WORSE for everyone who stayed, cutting what a
-///      stayer keeps by 45.45% - 500.000000 becomes 272.727272. Rounds 12, 13
-///      and 14 each shipped and then deleted a partial answer in this area, so it is measured and
-///      reported rather than half-built.
+///      **What changed for controller requests.** A request no longer sits behind a global FIFO
+///      refusal. Its controller, or an operator the controller approved, chooses whether and how
+///      much to service at the live marked price. `minAssetsOut` is transaction-local: it can
+///      refuse the controller's own execution and cannot pin another request. The six-hour auction
+///      mark, the fourteen-day workout mark and the unbounded lifetime of an unclosed workout are
+///      all still measured below because changing settlement authority does not change the mark.
+///
+///      The rejected alternative is still sized here. Paying a request at the un-impaired price
+///      while a mark stands leaves that price unchanged and makes the worst case WORSE for everyone
+///      who stayed, cutting what a stayer keeps by 45.45% - 500.000000 becomes 272.727272. The
+///      controller design instead pays `previewRedeem`, so that transfer is not built.
 contract LenderPoolExitPricingTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD, 8dp
     uint256 internal constant BONDS = 800;
@@ -406,66 +407,88 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
 
     // ── 3. Round 20's finding 2, measured and bounded ────────────────────────
 
-    /// @notice One free transaction turns a six-hour mark into a fourteen-day one and the queue
-    ///         refuses for all of it. Control: the same instant, filled instead, resolves and pays.
-    /// @dev **This is a measurement, not a fix.** The lever is `expireToWorkout`, which is
+    /// @notice A controller can settle at the live price under both the six-hour auction mark and
+    ///         the fourteen-day workout mark. A stranger cannot choose the settlement instant.
+    /// @dev The duration lever is still `expireToWorkout`, which is
     ///      permissionless and costs the caller nothing but gas, and the duration it selects is
     ///      `Config.WORKOUT_MAX_DURATION`. `Config.AUCTION_RESET_WINDOW` bounds re-strikes and does
-    ///      not reach this, so the cost model that window was chosen under does not cover it.
-    ///      Recorded here because the state it produces is a `LenderPool` state and this is where
-    ///      somebody will come looking for it.
-    function test_oneFreeTransactionHoldsTheQueueForFourteenDays() public {
-        _borrowAndBreach();
-        vm.prank(stranger);
-        credit.liquidate(alice);
-        uint256 id = auction.auctionOf(alice);
-        (, uint96 startedAt,,,,,,) = auction.auctions(id);
-
-        uint256 queued = pool.balanceOf(leaver);
-        vm.prank(leaver);
-        pool.requestWithdrawal(queued, leaver);
-
+    ///      not reach this. The mark remains; only the global service refusal is gone.
+    ///
+    ///      The control remains the same instant filled instead: it resolves, realises no loss and
+    ///      lets the controller service the full request. The two marked branches pin the new
+    ///      authority and the transaction-local execution bound.
+    function test_controllerChoosesServiceAtSixHoursAndFourteenDays() public {
+        (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
         uint256 snap = vm.snapshotState();
 
         // CONTROL: a floor fill at the boundary. Resolves, reopens and pays in full, same block.
-        vm.warp(uint256(startedAt) + Config.AUCTION_DURATION);
+        vm.warp(finishesAt);
         _realiseAtTheFloor(id);
         assertEq(pool.exitReserve(), 0, "the fill left a reserve standing");
-        assertEq(pool.serviceQueue(5), 1, "the fill did not reopen the queue");
+        uint256 controlShares = pool.maxRequestRedeem(leaver);
+        uint256 controlQuote = pool.previewRedeem(controlShares);
+        vm.prank(leaver);
+        pool.serviceWithdrawalRequest(leaver, controlShares, controlQuote);
         assertEq(pool.lifetimeSocialisedLoss(), 0, "the fill realised a loss");
         vm.prank(leaver);
         assertEq(pool.claim(), DEPOSIT, "the control did not return the whole stake");
 
         vm.revertToState(snap);
 
-        // ATTACK: a stranger with no shares and no capital, at the same instant.
-        vm.warp(uint256(startedAt) + Config.AUCTION_DURATION);
+        // At six hours the auction mark still stands. The controller owns settlement and its
+        // minimum is local to this call.
+        vm.warp(finishesAt);
+        uint256 sixHourMark = pool.exitReserve();
+        assertGt(sixHourMark, 0, "the six-hour auction mark disappeared");
+        uint256 sixHourShares = pool.maxRequestRedeem(leaver);
+        uint256 sixHourQuote = pool.previewRedeem(sixHourShares);
+        assertGt(sixHourShares, 0, "the six-hour request was not serviceable");
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, leaver, stranger)
+        );
+        pool.serviceWithdrawalRequest(leaver, sixHourShares, sixHourQuote);
+
+        (,, uint256 requestSharesBefore,,) = pool.withdrawalRequest(leaver);
+        vm.prank(leaver);
+        vm.expectRevert(
+            abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, sixHourQuote, sixHourQuote + 1)
+        );
+        pool.serviceWithdrawalRequest(leaver, sixHourShares, sixHourQuote + 1);
+        (,, uint256 requestSharesAfter,,) = pool.withdrawalRequest(leaver);
+        assertEq(requestSharesAfter, requestSharesBefore, "the refused bound changed the request");
+
+        uint256 markedSnap = vm.snapshotState();
+        vm.prank(leaver);
+        assertEq(
+            pool.serviceWithdrawalRequest(leaver, sixHourShares, sixHourQuote),
+            sixHourQuote,
+            "the exact six-hour quote did not settle"
+        );
+        assertEq(pool.claimable(leaver), sixHourQuote, "the six-hour service did not create the fixed claim");
+
+        vm.revertToState(markedSnap);
+
+        // A stranger may move the auction into workout, but still cannot settle the request.
         vm.prank(stranger);
         auction.expireToWorkout(id);
         assertGt(pool.exitReserve(), 0, "the workout left no reserve");
-
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(5);
-
-        // Still shut one second short of the forced close, which is the whole of the window.
-        vm.warp(block.timestamp + Config.WORKOUT_MAX_DURATION - 1);
-        vm.expectRevert(abi.encodeWithSelector(LenderPool.QueueHeldByReserve.selector, pool.exitReserve()));
-        pool.serviceQueue(5);
-        assertEq(Config.WORKOUT_MAX_DURATION / 1 days, 14, "the frozen window is not fourteen days");
-
-        // The escape `serviceQueue` names is real and unguarded. It is priced, which is the next
-        // test.
-        vm.startPrank(leaver);
-        pool.cancelWithdrawalRequest();
-        assertEq(pool.balanceOf(leaver), queued, "the cancel did not return the shares");
-        uint256 reachable = pool.maxWithdraw(leaver);
-        assertGt(reachable, 0, "the escape hatch was shut too");
-        pool.withdraw(reachable, leaver, leaver);
-        vm.stopPrank();
+        vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
+        assertEq(Config.WORKOUT_MAX_DURATION / 1 days, 14, "the workout window is not fourteen days");
+        uint256 fourteenDayShares = pool.maxRequestRedeem(leaver);
+        uint256 fourteenDayQuote = pool.previewRedeem(fourteenDayShares);
+        assertGt(fourteenDayShares, 0, "the fourteen-day request was not serviceable");
+        vm.prank(leaver);
+        assertEq(
+            pool.serviceWithdrawalRequest(leaver, fourteenDayShares, fourteenDayQuote),
+            fourteenDayQuote,
+            "the exact fourteen-day quote did not settle"
+        );
     }
 
     /// @notice What the escape costs is the mark's own share of the book, to within a wei of
-    ///         rounding. It is pro-rata exposure, not a penalty for having queued.
+    ///         rounding. It is pro-rata exposure, not a penalty for having requested an exit.
     /// @dev Round 20 reports the escape as "a 3.14% haircut for a loss the control shows would have
     ///      been zero". Both halves are true and the second is the finding; the first is not a
     ///      haircut in the sense of a fee. The two ratios below are computed from independent reads
@@ -493,12 +516,12 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         assertApproxEqAbs(haircutE18, markShareE18, 1e6, "the leaver's cost is not the mark's share of the book");
     }
 
-    /// @notice Paying a queued lender out of the unreserved book while the mark stands leaves the
+    /// @notice Paying a requested lender out of the unreserved book while the mark stands leaves the
     ///         un-impaired share price untouched and cuts every stayer's worst case.
-    /// @dev **This is the sizing of the contingent-entitlement branch `serviceQueue` describes, and
-    ///      it is why that branch is not in this pull request.** The obvious construction is to
+    /// @dev **This is the sizing of the un-impaired-price alternative, and why it is not used.**
+    ///      The obvious construction is to
     ///      treat the book as `exitAssets()` of value that is certain and `exitReserve()` of value
-    ///      that is at risk, pay a queued lender their pro-rata share of the certain part now at
+    ///      that is at risk, pay a requested lender their pro-rata share of the certain part now at
     ///      the un-impaired price, and leave the rest of their entry alive against the mark. The
     ///      arithmetic below runs that construction over the live book without executing it.
     ///
@@ -515,7 +538,7 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
     ///      `assertLt(stayerAfter, stayerBefore)`, so the prose contradicted the test directly
     ///      beneath it. Round 21 filed the inversion; round 23 re-counted the surviving sites as
     ///      one; there were three.
-    function test_payingAQueuedLenderEarlyWouldMoveTheMarkOntoWhoeverStays() public {
+    function test_payingARequestedLenderAtTheUnimpairedPriceWouldMoveTheMarkOntoWhoeverStays() public {
         _borrowAndBreach();
         vm.prank(stranger);
         credit.liquidate(alice);
@@ -553,7 +576,7 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
     // ── 4. The duration lever, re-derived. Audit round 20's finding 2, reopened ──
 
     /// @dev Stage round 20's finding 2: a breached position, a stranger's `liquidate`, and the
-    ///      whole of the leaver's stake parked in the withdrawal queue.
+    ///      whole of the leaver's stake held in a controller-scoped withdrawal request.
     function _stageTheParkedMark() private returns (uint256 id, uint256 finishesAt) {
         _borrowAndBreach();
         vm.prank(stranger);
@@ -569,21 +592,13 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         pool.requestWithdrawal(held, leaver);
     }
 
-    function _queueShut() private returns (bool) {
-        try pool.serviceQueue(5) returns (uint256) {
-            return false;
-        } catch {
-            return true;
-        }
-    }
-
-    /// @notice `Config.WORKOUT_MAX_DURATION` is a floor under the freeze, not a ceiling over it.
+    /// @notice `Config.WORKOUT_MAX_DURATION` is a floor under the mark, not a ceiling over it.
     /// @dev **This corrects round 20's finding 2 rather than restating it.** The finding is written
-    ///      as "one permissionless transaction at hour six buys fourteen days of frozen queue", and
+    ///      as "one permissionless transaction at hour six buys fourteen days of frozen exits", and
     ///      fourteen days reads as the bound. It is not. `CreditManager._impairmentFor` keys the
     ///      mark on `workoutsOpenFor(borrower) != 0`, and the only statement that decrements that
     ///      register is inside `closeWorkout` - which is permissionless, unrewarded and optional.
-    ///      So the constant sets the earliest instant a volunteer *may* end the freeze and nothing
+    ///      So the constant sets the earliest instant a volunteer *may* end the mark and nothing
     ///      sets a latest one. Measured below at thirty days past the forced-close boundary, with
     ///      the reserve unmoved.
     ///
@@ -603,22 +618,27 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         vm.prank(stranger);
         auction.expireToWorkout(id);
 
-        assertTrue(_queueShut(), "the queue was open the instant the workout opened");
+        uint256 markedAtOpen = pool.exitReserve();
+        assertGt(markedAtOpen, 0, "the workout opened without a mark");
+        assertGt(pool.maxRequestRedeem(leaver), 0, "the live mark made the request unserviceable");
         vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION - 1);
-        assertTrue(_queueShut(), "the queue reopened one second short of the forced close");
+        assertEq(pool.exitReserve(), markedAtOpen, "the mark moved one second short of forced close");
+        assertGt(pool.maxRequestRedeem(leaver), 0, "the request lost serviceability before forced close");
         vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
-        assertTrue(_queueShut(), "the constant released the mark by itself at the boundary");
+        assertEq(pool.exitReserve(), markedAtOpen, "the constant released the mark by itself at the boundary");
+        assertGt(pool.maxRequestRedeem(leaver), 0, "the request lost serviceability at the boundary");
         vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION + 30 days);
-        assertTrue(_queueShut(), "the constant released the mark by itself thirty days later");
+        assertEq(pool.exitReserve(), markedAtOpen, "the constant released the mark by itself thirty days later");
 
         uint256 heldOpen = pool.exitReserve();
-        assertGt(heldOpen, 0, "there was no reserve to hold open");
+        assertEq(heldOpen, markedAtOpen, "the held-open mark changed without a workout transition");
 
         // Only the call ends it, and ending it is what makes the loss permanent.
         assertEq(pool.lifetimeSocialisedLoss(), 0, "the loss was realised before the close");
         vm.prank(stranger);
         auction.closeWorkout(id);
-        assertFalse(_queueShut(), "the forced close did not reopen the queue");
+        assertEq(pool.exitReserve(), 0, "the forced close did not release the mark");
+        assertGt(pool.maxRequestRedeem(leaver), 0, "the close made the request unserviceable");
         assertEq(pool.lifetimeSocialisedLoss(), heldOpen, "the close did not realise what was marked");
     }
 
@@ -640,10 +660,11 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         assertGt(marked, 0, "the liquidation left no mark");
 
         vm.warp(finishesAt + 1);
-        assertTrue(_queueShut(), "the lapse alone released the mark");
+        assertEq(pool.exitReserve(), marked, "the lapse alone released the mark");
+        assertGt(pool.maxRequestRedeem(leaver), 0, "the lapsed mark made the request unserviceable");
         vm.warp(finishesAt + 365 days);
-        assertTrue(_queueShut(), "the mark released itself within a year");
         assertEq(pool.exitReserve(), marked, "the mark decayed on its own");
+        assertGt(pool.maxRequestRedeem(leaver), 0, "the year-old mark made the request unserviceable");
         assertEq(auction.workoutsOpenFor(alice), 0, "a workout opened without a caller");
 
         // And the exit under study is still the only move.
@@ -733,63 +754,54 @@ contract LenderPoolExitPricingTest is RiskParamsFixture {
         assertLt((oneEarly - atFloor) * 1_000, oneEarly, "the boundary tick is worth more than 0.1%");
     }
 
-    /// @notice The freeze costs the queued lender it is measured on exactly nothing. Both routes
-    ///         out of it are worth the same to the wei.
-    /// @dev **This is the falsifier every duration candidate has to clear, and none of them do.**
-    ///      Round 20's finding 2 prices the freeze as "a 3.14% haircut for a loss the control
+    /// @notice Servicing at the marked price or waiting for the matching write-down preserves the
+    ///         controller's value to the wei.
+    /// @dev **This is the falsifier every duration candidate has to clear.**
+    ///      Round 20's finding 2 prices the delay as "a 3.14% haircut for a loss the control
     ///      shows would have been zero". The haircut is real and it is the mark's pro-rata share -
     ///      `test_theCostOfLeavingUnderAMarkIsExactlyProRata` measures that. What it is *not* is a
-    ///      price of the *duration*: the lender who escapes at hour six and the lender who waits
-    ///      the whole workout out and is served by the queue finish holding the same value,
-    ///      because the mark is an exact forecast of the write-down the close performs. Whichever
-    ///      route they take, they end at their pro-rata share of what is left.
+    ///      price of the *duration*: the controller who services at hour six and the controller who
+    ///      waits for the workout close finish holding the same value, because the mark is an exact
+    ///      forecast of the write-down the close performs. Whichever route they take, they end at
+    ///      their pro-rata share of what is left.
     ///
     ///      Both paths are valued at the same wall clock and both count cash plus what is still in
     ///      hand, or the comparison would be measuring the clock rather than the price. Measured:
     ///      500.000000 against 500.000000.
     ///
-    ///      Consequence, and it is the reason the reopening of round 20's finding 2 ended in a
-    ///      refusal rather than a change: shortening or pricing the mark's duration transfers no
-    ///      value to the party the finding names. What the duration costs is liquidity timing,
-    ///      which is real and is not a loss.
-    function test_theFreezeCostsTheQueuedLenderNothingByEitherRoute() public {
+    ///      Consequence: changing the settlement authority removes the foreign timing choice, but
+    ///      shortening or pricing the mark's duration still transfers no value to the party the
+    ///      finding names. What the duration costs is liquidity timing, which is real and is not a
+    ///      loss.
+    function test_servicingAtTheMarkOrWaitingForTheWriteDownPreservesTheLeaversValue() public {
         (uint256 id, uint256 finishesAt) = _stageTheParkedMark();
         vm.warp(finishesAt);
         vm.prank(stranger);
         auction.expireToWorkout(id);
         uint256 snap = vm.snapshotState();
 
-        // PATH 1: take the escape `serviceQueue` names, at hour six, then hold.
-        vm.startPrank(leaver);
-        pool.cancelWithdrawalRequest();
-        pool.withdraw(pool.maxWithdraw(leaver), leaver, leaver);
-        vm.stopPrank();
+        // PATH 1: the controller services the currently cash-funded slice at hour six.
+        uint256 earlyShares = pool.maxRequestRedeem(leaver);
+        uint256 earlyQuote = pool.previewRedeem(earlyShares);
+        vm.prank(leaver);
+        pool.serviceWithdrawalRequest(leaver, earlyShares, earlyQuote);
         vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
         vm.prank(stranger);
         auction.closeWorkout(id);
-        vm.startPrank(leaver);
-        uint256 more = pool.maxWithdraw(leaver);
-        if (more != 0) pool.withdraw(more, leaver, leaver);
-        vm.stopPrank();
-        uint256 escapedEarly = usdc.balanceOf(leaver) + pool.previewRedeem(pool.balanceOf(leaver));
+        (,, uint256 remainingRequestShares,,) = pool.withdrawalRequest(leaver);
+        uint256 servicedEarly = pool.claimable(leaver) + pool.previewRedeem(remainingRequestShares);
 
         vm.revertToState(snap);
 
-        // PATH 2: wait the whole freeze out and be served by the queue.
+        // PATH 2: leave the whole request live until the matching write-down is realised.
         vm.warp(finishesAt + Config.WORKOUT_MAX_DURATION);
         vm.prank(stranger);
         auction.closeWorkout(id);
-        pool.serviceQueue(5);
-        vm.prank(leaver);
-        pool.claim();
-        vm.startPrank(leaver);
-        uint256 rest = pool.maxWithdraw(leaver);
-        if (rest != 0) pool.withdraw(rest, leaver, leaver);
-        vm.stopPrank();
-        uint256 waitedItOut = usdc.balanceOf(leaver) + pool.previewRedeem(pool.balanceOf(leaver));
+        (,, uint256 waitedRequestShares,,) = pool.withdrawalRequest(leaver);
+        uint256 waitedForWriteDown = pool.previewRedeem(waitedRequestShares);
 
-        assertEq(escapedEarly, waitedItOut, "the duration moved value between the two routes out");
-        assertGt(escapedEarly, 0, "the fixture paid the lender nothing on either route");
+        assertEq(servicedEarly, waitedForWriteDown, "service timing moved value between the two routes");
+        assertGt(servicedEarly, 0, "the fixture paid the lender nothing on either route");
     }
 
     /// @notice The caller who ends the sale process is paid for it, and a re-strike pays nothing.

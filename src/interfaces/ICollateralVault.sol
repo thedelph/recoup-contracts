@@ -22,7 +22,11 @@ interface ICollateralVault {
 
     /// @notice Deposit ETH; vault mints new bonds via the custody adapter using a
     ///         DexFi keeper-signed mint payload, and stakes them.
-    function depositETH(bytes calldata mintData) external payable;
+    /// @param attemptId Fresh random identifier used with the depositor to derive a
+    ///        one-use deterministic mint receiver.
+    /// @param mintData ABI-encoded keeper-signed DexFi mint payload whose receiver
+    ///        must equal the address derived for `attemptId`.
+    function depositETH(bytes32 attemptId, bytes calldata mintData) external payable;
 
     /// @notice Withdraw bond units. Only allowed when debt is zero or resulting
     ///         LTV ≤ maxLTV.

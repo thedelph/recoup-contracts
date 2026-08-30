@@ -115,6 +115,21 @@ library Config {
     ///      It is the PRD's original launch figure, which is also the far end of the ratchet
     ///      agreed with DexFi. Going beyond it is a redeploy, deliberately.
     uint256 internal constant GLOBAL_BORROW_CAP_MAX = 250_000e6;
+
+    /// @notice Maximum raw vault shares per raw USDC unit at the lender entry price.
+    /// @dev This is an arithmetic safety boundary, not an entry fee. `LenderPool.available()`
+    ///      retains enough recognised cash that writing off every outstanding principal unit still
+    ///      leaves the entry quotient at or below this value. Fair-price deposits preserve that
+    ///      inequality, so the boundary does not haircut a new lender.
+    ///
+    ///      Derived from the absolute deposit-cap ceiling. `GLOBAL_BORROW_CAP_MAX` is below `2**38`
+    ///      raw USDC units. Multiplying it by `2**128` keeps ordinary share supply below `2**166`,
+    ///      leaving 90 bits above the largest fully capitalised pool. The boundary is reached only
+    ///      after repeated catastrophic losses; at that point new lending tapers to zero until
+    ///      yield or repayment restores the cash buffer. Explicit recapitalisation is reserved for
+    ///      an abnormal entry-price violation, not for lending past this terminal risk boundary.
+    uint256 internal constant MAX_LENDER_SHARES_PER_ASSET = 1 << 128;
+
     uint256 internal constant INSURANCE_FUND_TARGET_BPS = 500; // ≥5% of outstanding debt per cap raise
     uint256 internal constant UNDERWRITING_APR_BPS = 2_500; // UI/modelling only, never marketed
 
@@ -164,10 +179,13 @@ library Config {
     ///      price - but the re-strike was free, permissionless and *unbounded*, and it re-opened the
     ///      auction's liveness register every time. `CreditManager._impairmentFor` keys the lender
     ///      pool's mark on that register, so an attacker holding no capital at all could keep a
-    ///      position perpetually live and hold the whole withdrawal queue shut over idle cash.
-    ///      Measured: 30 re-strikes over 7 days, 30 of 30 `serviceQueue` calls refused, 19,371 USDC
-    ///      idle, the lender paid nothing, and `openWorkoutCount` never leaving zero - so the
-    ///      forced close that bounds every *other* path was never armed at all.
+    ///      position perpetually live. Under the superseded FIFO withdrawal design, that mark held
+    ///      the whole queue shut over idle cash. Historical measurement: 30 re-strikes over 7 days,
+    ///      30 of 30 batch-service attempts refused, 19,371 USDC idle, the lender paid nothing, and
+    ///      `openWorkoutCount` never leaving zero, so the forced close that bounds every *other*
+    ///      path was never armed at all. Controller-scoped requests no longer have that global
+    ///      refusal; a standing mark instead lowers each request's live execution quote, which its
+    ///      controller or approved operator may accept subject to `minAssetsOut`.
     ///
     ///      This is the bound. Once it passes, `start` refuses to re-strike and the only legal move
     ///      on a lapsed auction is the permissionless `expireToWorkout`, which arms
@@ -197,10 +215,11 @@ library Config {
     ///      The trade-off, both directions stated because neither is free. Too short pushes a lot
     ///      that would have sold into a workout, which is a real redemption and removes a bond from
     ///      DexFi's fund - the outcome both sides least want - and gives the borrower a worse
-    ///      recovery. Too long leaves the lender pool's withdrawal queue shut for that whole period
-    ///      at the price of gas. Reaching the workout does **not** end the mark, so the worst case is
-    ///      this window *plus* `WORKOUT_MAX_DURATION`; at 14 days that was 28, and the second half is
-    ///      unavoidable while the first is not.
+    ///      recovery. Too long leaves the lender pool's mark standing and request execution quotes
+    ///      depressed for that whole period at the price of gas. The superseded FIFO design made
+    ///      the stronger failure a global queue shutdown. Reaching the workout does **not** end the
+    ///      mark, so the worst case is this window *plus* `WORKOUT_MAX_DURATION`; at 14 days that
+    ///      was 28, and the second half is unavoidable while the first is not.
     ///
     ///      Eight cycles is generous against the thing re-striking exists for: each one restarts at
     ///      100% of *current* NAV and decays to `AUCTION_FLOOR_BPS`, so a lot that has failed to
