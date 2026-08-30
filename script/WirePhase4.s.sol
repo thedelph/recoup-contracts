@@ -84,6 +84,12 @@ import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
 ///      pause operation - the one here that may legitimately need to run more than once - takes a
 ///      salt and the switchover, which runs once, does not.
 contract WirePhase4 is DeployBase {
+    /// @notice `assertOnly` was asked for a health report with no owner named.
+    /// @dev Its own error rather than a bare revert, because the failure it replaces looked
+    ///      exactly like a real one: `OwnershipNotTransferred` against the correct owner, i.e.
+    ///      a health report inventing a wiring failure out of an unset environment variable.
+    error OwnerNotNamedForReport();
+
     error DeployedAddressMissing(string name);
     error SwitchoverConfirmationMissing();
 
@@ -490,12 +496,35 @@ contract WirePhase4 is DeployBase {
     ///      should never be discouraged from checking.
     function assertOnly() external view {
         // **`_readParams`, not `_resolveParams`, and the difference is the whole point of the
-        // docstring above.** Resolving runs `_validateParams`, which since round 29 refuses a
-        // deployment owned by a contract with no guardian named - which is exactly the state an
-        // operator would run this report to understand. A read that refuses to answer in the case
-        // it exists for is not a read. The values are still the real ones: `_assertCoreGraph`
-        // reads `p.owner` out of them, so they cannot be faked.
-        _assertPhase4Wiring(_resolveDeployed(), _readParams(msg.sender));
+        // docstring above.** Resolving runs `_validateParams`, and a read that refuses to answer
+        // in the case it exists for is not a read.
+        //
+        // 🟥 **The rule this comment used to name is no longer here, corrected in audit round 38.**
+        // It said "resolving runs `_validateParams`, which since round 29 refuses a deployment
+        // owned by a contract with no guardian named". #352 moved that rule OUT of
+        // `_validateParams` and into `DeployBase._validateNewDeployment`, whose only caller is
+        // `_deployProtocol`, so it does not run on this path at all any more - not through
+        // `_resolveParams`, and not through `run()`, `queue()` or `executeQueued()`. The reason to
+        // read rather than resolve stands on the other rules `_validateParams` still applies;
+        // it no longer stands on the guardian rule, because that rule is gone from here.
+        //
+        // 🟥 **And "the values are still the real ones ... so they cannot be faked" is now only
+        // half true: they can be ABSENT.** #352 also stopped `RECOUP_OWNER` defaulting to the
+        // caller off-local, so with it unset `p.owner` reads `address(0)` and `_assertCoreGraph`
+        // reverts `OwnershipNotTransferred` naming the real, correct owner - a health report
+        // reporting a failure that does not exist.
+        //
+        // FIXED HERE, and the fix is the MESSAGE rather than the behaviour. Refusing to run when
+        // `RECOUP_OWNER` is unset would be the wrong direction: this is a read-only health report
+        // and it is the tool an operator reaches for when they are not sure what is set. What it
+        // must not do is blame the chain for a gap in the environment. So it names the missing
+        // variable and stops, instead of reporting a wiring failure that does not exist.
+        //
+        // Zero runtime bytes: this file is a script and is never deployed.
+        GovParams memory p = _readParams(msg.sender);
+        if (p.owner == address(0)) revert OwnerNotNamedForReport();
+
+        _assertPhase4Wiring(_resolveDeployed(), p);
         console.log("Phase-4 wiring holds.");
     }
 

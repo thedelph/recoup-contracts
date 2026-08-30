@@ -6,6 +6,62 @@ solc_version = "0.8.24"
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
+# Remappings are PINNED, and the reason is a measurement rather than a preference.
+# Forge auto-detects remappings from what is present on disk under `lib/`, not from what the
+# commit says. A recursive submodule checkout populates OpenZeppelin's own nested submodules
+# (`erc4626-tests`, `halmos-cheatcodes`) and forge then appends a remapping for each. `remappings`
+# is a field of solc METADATA, and metadata is hashed into every contract's CBOR trailer - so the
+# same commit compiled on two machines produced different bytecode for every contract, and for
+# `CreditWiring`, which is deployed by CREATE2 where the creation code IS the address, a different
+# address. MEASURED 2026-08-30: populated nested submodules gave 5 remappings and
+# 0x7186c084C24d01D56Ec63EE2060F52aCd2385d65; emptied, 2 remappings and
+# 0xbBd98f91088f09ABD9c1C6396b61623b7722C186. CI checks out `submodules: recursive`, so CI and an
+# ordinary local clone did not agree. With this line the address is identical in both states,
+# verified by flipping the submodules and rebuilding. Nothing in this tree imports through a
+# dropped remapping (measured: zero `erc4626-tests/`, `halmos-cheatcodes/` and
+# `openzeppelin-contracts/` imports across src, script and test).
+auto_detect_remappings = false
+
+# Three forge OPTIONS are pinned, and the distinction from the `libraries` pin round 37 refused is
+# the whole reason these are safe. `libraries` is a field of solc METADATA, filled from the
+# compiler input, so pinning it lands in the pinned library's own metadata and moves its own CREATE2
+# address: pin A and it deploys to B, with no fixed point. MEASURED 2026-08-30: `CreditWiring`'s
+# artifact `settings` keys are compilationTarget, evmVersion, libraries, metadata, optimizer and
+# remappings. None of the three below is a solc-input field, so NONE of them enters the CBOR
+# trailer, and the CREATE2 address cannot move. Verified rather than argued: with these lines the
+# initcode still hashes to 0xdeade73de1d8ac70af637801be7ad8adb711b27ac3f5553c42e490b17dbeac1d and
+# CREATE2 over the deterministic deployer at a zero salt still gives
+# 0xbBd98f91088f09ABD9c1C6396b61623b7722C186.
+#
+# 🟥 "A provable no-op" is TRUE ON 1.8.1 AND FALSE ON 1.7.1, and that is the point rather than a
+# caveat. `--isolate` became forge's default in 1.8.0. On 1.7.1 these lines CHANGE behaviour, which
+# is exactly what would have made an older local box reproduce CI's red instead of disagreeing with
+# it for a session. Round 36's refusal - "pinning would buy determinism with blindness" - conflated
+# pinning the TOOLCHAIN with pinning the OPTION. The toolchain stays deliberately unpinned in
+# `ci.yml` and resolves to `stable`; only the options are fixed here. Never copy the phrase "no-op"
+# forward without the version it was measured on.
+#
+# `create2_library_salt` is forge's own compiled-in default, thirty-two zero bytes, written down
+# rather than inherited. Pinning it does not move the library address, it FREEZES it against a
+# future forge default changing underneath the frozen deploy plan.
+isolate = true
+dynamic_test_linking = true
+create2_library_salt = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+# READ, never read-write, and the path is the narrowest one that works. `AssertLocked.s.sol` reads
+# `deployments/base-sepolia.json` to compare the record against the chain. `fs_permissions` is
+# process-wide, so `read-write` here would hand every test in the suite the ability to overwrite the
+# deployment record - and the entrypoint deliberately PRINTS its row for a human to paste rather
+# than stamping it, which is what keeps the record a deliberate act instead of a side effect.
+# 🟥 The `out` entry is forge's own DEFAULT and declaring this key at all REPLACES it rather than
+# adding to it - measured, `forge config` went from `path = "out"` to `path = "deployments"` on the
+# first attempt at this line. Nothing in this tree calls `vm.getCode`/`vm.getDeployedCode` today, so
+# the loss would have been silent until the first caller, which is the "retires an arm quietly"
+# shape this repository has already been bitten by twice. Both are declared.
+fs_permissions = [
+    { access = "read", path = "out" },
+    { access = "read", path = "deployments" },
+]
 remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/",
     "forge-std/=lib/forge-std/src/",
@@ -13,6 +69,10 @@ remappings = [
 
 # Public immutables use lowerCamelCase as part of the external API surface
 [lint]
+# Keep compilation and linting separate. Foundry's automatic post-build pass emits thousands of
+# advisory lint diagnostics here, and the hosted runner was terminated three times after solc had
+# already succeeded. Run `forge lint` explicitly when lint work is in scope.
+lint_on_build = false
 exclude_lints = ["screaming-snake-case-immutable"]
 
 # These are forge's current defaults, written down rather than inherited. `fail_on_revert`

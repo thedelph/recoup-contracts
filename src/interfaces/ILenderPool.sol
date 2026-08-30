@@ -6,8 +6,8 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ILiquiditySource} from "./ILiquiditySource.sol";
 
 /// @title ILenderPool
-/// @notice ERC-4626 USDC vault lending exclusively to CreditManager, with a FIFO
-///         withdrawal queue when idle USDC is short (PRD §4.2).
+/// @notice ERC-4626 USDC vault lending exclusively to CreditManager, with controller-scoped
+///         withdrawal requests when idle USDC is short (PRD §4.2).
 /// @dev **`LenderPool` declares `is ILenderPool`, and these events are declared here and only
 ///      here.** Audit round 11 found the implementation inheriting nothing, so conformance was
 ///      never compiler-checked - and both of the protocol's call sites into the pool swallow a
@@ -22,22 +22,25 @@ import {ILiquiditySource} from "./ILiquiditySource.sol";
 ///      which is what makes the drift structurally impossible instead of merely fixed this once. A
 ///      second copy in the implementation would restore exactly the freedom that produced the
 ///      drift. Events the implementation emits from machinery this interface does not describe -
-///      its wiring setters, its yield-stream freeze, its pull-payment claim - stay on the
-///      implementation, because promising them here would be promising behaviour no other
-///      `ILenderPool` has to have.
+///      its wiring setters and its yield-stream freeze - stay on the implementation, because
+///      promising them here would be promising behaviour no other `ILenderPool` has to have.
+///      `WithdrawalClaimed` stays here because both claim functions are part of this interface.
 interface ILenderPool is IERC4626, ILiquiditySource {
     event Lent(uint256 amount);
     event PrincipalRepaid(uint256 amount);
     /// @notice A repayment larger than what was recorded as out on loan, routed into the yield
-    ///         stream rather than landing in the share price in the repaying block.
+    ///         mechanism rather than landing in the share price in the repaying block.
     /// @dev Separate from `PrincipalRepaid`, which reports the whole amount. A surplus means an
     ///      earlier write-down is being reversed, and that is worth being able to see on its own.
+    ///      The amount may freeze below the stream floor; fixed-claim repair is reported separately.
     event PrincipalSurplusStreamed(uint256 amount);
-    /// @param amount The epoch's newly delivered lender share.
+    /// @notice Incoming recognised USDC restored part of a fixed-claim solvency shortfall.
+    event ClaimDeficitCovered(address indexed payer, uint256 amount, uint256 remaining);
+    /// @param amount The lender share actually pulled, including any exact fixed-claim repair.
     /// @param ratePerSecond Release rate, scaled by the implementation's fixed-point precision.
     /// @param streamEndsAt When the pot currently being released runs dry.
-    /// @dev Carries the stream terms, not just the amount. The amount alone no longer describes
-    ///      what happens to the share price, because it no longer happens at once.
+    /// @dev Carries the current stream terms as well as the amount. On a claim-only repair the terms
+    ///      can remain unchanged, and the paired `ClaimDeficitCovered` event explains the allocation.
     ///
     ///      **The drift this whole file's header is about.** The stream added the rate and the end
     ///      timestamp to the implementation and left this line at one parameter, so an indexer
@@ -53,44 +56,39 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      insurance netting and the exposure clamp both sit between them and the answer.
     event LossReservesSet(uint256 unplacedLoss, uint256 insuranceCover, uint256 exitReserve);
     event LossSocialised(uint256 amount);
-    /// @notice Money returned on an asset this pool has already written down, routed into the
-    ///         yield stream rather than landing in the share price in its own block.
+    /// @notice Money returned on an asset this pool has already written down.
     /// @dev The exact counterpart of `LossSocialised`, and separate from `PrincipalSurplusStreamed`
     ///      on purpose: a surplus repayment reverses a write-down through the principal leg and
     ///      moves `outstandingPrincipal`, while this arrives on a loan that has already been
     ///      written off entirely and moves nothing but the pot. An indexer that could not tell them
-    ///      apart would report a live loan where there is none.
+    ///      apart would report a live loan where there is none. The implementation first restores
+    ///      any fixed-claim insolvency, then streams value owned by a viable cohort or freezes it for
+    ///      a low non-zero cohort. Value arriving with no holder is removed from the recognised book
+    ///      rather than gifted to a later one.
     event LossRecovered(uint256 amount, uint256 lifetimeRecovered);
-    /// @notice The whole principal-unit ledger was divided by `2 ** shift`. Round-23 finding 7.
-    /// @dev Declared here for the same reason `QueuedWithdrawalReleasedAsDust` is: an indexer that
-    ///      caches `principalUnits` or `queueEntryPrincipalUnits` has no other way to learn that
-    ///      every figure it holds has been rescaled underneath it, and the rescaling is silent in
-    ///      every other log. Carries the resulting exponent as well as the shift, so a reader that
-    ///      missed an earlier one resynchronises from a single log rather than by replaying history.
-    event PrincipalUnitsRenormalised(uint256 shift, uint256 unitExponent, uint256 totalPrincipalUnits);
-    event WithdrawalQueued(address indexed lender, uint256 indexed queueIndex, uint256 assets);
-    event QueuedWithdrawalServiced(address indexed lender, uint256 indexed queueIndex, uint256 assets);
-    /// @notice A queued request was withdrawn by its owner, who took the escrowed shares back.
-    event WithdrawalRequestCancelled(address indexed lender, uint256 indexed queueIndex, uint256 shares);
-    /// @notice A queued remainder too small to be worth one asset-wei, returned to its owner.
-    /// @dev Declared here rather than left on the implementation, and the reason generalises.
-    ///      `queuePosition` is part of this interface, so an indexer is invited to reconstruct who
-    ///      is waiting from these events - and there are **four** ways an entry stops waiting, not
-    ///      two. An indexer that knows only `WithdrawalQueued` and `QueuedWithdrawalServiced` shows
-    ///      cancelled and dust-released lenders as still in the queue forever. Distinct from
-    ///      `QueuedWithdrawalServiced` because no USDC moves: a lender watching for their payout
-    ///      must not read this as one.
-    event QueuedWithdrawalReleasedAsDust(address indexed lender, uint256 indexed queueIndex, uint256 shares);
+    event WithdrawalRequested(
+        address indexed controller, uint256 indexed requestId, address indexed receiver, uint256 shares
+    );
+    event WithdrawalRequestServiced(
+        address indexed controller, uint256 indexed requestId, address indexed receiver, uint256 shares, uint256 assets
+    );
+    event WithdrawalRequestCancelled(
+        address indexed controller, uint256 indexed requestId, address indexed receiver, uint256 shares
+    );
+    event RequestOperatorSet(address indexed controller, address indexed operator, bool approved);
+    event WithdrawalClaimed(address indexed receiver, uint256 assets);
 
     // `lend`, `repayPrincipal` and `available` come from ILiquiditySource, which the
     // Phase 2 treasury float also implements. That is the whole point of the seam:
     // swapping the pool in behind CreditManager needs no change to CreditManager.
 
-    /// @notice Receive the lender share of harvested yield. It raises released share value over
-    ///         the rated stream window, not in the delivering block. See `LenderPool` for why.
-    ///         EpochHarvester only.
+    /// @notice Receive the lender share of harvested yield. It first repairs fixed claims, then
+    ///         raises released share value for a viable cohort over the rated stream window rather
+    ///         than in the delivering block. See `LenderPool` for why. EpochHarvester only.
     /// @dev While the stream is active, entry previews include its projected unreleased tail so a
-    ///      post-delivery entrant pays for the pot instead of diluting the delivered cohort.
+    ///      post-delivery entrant pays for the pot instead of diluting the delivered cohort. With
+    ///      supply below the stream safety floor, only the amount that repairs a fixed-claim
+    ///      insolvency may be pulled; any excess remains owed by the harvester.
     function distributeYield(uint256 amount) external;
 
     /// @notice Reserve the shortfall a borrower's live liquidation is expected to produce.
@@ -100,7 +98,7 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///         are idempotent and therefore silent on a no-op - no write, no event, no revert - and
     ///         a caller that treats "did not revert" as "did something" reports work it did not do.
     ///         Audit round 19 measured that: five refreshes, `refreshed = 1` each time, zero
-    ///         `Impaired` events, the withdrawal queue shut on the unchanged mark throughout.
+    ///         `Impaired` events, and an unchanged reserve throughout.
     function impair(address borrower, uint256 amount) external returns (bool wrote);
 
     /// @notice Drop a borrower's reserve because the position resolved. CreditManager only.
@@ -121,9 +119,9 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      report released, un-impaired NAV**, matching Maple on the impairment split. That
     ///      asymmetry is the mechanism, not an oversight: an entrant who bought at the impaired
     ///      price would profit when the impairment was released. During a live yield stream,
-    ///      `previewDeposit` and `previewMint` additionally price the projected unreleased tail;
-    ///      during a frozen backlog they remain on released NAV. Read `previewRedeem` for what a
-    ///      redemption would actually pay.
+    ///      `previewDeposit` and `previewMint` additionally price the unreleased tail, whether its
+    ///      clock is active or frozen, so a later entrant cannot dilute the cohort that owns it.
+    ///      Read `previewRedeem` for what a redemption would actually pay.
     function exitAssets() external view returns (uint256);
 
     /// @notice USDC currently out on loan. The ceiling on every reserve above, because a pool
@@ -168,11 +166,50 @@ interface ILenderPool is IERC4626, ILiquiditySource {
     ///      `repayPrincipal`: that leg nets against `outstandingPrincipal`, which the socialisation
     ///      has already written down, so a recovery arriving that way is recognised only when the
     ///      surviving book unwinds. It arrives here instead, where it is what it actually is - a
-    ///      gain on an asset the pool has already written off and is streamed for the same reason
-    ///      every other inbound gain is. The stream is allocated economically to shares present
-    ///      when the recovery is delivered; it does not reconstruct historical loss bearers.
+    ///      gain on an asset the pool has already written off. It first repairs any fixed-claim
+    ///      insolvency. Residual value is streamed for a live cohort, frozen for a low non-zero
+    ///      cohort, or removed from the recognised book when no holder remains. A stream is
+    ///      allocated economically to shares present when the recovery is delivered; it does not
+    ///      reconstruct historical loss bearers.
     function recoverLoss(uint256 amount) external;
 
-    /// @return index position in the FIFO queue (0 = next), remaining assets still owed
-    function queuePosition(address lender) external view returns (uint256 index, uint256 remaining);
+    /// @notice Escrow `shares` in a controller-scoped request with a receiver that cannot change.
+    function requestWithdrawal(uint256 shares, address receiver) external;
+
+    /// @notice Service exactly `shares` from `controller`'s request at the live exit price.
+    /// @dev Only the controller or an operator they approved may call this. `minAssetsOut` protects
+    ///      the controller against an adverse price move in the execution block.
+    function serviceWithdrawalRequest(address controller, uint256 shares, uint256 minAssetsOut)
+        external
+        returns (uint256 assetsOut);
+
+    /// @notice The most shares in `controller`'s request that its current pro-rata cash can fund.
+    function maxRequestRedeem(address controller) external view returns (uint256 shares);
+
+    /// @notice Read a controller's one live request and its current serviceable amount.
+    function withdrawalRequest(address controller)
+        external
+        view
+        returns (
+            uint256 requestId,
+            address receiver,
+            uint256 shares,
+            uint256 serviceableShares,
+            uint256 serviceableAssets
+        );
+
+    /// @notice Cash reserved pro rata for all currently requested shares.
+    function queueCashReserve() external view returns (uint256);
+
+    /// @notice Approve or revoke an operator that may choose service timing and amount.
+    function setRequestOperator(address operator, bool approved) external returns (bool);
+
+    function isRequestOperator(address controller, address operator) external view returns (bool);
+
+    /// @notice Cancel the caller's request and return its remaining shares.
+    function cancelWithdrawalRequest() external;
+
+    function claim() external returns (uint256 amount);
+
+    function claimFor(address receiver) external returns (uint256 amount);
 }

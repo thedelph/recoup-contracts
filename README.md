@@ -106,10 +106,16 @@ forge build
 forge test
 ```
 
-On the current public tree, the normal run is 733 passed, 0 failed and 13 skipped across 30 suites,
-746 total. Ten skips are the optional mainnet fork tests; three are fixture-decay detectors that are
-intentionally disabled in those fork harnesses. CI runs the full unit and invariant suite on every
-push and pull request.
+On the current public tree, the normal run is 1,227 passed, 0 failed and 32 skipped across 61
+suites, 1,259 total. Every one of the 32 skips is in the six `test/fork/` suites, which need a live
+Base RPC or an explicit opt-in and skip without one; nothing outside those six is skipped. CI runs
+the full unit and invariant suite on every push and pull request.
+
+Measured on this tree by a single `forge test` run with its summary line present, rather than
+carried from a previous sync. The figure this replaced read 733 across 30 suites and had been wrong
+since the sync before last. Three of the six fork suites report more tests than they declare,
+because they subclass a fixture and inherit its suite, so counting declarations in those files
+gives 29 rather than 32.
 
 ### Mainnet fork tests
 

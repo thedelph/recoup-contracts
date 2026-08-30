@@ -5,8 +5,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 import {Config} from "../Config.sol";
+import {MintAttemptReceiver} from "../MintAttemptReceiver.sol";
 import {ICustodyAdapter} from "../interfaces/ICustodyAdapter.sol";
 import {IDexFiBond} from "../interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../interfaces/IDexFiFarm.sol";
@@ -25,9 +27,27 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
     error NotVault();
     error NotClaimer();
-    error ReceiverMustBeAdapter(address receiver);
+    error InvalidBeneficiary();
+    error InvalidAttemptId();
+    error MintReceiverMismatch(address expected, address actual);
+    error MintNonceMustBeZero(uint256 supplied);
+    error MintAttemptAlreadyUsed(address receiver, uint256 nonce);
+    error MintAttemptAlreadyDeployed(address receiver);
+    error AdapterNotWhitelisted();
+    error ZeroMintAmount();
+    error InvalidRecoveryRecipient(address recipient);
+    error InvalidMintReceiverCode(address receiver, bytes32 actual, bytes32 expected);
+    error MintReceiverDeployMismatch(address expected, address actual);
+    error MintReceiverPositionMismatch(
+        uint256 expectedStake, uint256 actualStake, uint256 expectedLoose, uint256 actualLoose
+    );
+    error AdapterPositionMismatch(
+        uint256 expectedStake, uint256 actualStake, uint256 expectedLoose, uint256 actualLoose
+    );
     error PaymentMismatch(uint256 expected, uint256 actual);
     error MintAmountMismatch(uint256 expected, uint256 actual);
+    error MintReceiverUsdcMismatch(uint256 expected, uint256 actual);
+    error NothingToRecover(address receiver);
     error ZeroAddress();
     error RenounceDisabled();
     error NothingToFlush();
@@ -37,11 +57,71 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     event EmergencyUnstaked(address indexed to, uint256 amount);
     event YieldParked(address indexed recipient, uint256 amount, uint256 totalOwed);
     event YieldFlushed(address indexed recipient, uint256 amount);
+    event MintAttemptExecuted(
+        address indexed beneficiary,
+        bytes32 indexed attemptId,
+        address indexed receiver,
+        uint256 paymentAmount,
+        uint256 bondAmount
+    );
+    /// @dev 🟥 **`bonds` means two different things and only `emergency` says which.** On the
+    ///      normal path it is the amount that moved clone -> adapter -> `recoveryRecipient` in this
+    ///      transaction. On the emergency path `emergencyRecoverAll` deliberately performs no
+    ///      ERC-1155 transfer, so `bonds` is the amount **still sitting at the clone** and
+    ///      `recoveryRecipient` is `address(0)`. MEASURED at audit round 34, same 9 units both
+    ///      ways: normal left 0 at the clone and 9 at the recipient; emergency left 9 at the clone
+    ///      and 0 at the adapter. A consumer that reads `bonds` as "delivered to
+    ///      `recoveryRecipient`" therefore reads the emergency event as 9 units sent to the zero
+    ///      address. `emergency == true` and `recoveryRecipient == address(0)` are both reliable
+    ///      discriminators; nothing but this comment says so.
+    ///
+    ///      **`farmYieldForwarded` can under-report** - see `_recoverTo`, where a re-entrant
+    ///      `flushMintAttemptYield` was measured making it read 0 against 41.000000 that really
+    ///      left. Read `farmYieldDelivered` and the recipient's balance, never this field alone.
+    event MintAttemptRecovered(
+        address indexed beneficiary,
+        bytes32 indexed attemptId,
+        address indexed receiver,
+        address recoveryRecipient,
+        uint256 bonds,
+        uint256 farmYieldForwarded,
+        uint256 rawUsdcForwarded,
+        uint256 rawUsdcRemaining,
+        uint256 nativeForwarded,
+        uint256 nativeRemaining,
+        bool emergency
+    );
+    event MintAttemptYieldFlushed(
+        address indexed beneficiary,
+        bytes32 indexed attemptId,
+        address indexed receiver,
+        uint256 received,
+        uint256 swept
+    );
 
     IDexFiBond public immutable bond;
     IDexFiFarm public immutable farm;
     IERC20 public immutable usdc;
     address public immutable vault;
+    MintAttemptReceiver public immutable mintReceiverImplementation;
+
+    bytes32 public constant MINT_ATTEMPT_DOMAIN = keccak256("RECOUP_MINT_ATTEMPT_V1");
+
+    struct MintSnapshot {
+        uint256 childStake;
+        uint256 childLoose;
+        uint256 childUsdc;
+    }
+
+    struct RecoveryResult {
+        uint256 bonds;
+        uint256 farmForwarded;
+        uint256 swept;
+        uint256 rawUsdcForwarded;
+        uint256 rawUsdcRemaining;
+        uint256 nativeForwarded;
+        uint256 nativeRemaining;
+    }
 
     /// @notice Where claimed/swept USDC is sent. Defaults to a treasury sink at
     ///         deploy; repointed to the EpochHarvester when Phase 3 lands.
@@ -88,10 +168,32 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
     /// @inheritdoc ICustodyAdapter
     /// @dev Monotonic, and the reason it can be trusted is that `_settleFarmPayout` is handed a
-    ///      *measured farm delta* rather than this contract's balance. `_trySweepUsdc` moves
-    ///      everything sitting here, donations included, but only what the farm paid is ever added
-    ///      to this counter. So a stranger can raise this contract's balance, and the harvester's,
-    ///      and move this number by nothing.
+    ///      *measured delta* rather than this contract's balance. `_trySweepUsdc` moves everything
+    ///      sitting here, donations included, but only a measured delta is ever added to this
+    ///      counter. **So the property that holds is that a party who can only SEND TOKENS cannot
+    ///      move this number** - not the wider claim that no outside party can, which this comment
+    ///      used to make and which is false on one path.
+    ///
+    ///      **The exception, named rather than left to be found. Recorded round-34 Low 1.**
+    ///      `autoDepositPaid` in `_mintIntoReceiver` is the one measurement feeding this counter
+    ///      that is taken across `bond.mint` rather than across a `farm.*` call: it is the
+    ///      receiver's USDC balance differenced over the whole mint. DexFi's `treasury` is
+    ///      owner-settable and is called inside that window, so USDC arriving at the receiver from
+    ///      that address during the mint is counted here as farm yield. It is measured against
+    ///      `Config.MIN_EPOCH_FARM_YIELD` - one dollar - so it is the epoch-liveness signal that
+    ///      would be bought, exactly as round 11's donated $1.82 bought one.
+    ///
+    ///      It needs DexFi's owner key, which already permits strictly better attacks than
+    ///      manufacturing a dollar of apparent yield, and `treasury()` is an EOA today, so the
+    ///      hook is inert. It is written down because an unstated exception in a monotonicity
+    ///      claim reads as coverage.
+    ///
+    ///      **The obvious fix is REFUSED, and the reason is worth keeping.** Corroborating
+    ///      `autoDepositPaid` against a `farm.pendingShare(receiver)` read taken before the mint
+    ///      cannot work: the farm is MasterChef-style, `bond.mint`'s `depositForAccount` hook is a
+    ///      deposit, and a deposit settles the whole position's pending rewards. So the pre-mint
+    ///      `pendingShare` IS the quantity the auto-deposit pays out. The check would compare a
+    ///      figure against itself, and would pass on precisely the case it was added to catch.
     ///
     ///      Audit round 11 is why it exists, and the shape of that finding is why it lives here
     ///      rather than in the harvester. `EpochHarvester.harvest` treats the farm claim as
@@ -137,6 +239,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         usdc = usdc_;
         vault = vault_;
         yieldRecipient = yieldRecipient_;
+        mintReceiverImplementation = new MintAttemptReceiver(address(this), bond_, farm_, usdc_);
         // Standing approval so stake() can move bond units into the farm.
         bond_.setApprovalForAll(address(farm_), true);
     }
@@ -252,59 +355,159 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     // ── ICustodyAdapter ──────────────────────────────────────────────────────
 
     /// @inheritdoc ICustodyAdapter
-    /// @dev Slither unused-return: only the staked amount from userInfo is needed;
-    ///      rewardDebt is MasterChef bookkeeping this contract does not consume.
-    // slither-disable-next-line unused-return
-    function mintBonds(bytes calldata mintData) external payable onlyVault returns (uint256 amount) {
+    function mintBonds(address beneficiary, bytes32 attemptId, bytes calldata mintData)
+        external
+        payable
+        onlyVault
+        returns (uint256 amount)
+    {
         IDexFiBond.MintDataInput memory data = abi.decode(mintData, (IDexFiBond.MintDataInput));
-        // Bonds auto-stake for the receiver on mint; custody must land here.
-        if (data.receiver != address(this)) revert ReceiverMustBeAdapter(data.receiver);
-        // Strict equality is deliberate and load-bearing: the bond takes
-        // `msg.value >= paymentAmount`, forwards only `paymentAmount` to its treasury,
-        // and exposes no native-withdrawal path, so any overpayment is burned with no
-        // recovery by anyone. Relaxing this to `>=` would turn a revert into a silent,
-        // permanent loss of the depositor's ETH.
-        if (msg.value != data.paymentAmount) revert PaymentMismatch(data.paymentAmount, msg.value);
+        address receiver = _validateMintAttempt(beneficiary, attemptId, data);
 
-        (uint256 stakedBefore,) = farm.userInfo(address(this));
-        uint256 looseBefore = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
-        // Measured across the mint itself, not just the fallback stake below. On the
-        // auto-stake path `bond.mint` drives the farm's `depositForAccount` hook for
-        // this adapter, and a MasterChef-style pool settles the whole position's
-        // pending rewards on any deposit - so an ETH mint can flush an epoch of every
-        // borrower's yield in here with nothing measuring it. That is the same leak
-        // `_settleFarmPayout` was factored out to close, and this was the one
-        // farm-touching path still outside it.
-        uint256 usdcBefore = usdc.balanceOf(address(this));
+        address deployed = Clones.cloneDeterministic(
+            address(mintReceiverImplementation), _mintAttemptSalt(beneficiary, attemptId)
+        );
+        if (deployed != receiver) revert MintReceiverDeployMismatch(receiver, deployed);
 
-        bond.mint{value: msg.value}(data);
+        uint256 farmPaid = _mintAndConsolidate(receiver, data);
+        _settleFarmPayout(farmPaid);
 
-        (uint256 stakedAfter,) = farm.userInfo(address(this));
-        uint256 looseAfter = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
-
-        // Units from THIS mint appear either as staked growth (auto-stake path) or
-        // as newly-loose units (no-reward-pool fallback). Pre-existing loose bonds
-        // (donations/mis-sends) are excluded, so credit can never absorb them and
-        // the credited amount is pinned to DexFi's signed `amountNfts`.
-        uint256 newlyLoose = looseAfter - looseBefore;
-        uint256 minted = (stakedAfter - stakedBefore) + newlyLoose;
-        if (minted != data.amountNfts) revert MintAmountMismatch(data.amountNfts, minted);
-
-        // Same measurement `stake()` performs, for the same reason: this is a
-        // MasterChef-style farm, so `deposit` settles the whole adapter position's
-        // pending rewards. Unmeasured, an epoch of every borrower's yield would sit
-        // here uncounted until some later sweep pushed it out as an untracked
-        // donation. Only the fallback path reaches this - on the auto-stake path
-        // `newlyLoose` is zero and `bond.mint` has already staked - but the fallback
-        // is the one that fires if DexFi ever unsets the reward pool.
-        if (newlyLoose > 0) farm.deposit(newlyLoose);
-
-        // One settle covering both branches, so the auto-stake path is measured too.
-        // The return is discarded rather than reported: this path already returns the
-        // minted bond count, and the yield still reaches borrowers because the
-        // harvester sizes an epoch from its own balance, not from a reported figure.
-        _settleFarmPayout(usdc.balanceOf(address(this)) - usdcBefore);
         amount = data.amountNfts;
+        emit MintAttemptExecuted(beneficiary, attemptId, receiver, data.paymentAmount, amount);
+    }
+
+    /// @notice Counterfactual receiver used for one beneficiary's independent mint attempt.
+    function predictMintReceiver(address beneficiary, bytes32 attemptId)
+        public
+        view
+        returns (address receiver)
+    {
+        if (beneficiary == address(0)) revert InvalidBeneficiary();
+        if (attemptId == bytes32(0)) revert InvalidAttemptId();
+        receiver = Clones.predictDeterministicAddress(
+            address(mintReceiverImplementation), _mintAttemptSalt(beneficiary, attemptId), address(this)
+        );
+    }
+
+    /// @notice Retry a child clone's delivery of corroborated farm yield.
+    /// @dev Permissionless because both the receiver and final yield destination are fixed.
+    function flushMintAttemptYield(address beneficiary, bytes32 attemptId)
+        external
+        returns (uint256 swept)
+    {
+        address receiver = predictMintReceiver(beneficiary, attemptId);
+        _requireMintReceiverCode(receiver);
+
+        uint256 beforeBalance = usdc.balanceOf(address(this));
+        uint256 reported = MintAttemptReceiver(payable(receiver)).flushFarmYield();
+        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
+        uint256 corroborated = reported < received ? reported : received;
+        if (corroborated != 0) swept = _settleFarmPayout(corroborated);
+
+        emit MintAttemptYieldFlushed(beneficiary, attemptId, receiver, corroborated, swept);
+    }
+
+    /// @notice Recover a front-run or donated counterfactual position without crediting a user.
+    /// @dev Bonds pass through the whitelisted adapter and leave in the same transaction for the
+    ///      explicit governance-chosen recipient. They are never pooled with credited collateral.
+    function recoverMintAttempt(
+        address beneficiary,
+        bytes32 attemptId,
+        address payable recoveryRecipient
+    )
+        external
+        onlyOwner
+        returns (
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256
+        )
+    {
+        address receiver = _prepareRecovery(beneficiary, attemptId);
+        if (recoveryRecipient == address(0)) revert ZeroAddress();
+        if (recoveryRecipient == address(this) || recoveryRecipient == receiver) {
+            revert InvalidRecoveryRecipient(recoveryRecipient);
+        }
+        // **The preflight is conditional, and it used to be unconditional.** As written before,
+        // it demanded the bond whitelist for every recovery, including one that never touches an
+        // ERC-1155: a clone holding nothing but donated USDC or donated native could not be
+        // emptied at all while DexFi had the adapter de-whitelisted. The money then sat at a
+        // counterfactual address behind a third party's list, for a transfer that list does not
+        // govern.
+        //
+        // **It keys on the STAKE as well as the loose bonds, and the loose-bond-only form of this
+        // condition was considered and refused.** `MintAttemptReceiver.recoverAll` withdraws from
+        // the farm FIRST and reads its own bond balance afterwards, so at preflight time a staked
+        // clone reads zero loose bonds and still needs the bond path one call later. The clone is
+        // never whitelisted, and the adapter as `to` is the only whitelisted party in the
+        // clone-to-adapter handoff; a condition that looked only at loose bonds would therefore
+        // skip this check and die inside DexFi's `_update` with an opaque error instead of this
+        // named one.
+        //
+        // It is tight in the other direction too. A pending-only position is claimed with
+        // `farm.withdraw(0)`, moves no bond at all, and correctly recovers while the adapter is
+        // de-whitelisted - which is why `pendingShare` is deliberately not one of the terms.
+        //
+        // The flag is recomputed here rather than threaded out of `_prepareRecovery`, which
+        // already reads both quantities. That saving was considered and refused: the condition is
+        // written down as it stands so a later reader does not have to re-derive it from a
+        // boolean's provenance, and bytes are not the binding constraint on this contract.
+        (uint256 stakedAtReceiver,) = farm.userInfo(receiver);
+        bool needsBondPath =
+            stakedAtReceiver != 0 || bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID) != 0;
+        if (needsBondPath && !bond.whitelistContains(address(this))) revert AdapterNotWhitelisted();
+
+        RecoveryResult memory result = _recoverTo(receiver, recoveryRecipient);
+
+        emit MintAttemptRecovered(
+            beneficiary,
+            attemptId,
+            receiver,
+            recoveryRecipient,
+            result.bonds,
+            result.farmForwarded,
+            result.rawUsdcForwarded,
+            result.rawUsdcRemaining,
+            result.nativeForwarded,
+            result.nativeRemaining,
+            false
+        );
+        return (
+            result.bonds,
+            result.swept,
+            result.rawUsdcForwarded,
+            result.rawUsdcRemaining,
+            result.nativeForwarded,
+            result.nativeRemaining
+        );
+    }
+
+    /// @notice Escape a broken farm while leaving bonds at the clone until the adapter whitelist
+    ///         is restored and normal recovery can route them to an explicit recipient.
+    function emergencyRecoverMintAttempt(address beneficiary, bytes32 attemptId)
+        external
+        onlyOwner
+        returns (uint256, uint256, uint256, uint256)
+    {
+        address receiver = _prepareRecovery(beneficiary, attemptId);
+        RecoveryResult memory result = _emergencyRecover(receiver);
+        emit MintAttemptRecovered(
+            beneficiary,
+            attemptId,
+            receiver,
+            address(0),
+            result.bonds,
+            result.farmForwarded,
+            0,
+            result.rawUsdcRemaining,
+            0,
+            result.nativeRemaining,
+            true
+        );
+        return (result.bonds, result.swept, result.rawUsdcRemaining, result.nativeRemaining);
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -383,14 +586,328 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
+    /// @dev The nine-check mint preflight, and what each check is worth. Audit round 34
+    ///      measured this by deleting each check in turn and running
+    ///      `MintAttemptReceiverTest`, so every backstop named below is an observed revert
+    ///      selector rather than an argument. Eight of the nine reddened a test; the ninth,
+    ///      `InvalidBeneficiary`, appeared nowhere in `test/` and now has one.
+    ///
+    ///      **Seven of the nine are backstopped only by DexFi's bond contract or by the
+    ///      CREATE2 opcode.** DexFi's bond is owned by a single EOA and is treated
+    ///      throughout this repo as mutable, so a backstop living over there is not a reason
+    ///      to drop a check here - it is a dependency on somebody else's upgrade policy.
+    ///      Only check 9 changes whether the transaction succeeds at all; the rest change
+    ///      which error a user sees, how much gas they burn, and how far into DexFi the call
+    ///      gets before it unwinds.
+    ///
+    ///      1. `InvalidBeneficiary` (raised in `predictMintReceiver`) - **UNREACHABLE on
+    ///         this path.** `mintBonds` is `onlyVault` against an immutable `vault`, and
+    ///         `CollateralVault.depositETH`'s single call site passes `msg.sender`, which
+    ///         the EVM never sets to the zero address. Deleting it reddens nothing here. It
+    ///         is load-bearing on `predictMintReceiver`, `flushMintAttemptYield` and both
+    ///         recovery doors, where it closes the zero-beneficiary salt namespace - see
+    ///         `test_zeroBeneficiaryIsRejectedOnEveryPathThatCanReachIt` for the trade that
+    ///         closure makes.
+    ///      2. `InvalidAttemptId` (raised in `predictMintReceiver`) - reachable and
+    ///         unshadowed: a borrower can send `bytes32(0)` straight through `depositETH`.
+    ///      3. `MintReceiverMismatch` - backstopped by `MintAmountMismatch`, because a mint
+    ///         that landed anywhere else leaves this clone's bond delta at zero. Deleting it
+    ///         still reverts, further in, with an error naming the wrong quantity.
+    ///      4. `MintNonceMustBeZero` - backstopped by DexFi's own `InvalidNonce`. Rejects
+    ///         before the clone is deployed and before any ETH leaves this contract. Note it
+    ///         is a different quantity from check 6: this is the nonce the payload declares,
+    ///         that is the nonce the receiver actually holds.
+    ///      5. `ZeroMintAmount` - backstopped by `CollateralVault.NothingMinted`, which is
+    ///         **in the caller, not here**. On its own this adapter would deploy a clone,
+    ///         forward `msg.value` and consume a DexFi UUID for zero bonds, and only the
+    ///         vault's post-check unwinds it. Any second caller of `mintBonds` without that
+    ///         post-check would pay ETH for nothing.
+    ///      6. `MintAttemptAlreadyUsed` - backstopped by DexFi's `UUIDAlreadyExist` on a
+    ///         replayed payload, and by check 7 once the clone exists, but by **neither**
+    ///         when a front-runner has consumed the receiver's nonce with a payload of their
+    ///         own and no clone has been deployed. It is the guard that names the front-run
+    ///         condition, which is what tells an operator to reach for `recoverMintAttempt`.
+    ///      7. `MintAttemptAlreadyDeployed` - backstopped structurally, because CREATE2
+    ///         cannot overwrite: `Clones.cloneDeterministic` reverts `FailedDeployment()`.
+    ///         What this check buys is **gas**, and the ordinary user who needs it is one
+    ///         retrying an attempt governance has already recovered. Measured as the gas
+    ///         `forge` reports for
+    ///         `test_pendingOnlyCounterfactualPositionIsClaimedWithWithdrawZero`: 345,939
+    ///         with the check, 1,024,211,172 without it, because a create that collides
+    ///         consumes every unit forwarded to it rather than returning them.
+    ///      8. `AdapterNotWhitelisted` - backstopped by DexFi's `AddressesNotWhitelisted`
+    ///         when the clone tries to hand the bonds over. Fails before the clone is
+    ///         deployed, and names the PRD §14 ask #5 dependency rather than three raw
+    ///         addresses. Distinct from the same guard in `recoverMintAttempt`, which is
+    ///         separately reached and separately covered.
+    ///      9. `PaymentMismatch` - **the only one whose deletion lets a transaction
+    ///         succeed.** Underpayment is caught by DexFi and a zero payment by
+    ///         `CollateralVault.ZeroAmount`, so overpayment is this check's entire job.
+    ///         Measured with it deleted: 1.5 ETH against a 1.0 ETH signed payment credits
+    ///         the same 40 bonds and strands 0.5 ETH at the bond contract, which forwards
+    ///         only the signed amount and has no native rescue.
+    function _validateMintAttempt(
+        address beneficiary,
+        bytes32 attemptId,
+        IDexFiBond.MintDataInput memory data
+    ) private view returns (address receiver) {
+        receiver = predictMintReceiver(beneficiary, attemptId);
+        if (data.receiver != receiver) revert MintReceiverMismatch(receiver, data.receiver);
+        if (data.nonce != 0) revert MintNonceMustBeZero(data.nonce);
+        if (data.amountNfts == 0) revert ZeroMintAmount();
+
+        uint256 currentNonce = bond.nonces(receiver);
+        if (currentNonce != 0) revert MintAttemptAlreadyUsed(receiver, currentNonce);
+        if (receiver.code.length != 0) revert MintAttemptAlreadyDeployed(receiver);
+        if (!bond.whitelistContains(address(this))) revert AdapterNotWhitelisted();
+
+        // DexFi accepts `>=`, forwards only the signed payment, and has no native
+        // rescue. Equality prevents an accidental overpayment from being burned.
+        if (msg.value != data.paymentAmount) {
+            revert PaymentMismatch(data.paymentAmount, msg.value);
+        }
+    }
+
+    /// @dev Move one signed mint through its fresh child and consolidate the exact
+    ///      signed amount under the adapter's existing pooled farm position.
+    function _mintAndConsolidate(address receiver, IDexFiBond.MintDataInput memory data)
+        private
+        returns (uint256 farmPaid)
+    {
+        (MintSnapshot memory beforeMint, uint256 stakedDelta, uint256 autoDepositPaid) =
+            _mintIntoReceiver(receiver, data);
+        (uint256 childFarmPaid, uint256 adapterLooseBefore) = _releaseFromReceiver(
+            receiver, data.amountNfts, stakedDelta, autoDepositPaid, beforeMint
+        );
+        farmPaid = childFarmPaid + _stakeReleasedMint(data.amountNfts, adapterLooseBefore);
+    }
+
+    function _mintIntoReceiver(address receiver, IDexFiBond.MintDataInput memory data)
+        private
+        returns (MintSnapshot memory beforeMint, uint256 stakedDelta, uint256 autoDepositPaid)
+    {
+        (beforeMint.childStake,) = farm.userInfo(receiver);
+        beforeMint.childLoose = bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID);
+        beforeMint.childUsdc = usdc.balanceOf(receiver);
+
+        bond.mint{value: msg.value}(data);
+
+        (uint256 childStakeAfter,) = farm.userInfo(receiver);
+        uint256 childLooseAfter = bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID);
+        stakedDelta = childStakeAfter - beforeMint.childStake;
+        uint256 looseDelta = childLooseAfter - beforeMint.childLoose;
+        uint256 minted = stakedDelta + looseDelta;
+        if (minted != data.amountNfts) revert MintAmountMismatch(data.amountNfts, minted);
+
+        autoDepositPaid = usdc.balanceOf(receiver) - beforeMint.childUsdc;
+    }
+
+    function _releaseFromReceiver(
+        address receiver,
+        uint256 amount,
+        uint256 stakedDelta,
+        uint256 autoDepositPaid,
+        MintSnapshot memory beforeMint
+    ) private returns (uint256 childFarmPaid, uint256 adapterLooseBefore) {
+        adapterLooseBefore = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
+        uint256 adapterUsdcBefore = usdc.balanceOf(address(this));
+        uint256 reported = MintAttemptReceiver(payable(receiver)).releaseMint(
+            stakedDelta, amount, autoDepositPaid
+        );
+        uint256 received = usdc.balanceOf(address(this)) - adapterUsdcBefore;
+        childFarmPaid = reported < received ? reported : received;
+
+        _requireReceiverRestored(receiver, beforeMint);
+        uint256 adapterLooseAfter = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
+        uint256 receivedBonds = adapterLooseAfter - adapterLooseBefore;
+        if (receivedBonds != amount) revert MintAmountMismatch(amount, receivedBonds);
+    }
+
+    function _requireReceiverRestored(address receiver, MintSnapshot memory beforeMint) private view {
+        (uint256 actualStake,) = farm.userInfo(receiver);
+        uint256 actualLoose = bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID);
+        if (actualStake != beforeMint.childStake || actualLoose != beforeMint.childLoose) {
+            revert MintReceiverPositionMismatch(
+                beforeMint.childStake, actualStake, beforeMint.childLoose, actualLoose
+            );
+        }
+
+        uint256 expectedUsdc =
+            beforeMint.childUsdc + MintAttemptReceiver(payable(receiver)).parkedFarmYield();
+        uint256 actualUsdc = usdc.balanceOf(receiver);
+        if (actualUsdc != expectedUsdc) revert MintReceiverUsdcMismatch(expectedUsdc, actualUsdc);
+    }
+
+    function _stakeReleasedMint(uint256 amount, uint256 adapterLooseBefore)
+        private
+        returns (uint256 farmPaid)
+    {
+        (uint256 stakeBefore,) = farm.userInfo(address(this));
+        uint256 usdcBefore = usdc.balanceOf(address(this));
+        farm.deposit(amount);
+        farmPaid = usdc.balanceOf(address(this)) - usdcBefore;
+
+        (uint256 stakeAfter,) = farm.userInfo(address(this));
+        uint256 looseAfter = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
+        if (stakeAfter != stakeBefore + amount || looseAfter != adapterLooseBefore) {
+            revert AdapterPositionMismatch(
+                stakeBefore + amount, stakeAfter, adapterLooseBefore, looseAfter
+            );
+        }
+    }
+
+    /// @dev **Reads its own balances after running recipient-chosen code, deliberately, and audit
+    ///      round 34 measured what that costs.** Three windows hand control to `recoveryRecipient`
+    ///      inside this call, not one: `recoverAll`'s raw-USDC leg, its `_tryForwardNative` raw
+    ///      `call`, and - later than both - the ERC-1155 acceptance hook on the
+    ///      `bond.safeTransferFrom` below, which fires *after* the bond equality check and *before*
+    ///      the USDC subtraction. The owner names that address; the code at it is not the owner's,
+    ///      and there is no `ReentrancyGuard` anywhere in this contract, so the permissionless
+    ///      `flushYieldTo` and `flushMintAttemptYield` are re-enterable from all three.
+    ///
+    ///      **Neither value read can be inflated, and that part is checked rather than argued.**
+    ///      Bonds are compared for *equality* against the clone's own report, so a donation into
+    ///      this contract mid-call reverts instead of over-crediting - MEASURED: one bond unit
+    ///      donated from the recipient produced `MintAmountMismatch(5, 6)`. Farm USDC is
+    ///      `min(reportedFarm, received)`, so a donation cannot lift it above what the clone said
+    ///      it sent - MEASURED: 500.000000 donated against 12.000000 reported still credited
+    ///      12.000000.
+    ///
+    ///      **The checked subtraction below is not the mitigation, it is the exposure.**
+    ///      `flushYieldTo` is permissionless and moves USDC *out* of this contract. Re-entered from
+    ///      any of the three windows it drops the balance under `usdcBefore` and panics the whole
+    ///      recovery, so a recovery recipient can block its own recovery - the precise outcome
+    ///      `_tryForwardNative` was made best-effort to prevent. MEASURED at round 34 from both the
+    ///      native leg and the ERC-1155 hook, the second with the clone holding no native balance
+    ///      at all. Bounded rather than permanent: the park is finite, and the owner can flush it
+    ///      first or name a different recipient. **Do not "fix" this by saturating the
+    ///      subtraction** - that hides the drain instead of refusing it, and the read is then the
+    ///      thing that is wrong.
+    ///
+    ///      **What is silently wrong is the reporting, and it under-counts.** Re-entering
+    ///      `flushMintAttemptYield` for a *different* clone carrying parked yield makes the inner
+    ///      `_settleFarmPayout` sweep this contract's whole free balance - including the farm USDC
+    ///      this call has already received and not yet measured. MEASURED: 48.000000 reached
+    ///      `yieldRecipient`, `farmYieldDelivered` recorded 7.000000, and both this function's
+    ///      `swept` and `MintAttemptRecovered.farmYieldForwarded` reported 0 for the 41.000000 that
+    ///      actually left. No money is lost - it goes to the destination it was always going to -
+    ///      and under-counting that watermark is the safe direction, which is why this is recorded
+    ///      rather than guarded. The **event** is the part a consumer can act wrongly on.
+    function _recoverTo(address receiver, address payable recoveryRecipient)
+        private
+        returns (RecoveryResult memory result)
+    {
+        uint256 bondBefore = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
+        uint256 usdcBefore = usdc.balanceOf(address(this));
+        uint256 reportedBonds;
+        uint256 reportedFarm;
+        (
+            reportedBonds,
+            reportedFarm,
+            result.rawUsdcForwarded,
+            result.rawUsdcRemaining,
+            result.nativeForwarded,
+            result.nativeRemaining
+        ) = MintAttemptReceiver(payable(receiver)).recoverAll(recoveryRecipient);
+
+        result.bonds = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID) - bondBefore;
+        if (result.bonds != reportedBonds) {
+            revert MintAmountMismatch(reportedBonds, result.bonds);
+        }
+        if (result.bonds != 0) {
+            bond.safeTransferFrom(
+                address(this), recoveryRecipient, Config.DEXFI_BOND_TOKEN_ID, result.bonds, ""
+            );
+        }
+
+        uint256 received = usdc.balanceOf(address(this)) - usdcBefore;
+        result.farmForwarded = reportedFarm < received ? reportedFarm : received;
+        if (result.farmForwarded != 0) {
+            result.swept = _settleFarmPayout(result.farmForwarded);
+        }
+    }
+
+    function _emergencyRecover(address receiver)
+        private
+        returns (RecoveryResult memory result)
+    {
+        uint256 usdcBefore = usdc.balanceOf(address(this));
+        uint256 reportedFarm;
+        (result.bonds, reportedFarm, result.rawUsdcRemaining, result.nativeRemaining) =
+            MintAttemptReceiver(payable(receiver)).emergencyRecoverAll();
+
+        uint256 received = usdc.balanceOf(address(this)) - usdcBefore;
+        result.farmForwarded = reportedFarm < received ? reportedFarm : received;
+        if (result.farmForwarded != 0) {
+            result.swept = _settleFarmPayout(result.farmForwarded);
+        }
+    }
+
+    function _prepareRecovery(address beneficiary, bytes32 attemptId)
+        private
+        returns (address receiver)
+    {
+        receiver = predictMintReceiver(beneficiary, attemptId);
+        (uint256 staked,) = farm.userInfo(receiver);
+        if (
+            staked == 0 && farm.pendingShare(receiver) == 0
+                && bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID) == 0
+                && usdc.balanceOf(receiver) == 0 && receiver.balance == 0
+        ) revert NothingToRecover(receiver);
+
+        if (receiver.code.length == 0) {
+            address deployed = Clones.cloneDeterministic(
+                address(mintReceiverImplementation), _mintAttemptSalt(beneficiary, attemptId)
+            );
+            if (deployed != receiver) revert MintReceiverDeployMismatch(receiver, deployed);
+        } else {
+            _requireMintReceiverCode(receiver);
+        }
+    }
+
+    function _requireMintReceiverCode(address receiver) private view {
+        bytes32 expected = _mintReceiverRuntimeCodeHash();
+        bytes32 actual = receiver.codehash;
+        if (receiver.code.length == 0 || actual != expected) {
+            revert InvalidMintReceiverCode(receiver, actual, expected);
+        }
+    }
+
+    function _mintReceiverRuntimeCodeHash() private view returns (bytes32) {
+        // Exact 45-byte ERC-1167 runtime emitted by OpenZeppelin Clones.
+        return keccak256(
+            abi.encodePacked(
+                hex"363d3d373d3d3d363d73",
+                bytes20(address(mintReceiverImplementation)),
+                hex"5af43d82803e903d91602b57fd5bf3"
+            )
+        );
+    }
+
+    function _mintAttemptSalt(address beneficiary, bytes32 attemptId)
+        private
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(MINT_ATTEMPT_DOMAIN, beneficiary, attemptId));
+    }
+
     /// @dev What every farm interaction does with the USDC it shook loose: forward it
     ///      and report it, or - if the transfer cannot go through - carry it in
     ///      `unreportedYield` so the next successful claim picks it up.
     ///
-    ///      Shared by `stake`, `unstake` and `mintBonds` because all three call into a
-    ///      MasterChef-style farm, and every one of those calls settles the pending
-    ///      rewards of the entire adapter position. Having it in one place is what
-    ///      stops a new farm-touching path quietly reintroducing the leak.
+    ///      Shared by every path that touches the farm, because a MasterChef-style pool
+    ///      settles the pending rewards of the entire adapter position on any call that
+    ///      moves its stake - so each of them can shake USDC loose whether or not that
+    ///      was its purpose. Having it in one place is what stops a new farm-touching
+    ///      path quietly reintroducing the leak.
+    ///
+    ///      The callers are named rather than counted, because a count written here goes
+    ///      stale silently the next time a path is added and a symbol does not: `stake`,
+    ///      `unstake`, `claimYield`, `mintBonds`, `flushMintAttemptYield`, `_recoverTo`
+    ///      and `_emergencyRecover`. The two prose counts that stood here said three and
+    ///      four while the tree had seven, which audit round 31 filed and which is why this
+    ///      paragraph no longer carries a number.
     /// @param farmPaid USDC measured as arriving from the farm during the call.
     /// @return swept Total forwarded onward, including any previously carried amount.
     ///         Zero when the sweep could not go through.
@@ -401,9 +918,9 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         }
         swept = farmPaid + unreportedYield;
         unreportedYield = 0;
-        // Counted here rather than at the four call sites, for the same reason the sweep itself
-        // lives here: this is the one funnel every farm-touching path goes through, so a fifth
-        // path cannot deliver farm yield without also corroborating the epoch that pays it out.
+        // Counted here rather than at each caller, for the same reason the sweep itself lives
+        // here: this is the one funnel every farm-touching path goes through, so a NEW path
+        // cannot deliver farm yield without also corroborating the epoch that pays it out.
         // That is what stops a new path quietly reintroducing round 11's finding, the same way
         // this helper stops one reintroducing the leak it was factored out to close.
         //

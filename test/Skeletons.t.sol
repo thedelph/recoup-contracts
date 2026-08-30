@@ -122,13 +122,17 @@ contract SkeletonsTest is RiskParamsFixture {
         harvester.harvestRange(0, 1);
 
         // The LenderPool used to be the remaining phase-4 stub and is implemented as of
-        // 2026-08-10, so `queuePosition` answers rather than reverting. Nobody is queued here, and
-        // (0, 0) is the honest answer to "where in the queue is an address that never joined it".
+        // 2026-08-10, so `withdrawalRequest` answers rather than reverting. This controller has
+        // no request, and a zeroed tuple is the honest answer.
         // Kept as an assertion rather than deleted, because this file's job is to say which
         // skeletons are still skeletons - and the answer is now none of them.
-        (uint256 index, uint256 remaining) = pool.queuePosition(address(this));
-        assertEq(index, 0);
-        assertEq(remaining, 0);
+        (uint256 requestId, address receiver, uint256 shares, uint256 serviceableShares, uint256 serviceableAssets) =
+            pool.withdrawalRequest(address(this));
+        assertEq(requestId, 0);
+        assertEq(receiver, address(0));
+        assertEq(shares, 0);
+        assertEq(serviceableShares, 0);
+        assertEq(serviceableAssets, 0);
     }
 
     function test_borrowRefusesUntilLiquiditySourceIsWired() public {
@@ -191,19 +195,23 @@ contract SkeletonsTest is RiskParamsFixture {
         assertEq(ILenderPool.ImpairmentReleased.selector, keccak256("ImpairmentReleased(address,uint256,uint256)"));
         assertEq(ILenderPool.LossReservesSet.selector, keccak256("LossReservesSet(uint256,uint256,uint256)"));
         assertEq(ILenderPool.LossSocialised.selector, keccak256("LossSocialised(uint256)"));
-        assertEq(ILenderPool.WithdrawalQueued.selector, keccak256("WithdrawalQueued(address,uint256,uint256)"));
         assertEq(
-            ILenderPool.QueuedWithdrawalServiced.selector,
-            keccak256("QueuedWithdrawalServiced(address,uint256,uint256)")
+            ILenderPool.WithdrawalRequested.selector,
+            keccak256("WithdrawalRequested(address,uint256,address,uint256)")
+        );
+        assertEq(
+            ILenderPool.WithdrawalRequestServiced.selector,
+            keccak256("WithdrawalRequestServiced(address,uint256,address,uint256,uint256)")
         );
         assertEq(
             ILenderPool.WithdrawalRequestCancelled.selector,
-            keccak256("WithdrawalRequestCancelled(address,uint256,uint256)")
+            keccak256("WithdrawalRequestCancelled(address,uint256,address,uint256)")
         );
         assertEq(
-            ILenderPool.QueuedWithdrawalReleasedAsDust.selector,
-            keccak256("QueuedWithdrawalReleasedAsDust(address,uint256,uint256)")
+            ILenderPool.RequestOperatorSet.selector,
+            keccak256("RequestOperatorSet(address,address,bool)")
         );
+        assertEq(ILenderPool.WithdrawalClaimed.selector, keccak256("WithdrawalClaimed(address,uint256)"));
     }
 
     /// @dev And the same claim end to end, against a log the pool actually wrote, because the test

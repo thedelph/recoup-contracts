@@ -560,27 +560,29 @@ contract YieldStreamClockTest is Test {
     // -- round-23 finding 23 is still inert -----------------------------------
 
     /// @notice RE-VERIFICATION, not an assumption. Finding 23 sits in the do-not-re-file block
-    ///         because the two `pendingYield += x; yieldRate = 0;` branches - `repayPrincipal`'s
-    ///         and `recoverLoss`'s - do not crystallise a running stream, and are unreachable
-    ///         behind `_update`'s freeze. The fix here touches neither the freeze block nor either
-    ///         branch, but "does not touch" is an argument and this is a measurement.
-    /// @dev The claim measured: whenever `totalSupply() < MIN_SUPPLY_FOR_YIELD`, the stream is
-    ///      already frozen, so there is nothing left to crystallise and the missing call costs
-    ///      nothing. `MIN_SUPPLY_FOR_YIELD` is private; the band is entered by emptying the pool,
-    ///      which is the only way supply moves at all.
+    ///         because the two frozen-pot branches - `repayPrincipal`'s and `recoverLoss`'s - do not
+    ///         need to crystallise a running stream: a low but non-zero supply reaches them only
+    ///         after `_update` has already frozen it. The fix here touches neither the freeze block
+    ///         nor either branch, but "does not touch" is an argument and this is a measurement.
+    /// @dev The claim measured is deliberately about the low but non-zero band. At exactly zero
+    ///      supply canonical cash de-recognises the terminal tail so a future cohort cannot inherit
+    ///      it. `MIN_SUPPLY_FOR_YIELD` is private, so its derived value is repeated in the fixture.
     function test_clock_f23_theUncrystallisedBranchesAreStillInert() public {
         uint256 shares = _deposit(alice, DEPOSIT);
         _epoch(EPOCH);
         skip(2 days);
 
         uint256 liveTail = pool.unreleasedYield();
-        assertGt(liveTail, 0, "fixture: a live tail exists to be lost");
+        assertGt(liveTail, 0, "fixture: a live tail exists to be frozen");
 
+        uint256 unsafeSupply = (10 ** 3) * Config.BPS - 1;
         vm.prank(alice);
-        pool.redeem(shares, alice, alice);
-        assertEq(pool.totalSupply(), 0, "the pool is empty");
+        pool.redeem(shares - unsafeSupply, alice, alice);
+        assertEq(pool.totalSupply(), unsafeSupply, "the exact low-supply fixture was not reached");
+        assertGt(pool.totalSupply(), 0, "the low-supply cohort was emptied");
+        assertLt(pool.totalSupply(), (10 ** 3) * Config.BPS, "the supply did not cross the yield floor");
 
-        // `_update` got there first. This is the whole of finding 23's inertness.
+        // `_update` got there first in the live low-supply band. This is finding 23's inertness.
         assertEq(pool.yieldRate(), 0, "the stream is already frozen before either branch is reached");
         assertEq(pool.pendingYield(), liveTail, "and the live tail was crystallised on the way out");
 

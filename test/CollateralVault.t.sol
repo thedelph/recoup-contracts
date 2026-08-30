@@ -27,6 +27,7 @@ import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 ///         the whitelist gate, and the withdrawal LTV rule.
 contract CollateralVaultTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp - 2026-07-24 real snapshot
+    bytes32 internal constant MINT_ATTEMPT_ID = bytes32(uint256(1));
 
     address internal admin = makeAddr("admin");
     address internal alice = makeAddr("alice");
@@ -155,36 +156,43 @@ contract CollateralVaultTest is RiskParamsFixture {
     ///      DexFi's mint - so it stays behind the contract-level pause and behind the switch the
     ///      guardian may throw.
     function test_depositETH_isStillShutByThePause() public {
-        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 40, 1 ether
+        );
         vm.deal(alice, 1 ether);
         vm.prank(admin);
         vault.pause();
 
         vm.prank(alice);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
     }
 
     // ── depositETH (signed mint, auto-stake) ─────────────────────────────────
 
     function test_depositETH_mintsAndAutoStakes() public {
-        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 40, 1 ether
+        );
         vm.deal(alice, 1 ether);
 
         vm.prank(alice);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
 
         assertEq(vault.bondCount(alice), 40);
         assertEq(farm.staked(address(adapter)), 40);
     }
 
-    function test_depositETH_receiverMustBeAdapter() public {
-        bytes memory mintData = _mintData(alice, 40, 1 ether);
+    function test_depositETH_receiverMustMatchPredictedAttemptReceiver() public {
+        address expected = adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID);
+        bytes memory mintData = _mintData(alice, MINT_ATTEMPT_ID, 40, 1 ether);
         vm.deal(alice, 1 ether);
 
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(DirectCallAdapter.ReceiverMustBeAdapter.selector, alice));
-        vault.depositETH{value: 1 ether}(mintData);
+        vm.expectRevert(
+            abi.encodeWithSelector(DirectCallAdapter.MintReceiverMismatch.selector, expected, alice)
+        );
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
     }
 
     // -- depositETH is a farm-touching path and must report what it flushes ---
@@ -207,12 +215,14 @@ contract CollateralVaultTest is RiskParamsFixture {
         farm.setPendingYield(address(adapter), 500e6);
 
         uint256 sinkBefore = usdc.balanceOf(yieldSink);
-        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 40, 1 ether
+        );
         vm.deal(alice, 1 ether);
 
         vm.recordLogs();
         vm.prank(alice);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
         (uint256 count, uint256 reported) = _yieldHarvested();
 
         uint256 moved = usdc.balanceOf(yieldSink) - sinkBefore;
@@ -229,12 +239,14 @@ contract CollateralVaultTest is RiskParamsFixture {
     ///      above, which is exactly how an event assertion passes for the wrong reason. The four
     ///      siblings all guard on `swept != 0` and this one must too.
     function test_depositETH_reportsNothingWhenTheFarmSettlesNothing() public {
-        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 40, 1 ether
+        );
         vm.deal(alice, 1 ether);
 
         vm.recordLogs();
         vm.prank(alice);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
         (uint256 count,) = _yieldHarvested();
 
         assertEq(usdc.balanceOf(yieldSink), 0, "premise: the farm settled nothing");
@@ -261,12 +273,14 @@ contract CollateralVaultTest is RiskParamsFixture {
         usdc.setBlocked(yieldSink, false);
         farm.setPendingYield(address(adapter), 300e6);
 
-        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 40, 1 ether
+        );
         vm.deal(alice, 1 ether);
 
         vm.recordLogs();
         vm.prank(alice);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
         (uint256 count, uint256 reported) = _yieldHarvested();
 
         emit log_named_uint("MEASURED USDC delivered by this deposit", usdc.balanceOf(yieldSink));
@@ -287,12 +301,14 @@ contract CollateralVaultTest is RiskParamsFixture {
         farm.setPendingYield(address(adapter), 500e6);
         usdc.setBlocked(yieldSink, true);
 
-        bytes memory mintData = _mintData(address(adapter), 40, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 40, 1 ether
+        );
         vm.deal(alice, 1 ether);
 
         vm.recordLogs();
         vm.prank(alice);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
         (uint256 count,) = _yieldHarvested();
 
         assertEq(usdc.balanceOf(yieldSink), 0, "premise: the recipient could not receive");
@@ -460,10 +476,12 @@ contract CollateralVaultTest is RiskParamsFixture {
         bond.safeTransferFrom(winner, address(adapter), 0, 500, "");
         assertEq(bond.bondBalance(address(adapter)), 500);
 
-        bytes memory mintData = _mintData(address(adapter), 1, 1 ether);
+        bytes memory mintData = _mintData(
+            adapter.predictMintReceiver(alice, MINT_ATTEMPT_ID), MINT_ATTEMPT_ID, 1, 1 ether
+        );
         vm.deal(alice, 1 ether);
         vm.prank(alice);
-        vault.depositETH{value: 1 ether}(mintData);
+        vault.depositETH{value: 1 ether}(MINT_ATTEMPT_ID, mintData);
 
         // Alice is credited exactly what she minted, not the donation.
         assertEq(vault.bondCount(alice), 1);
@@ -927,14 +945,14 @@ contract CollateralVaultTest is RiskParamsFixture {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    function _mintData(address receiver, uint256 amountNfts, uint256 payment)
+    function _mintData(address receiver, bytes32 attemptId, uint256 amountNfts, uint256 payment)
         internal
         view
         returns (bytes memory)
     {
         return abi.encode(
             IDexFiBond.MintDataInput({
-                uuid: 1,
+                uuid: uint256(attemptId),
                 nonce: 0,
                 receiver: receiver,
                 amountNfts: amountNfts,

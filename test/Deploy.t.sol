@@ -9,7 +9,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 import {DeployBase} from "../script/DeployBase.sol";
-import {DeployTestnet} from "../script/Deploy.s.sol";
+import {DeployMainnet, DeployTestnet} from "../script/Deploy.s.sol";
 import {WirePhase4} from "../script/WirePhase4.s.sol";
 import {ICreditManager} from "../src/interfaces/ICreditManager.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
@@ -164,6 +164,64 @@ contract ExposedWirePhase4 is WirePhase4, EnvOverridable {
     }
 }
 
+/// @notice `DeployMainnet` with its three preconditions reachable from a test.
+///
+/// @dev **Audit round 38 found the three gates were executed by nothing.** `DeployTestnet`
+///      has both of its refusals run by this suite; `DeployMainnet` has three and had none. Its
+///      `run()` body had never been entered by any test in the tree, so the guard set that stands
+///      between a stray `forge script` and Base mainnet was read-only evidence - the exact shape
+///      the note above `test_testnet_refusesAnyChainButBaseSepolia` calls out and then leaves
+///      standing for the mainnet target.
+///
+/// @dev **No `vm.setEnv`, and that is why the harness exists at all rather than the tests calling
+///      `new DeployMainnet()` directly.** Two of the three gates read the environment, and this
+///      process contains zero `vm.setEnv` calls on purpose - see `EnvOverridable`, which records
+///      the measured race that removed the last one. The subclass adds the storage-backed seam and
+///      nothing else, so `run()` here is the real `run()`; it is the same construction
+///      `ExposedWirePhase4` uses, for the same reason.
+///
+/// @dev **All three gates fire before `_resolveParams`**, so none of these tests needs a fork, a
+///      funded key, or the live `Config.DEXFI_BOND_NFT` to exist. The `Externals` struct that names
+///      the real Base addresses is built one statement after the parameter resolution that stops
+///      every test here, which is what keeps this suite chain-free.
+contract DeployMainnetHarness is DeployMainnet, EnvOverridable {
+    /// @dev Solidity refuses an inherited function two bases define, even when one is an override
+    ///      of the other's. Both forward to `EnvOverridable`; a forwarder pointing at `DeployBase`
+    ///      would hand the script back the process environment with nothing in the diff saying so.
+    function _envOrAddress(string memory key, address fallbackValue)
+        internal
+        view
+        override(DeployBase, EnvOverridable)
+        returns (address)
+    {
+        return EnvOverridable._envOrAddress(key, fallbackValue);
+    }
+
+    function _envOrString(string memory key, string memory fallbackValue)
+        internal
+        view
+        override(DeployBase, EnvOverridable)
+        returns (string memory)
+    {
+        return EnvOverridable._envOrString(key, fallbackValue);
+    }
+
+    /// @notice The script's own two literals, read back rather than retyped in the tests.
+    /// @dev A test that hardcodes `"RECOUP_DEPLOY_BASE_MAINNET"` still passes after somebody
+    ///      changes the phrase in `Deploy.s.sol`: it would install a phrase the script no longer
+    ///      wants, the gate would refuse, and `test_mainnet_requiresTheConfirmationPhrase` would go
+    ///      on asserting a refusal for the wrong reason while the control that proves the gate is
+    ///      passable is the one that breaks. Reading both constants off the contract under test
+    ///      means the fixture cannot disagree with it.
+    function confirmPhrase() external pure returns (string memory) {
+        return CONFIRM_PHRASE;
+    }
+
+    function baseChainId() external pure returns (uint256) {
+        return BASE_CHAIN_ID;
+    }
+}
+
 /// @notice Coverage for the deployment path itself.
 ///
 ///         Until now `DeployLocal` wired the protocol and `DeployMainnet` reverted,
@@ -258,6 +316,15 @@ contract DeployTest is Test, EnvOverridable {
     ///      below the cheatcode, and the functions under test are internal.
     function exposedValidateParams(GovParams memory p, address deployer) external view {
         _validateParams(p, deployer);
+    }
+
+    /// @dev The superset the deploy path uses. Separate from the wrapper above because the
+    ///      difference between the two is itself a finding: one is a rule about a set of addresses
+    ///      and the other is a rule about the act of MAKING a deployment, and having the second
+    ///      live where the first does made the Phase-4 switchover unreachable on the shape this
+    ///      repository ships.
+    function exposedValidateNewDeployment(GovParams memory p, address deployer) external view {
+        _validateNewDeployment(p, deployer);
     }
 
     function exposedAssertWiring(Deployed memory d, GovParams memory p) external view {
@@ -1807,8 +1874,12 @@ contract DeployTest is Test, EnvOverridable {
     ///      which put a writer of the same four keys `_installParams` writes into a suite that runs
     ///      its functions in parallel. `DeployTest` is itself an `EnvOverridable`, so the four
     ///      overrides live in this contract's storage, which forge isolates per test function.
-    ///      `RECOUP_OWNER` is deliberately left alone: it defaults to the deployer rather than to
-    ///      zero, so zeroing it would trip `OwnerRequired` instead of reaching a default.
+    ///      `RECOUP_OWNER` is deliberately left alone, and the reason changed with the fix that
+    ///      made `OwnerRequired` reachable. It used to default to the deployer on EVERY chain, so
+    ///      zeroing it here would have proved nothing about the local branch. It now defaults to
+    ///      zero and takes the deployer only inside `if (_isLocal())`, which
+    ///      `test_R36_recoupOwnerNoLongerDefaultsToTheBroadcastingKey` pins on both chain ids
+    ///      rather than folding a second subject into this test.
     function test_localDefaultsDoNotPointAtTheDeployer() public {
         string[4] memory keys;
         keys[0] = "RECOUP_YIELD_RECIPIENT";
@@ -1991,6 +2062,13 @@ contract DeployTest is Test, EnvOverridable {
     ///      to schedule. Under the timelock that is 48 hours. Nothing was checking the PARAMETER,
     ///      which is the half no post-condition can reach, because a post-condition can only ask
     ///      whether the chain matches what it was told.
+    /// @dev **Through `_validateNewDeployment`, not `_validateParams`, and the second assertion
+    ///      below is the whole reason the rule moved.** The rule is about the act of MAKING a
+    ///      deployment - `_wire` installs the guardian before `_handOver`, so after that moment the
+    ///      only route to one is a timelocked `setGuardian`. Asking it of a deployment that already
+    ///      exists refuses an operation nothing can then satisfy, which is what made the Phase-4
+    ///      switchover unreachable. `_validateParams` therefore accepts these same parameters now,
+    ///      and that acceptance is asserted rather than left implied.
     function test_validate_refusesAGuardianlessDeployUnderAContractOwner() public {
         TimelockController timelock = _timelock();
         vm.chainId(8453);
@@ -2001,6 +2079,11 @@ contract DeployTest is Test, EnvOverridable {
         vm.expectRevert(
             abi.encodeWithSelector(DeployBase.GuardianRequiredForContractOwner.selector, address(timelock))
         );
+        this.exposedValidateNewDeployment(p, address(this));
+
+        // The address rules alone accept it, which is what lets an ALREADY deployed protocol be
+        // switched over. The guardian is still constrained there, by `_assertCoreGraph` comparing
+        // the deployed value against the parameter on all three contracts.
         this.exposedValidateParams(p, address(this));
     }
 
@@ -2012,7 +2095,7 @@ contract DeployTest is Test, EnvOverridable {
         GovParams memory p = _paramsOwnedBy(address(timelock));
         p.guardian = makeAddr("guardian");
 
-        this.exposedValidateParams(p, address(this));
+        this.exposedValidateNewDeployment(p, address(this));
     }
 
     /// @notice **The regression guard, and it is the point of the rule rather than an exception to
@@ -2028,7 +2111,7 @@ contract DeployTest is Test, EnvOverridable {
         assertEq(p.guardian, address(0), "premise: unfilled");
         assertEq(p.owner.code.length, 0, "premise: the owner is a key, not a contract");
 
-        this.exposedValidateParams(p, address(this));
+        this.exposedValidateNewDeployment(p, address(this));
     }
 
     /// @notice The placement, pinned. **Not a coverage test - a test of WHERE the guard sits.**
@@ -2039,12 +2122,18 @@ contract DeployTest is Test, EnvOverridable {
     ///      alone. MEASURED: a guard placed above `if (_isLocal()) return;` reverts that test in
     ///      CI, where there is no `contracts/.env` to supply an EOA. This test breaks first, and
     ///      under a name that says why.
+    ///
+    ///      **The rule has since moved down a level, to `_validateNewDeployment`, and this test
+    ///      moved with it.** The local relaxation is the same relaxation and exists for the same
+    ///      measured reason, so both calls are made here: the second is the one that pins the
+    ///      placement now, and the first pins that the rule did not get left behind as well.
     function test_validate_theContractOwnerRuleIsRelaxedLocally() public view {
         GovParams memory p = _paramsOwnedBy(address(this));
         assertGt(address(this).code.length, 0, "premise: this fixture's owner is a contract");
         assertEq(p.guardian, address(0), "premise: with no guardian");
 
         this.exposedValidateParams(p, address(this));
+        this.exposedValidateNewDeployment(p, address(this));
     }
 
     /// @dev Locally the same params are fine, so day-to-day work needs no setup.
@@ -2110,6 +2199,104 @@ contract DeployTest is Test, EnvOverridable {
 
         vm.chainId(84532);
         vm.expectRevert(DeployTestnet.TestnetConfirmationMissing.selector);
+        script.run();
+    }
+
+    // ── mainnet target gates (audit round 38) ─────────────────
+
+    /// @notice **`DeployMainnet` has three preconditions and no test had ever entered its `run()`.**
+    /// @dev The note above the testnet pair says `DeployLocal` and `DeployMainnet` "have `run()`
+    ///      bodies that no test has ever invoked, so their gates were only ever read rather than
+    ///      executed", and then closes the testnet ones and leaves the mainnet ones exactly as it
+    ///      found them. These three close that.
+    ///
+    ///      This is the outermost of the three and the one a slip actually reaches: a mainnet
+    ///      script pointed at a local node by a copied command line, or at Base Sepolia by an
+    ///      `--rpc-url` that was right for the previous run. Both ids are asserted because they
+    ///      fail for different reasons downstream - 31337 is `_isLocal()`, where every parameter
+    ///      rule relaxes, and 84532 is not - and a chain gate that only refused one of them would
+    ///      still look correct from either single test.
+    ///
+    ///      The revert carries the chain id, so the assertion is on the argument too: a guard that
+    ///      reported the id it wanted rather than the id it found would tell an operator nothing.
+    function test_mainnet_refusesAnyChainButBase() public {
+        DeployMainnetHarness script = new DeployMainnetHarness();
+
+        // setUp leaves us on anvil.
+        vm.expectRevert(abi.encodeWithSelector(DeployMainnet.WrongChain.selector, ANVIL_CHAIN_ID));
+        script.run();
+
+        vm.chainId(84532);
+        vm.expectRevert(abi.encodeWithSelector(DeployMainnet.WrongChain.selector, uint256(84532)));
+        script.run();
+
+        // The control, and it is what makes the two above a statement about the CHAIN rather than
+        // about `run()` reverting on every input: on Base the chain gate passes and the next gate
+        // is the one that speaks.
+        vm.chainId(script.baseChainId());
+        vm.expectRevert(DeployMainnet.MainnetConfirmationMissing.selector);
+        script.run();
+    }
+
+    /// @notice The confirmation phrase, absent and wrong.
+    /// @dev **The wrong-phrase arm is the one that carries the weight.** Absent alone is satisfied
+    ///      by any comparison that happens to reject the empty string, so a comparison inverted to
+    ///      `==` would still refuse an unset variable - it would refuse a CORRECT one instead, and
+    ///      the gate would have become a gate against the operator who followed the runbook. The
+    ///      third arm is the control: install what `Deploy.s.sol` actually asks for and the script
+    ///      moves on to the custody decision, which is the only way to show this gate is passable
+    ///      as well as closable.
+    ///
+    ///      `script/.env.example` documents passing the phrase inline rather than storing it, and
+    ///      that matters here: forge auto-loads `.env`, so a stored phrase would be present on
+    ///      every invocation and the absent arm would fail while the guard silently stopped
+    ///      guarding anything. Nothing in this test touches the process environment either way -
+    ///      the phrase is installed on the script object. See `EnvOverridable`.
+    function test_mainnet_requiresTheConfirmationPhrase() public {
+        DeployMainnetHarness script = new DeployMainnetHarness();
+        vm.chainId(script.baseChainId());
+
+        vm.expectRevert(DeployMainnet.MainnetConfirmationMissing.selector);
+        script.run();
+
+        script.setEnvString("RECOUP_MAINNET_CONFIRM", "RECOUP_DEPLOY_BASE_SEPOLIA");
+        vm.expectRevert(DeployMainnet.MainnetConfirmationMissing.selector);
+        script.run();
+
+        script.setEnvString("RECOUP_MAINNET_CONFIRM", script.confirmPhrase());
+        vm.expectRevert(DeployMainnet.CustodyDecisionUnrecorded.selector);
+        script.run();
+    }
+
+    /// @notice The custody decision, unrecorded and recorded wrong.
+    /// @dev The decision - direct-call adapter against a Safe-based backend - depends on DexFi's
+    ///      whitelist answer, so the script refuses to infer it. `"direct"` is the only accepted
+    ///      value today, which makes the second arm the one worth having: a plausible near-miss
+    ///      like `"safe"` is what an operator who HAS made the decision would type, and it has to
+    ///      be refused by the same named error rather than fall through to a deployment that used
+    ///      the other adapter.
+    ///
+    ///      **The last arm is the control for all three gates at once.** With the chain, the
+    ///      phrase and the custody value all satisfied, `run()` reaches `_resolveParams` and stops
+    ///      on `OwnerRequired()` - a parameter rule, not a gate. That is the assertion that says
+    ///      the three refusals above are a gate set that can be satisfied rather than a wall, and
+    ///      it also pins the ORDER: the custody check is the last thing that runs before the
+    ///      script starts resolving operators. Nothing is deployed, because the resolution reverts
+    ///      one statement before the `Externals` struct that names the live Base addresses.
+    function test_mainnet_requiresTheCustodyDecisionToBeRecorded() public {
+        DeployMainnetHarness script = new DeployMainnetHarness();
+        vm.chainId(script.baseChainId());
+        script.setEnvString("RECOUP_MAINNET_CONFIRM", script.confirmPhrase());
+
+        vm.expectRevert(DeployMainnet.CustodyDecisionUnrecorded.selector);
+        script.run();
+
+        script.setEnvString("RECOUP_CUSTODY_ADAPTER", "safe");
+        vm.expectRevert(DeployMainnet.CustodyDecisionUnrecorded.selector);
+        script.run();
+
+        script.setEnvString("RECOUP_CUSTODY_ADAPTER", "direct");
+        vm.expectRevert(DeployBase.OwnerRequired.selector);
         script.run();
     }
 
@@ -2314,6 +2501,83 @@ contract DeployTest is Test, EnvOverridable {
         vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "harvester.creditManager"));
         this.exposedAssertWiring(d, _paramsOwnedHere());
         vm.clearMockedCalls();
+    }
+
+    // ── the mint-receiver implementation graph ───────────────────────────────
+
+    /// @notice The five `mintReceiverImplementation` post-conditions PR #339 added to
+    ///         `_assertCoreGraph`, each proved to be individually reachable and individually
+    ///         load-bearing.
+    /// @dev **#339 shipped the five clauses and no tests for them, so not one of them had ever
+    ///      been observed to fail.** `grep -rn "mintReceiver\|MintReceiver"` over this file
+    ///      returned nothing until these landed: five assertions certified by nothing.
+    ///
+    ///      MEASURED (audit round 34, tree `bb7bc90`, forge 1.8.1): **5 PASS with the clauses
+    ///      present in `_assertCoreGraph`, and 5 FAIL - "next call did not revert as expected" -
+    ///      with all five deleted** (the `d.adapter.mintReceiverImplementation()` call left in
+    ///      place so nothing else shifted). So each one is reached, and each one is the only
+    ///      thing standing between this deployment and the state it names.
+    ///
+    ///      Two shaping notes, both load-bearing. Every case calls `exposedAssertWiring`
+    ///      UNMOCKED first, through `_mintReceiverGraph`, as a control - without it a test would
+    ///      pass just as happily if the fixture reverted for an unrelated reason. And
+    ///      `vm.expectRevert` is given the FULLY ENCODED `WiringIncomplete(string)` payload
+    ///      rather than the bare selector, so a pass identifies the individual clause instead of
+    ///      merely proving that something reverted somewhere inside `_assertCoreGraph`.
+    ///
+    ///      `vm.mockCall` rather than a substituted contract because every binding involved is an
+    ///      immutable set in a constructor - `mintReceiverImplementation` on the adapter, and
+    ///      `adapter`, `bond`, `farm` and `usdc` on the implementation. There is no setter to
+    ///      misuse.
+    function _mintReceiverGraph() internal returns (Deployed memory d, GovParams memory p, address impl) {
+        p = _params();
+        d = _deployProtocol(_externals(), p, address(this));
+        impl = address(d.adapter.mintReceiverImplementation());
+        // Control: the untouched graph passes, so any revert below is the mutation.
+        this.exposedAssertWiring(d, p);
+    }
+
+    function test_assertWiring_catchesAMintReceiverImplementationWithNoCode() public {
+        (Deployed memory d, GovParams memory p,) = _mintReceiverGraph();
+        address codeless = makeAddr("codelessImplementation");
+        assertEq(codeless.code.length, 0, "fixture: stand-in must be codeless");
+        vm.mockCall(
+            address(d.adapter),
+            abi.encodeWithSignature("mintReceiverImplementation()"),
+            abi.encode(codeless)
+        );
+        vm.expectRevert(
+            abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "adapter.mintReceiverImplementation")
+        );
+        this.exposedAssertWiring(d, p);
+    }
+
+    function test_assertWiring_catchesAMintReceiverPointedAtAnotherAdapter() public {
+        (Deployed memory d, GovParams memory p, address impl) = _mintReceiverGraph();
+        vm.mockCall(impl, abi.encodeWithSignature("adapter()"), abi.encode(makeAddr("otherAdapter")));
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "mintReceiver.adapter"));
+        this.exposedAssertWiring(d, p);
+    }
+
+    function test_assertWiring_catchesAMintReceiverBuiltOnAnotherBond() public {
+        (Deployed memory d, GovParams memory p, address impl) = _mintReceiverGraph();
+        vm.mockCall(impl, abi.encodeWithSignature("bond()"), abi.encode(makeAddr("otherBond")));
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "mintReceiver.bond"));
+        this.exposedAssertWiring(d, p);
+    }
+
+    function test_assertWiring_catchesAMintReceiverBuiltOnAnotherFarm() public {
+        (Deployed memory d, GovParams memory p, address impl) = _mintReceiverGraph();
+        vm.mockCall(impl, abi.encodeWithSignature("farm()"), abi.encode(makeAddr("otherFarm")));
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "mintReceiver.farm"));
+        this.exposedAssertWiring(d, p);
+    }
+
+    function test_assertWiring_catchesAMintReceiverBuiltOnAnotherUsdc() public {
+        (Deployed memory d, GovParams memory p, address impl) = _mintReceiverGraph();
+        vm.mockCall(impl, abi.encodeWithSignature("usdc()"), abi.encode(makeAddr("otherUsdc")));
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "mintReceiver.usdc"));
+        this.exposedAssertWiring(d, p);
     }
 
     /// @notice And `liquidity.creditManager` is checked after the switchover too, not only before.

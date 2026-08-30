@@ -13,9 +13,14 @@ pragma solidity ^0.8.24;
 /// @dev Bonds are fungible ERC-1155 units (id 0), so all quantities are amounts.
 interface ICustodyAdapter {
     /// @notice Mint new bonds from ETH via DexFi's signature-gated purchase flow.
+    /// @param beneficiary Vault depositor whose independently salted attempt this is.
+    /// @param attemptId Fresh random identifier used to derive the attempt receiver.
     /// @param mintData ABI-encoded IDexFiBond.MintDataInput obtained from DexFi's
     ///        backend (keeper-signed) by the frontend.
-    function mintBonds(bytes calldata mintData) external payable returns (uint256 amount);
+    function mintBonds(address beneficiary, bytes32 attemptId, bytes calldata mintData)
+        external
+        payable
+        returns (uint256 amount);
 
     /// @notice Stake bond units into the DexFi farm.
     /// @return swept USDC the farm paid out alongside the stake and that was forwarded

@@ -700,7 +700,12 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      This makes `farmYieldDelivered` the eighth `ICustodyAdapter` selector this contract
     ///      calls - see `setCustodyAdapter`'s census, which had to be re-derived for it.
     // slither-disable-next-line reentrancy-benign
-    function depositETH(bytes calldata mintData) external payable whenNotPaused nonReentrant {
+    function depositETH(bytes32 attemptId, bytes calldata mintData)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
         ICustodyAdapter adapter = _adapter();
         if (msg.value == 0) revert ZeroAmount();
 
@@ -708,7 +713,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         // cannot pick up a settlement some other path performed.
         uint256 deliveredBefore = adapter.farmYieldDelivered();
         // Mint via DexFi's keeper-signed payload; bonds auto-stake for the adapter.
-        uint256 amount = adapter.mintBonds{value: msg.value}(mintData);
+        uint256 amount = adapter.mintBonds{value: msg.value}(msg.sender, attemptId, mintData);
         uint256 swept = adapter.farmYieldDelivered() - deliveredBefore;
         if (amount == 0) revert NothingMinted();
 

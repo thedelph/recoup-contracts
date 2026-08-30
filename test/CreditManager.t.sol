@@ -1935,7 +1935,9 @@ contract CreditManagerTest is RiskParamsFixture {
     ///      and free of any cooldown, and every borrow, repay, deposit and withdrawal
     ///      reaches the same code through `_settle`. A hostile caller and an ordinary busy
     ///      market drive it identically, which is why the finding needed no attacker.
-    function _walk(uint256 secondsToWalk) private {
+    ///      This is an accounting proof, not a gas measurement, so metering stays off while
+    ///      the harness executes the requested cadence.
+    function _walk(uint256 secondsToWalk) private noGasMetering {
         for (uint256 i = 0; i < secondsToWalk; ++i) {
             skip(1);
             credit.accrueYield();

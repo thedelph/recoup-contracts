@@ -174,7 +174,7 @@ contract PausedModeTest is Test, DeployBase {
         vm.deal(borrower, 1 ether);
         vm.prank(borrower);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        d.vault.depositETH{value: 1 ether}("");
+        d.vault.depositETH{value: 1 ether}(bytes32(uint256(1)), "");
         emit log("REFUSED  CollateralVault.depositETH");
 
         // ── allowed ──
@@ -209,8 +209,10 @@ contract PausedModeTest is Test, DeployBase {
         d.pool.requestWithdrawal(1e6, lender);
         emit log("ALLOWED  LenderPool.requestWithdrawal");
 
-        d.pool.serviceQueue(10);
-        emit log("ALLOWED  LenderPool.serviceQueue");
+        uint256 serviceable = d.pool.maxRequestRedeem(lender);
+        vm.prank(lender);
+        d.pool.serviceWithdrawalRequest(lender, serviceable, 0);
+        emit log("ALLOWED  LenderPool.serviceWithdrawalRequest");
 
         vm.prank(lender);
         d.pool.claim();
