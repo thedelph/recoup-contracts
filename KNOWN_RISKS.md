@@ -1,10 +1,9 @@
 # Known risks and activation gates
 
 This is the launch-critical and material current security posture for the public contracts. The
-core protocol executable logic is this tree's, synced from the working tree on 2026-08-31. That
-sync replaced the lender pool, the credit manager and the collateral vault, so any analysis dated
-against the previous baseline `95e2c76` (2026-08-21) describes a pool this source no longer
-contains. This record is organised by present effect, not by discovery date. Historical internal review notes are
+core protocol executable logic in this repository is current as of 2026-08-31, and everything
+below is written against it. Analysis published here before that date was written against an
+earlier lender pool, credit manager and collateral vault, and does not describe this source. This record is organised by present effect, not by discovery date. Historical internal review notes are
 in [`AUDITS.md`](AUDITS.md); the code-level integration tour is in [`REVIEW.md`](REVIEW.md).
 
 Internal adversarial review, unit tests, invariant campaigns and mainnet fork tests are evidence, but
@@ -34,7 +33,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty and not wired as `CreditManager`'s liquidity source |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
-| Current-source parity | **None, deliberately.** This source is now synced to the working tree, which the Sepolia set predates. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
+| Current-source parity | **None, deliberately.** This source is current as of 2026-08-31 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
 | External audit | Not completed |
 | Third-party funds | Not accepted |
 
@@ -237,21 +236,20 @@ position yield to insurance, and a live position can temporarily block the trans
 
 ## What this source contains
 
-This repository is a curated publication of the protocol's contracts. Previous revisions lagged the
-working tree and said so here. **That lag is closed.** The four round-22 fixes this section used to
-list as absent - F4 (`setYieldRecipient` redirecting a full epoch's gross yield, closed by an
+This repository is a curated publication of the protocol's contracts, current as of 2026-08-31.
+
+It contains the round-22 remediation in full - F4 (`setYieldRecipient` redirecting a full epoch's gross yield, closed by an
 `owedToRecipient` balance drained by a permissionless `flushYieldTo`), F5 (a blacklisted liquidity
 source freezing `pendingPrincipal` and the escape from it together, closed by `owedToSource` plus a
 permissionless `flushPrincipalTo`), F8 (`workoutSettleAfterClose` resolving its payee from state
 `closeWorkout` can empty in the same block, closed by recording a `bearer` at every close) and F9
-(`lossBearerOf` recorded at write-down time) - are all present. So is the round-23 remediation in
-full, including the entry-side EIP-5143 overloads whose absence was the clearest way to see the old
-gap from inside the source.
+(`lossBearerOf` recorded at write-down time) - and the round-23 remediation, including the
+entry-side EIP-5143 overloads.
 
-**One property the lag preserved, and this sync ends it.** The published `src/CreditManager.sol`
-used to compile to 23,833 bytes of runtime code, byte-for-byte what is deployed at the Base Sepolia
-address in `deployments/base-sepolia.json`, so what you read here was what was running on that
-testnet. It no longer is. This source compiles to a different `CreditManager`, and the Sepolia
+**The published source no longer matches the deployed testnet bytecode, and that is worth knowing
+before you compare them.** `src/CreditManager.sol` once compiled to 23,833 bytes of runtime code,
+byte-for-byte what is deployed at the Base Sepolia address in `deployments/base-sepolia.json`. It
+compiles to a different `CreditManager` now, and the Sepolia
 deployment is now **historic**: verify it against the block explorer rather than against this tree,
 and read `deployments/base-sepolia.json` as a record of what was deployed rather than a description
 of this code.
@@ -287,7 +285,7 @@ accepted for the present pre-launch state.
 | Round 21 borrower stream cadence | Bond movement and zero-claim epochs can bypass the intended epoch gap and repeatedly re-rate borrower yield; the measured trace still had 35% unreleased after five days |
 | Round 22 F16 | Public callers can pin the lot or cap the price, but cannot bind both in one call; price monotonicity across a re-strike is not restored and the widened fuzz test is still owed |
 | Round 22 F17 | `LenderPool.claim` remains the unswept member of the delegated `*For` claim class |
-| Round 22 F18 | **Partly closed, and this sync ships the closed half.** The insurance booking at a clean workout close is now bounded to what the lot could actually reach, rather than to what it generated. The **pre-close ordering hazard remains open**: a stranger sweeping mid-workout still changes what the close sees |
+| Round 22 F18 | **Partly closed, and the closed half is in this source.** The insurance booking at a clean workout close is now bounded to what the lot could actually reach, rather than to what it generated. The **pre-close ordering hazard remains open**: a stranger sweeping mid-workout still changes what the close sees |
 | Round 22 F19 | `claimSurplusFor` can front-run the auction's own sweep into a revert |
 | Round 22 F23 | `_settle` can advance a borrower's yield index past a payout that floors to zero; the proposed one-line fix was measured inert |
 | Long-gap lender yield | A long delivery gap can defer several epochs and then stream about 3.10 epochs over five days rather than their original accrual windows |
