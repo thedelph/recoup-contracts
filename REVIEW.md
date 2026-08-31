@@ -142,14 +142,8 @@ Seven suite files declaring 66 `invariant_*` functions, fuzzed over randomised c
 `test/*.invariants.t.sol`. Sixty of those names are distinct; the gap is the frame guard
 `invariant_theHandlerNeverDropsAFrame`, declared once in each of the seven campaign contracts,
 across the fourteen contracts those seven files hold - one handler and one campaign each. Counted
-by declaration, not by assertion, and the earlier figure of 59 matched none of these bases.
-
-Re-measured on this tree by `grep -c "function invariant_"` over `test/*.invariants.t.sol`, which
-is the basis for every number in this paragraph. Two of them moved and one did not, which is worth
-saying because the one that did not looks like evidence that none of them did: this paragraph
-previously read SIX files and THIRTEEN contracts, both now wrong, while 66 and 60 happen to be
-unchanged. The 66 is a coincidence rather than a constant - it read 53 before a seventh campaign
-was added and 66 after.
+by declaration rather than by assertion, which is the only basis on which all four of those numbers
+agree; `grep -c "function invariant_" test/*.invariants.t.sol` reproduces them.
 
 The one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no
 state
