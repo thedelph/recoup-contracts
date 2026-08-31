@@ -70,13 +70,19 @@ liquidation threshold, global borrow cap and per-account cap live in bounded sto
 
 ## Activation blockers and residual risks
 
-The pool is not approved to wire or fund. The current blockers are:
+The pool is not approved to wire or fund, and no public, DexFi or Bond Fund capital is accepted
+before an external audit. That gate is independent of the findings below.
 
-| Finding | Summary |
+The three findings this table used to list were written against a pool this source replaces:
+
+| Finding | Status in this source |
 |---|---|
-| Round 22 F3 | Principal-cap accounting is only partly remediated; fungible share composition, dust boundaries and repeated-loss quotient growth remain |
-| Round 22 F12 | Permissionless queue service can turn shares into a claim that its receiver cannot collect |
-| Round 21 F7 | A queued withdrawal is valued against the whole book but reserved out of cash, so it over-reserves by the pool's leverage; at 6.00x, 1.67% of the book halts all borrowing |
+| Round 22 F3, principal-cap accounting | **Closed.** There are no principal units; cap usage is `max(accountedCash + outstandingPrincipal - totalClaimable, 0)` and the quotient bound is held explicitly rather than emergently |
+| Round 21 F7, queue over-reservation | **Closed.** The reserve is a per-controller pro-rata slice of executable cash, not a book-priced claim taken out of cash, so the leverage multiplier is gone by construction |
+| Round 22 F12, uncollectable claims | **Half closed.** Service is no longer permissionless. A claim recorded for a receiver the asset refuses to pay is still uncollectable, and that half is accepted rather than fixed |
+
+`KNOWN_RISKS.md` carries the mechanism for each, naming the functions so the claims can be checked
+against the source.
 
 **Two rows were removed in this sync, and removed because they are fixed rather than because they
 were reconsidered.** Round 22 F11 (non-epoch recovery cash inheriting an unrelated epoch clock) and
