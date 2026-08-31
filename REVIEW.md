@@ -36,7 +36,7 @@ list.
 
 | Exit | Destination | What constrains it |
 |---|---|---|
-| `CollateralVault.withdrawBonds` (`src/CollateralVault.sol`) | `msg.sender`, the original depositor | Capped at that user's own balance; refused if it would push their post-withdrawal LTV past `MAX_LTV_BPS`; refused outright if the NAV oracle is stale |
+| `CollateralVault.withdrawBonds` (`src/CollateralVault.sol`) | `msg.sender`, the original depositor | Capped at that user's own balance; refused if it would push their post-withdrawal LTV past `maxLtvBps`, which is live bounded storage in `RiskParams` rather than a compiled constant; refused outright if the NAV oracle is stale |
 | `CollateralVault.seize` (`src/CollateralVault.sol`) | the address the auction nominates | `msg.sender` must be the wired liquidation auction, and the position must actually be liquidatable |
 | `CollateralVault.disposeTo` (`src/CollateralVault.sol`) | the address the auction nominates | `msg.sender` must be the wired liquidation auction. Deliberately not gated on liquidatability, because by this point the lot belongs to the auction and carries no debt, so that check would refuse it every time |
 | `DirectCallAdapter.emergencyUnstake` (`src/adapters/DirectCallAdapter.sol`) | a governance address chosen by the owner | `onlyOwner`. Break-glass: it calls the farm's `emergencyWithdraw` and forfeits pending rewards, so it is a last resort rather than a convenience |
@@ -142,14 +142,8 @@ Seven suite files declaring 66 `invariant_*` functions, fuzzed over randomised c
 `test/*.invariants.t.sol`. Sixty of those names are distinct; the gap is the frame guard
 `invariant_theHandlerNeverDropsAFrame`, declared once in each of the seven campaign contracts,
 across the fourteen contracts those seven files hold - one handler and one campaign each. Counted
-by declaration, not by assertion, and the earlier figure of 59 matched none of these bases.
-
-Re-measured on this tree by `grep -c "function invariant_"` over `test/*.invariants.t.sol`, which
-is the basis for every number in this paragraph. Two of them moved and one did not, which is worth
-saying because the one that did not looks like evidence that none of them did: this paragraph
-previously read SIX files and THIRTEEN contracts, both now wrong, while 66 and 60 happen to be
-unchanged. The 66 is a coincidence rather than a constant - it read 53 before a seventh campaign
-was added and 66 after.
+by declaration rather than by assertion, which is the only basis on which all four of those numbers
+agree; `grep -c "function invariant_" test/*.invariants.t.sol` reproduces them.
 
 The one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no
 state

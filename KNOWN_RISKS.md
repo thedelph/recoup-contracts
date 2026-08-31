@@ -1,9 +1,9 @@
 # Known risks and activation gates
 
 This is the launch-critical and material current security posture for the public contracts. The
-core protocol executable-logic baseline remains `95e2c76` (2026-08-21); the later referral-only
-change removes delegated registration without changing the core loan or lender-pool logic. This
-record is organised by present effect, not by discovery date. Historical internal review notes are
+core protocol executable logic in this repository is current as of 2026-08-31, and everything
+below is written against it. Analysis published here before that date was written against an
+earlier lender pool, credit manager and collateral vault, and does not describe this source. This record is organised by present effect, not by discovery date. Historical internal review notes are
 in [`AUDITS.md`](AUDITS.md); the code-level integration tour is in [`REVIEW.md`](REVIEW.md).
 
 Internal adversarial review, unit tests, invariant campaigns and mainnet fork tests are evidence, but
@@ -33,7 +33,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty and not wired as `CreditManager`'s liquidity source |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
-| Current-source parity | **None, deliberately.** This source is now synced to the working tree, which the Sepolia set predates. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
+| Current-source parity | **None, deliberately.** This source is current as of 2026-08-31 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
 | External audit | Not completed |
 | Third-party funds | Not accepted |
 
@@ -45,86 +45,79 @@ source hashes, so equal length with different metadata is not by itself proof of
 change, but it does mean this public tree is not the recorded deployment snapshot. The deployment
 record is [`deployments/base-sepolia.json`](deployments/base-sepolia.json).
 
-## Current `LenderPool` activation blockers
+## `LenderPool` findings, and what the current source does about them
 
-### Round 22 F3: principal-cap accounting is only partly remediated
+The three findings this section used to list as activation blockers were written against a
+`LenderPool` that this source replaces. Two are closed by construction and one is narrowed to a
+disclosed residual. Each claim below names the function that carries it, so it can be checked
+against the source rather than believed.
 
-Loss-aware principal units removed the original nonlinear rotating-lender cap-pinning trace, and
-queue requests now preserve their exact principal units. The remaining model still compresses
-transferable, differently priced share lots into scalar units.
+**Closing them does not open activation.** The third-party capital gate is separate and unchanged:
+no public, DexFi or Bond Fund capital is accepted before an external audit, whatever this section
+says.
 
-Known residual paths are:
+### Round 22 F3: principal-cap accounting. CLOSED, by removing the mechanism
 
-- Fungible transfers and merge/split operations average lots that entered at different prices.
-- Even with no realised loss, splitting off a dust share can make its redemption round to zero assets
-  while reducing `netDeposits` by one asset-wei. Repetition is linear and gas-bound, but it still
-  erodes the cap.
-- The post-loss path retains a separate double-ceiling boundary residual.
-- Repeated near-total loss and refill cycles can grow the principal-unit quotient until issuance
-  exhausts its integer range.
+F3 was about compressing transferable, differently priced share lots into scalar principal units,
+and its residuals were properties of those units: dust redemptions eroding the cap by an asset-wei
+at a time, a double-ceiling boundary, and a principal-unit quotient that repeated loss-and-refill
+cycles could grow until issuance exhausted its integer range.
 
-Closing this requires an explicit product/accounting choice: exact transferable lot provenance,
-restrictions on share composition, or a bounded and proven rescaling policy.
+There are no principal units in this source. Deposit-cap usage is
+`max(accountedCash + outstandingPrincipal - totalClaimable, 0)` in `depositCapUsage()`, which
+follows the recognised entry book rather than holder lots, controller order or raw token balance.
+The residuals above cannot be reproduced against it because the quantity they were about does not
+exist.
 
-### Closed in this sync: Round 22 F11 and Round 22 F6a
+What replaces the overflow bound is explicit rather than emergent. The entry quotient is bounded by
+`2^128` shares per asset, and three things hold that bound: `minimumEntryAssets()`,
+`entryPriceCashReserve()` while principal is at risk, and `maximumShareSupply()`. Repeated losses
+taper lending rather than multiplying a quotient toward overflow.
 
-Both were listed here as activation blockers against the previous published source and are **fixed in
-this one**. F11 was non-epoch recovery cash rated on the yield-epoch clock (the same 400 USDC
-recovery measured streaming over five days after a recent epoch and over 180 days after a drought, a
-lender leaving on day five forfeiting 388.888889 USDC in the drought case). F6a was `_rateStream`
-flooring a new stream's duration at the old one's remaining time, so repeated deliveries could
-postpone the end of a tail indefinitely.
+Cash is now accounted rather than inferred. `_accountedCash` changes only through explicit pool
+flows, so a raw token transfer can replace missing backing up to that stored book but cannot lift
+value above it; anything above is `unmanagedSurplus()` and never enters cap usage. External balance
+loss is visible immediately through `cashDeficit()`, entry stays closed while a deficit remains, and
+the two repair doors, `coverClaimDeficit` and `coverEntryPriceDeficit`, are deficit-capped: partial
+cover is allowed and excess is refused.
 
-They are recorded here rather than deleted because the earlier revision of this file told readers to
-treat them as live, and a reader returning to it is owed the reason the rows disappeared.
+### Round 21 F7: a queued withdrawal reserving against the whole book. CLOSED
 
-### Round 22 F12: queue service can create an uncollectable claim
+F7 was a real and measured exposure and the numbers were not wrong. The pool valued a queued exit
+against the whole book, loans included, then subtracted that figure from cash alone, so the
+over-reservation multiple equalled the pool's leverage. At 6.00x a holder of a sixth of the book
+took every other lender's `maxWithdraw` to zero, and 1.67% of the book halted borrowing. Fifteen
+candidate fixes were built and refused across five audit rounds, every one of them changing a
+reserve that neither computing function read.
 
-Any caller can service a queued withdrawal. Service burns the lender's shares and records USDC in
-`claimable[receiver]`. If that receiver cannot call the pool, or the asset refuses to transfer to it,
-the lender cannot recover the burned shares or redirect the claim.
+The mechanism those numbers describe is not in this source. `_queueCashReserve` is
+`mulDiv(executableCash, requestedShares, totalSupply(), Ceil)`: a pro-rata slice of executable
+**cash**, taken per controller, with the entry-price reserve removed first because it is senior
+while principal can still be lost. A holder of a tenth of the supply reserves a tenth of the cash.
+The leverage multiplier is gone by construction, not by tuning, which is why the fifteen refusals do
+not apply to it.
 
-A delegated claim only solves the first case. The design must also handle an asset-level rejection or
-avoid irreversible service before collectability is known.
+### Round 22 F12: uncollectable claims. Authority half CLOSED, receiver half ACCEPTED
 
-### Round 21 F7: a queued withdrawal reserves cash against a claim on the whole book
+F12 had two halves. Servicing was permissionless, so any caller could burn a lender's shares and
+strand the proceeds; and a claim recorded for a receiver that cannot be paid is unrecoverable.
 
-The pool values a queued exit against the **whole book**, outstanding loans included, and then
-subtracts that figure from **cash alone**. The over-reservation is therefore the pool's leverage,
-`totalAssets()` over cash, and it is present with nothing impaired anywhere in the system.
+The first half is closed. `serviceWithdrawalRequest` reverts `UnauthorizedRequestOperator` unless the caller is
+the controller or an operator that controller approved through `setRequestOperator`, so nobody else
+can force service. `claimFor` provides the delegated collection the old text asked for.
 
-Measured at six leverages from 1.50x to 6.00x, with total impairment, the exit reserve and the live
-auction count all asserted at zero on both sides of every request: **the multiple tracks leverage
-exactly at every point.** A holder of a fixed tenth of the book locks 15% of the cash at 1.50x and
-**60% at 6.00x**.
+**The second half is accepted and disclosed rather than fixed.** If the asset itself refuses to
+transfer to the receiver, for instance because that address is blocked at the token, the claim
+cannot be collected and the shares are already burned. Service is still irreversible before
+collectability is known. That is a residual risk of this design, it is not closed, and a reviewer
+should treat it as open.
 
-Two consequences, both of which get **cheaper as leverage rises**:
+### Round 22 F11 and F6a: closed in an earlier sync
 
-| Consequence | Claim required, as a fraction of the book | At 6.00x |
-|---|---|---|
-| Every other lender's `maxWithdraw` goes to zero | `1 / leverage` | 16.67% |
-| All borrowing halts | `1 / leverage - 0.15` | **1.67%** |
-
-At 6.00x a lender holding five sixths of the pool is taken to zero by one free, revocable request
-from the holder of the other sixth. The second threshold reaches zero at 6.667x, where the 15% hot
-float alone has consumed the cash and no queue is needed to halt lending at all.
-
-The request is free, revocable and continues earning. Fifteen candidate fixes were built and refused
-across five audit rounds. **Every one of them changed the exit reserve, and neither of the two
-functions that compute this reservation reads it** - so they are refutations of those fifteen
-mechanisms and are not evidence about the design. A fix has to change the two functions that
-subtract a book-priced claim from cash. The design remains unresolved and this remains an activation
-blocker.
-
-**An earlier revision of this section reported the lock as 3.00x at zero impairment.** That figure
-was the queued claim divided by idle cash in one fixture, not an over-reservation multiple; the same
-fixture's multiple is 6.00x. It is corrected here rather than quietly replaced, because the previous
-wording understated the exposure and named impairment as the trigger when the only precondition is
-that the pool is levered.
-
-A related accepted exposure is the permissionless workout transition. Once an auction expires, any
-caller can move it into workout and hold the full-debt impairment, and therefore the queue, for up to
-14 days. This is part of the same queue design problem rather than a sixth activation blocker.
+F11 rated non-epoch recovery cash on the yield-epoch clock, so the same 400 USDC recovery streamed
+over five days after a recent epoch and over 180 days after a drought. F6a had `_rateStream` floor a
+new stream's duration at the old one's remaining time, letting repeated deliveries postpone a tail
+indefinitely. Both are fixed in this source.
 
 ## Material residual risks
 
@@ -243,21 +236,20 @@ position yield to insurance, and a live position can temporarily block the trans
 
 ## What this source contains
 
-This repository is a curated publication of the protocol's contracts. Previous revisions lagged the
-working tree and said so here. **That lag is closed.** The four round-22 fixes this section used to
-list as absent - F4 (`setYieldRecipient` redirecting a full epoch's gross yield, closed by an
+This repository is a curated publication of the protocol's contracts, current as of 2026-08-31.
+
+It contains the round-22 remediation in full - F4 (`setYieldRecipient` redirecting a full epoch's gross yield, closed by an
 `owedToRecipient` balance drained by a permissionless `flushYieldTo`), F5 (a blacklisted liquidity
 source freezing `pendingPrincipal` and the escape from it together, closed by `owedToSource` plus a
 permissionless `flushPrincipalTo`), F8 (`workoutSettleAfterClose` resolving its payee from state
 `closeWorkout` can empty in the same block, closed by recording a `bearer` at every close) and F9
-(`lossBearerOf` recorded at write-down time) - are all present. So is the round-23 remediation in
-full, including the entry-side EIP-5143 overloads whose absence was the clearest way to see the old
-gap from inside the source.
+(`lossBearerOf` recorded at write-down time) - and the round-23 remediation, including the
+entry-side EIP-5143 overloads.
 
-**One property the lag preserved, and this sync ends it.** The published `src/CreditManager.sol`
-used to compile to 23,833 bytes of runtime code, byte-for-byte what is deployed at the Base Sepolia
-address in `deployments/base-sepolia.json`, so what you read here was what was running on that
-testnet. It no longer is. This source compiles to a different `CreditManager`, and the Sepolia
+**The published source no longer matches the deployed testnet bytecode, and that is worth knowing
+before you compare them.** `src/CreditManager.sol` once compiled to 23,833 bytes of runtime code,
+byte-for-byte what is deployed at the Base Sepolia address in `deployments/base-sepolia.json`. It
+compiles to a different `CreditManager` now, and the Sepolia
 deployment is now **historic**: verify it against the block explorer rather than against this tree,
 and read `deployments/base-sepolia.json` as a record of what was deployed rather than a description
 of this code.
@@ -293,12 +285,11 @@ accepted for the present pre-launch state.
 | Round 21 borrower stream cadence | Bond movement and zero-claim epochs can bypass the intended epoch gap and repeatedly re-rate borrower yield; the measured trace still had 35% unreleased after five days |
 | Round 22 F16 | Public callers can pin the lot or cap the price, but cannot bind both in one call; price monotonicity across a re-strike is not restored and the widened fuzz test is still owed |
 | Round 22 F17 | `LenderPool.claim` remains the unswept member of the delegated `*For` claim class |
-| Round 22 F18 | **Partly closed, and this sync ships the closed half.** The insurance booking at a clean workout close is now bounded to what the lot could actually reach, rather than to what it generated. The **pre-close ordering hazard remains open**: a stranger sweeping mid-workout still changes what the close sees |
+| Round 22 F18 | **Partly closed, and the closed half is in this source.** The insurance booking at a clean workout close is now bounded to what the lot could actually reach, rather than to what it generated. The **pre-close ordering hazard remains open**: a stranger sweeping mid-workout still changes what the close sees |
 | Round 22 F19 | `claimSurplusFor` can front-run the auction's own sweep into a revert |
 | Round 22 F23 | `_settle` can advance a borrower's yield index past a payout that floors to zero; the proposed one-line fix was measured inert |
 | Long-gap lender yield | A long delivery gap can defer several epochs and then stream about 3.10 epochs over five days rather than their original accrual windows |
 | Impairment refresh | A conservative stale-high mark persists until a permissionless refresh; `refreshImpairments` can report apparent progress when `impair` no-ops |
-| Queue progress event | A cancelled queue husk can suppress `QueueHeldByReserve` for one call that still makes progress |
 
 ### Oracle, wiring and migration
 
@@ -331,7 +322,7 @@ accepted for the present pre-launch state.
 | Liquidation caller bounty | Prepaid by the borrower, parked against the auction id and credited only by a transition that resolves the position |
 | Auction reset | Re-strikes in place without changing the auction id; the first-open timestamp bounds reset to 48 hours |
 | Risk parameters | Max LTV, liquidation threshold and both borrow caps live in bounded `RiskParams` storage and match the current Sepolia record |
-| F3 original nonlinear ratchet | Removed, but F3 remains an activation blocker for the residual paths above |
+| F3 principal-cap accounting | Closed. The principal-unit mechanism its residuals were properties of is not in this source; cap usage follows the recognised entry book |
 | F10 post-delivery capture | Closed for capital entering after a live pot is delivered, with the narrower semantics above |
 
 ## Verification sources

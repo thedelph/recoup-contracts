@@ -29,7 +29,19 @@ jobs:
           # `forge-std` and `openzeppelin-contracts` are git submodules. Without this the
           # checkout succeeds, every import fails, and the failure reads like a broken
           # remapping rather than a missing checkout flag.
-          submodules: recursive
+          #
+          # `true` rather than `recursive`, deliberately. Recursive additionally fetches
+          # OpenZeppelin's own `erc4626-tests` and `halmos-cheatcodes`, which nothing in this
+          # repository imports. It used to matter for a worse reason: forge auto-detected
+          # remappings from what was on disk under `lib/`, so a recursive checkout appended one
+          # per nested submodule, and since `remappings` is a solc metadata field hashed into
+          # every contract's CBOR trailer, CI and an ordinary clone compiled different bytecode
+          # from the same commit. `foundry.toml` pins remappings now, so the two agree. Verified
+          # from a cold clone: 4,997 bytes of `CreditWiring` initcode and two remappings either
+          # way.
+          submodules: true
+          # The scope check below diffs against the base branch.
+          fetch-depth: 0
 
       # Seven paths exist only in this repository. They have no counterpart in the working tree
       # this source is ported from, so a wholesale copy of that tree over this one deletes six of
@@ -73,11 +85,43 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
 
+      # Documentation-only pull requests skip the build and the suite, which is thirteen
+      # minutes they cannot affect the outcome of.
+      #
+      # 🟥 **Deliberately an in-job gate rather than a workflow-level `paths:` filter, and
+      # the reason is the step immediately above this one.** A `paths:` filter would skip the whole
+      # job on a documentation-only change, and the public-only survival check is precisely the
+      # guard that a documentation change can defeat: a pull request deleting `KNOWN_RISKS.md`
+      # touches nothing but markdown. Filtering at the workflow level would switch that guard off
+      # for exactly the pull requests it exists to catch.
+      #
+      # The second reason is durability. `forge test` is not a required status check on this
+      # repository today. If it is ever made one, a `paths:` filter becomes a trap: the check never
+      # reports at all and the pull request waits forever. An in-job gate always reports.
+      - name: Does this change touch anything but documentation?
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            changed=$(git diff --name-only HEAD^ HEAD)
+          else
+            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          fi
+          if printf '%s\n' "$changed" | grep -v '^$' | grep -qv '\.md$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Markdown only, so the build and the suite were skipped. The public-only" >> "$GITHUB_STEP_SUMMARY"
+            echo "survival check above still ran, which is the one that matters here." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Show versions
+        if: steps.scope.outputs.run == 'true'
         run: forge --version
 
       - name: Build
+        if: steps.scope.outputs.run == 'true'
         run: forge build
 
       - name: Test
+        if: steps.scope.outputs.run == 'true'
         run: forge test -vv
