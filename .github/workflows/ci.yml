@@ -83,6 +83,33 @@ jobs:
           fi
           echo "All seven public-only paths present, and README.md still carries its disclosure."
 
+      # The limit the step above states out loud - "this proves the files EXIST, it does not prove
+      # their contents are current" - is what this step starts closing.
+      #
+      # On 2026-08-31 the Solidity in this repository was replaced and the risk register was not.
+      # KNOWN_RISKS.md went on naming `netDeposits` and `QueueHeldByReserve`, neither of which
+      # exists in the source that shipped beside it, while saying nothing about `_accountedCash`,
+      # which appears two dozen times in LenderPool.sol. Three findings stood published as live
+      # activation blockers against a pool that had been deleted. This checks the weaker property
+      # that would nonetheless have caught all of it: every name the documentation prints as code
+      # is a name the source still uses. The script's own header states what it does not check.
+      #
+      # Deliberately on the ungated side, above the scope check and before the toolchain:
+      #
+      #  - A documentation-only pull request is exactly the kind this catches, so gating it behind
+      #    `steps.scope.outputs.run` would switch it off for its own case. That is the same mistake
+      #    a workflow-level `paths:` filter would make, and the comment below says why that one was
+      #    refused too.
+      #  - It needs no build, no artifacts and no `forge`, so it has nothing to wait for.
+      #  - It is Node builtins only, with no dependencies and no install step. GitHub's Ubuntu image
+      #    ships Node; if that ever stops being true this step fails loudly rather than skipping.
+      #
+      # It is deliberately not added to the survival list above. Deleting the script makes this step
+      # fail with a missing-file error on its own, which is the same protection without adding a
+      # hand-maintained name to a count whose basis nobody can now re-derive.
+      - name: Documentation names code that exists
+        run: node .github/scripts/check-doc-identifiers.mjs
+
       - uses: foundry-rs/foundry-toolchain@v1
 
       # Documentation-only pull requests skip the build and the suite, which is thirteen
