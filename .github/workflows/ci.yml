@@ -70,18 +70,47 @@ jobs:
           done
           if [ -n "$missing" ]; then
             echo "These paths exist only in this repository and are gone:$missing"
-            echo "A wholesale copy from the private working tree deletes them. Restore them rather"
-            echo "than re-deriving them - they have no counterpart there to copy from."
+            echo "They have no counterpart in the tree this source is synced from, so a wholesale"
+            echo "copy over this one removes them. Restore them from this repository's own history."
+            echo "Do not re-derive them: there is nowhere else to copy them from."
             exit 1
           fi
           if ! grep -q '^## Activation blockers and residual risks' README.md; then
             echo "README.md has lost its '## Activation blockers and residual risks' section."
             echo "That section is the published disclosure of what still blocks the LenderPool, and"
-            echo "the private repo's contracts/README.md - which shares only the H1 with this file -"
-            echo "does not contain it. It cannot be recovered by copying."
+            echo "it exists only here. The README this source is synced from shares its H1 with this"
+            echo "file and nothing else, so the section cannot be recovered by copying it in again."
+            echo "Restore it from this repository's own history."
             exit 1
           fi
           echo "All seven public-only paths present, and README.md still carries its disclosure."
+
+      # The limit the step above states out loud - "this proves the files EXIST, it does not prove
+      # their contents are current" - is what this step starts closing.
+      #
+      # On 2026-08-31 the Solidity in this repository was replaced and the risk register was not.
+      # KNOWN_RISKS.md went on naming `netDeposits` and `QueueHeldByReserve`, neither of which
+      # exists in the source that shipped beside it, while saying nothing about `_accountedCash`,
+      # which appears two dozen times in LenderPool.sol. Three findings stood published as live
+      # activation blockers against a pool that had been deleted. This checks the weaker property
+      # that would nonetheless have caught all of it: every name the documentation prints as code
+      # is a name the source still uses. The script's own header states what it does not check.
+      #
+      # Deliberately on the ungated side, above the scope check and before the toolchain:
+      #
+      #  - A documentation-only pull request is exactly the kind this catches, so gating it behind
+      #    `steps.scope.outputs.run` would switch it off for its own case. That is the same mistake
+      #    a workflow-level `paths:` filter would make, and the comment below says why that one was
+      #    refused too.
+      #  - It needs no build, no artifacts and no `forge`, so it has nothing to wait for.
+      #  - It is Node builtins only, with no dependencies and no install step. GitHub's Ubuntu image
+      #    ships Node; if that ever stops being true this step fails loudly rather than skipping.
+      #
+      # It is deliberately not added to the survival list above. Deleting the script makes this step
+      # fail with a missing-file error on its own, which is the same protection without adding a
+      # hand-maintained name to a count whose basis nobody can now re-derive.
+      - name: Documentation names code that exists
+        run: node .github/scripts/check-doc-identifiers.mjs
 
       - uses: foundry-rs/foundry-toolchain@v1
 
