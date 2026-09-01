@@ -583,9 +583,15 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     /// @notice Install or clear the guardian (go-live item G4). Zero disables the role.
     /// @dev Refuses `owner()` for the reason `GuardianMustDifferFromOwner` gives: a single
     ///      address holding both roles is the configuration the second key does not defend
-    ///      against. Note this is checked against the owner **at the time of the call** - a later
-    ///      `transferOwnership` to the guardian's address would collapse them, and the G2
-    ///      handover is exactly such a transfer, so re-read the guardian after it.
+    ///      against. Note this is checked against the owner **at the time of the call**.
+    ///
+    ///      🟥 **This continued "a later `transferOwnership` to the guardian's address would
+    ///      collapse them ... so re-read the guardian after it" until audit round 40 - which
+    ///      closed exactly that hole a few lines below, in the same commit that left this
+    ///      standing.** `transferOwnership` now refuses a handover to the sitting guardian, so
+    ///      the collapse is unreachable rather than something to read back afterwards. The G2
+    ///      handover is still such a transfer and it now REVERTS: move or clear the guardian
+    ///      first. See `transferOwnership`.
     function setGuardian(address guardian_) external onlyOwner {
         if (guardian_ == owner()) revert GuardianMustDifferFromOwner();
         guardian = guardian_;
@@ -622,6 +628,40 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      `msg.sender` is never the zero address.
     function _requireOwnerOrGuardian() private view {
         if (msg.sender != owner() && msg.sender != guardian) revert NotOwnerOrGuardian();
+    }
+
+    /// @notice Hand ownership on. Refuses a handover to the sitting guardian.
+    /// @dev **Audit round 36 finding D4, carried three rounds, closed in round 40.** `setGuardian`
+    ///      refuses `guardian_ == owner()`; this is the same pair's other writer and it refused
+    ///      nothing, so an ordinary handover to the guardian's address collapsed the two-key model
+    ///      with no revert and no event saying so. The single key then satisfied both
+    ///      `_requireOwnerOrGuardian` and `onlyOwner`, which is exactly the state `unpause`'s
+    ///      `onlyOwner` exists to prevent. **The G2 timelock handover IS a `transferOwnership`**,
+    ///      so this is the writer that had to carry the rule.
+    ///
+    ///      `NAVOracle` is the control and has always been symmetric: `setKeeper` refuses the
+    ///      confirmer and `setNavConfirmer` refuses the keeper, so neither writer of that pair can
+    ///      collapse it.
+    ///
+    ///      **`DeployBase` already refused this at deploy time and that is not the same cover.**
+    ///      `_validateParams` refuses `p.guardian == p.owner` and `_assertWiring` re-reads both
+    ///      slots after `_handOver`. Both are script-side and one-shot. Every later rotation -
+    ///      which is every G2 handover, and the exact transaction `setGuardian`'s own docstring
+    ///      warns about - happens against a live contract with no script in the path.
+    ///
+    ///      **The clause is unconditional and does not exempt a zero `guardian`.** With the role
+    ///      unfilled this refuses `transferOwnership(address(0))` one step ahead of `Ownable`'s
+    ///      `OwnableInvalidOwner`. Both refuse and nothing reaches a different state; only the
+    ///      error name changes, and `renounceOwnership` below already refuses that same act under
+    ///      a third name. The conditional form that keeps the OZ name was BUILT AND MEASURED
+    ///      rather than argued; the figures are on `CreditManager`'s copy, which is the contract
+    ///      with the margin to lose.
+    ///
+    ///      The sanctioned handover to an address that is currently the guardian is two calls
+    ///      rather than one: move or clear the guardian first, then transfer.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == guardian) revert GuardianMustDifferFromOwner();
+        super.transferOwnership(newOwner);
     }
 
     /// @dev Renouncing would permanently disable all wiring and the pause switch.

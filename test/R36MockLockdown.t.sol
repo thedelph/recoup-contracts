@@ -239,6 +239,90 @@ contract R36MockLockdownTest is Test {
         assertEq(farm.admin(), address(0), "unchanged");
     }
 
+    // ── the second key can be rotated and revoked (round 40) ─────────────────
+
+    /// @notice **The rotation that did not exist.** `lockTo` is one-way, so before round 40 the
+    ///         `operator` slot was frozen for the life of the deployment: a keeper rotation
+    ///         stranded the epoch job, and a keeper COMPROMISE could not be revoked at all
+    ///         without redeploying all three mocks and moving all three addresses.
+    /// @dev The revocation arm is the one that matters. `seedStakeFor` is `gated`, and
+    ///      `test_R36_theUngatedFarmLetsAStrangerWithdrawSomebodyElsesBonds` above shows what a
+    ///      caller who reaches that surface can take.
+    function test_R40_theOperatorCanBeRotatedAndRevoked() public {
+        _lockAll();
+        address newKeeper = address(0xBEEF);
+
+        // Rotation: the old key stops working and the new one starts.
+        vm.prank(ADMIN);
+        farm.setOperator(newKeeper);
+        assertEq(farm.operator(), newKeeper, "the second key moved");
+
+        vm.prank(KEEPER);
+        vm.expectRevert(abi.encodeWithSelector(MockLockdown.MockLocked.selector, KEEPER));
+        farm.setPendingYield(VICTIM, 1);
+
+        vm.prank(newKeeper);
+        farm.setPendingYield(VICTIM, 1);
+
+        // Revocation: zero clears the role outright, in one transaction.
+        vm.prank(ADMIN);
+        farm.setOperator(address(0));
+        assertEq(farm.operator(), address(0), "the second key is gone");
+        vm.prank(newKeeper);
+        vm.expectRevert(abi.encodeWithSelector(MockLockdown.MockLocked.selector, newKeeper));
+        farm.setPendingYield(VICTIM, 2);
+
+        // And `admin` is untouched throughout: `lockTo` is still one-way. Sent from the LOCK
+        // AUTHORITY (this contract), because `lockTo` checks authority before it checks
+        // one-wayness - so pranking as `ADMIN` reaches `MockLocked` and proves the wrong clause.
+        assertEq(farm.admin(), ADMIN, "admin never moved");
+        vm.expectRevert(MockLockdown.MockAlreadyLocked.selector);
+        farm.lockTo(STRANGER, STRANGER);
+    }
+
+    /// @notice **The escalation this is built to refuse, and the one way to build it wrong.**
+    /// @dev `setOperator` is deliberately NOT `gated`. `gated` admits the operator as well as the
+    ///      admin, so had it carried that modifier the second key could re-point itself - handing
+    ///      the gated surface to a third party, or locking the admin's chosen operator out of it.
+    ///      A stranger is refused for the same reason. Both arms are asserted because the
+    ///      difference between them and the shipped form is one modifier.
+    function test_R40_neitherTheOperatorNorAStrangerMayMoveTheSecondKey() public {
+        _lockAll();
+
+        vm.prank(KEEPER);
+        vm.expectRevert(MockLockdown.MockAdminRequired.selector);
+        farm.setOperator(STRANGER);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(MockLockdown.MockAdminRequired.selector);
+        farm.setOperator(STRANGER);
+
+        assertEq(farm.operator(), KEEPER, "the second key is where the admin put it");
+    }
+
+    /// @notice **It fails closed BEFORE lockdown, which is a free property rather than a clause.**
+    /// @dev While `admin` is zero, `msg.sender != admin` holds for every possible caller, because
+    ///      `msg.sender` is never the zero address. So `setOperator` cannot be used to squat the
+    ///      operator slot in the window between the constructor and `lockTo` - the window round 38
+    ///      measured at 40 transactions and a block boundary before the round-39 remediation
+    ///      narrowed it to one transaction. Asserted rather than reasoned about, because the whole
+    ///      point of the surrounding gate is that it is default-OPEN and this member is not.
+    function test_R40_setOperatorIsShutBeforeTheStackIsLocked() public {
+        assertEq(farm.admin(), address(0), "premise: unlocked, and every gated setter is open");
+        farm.setPendingYield(VICTIM, 1);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(MockLockdown.MockAdminRequired.selector);
+        farm.setOperator(STRANGER);
+
+        // Including from the address that will become admin, which has no standing yet either.
+        vm.prank(ADMIN);
+        vm.expectRevert(MockLockdown.MockAdminRequired.selector);
+        farm.setOperator(KEEPER);
+
+        assertEq(farm.operator(), address(0), "nothing was squatted");
+    }
+
     /// @dev The operator is optional. Locking without one still closes the surface.
     function test_R36_theOperatorMayBeOmitted() public {
         farm.lockTo(ADMIN, address(0));

@@ -107,3 +107,63 @@ base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 [etherscan]
 base = { key = "${ETHERSCAN_API_KEY}", chain = 8453 }
 base_sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 84532 }
+
+# The NEUTER profile. Use it for any measurement whose point is that a change to `src/` MUST show
+# up in a test result: neutering a clause and re-running, mutation testing, or any check that a
+# guard is load-bearing.
+#
+# `dynamic_test_linking` defers library and contract linking from compile time to test time. It is
+# a real speed win on the dev loop and is forge's DEFAULT since 1.8.0 (foundry-rs/foundry#14718,
+# 2026-08-27; nightlies since 2026-06-08). The Foundry book still documents `false`, so the book
+# cannot tell you what your forge is doing - `forge config` can.
+#
+# The hazard it is named for: maintainer grandizzy, on foundry-rs/foundry#11337, "mind this won't
+# rebuild tests when you change srcs". Round 40 MEASURED that here - a neuter that deleted a clause
+# from `src/` and re-ran an existing test reported PASS with gas identical to the byte, 27662942
+# across three different source states, and a `-vvvv` trace showing a revert from a clause no
+# longer in the file. The same neuter under `--force` went red at 27399735. The v1.8.0
+# breaking-changes note endorses exactly one remedy, `--no-dynamic-test-linking`, and the Gambit
+# mutation-testing author reports needing this same separate-profile shape. Mutation testing IS
+# neutering.
+#
+# 🟥 BUT THIS PROFILE IS INSURANCE, NOT THE REPAIR OF A DEFECT ANYONE HAS RE-MEASURED. Round 41
+# tried three shapes at forge 1.8.1 with `dynamic_test_linking = true` and COULD NOT REPRODUCE the
+# staleness - every one correctly went red under the DEFAULT profile, with gas that MOVED:
+#   * `new`-constructed contract, `NAVOracle.setKeeper`'s `KeysMustDiffer` clause deleted and
+#     `test_setKeeper_rejectsTheConfirmer` re-run incrementally - PASS 39012 -> FAIL 43036;
+#   * INLINED internal library member, `LtvMath.collateralValue` - PASS 452 -> FAIL 3566;
+#   * EXTERNAL, link-referenced library member, which is the only shape the flag actually
+#     governs - PASS 3528 -> FAIL 6693, and the identical 6693 under this profile.
+# So do not read round 40's figures as a property of forge 1.8.1. Whatever produced them was
+# narrower than "an incremental run does not see a `src/` edit", and it has not been isolated. The
+# honest statement is that the failure mode is REPORTED UPSTREAM and MEASURED ONCE HERE, and that
+# a neuter which cannot go red is a false green - which costs one config line to rule out and a
+# whole round to detect. Re-derive before quoting either set of numbers.
+#
+# Profiles INHERIT from `[profile.default]` - VERIFIED, not assumed, by diffing
+# `forge config --profile neuter` against `forge config` at this commit. The only substantive
+# difference is the `dynamic_test_linking` line; `isolate`, both `fs_permissions` entries,
+# `remappings`, `auto_detect_remappings`, `solc`, `create2_library_salt` and the whole
+# `[invariant]` block including `fail_on_revert = false` all survive, and adding this table left
+# `forge config` for the default profile byte-identical. Measured in practice too:
+# `FOUNDRY_PROFILE=neuter forge test --match-path test/ReferralRegistry.invariants.t.sol` is 6
+# passed / 0 failed, frame guard included.
+#
+# It cannot move a CREATE2 library address, for the reason the three pins above cannot: it is not
+# a solc-INPUT field. VERIFIED rather than argued - `forge build --force` under each profile gives
+# a `CreditWiring` artifact whose initcode and runtime are byte-identical
+# (initcode sha256 111a3d2120f1472764ae5037dfaaf7f417a6f2ef376c888455eb7b566294d259, runtime
+# f62761f12d0e1f191a9edae791dbf43978fa8d6424c77623d6873650595f8c04, `settings` keys unchanged at
+# compilationTarget, evmVersion, libraries, metadata, optimizer, remappings, and the string
+# `dynamic_test_linking` absent from the metadata entirely).
+#
+# COST, so nobody is surprised by it: the two profiles share one `out/`, and switching between
+# them invalidates the incremental cache in both directions - measured, a targeted run right after
+# a default-profile run recompiled all 100 files. Alternating profiles is therefore not cheap;
+# staying in one for a whole neuter session is.
+#
+# Usage: `FOUNDRY_PROFILE=neuter forge test --match-contract <X>`. It is not a substitute for
+# `--force` where a full clean rebuild is what you want; it is the targeted guarantee that a
+# `src/` edit reaches the test.
+[profile.neuter]
+dynamic_test_linking = false

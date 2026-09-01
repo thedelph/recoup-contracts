@@ -709,8 +709,13 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     // ── Wiring (owner, behind timelock in production) ────────────────────────
 
     /// @notice Install or clear the guardian (go-live item G4). Zero disables the role.
-    /// @dev Checked against the owner **at the time of the call**. The G2 handover is a
-    ///      `transferOwnership`, so re-read the guardian after it.
+    /// @dev Checked against the owner **at the time of the call**.
+    ///
+    ///      🟥 **This ended "The G2 handover is a `transferOwnership`, so re-read the guardian
+    ///      after it" until audit round 40**, which closed that hole in `transferOwnership`
+    ///      below. The handover is still a `transferOwnership`; it now REVERTS on a handover to
+    ///      the sitting guardian rather than silently collapsing the pair, so there is nothing to
+    ///      re-read. Move or clear the guardian first.
     function setGuardian(address guardian_) external onlyOwner {
         if (guardian_ == owner()) revert GuardianMustDifferFromOwner();
         guardian = guardian_;
@@ -740,6 +745,30 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     /// @dev A zero `guardian` cannot match a caller, because `msg.sender` is never zero.
     function _requireOwnerOrGuardian() private view {
         if (msg.sender != owner() && msg.sender != guardian) revert NotOwnerOrGuardian();
+    }
+
+    /// @notice Hand ownership on. Refuses a handover to the sitting guardian.
+    /// @dev **Audit round 36 finding D4, carried three rounds, closed in round 40.** The full
+    ///      argument is on `CollateralVault.transferOwnership`; the short version is that
+    ///      `setGuardian` refuses `guardian_ == owner()`, this is the same pair's other writer,
+    ///      and it refused nothing - so a handover to the guardian's address collapsed the
+    ///      two-key model silently and the single key then both paused and unpaused. The G2
+    ///      timelock handover is precisely such a transfer.
+    ///
+    ///      **The zero-guardian case is a measurement, not an argument.** Unconditional, this
+    ///      refuses `transferOwnership(address(0))` ahead of `Ownable`'s `OwnableInvalidOwner`;
+    ///      both refuse, only the error name differs, and `renounceOwnership` below refuses the
+    ///      same act under a third. The conditional form that preserves the OZ name is
+    ///      `if (guardian != address(0) && newOwner == guardian)`, and it was built and measured
+    ///      on this contract because this contract is the one with the margin to lose. MEASURED,
+    ///      `forge build --sizes`, this contract only: baseline **22,015**, unconditional
+    ///      **22,079 (+64)**, conditional **22,101 (+86)**. The OZ error name therefore costs
+    ///      **22 bytes per contract**, to rename a revert on a call that is refused either way,
+    ///      while widening the set this clause accepts. Refused on that measurement. Do not
+    ///      re-argue it from the shape of the expression.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == guardian) revert GuardianMustDifferFromOwner();
+        super.transferOwnership(newOwner);
     }
 
     /// @dev Renouncing would permanently freeze wiring and the pause switch.
@@ -883,10 +912,18 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Repoint the balance sheet that bears socialised losses.
     /// @dev **Audit round 11: this had `onlyOwner` and nothing else, while both of its structural
-    ///      siblings carried a live-state guard.** `setLiquiditySource` refuses while debt,
-    ///      pending principal or an unplaced loss is outstanding, and `LenderPool.setCreditManager`
-    ///      refuses while the pool has principal out. This setter decides where every future
-    ///      default lands and was the one that would move under anything.
+    ///      siblings carried a live-state guard.** `setLiquiditySource` refuses while debt or an
+    ///      unplaced loss is outstanding, and `LenderPool.setCreditManager` refuses while the pool
+    ///      has principal out. 🟥 **This sentence used to say "debt, pending principal or an
+    ///      unplaced loss", and `pendingPrincipal` is HANDLED there rather than refused** -
+    ///      best-effort delivered, residue parked into `owedToSource[outgoing]`. PR #242 deleted
+    ///      that clause and corrected its own source of truth in place; audit round 40 found four
+    ///      surviving copies and fixed them, all four in `script/`, and this one in `src/` was
+    ///      never enumerated. It was found in round 41 by a detector prototype rather than by a
+    ///      hand sweep, which is the argument for building the detector.
+    ///
+    ///      This setter decides where every future default lands and was the one that would move
+    ///      under anything.
     ///
     ///      Two clauses, mirroring those two siblings - and a third added by audit round 21, which
     ///      is about the pointer pair rather than about this pool's own state. It is set out at the
@@ -2729,10 +2766,26 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      unwind it, because nothing untrue is written down; and there is no migration deadlock,
     ///      because the counter can now only ever hold loss the pool itself funded.
     ///
-    ///      `setLiquiditySource` refuses while any principal is out, so the source cannot change
-    ///      under a live loan and "who funded this" is never ambiguous. That guard is what makes
-    ///      the current pointer a sound proxy for provenance here; without it this check would be
-    ///      reading today's configuration to answer a question about yesterday's money.
+    ///      `setLiquiditySource` refuses while `totalDebt != 0`, so the source cannot change under a
+    ///      live loan and "who funded this" is never ambiguous. That guard is what makes the current
+    ///      pointer a sound proxy for provenance here; without it this check would be reading
+    ///      today's configuration to answer a question about yesterday's money.
+    ///
+    ///      **`totalDebt`, and naming the quantity is the whole of the correction.** This paragraph
+    ///      rested on the setter "refusing while any principal is out", which is one reading away
+    ///      from a clause that is no longer there: PR #242 changed
+    ///      `if (totalDebt != 0 || pendingPrincipal != 0)` to `if (totalDebt != 0)`, so a repoint
+    ///      with principal owed home does **not** revert. It settles best-effort and parks whatever
+    ///      the outgoing source could not take in `owedToSource[outgoing]`.
+    ///
+    ///      **The argument survives that, and `totalDebt` is exactly why.** `pendingPrincipal` is
+    ///      principal already written down or repaid and owed *back* to the source - never principal
+    ///      out with a borrower - so it is not money a later default can be charged against, and the
+    ///      park keys anything undeliverable to the era that earned it rather than to the next
+    ///      source. What the provenance question needs is that no borrower debt can straddle a
+    ///      repoint, and `totalDebt != 0` is that statement exactly. The other half is this setter's
+    ///      `_requireNoUnsocialisedLoss()`, which stops a loss banked against one source being
+    ///      settled against the next. Read `setLiquiditySource`, not a paraphrase of it.
     ///
     ///      **Audit round 21 finding 5: the branch above was silently wrong for a third wiring.**
     ///      The two the argument covers are "pool funds and pool absorbs" and "treasury funds, so

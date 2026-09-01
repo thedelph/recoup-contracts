@@ -613,8 +613,13 @@ abstract contract DeployBase is Script {
         //
         // Note what the contracts' own `guardian != owner()` check can and cannot see from here:
         // at this point the owner is still `deployer`, so a guardian equal to `p.owner` passes
-        // all three calls and only collapses at `_handOver`. `_validateParams` is what catches that,
-        // and `_assertWiring` re-checks it after the handover, when the state is observable.
+        // all three calls and is REFUSED at `_handOver`. `_validateParams` is what catches it
+        // before a broadcast spends a nonce, and `_assertWiring` re-checks after the handover.
+        //
+        // 🟥 **This said "only COLLAPSES at `_handOver`" until audit round 40 and that is no
+        // longer the behaviour**: `transferOwnership` refuses a handover to the sitting guardian
+        // on all three contracts, so `_handOver` reverts `GuardianMustDifferFromOwner` instead of
+        // completing into a collapsed pair.
         d.vault.setGuardian(p.guardian);
         d.credit.setGuardian(p.guardian);
         // The third holder of the same role, added with the lender pool's entry pause. It sits here
@@ -636,6 +641,49 @@ abstract contract DeployBase is Script {
         // has principal out, so wiring it now is what keeps it wirable at all later.
         d.pool.setCreditManager(address(d.credit));
         d.pool.setEpochHarvester(address(d.harvester));
+
+        // **THE POOL SHIPS SHUT. Audit round 36 finding D7, executed and closed in round 40.**
+        //
+        // `_log` printed "The LenderPool ships dormant" for five rounds and nothing established
+        // it. The pool is constructed with `Config.DEFAULT_LENDER_POOL_DEPOSIT_CAP` and unpaused,
+        // so it took public USDC from the block it existed, while `_assertWiring` positively
+        // REQUIRED `harvester.lenderPool() == 0` - the state in which `EpochHarvester` accrues the
+        // lender share for a pool bearing no credit risk at all.
+        //
+        // **EXECUTED**, `test/R40D7Capture.t.sol`: a stranger deposits 1,200.000000 into the
+        // unwired pool, the protocol runs four epochs on treasury money so the stranger carries
+        // zero risk, `pendingLenderYield` reaches 1,000.000000 parked, the owner runs
+        // `_wirePhase4`, and the stranger calls the permissionless `flushLenderYield()`. Profit
+        // **999.999999**, the whole parked backlog to one wei.
+        //
+        // 🟥 **THE DEPLOY BLOCK IS NOT THE MECHANISM, and that framing is why this sat unexecuted
+        // for four rounds.** A control has the attacker arrive one block AFTER the switchover and
+        // take the identical 999999999. The value leaks at the FLUSH instant, so the question is
+        // never "who got in early", it is "who holds shares when the backlog lands".
+        //
+        // 🟥 **AND THE PRESCRIBED FIX IS REFUTED BY EXECUTION - do not rebuild it.** The ledger
+        // prescribed `pool.pause()` in `_phase4PauseCalls` with `unpause` as a trailing leg of the
+        // switchover batch. Run in exactly that shape, the profit is **999999999, unchanged**,
+        // because `flushLenderYield` is a separate permissionless call that necessarily lands
+        // after the trailing unpause: the just-in-time depositor simply arrives one block later.
+        // The pause was on the wrong side of the only door that matters. **For the same reason
+        // there is deliberately NO `pool.unpause()` leg in `_phase4Calls`** - such a leg IS that
+        // trailing unpause, and adding it would re-open the capture this line closes.
+        //
+        // So the pool ships PAUSED and stays paused through the switchover. Unpausing is a
+        // separate, deliberate operator act, and it must be sent atomically with seeding the
+        // intended cohort and calling `flushLenderYield` - one operation, so no block exists in
+        // which the pool is open and the backlog is unclaimed. `_assertWiring` asserts the shipped
+        // state below; `_assertPhase4Wiring` deliberately does NOT read the pool's switch, because
+        // by the time it can be run the operator may legitimately have completed that seed.
+        //
+        // Entry only. `redeem` and `withdraw` are not `whenNotPaused`, so anybody already in can
+        // still leave - asserted in the capture file.
+        //
+        // Zero runtime bytes: this is a script, and nothing deployed changes. The Solidity variant
+        // was measured and refused - `_pause()` in `LenderPool`'s constructor costs +162 initcode
+        // and turns roughly 190 fixtures that deposit straight after construction red.
+        d.pool.pause();
 
         // **Audit round 11: the two calls that used to sit here paid the lender share for zero
         // credit exposure.** `credit.setLenderPool` and `harvester.setLenderPool` were made in the
@@ -735,14 +783,33 @@ abstract contract DeployBase is Script {
     ///      changes nothing here, because the pool's switch is a *third* switch and this operation
     ///      does not throw it - the same relationship `depositBonds` has to the vault's, two
     ///      paragraphs down. What it does change is what an operator has to send during an
-    ///      incident, where the pause is now four transactions rather than three. It is enough because of what leg 2 already
-    ///      demands: `setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is
-    ///      non-zero, so **no pre-existing position can be carried into the gap and defaulted
-    ///      there** - and by the identity `outstandingPrincipal == pendingPrincipal + totalDebt`
-    ///      that same precondition also pins the pool's own principal at zero on entry. A fresh
-    ///      borrow is the only door into the gap, and the pause is the lock on that one door.
-    ///      Do not "improve" this by relaxing leg 2's precondition; it is half the reason the
-    ///      pause works.
+    ///      incident, where the pause is now four transactions rather than three. It is enough
+    ///      because of what the switchover legs between them demand, and **naming the right leg
+    ///      matters, because this sentence named the wrong one for three rounds.** It read
+    ///      "`setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is non-zero",
+    ///      and the second half of that has been false since PR #242 deleted the clause on
+    ///      2026-08-20 (audit round 40, item 7). Of the two BALANCES that sentence named,
+    ///      `setLiquiditySource` refuses on `totalDebt` and not on `pendingPrincipal`, which it
+    ///      **handles** - best-effort delivering to the outgoing source and parking whatever will
+    ///      not go as `owedToSource[outgoing]`. It refuses on `unsocialisedLoss` as well, and on
+    ///      `ZeroAddress`, and on a wrong-but-coded incoming pointer through
+    ///      `_requireWiringRan(CreditWiring.checkLiquiditySourceSwap(...))`.
+    ///
+    ///      🟥 **An earlier draft of this line said "and on nothing else", which is false and
+    ///      disagreed with the sibling copy in `WirePhase4.s.sol` written in the same wave.**
+    ///      Two copies of one fact is how the original defect got here; a closing absolute is the
+    ///      clause that makes a second copy wrong.
+    ///
+    ///      What actually pins `pendingPrincipal` at zero is the **settle leg**, which is the
+    ///      hard delivery rather than the best-effort one and takes the whole atomic batch down
+    ///      with it when the outgoing source will not accept USDC. So the conclusion stands and
+    ///      only its support moved: on any batch that executes at all, both terms of the identity
+    ///      `outstandingPrincipal == pendingPrincipal + totalDebt` are zero, so **no pre-existing
+    ///      position can be carried into the gap and defaulted there**, and the pool's own
+    ///      principal is zero on entry; on a batch that cannot execute, nothing moves and no gap
+    ///      opens. A fresh borrow is the only door into the gap, and the pause is the lock on
+    ///      that one door. Do not "improve" this by relaxing the settle leg to best-effort; it is
+    ///      half the reason the pause works.
     ///
     ///      The vault is paused for the same span. **That sentence used to continue "its
     ///      `depositBonds`/`depositETH` are the only other `whenNotPaused` functions in the
@@ -900,10 +967,29 @@ abstract contract DeployBase is Script {
     ///
     ///      The order is load-bearing, top to bottom:
     ///
-    ///      1. `settlePrincipal` before any pointer moves. `setLiquiditySource` refuses while
-    ///         `pendingPrincipal` is non-zero, and the manager's own migration notes say the
-    ///         principal becomes unreachable by every contract if the pointer moves before the
-    ///         money does.
+    ///      1. `settlePrincipal` before any pointer moves - and **not for either of the two
+    ///         reasons this entry gave until audit round 40, item 7.** It said
+    ///         `setLiquiditySource` refuses while `pendingPrincipal` is non-zero, and cited the
+    ///         manager's own migration notes for the principal becoming unreachable if the
+    ///         pointer moves first. PR #242 deleted that clause on 2026-08-20 and those notes now
+    ///         say the opposite in the present tense. `setLiquiditySource` **handles**
+    ///         `pendingPrincipal`: it best-effort delivers to the outgoing source and parks
+    ///         whatever will not go as `owedToSource[outgoing]`, which stays collectable rather
+    ///         than becoming unreachable. MEASURED, this batch with the settle leg dropped **and
+    ///         the outgoing treasury source BLOCKED in `MockUSDC`**: it executed clean,
+    ///         `liquiditySource` moved to the pool, `pendingPrincipal` went to zero and
+    ///         500,000,000 landed in `owedToSource[treasury]`. **The blocked condition is
+    ///         load-bearing and an earlier draft of this line dropped it**: with the source
+    ///         unblocked the identical batch settles the money home and `owedToSource[treasury]`
+    ///         is zero. The park is what a REFUSING source produces, not what dropping the leg
+    ///         produces on its own.
+    ///
+    ///         The order is load-bearing on the difference between those two outcomes.
+    ///         `settlePrincipal` is the **hard** delivery and `_deliverPrincipal`'s best-effort
+    ///         arm inside `setLiquiditySource` is the soft one, so putting the hard one first is
+    ///         what makes "the money went home" a condition of the switchover rather than a hope,
+    ///         and what turns a source that will not take delivery into a batch that refuses
+    ///         instead of a silent park.
     ///      2. `setLiquiditySource` before `setLenderPool`, so the pool is the funder before it is
     ///         the sink. Never the reverse: a pool named as the loss sink while the treasury still
     ///         funds the book is exactly the shipped state round 11 found, and `_socialise` would
@@ -931,10 +1017,24 @@ abstract contract DeployBase is Script {
     ///      The root cause was the revert, not the branch. `settlePrincipal` now returns early at
     ///      zero, so the leg is unconditional, the leg count is a constant, and **this function
     ///      reads no mutable state at all - which the `pure` below is the compiler enforcing.**
-    ///      Correctness does not move to the settle leg having found something: `setLiquiditySource`
-    ///      independently refuses while `pendingPrincipal != 0`, and it runs immediately after the
-    ///      settle inside the same atomic `executeBatch`. That makes the batch **immune** to the
-    ///      front-run rather than defended against it.
+    ///      That early return is the whole of the defence against this particular front-run: a
+    ///      griefer who zeroes the counter has settled the principal home himself, and the leg
+    ///      then no-ops instead of reverting, so neither the batch's shape nor its outcome moves.
+    ///
+    ///      🟥 **The IMMUNITY claim that used to close this paragraph is RETRACTED - audit round
+    ///      40, item 7.** It read: "Correctness does not move to the settle leg having found
+    ///      something: `setLiquiditySource` independently refuses while `pendingPrincipal != 0`
+    ///      ... that makes the batch **immune** to the front-run rather than defended against
+    ///      it." There is no such clause and there has not been since PR #242, 2026-08-20; the
+    ///      setter handles `pendingPrincipal` rather than refusing it. Nothing downstream
+    ///      re-checks the settle leg's work, so the settle leg is the only place a source that
+    ///      will not take delivery is discovered, and it discovers it at **execution** time, 48
+    ///      hours after the operator committed. MEASURED with the outgoing
+    ///      `TreasuryLiquiditySource` blocked in `MockUSDC` on a book carrying `totalDebt == 0`
+    ///      and `pendingPrincipal == 500000000`: the committed batch reverts in the settle leg
+    ///      with `Blocked(...)`, `liquiditySource` is unmoved, the protocol stays paused, and the
+    ///      timelock operation stays `Ready` - an armed replay, the round-21 shape. Safe by
+    ///      atomicity, not immune.
     ///
     ///      Do not reintroduce a conditional leg here. A `view` on this function is the tell.
     function _phase4Calls(Deployed memory d)
@@ -1034,6 +1134,28 @@ abstract contract DeployBase is Script {
         // what stops the two lines being quietly restored.
         if (d.credit.lenderPool() != address(0)) revert LenderExposureWiredEarly("credit.lenderPool");
         if (d.harvester.lenderPool() != address(0)) revert LenderExposureWiredEarly("harvester.lenderPool");
+
+        // **The other half of those two lines, and it took round 36 finding D7 to notice it was
+        // missing.** The two assertions above establish that the pool bears NO credit risk in a
+        // shipped deployment. Nothing established that it was therefore shut, so for five rounds
+        // this function certified "the pool carries no risk" over a pool that was simultaneously
+        // taking public USDC at a live 25,000.000000 cap - which is not a contradiction the
+        // assertion set could see, because it is the *conjunction* that is the finding. A
+        // depositor in a pool that carries no risk is a depositor who cannot lose and who is
+        // holding shares when the parked lender backlog lands.
+        //
+        // **Executed**, `test/R40D7Capture.t.sol`: the whole backlog, 999.999999 on 1,200.000000
+        // posted, to a stranger with zero exposure. `_wire` now ships the pool paused and this is
+        // the post-condition that says so.
+        //
+        // Deliberately in `_assertWiring` and NOT in `_assertCoreGraph`. It was written into the
+        // shared function first and that was wrong: `_assertPhase4Wiring` reaches
+        // `_assertCoreGraph`, so the rule leaked forward onto a protocol that has legitimately
+        // completed its switchover and unpaused to seed the intended cohort - measured, nine
+        // switchover tests failing `WiringIncomplete("pool.paused")` on states that are correct.
+        // The rule is about the PRE-Phase-4 window only, which is exactly the window the two
+        // `LenderExposureWiredEarly` lines above define, and that is why it belongs beside them.
+        if (!d.pool.paused()) revert WiringIncomplete("pool.paused");
 
         // Without these two the protocol deploys but cannot lend a cent, which is the
         // failure mode worth catching in the script rather than in production. **Not shared with
@@ -1255,9 +1377,12 @@ abstract contract DeployBase is Script {
         if (d.credit.guardian() != p.guardian) revert WiringIncomplete("credit.guardian");
         if (d.pool.guardian() != p.guardian) revert WiringIncomplete("pool.guardian");
         // **The check neither contract can make for itself.** `setGuardian` compares against the
-        // owner at call time, which during `_wire` is still the deployer - so a guardian equal to
-        // the incoming owner passes there and collapses one `transferOwnership` later. This runs
-        // after `_handOver`, which is the first moment the final pairing is observable on chain.
+        // owner at call time, which during `_wire` is still the deployer - so a guardian equal
+        // to the incoming owner passes there, and one `transferOwnership` later it is REFUSED
+        // rather than collapsing (audit round 40; the clause is on each contract's
+        // `transferOwnership`). This runs after `_handOver`, which is the first moment the final
+        // pairing is observable on chain, and it is now a belt-and-braces re-read rather than the
+        // only thing standing between the deployment and a collapsed pair.
         if (p.guardian != address(0)) {
             if (d.vault.guardian() == d.vault.owner()) revert GuardianMustDifferFromOwner();
             if (d.credit.guardian() == d.credit.owner()) revert GuardianMustDifferFromOwner();
@@ -1486,6 +1611,15 @@ abstract contract DeployBase is Script {
         // deployed and knows who its manager is, and is wired into nothing that pays it or
         // charges it. That is the safe shipping state, and it takes an explicit later operation
         // (`_wirePhase4`) to leave it.
-        console.log("The LenderPool ships dormant. Phase 4 wires funding and losses together.");
+        //
+        // 🟥 **This line said "ships dormant" for five rounds while the pool took public USDC
+        // from the block it existed** - round 36 D7, executed and closed in round 40. It is now
+        // true rather than aspirational: `_wire` pauses the pool and `_assertWiring` refuses a
+        // deployment where it is open. The wording names the switch explicitly, because
+        // "dormant" was the word that let a reader believe entry was shut when in fact only the
+        // WIRING was absent - and the pool being unwired is precisely what made depositing into
+        // it profitable.
+        console.log("The LenderPool ships PAUSED and unwired. Phase 4 wires funding and losses together.");
+        console.log("Unpause, seed the intended cohort and flushLenderYield in ONE tx - see _wire.");
     }
 }

@@ -4,11 +4,13 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 import {DeployBase} from "../script/DeployBase.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
+import {LenderPool} from "../src/LenderPool.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {MockBond} from "./mocks/MockBond.sol";
@@ -530,40 +532,63 @@ contract R36DeployPathTest is Test, DeployBase {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // FINDING - transferOwnership is the unguarded writer of the guardian/owner pair.
+    // FINDING D4, CLOSED IN ROUND 40 - transferOwnership was the unguarded writer
+    // of the guardian/owner pair.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice **`setGuardian` refuses `guardian_ == owner()`. `transferOwnership` writes the other
-    ///         half of that same pair and refuses nothing**, so an ordinary handover to the
-    ///         guardian's address collapses the two-key model with no revert and no event saying so.
-    ///         One key then satisfies both `_requireOwnerOrGuardian` and `onlyOwner`, which is
-    ///         exactly the state `unpause`'s `onlyOwner` exists to prevent.
-    /// @dev The control is `NAVOracle`, which guards its own two-key pair from BOTH writers:
-    ///      `setKeeper` refuses the confirmer and `setNavConfirmer` refuses the keeper. Asserted
-    ///      here so the finding is a comparison rather than an opinion.
-    function test_R36_transferOwnershipCollapsesTheGuardianPairThatSetGuardianDefends() public {
+    /// @notice **`setGuardian` refuses `guardian_ == owner()`, and `transferOwnership` writes the
+    ///         other half of that same pair.** Until round 40 it refused nothing, so an ordinary
+    ///         handover to the guardian's address collapsed the two-key model with no revert and
+    ///         no event saying so, and the single key then satisfied both `_requireOwnerOrGuardian`
+    ///         and `onlyOwner` - the exact state `unpause`'s `onlyOwner` exists to prevent.
+    ///
+    /// @dev 🟥 **THIS TEST USED TO ASSERT THE DEFECT AND PASSED FOR THREE ROUNDS.** It performed
+    ///      the transfer, asserted `owner() == guardian()`, and then asserted the single key could
+    ///      both `pause()` and `unpause()`. It is inverted here rather than deleted, because the
+    ///      collapse is a property that must be able to go red again: what it asserts now is that
+    ///      all three pausable contracts refuse the transfer, and that the pair is still two keys
+    ///      afterwards.
+    ///
+    ///      The control is `NAVOracle`, which has always guarded its own two-key pair from BOTH
+    ///      writers: `setKeeper` refuses the confirmer and `setNavConfirmer` refuses the keeper.
+    ///      Asserted here so the closure is a comparison rather than an opinion.
+    function test_R36_transferOwnershipRefusesTheGuardianOnAllThreePausableContracts() public {
         address g = makeAddr("r36.guardian");
         GovParams memory p = _params();
         p.guardian = g;
         Deployed memory d = _deployProtocol(_externals(), p, deployer);
         _assertWiring(d, p);
 
-        // The rule, from the writer that has it.
+        // The rule, from the writer that always had it.
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.GuardianMustDifferFromOwner.selector));
         d.vault.setGuardian(owner);
 
-        // The same rule, from the writer that does not.
+        // The same rule, from the writer that did not have it. All three contracts, because all
+        // three carried the same `setGuardian` clause and the same omission beside it.
         vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.GuardianMustDifferFromOwner.selector));
         d.vault.transferOwnership(g);
-        assertEq(d.vault.owner(), g, "ownership moved to the guardian");
-        assertEq(d.vault.guardian(), g, "and the guardian is still the guardian");
-        assertEq(d.vault.owner(), d.vault.guardian(), "the two-key model is now one key");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.GuardianMustDifferFromOwner.selector));
+        d.credit.transferOwnership(g);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.GuardianMustDifferFromOwner.selector));
+        d.pool.transferOwnership(g);
 
-        // And that one key can now both shut and reopen, which is the property that was traded away.
+        assertEq(d.vault.owner(), owner, "ownership did not move");
+        assertEq(d.vault.guardian(), g, "and the guardian is still a different key");
+        assertTrue(d.vault.owner() != d.vault.guardian(), "the two-key model is still two keys");
+        assertTrue(d.credit.owner() != d.credit.guardian(), "on the manager too");
+        assertTrue(d.pool.owner() != d.pool.guardian(), "and on the pool");
+
+        // And the guardian cannot reopen what it shut, which is the property that was traded away.
         vm.prank(g);
         d.vault.pause();
         vm.prank(g);
+        vm.expectRevert();
+        d.vault.unpause();
+        vm.prank(owner);
         d.vault.unpause();
 
         // The control: NAVOracle guards its two-key pair from both writers.
@@ -575,40 +600,91 @@ contract R36DeployPathTest is Test, DeployBase {
         d.oracle.setNavConfirmer(keeper);
     }
 
+    /// @notice The sanctioned handover to an address that is currently the guardian is two calls,
+    ///         not one, and the round-40 clause does not block it - it sequences it.
+    /// @dev The point of the control. A rule that closed the G2 handover altogether would be a
+    ///      worse defect than the one it closed, so this asserts the whole legitimate sequence:
+    ///      move the guardian off the incoming owner, transfer, then re-install a distinct
+    ///      guardian and check it still works from both sides.
+    function test_R36_theHandoverStillWorksWhenTheGuardianIsMovedFirst() public {
+        address g = makeAddr("r36.guardian");
+        address incoming = makeAddr("r36.incomingOwner");
+        address g2 = makeAddr("r36.guardian2");
+        GovParams memory p = _params();
+        p.guardian = g;
+        Deployed memory d = _deployProtocol(_externals(), p, deployer);
+
+        // An ordinary handover to a third party was never in question and still is not.
+        vm.prank(owner);
+        d.vault.transferOwnership(incoming);
+        assertEq(d.vault.owner(), incoming, "a handover to a non-guardian is untouched");
+
+        // Now the case the clause governs: hand the manager to the address that is the guardian.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.GuardianMustDifferFromOwner.selector));
+        d.credit.transferOwnership(g);
+
+        vm.prank(owner);
+        d.credit.setGuardian(g2);
+        vm.prank(owner);
+        d.credit.transferOwnership(g);
+        assertEq(d.credit.owner(), g, "the handover lands once the guardian has moved off it");
+        assertEq(d.credit.guardian(), g2, "and the second key is still a second key");
+
+        // Both halves of the pair still behave, from the new owner and the new guardian.
+        vm.prank(g2);
+        d.credit.pause();
+        vm.prank(g2);
+        vm.expectRevert();
+        d.credit.unpause();
+        vm.prank(g);
+        d.credit.unpause();
+        assertFalse(d.credit.paused(), "the owner reopened it and the guardian could not");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // FINDING - "the LenderPool ships dormant" is printed, not established.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice **`_log` prints "The LenderPool ships dormant" and nothing in `_wire` or
-    ///         `_assertWiring` establishes it.** The pool is constructed unpaused with a non-zero
-    ///         deposit cap, so it takes public USDC from the block it exists, while
-    ///         `_assertWiring` positively *requires* `harvester.lenderPool() == 0` - the state in
-    ///         which `EpochHarvester` accrues the lender share for a pool that carries no risk.
-    /// @dev The two facts together are the switchover-window exposure: the backlog becomes payable
-    ///      at `_phase4Calls` leg 4 (`harvester.setLenderPool`) and `flushLenderYield` is
-    ///      permissionless, while nothing in `_phase4PauseCalls` ever shuts the pool's own door.
-    ///      MEASURED on the live Base Sepolia set 2026-08-29 by `cast call`:
+    /// @notice **Round 36 finding D7, CLOSED in round 40: the pool now ships shut.**
+    ///
+    /// @dev 🟥 **This test asserted the finding and passed for four rounds.** It read: "`_log`
+    ///      prints 'The LenderPool ships dormant' and nothing in `_wire` or `_assertWiring`
+    ///      establishes it", and it proved the point by having a stranger deposit into the
+    ///      freshly deployed pool, take 100% of supply, and watch `_assertWiring` pass over the
+    ///      top of it. What it never did was follow the money, which is why it sat as a finding
+    ///      rather than a fix for four rounds. Round 40 followed it: `test/R40D7Capture.t.sol`
+    ///      executes the chain end to end and the stranger's profit is the whole parked lender
+    ///      backlog, 999.999999 on 1,200.000000 posted.
+    ///
+    ///      Inverted rather than deleted. The original observation is still the load-bearing one -
+    ///      `_assertWiring` still positively REQUIRES `harvester.lenderPool() == 0`, the state in
+    ///      which `EpochHarvester` accrues a lender share for a pool bearing no risk - so what
+    ///      changed is only that the door into that state is now shut and asserted shut.
+    ///
+    ///      MEASURED on the live Base Sepolia set 2026-08-29 by `cast call`, and this is the
+    ///      deployment the fix does NOT reach because it predates it:
     ///      `EpochHarvester.pendingLenderYield()` = 124885415, `EpochHarvester.lenderPool()` = 0,
-    ///      `LenderPool.totalSupply()` = 0.
-    function test_R36_theLenderPoolIsOpenForDepositsFromTheBlockItIsDeployed() public {
+    ///      `LenderPool.totalSupply()` = 0. The backlog is real and the pool on chain is open.
+    function test_R36_theLenderPoolNowShipsShutToDepositors() public {
         Deployed memory d = _deployProtocol(_externals(), _params(), deployer);
         _assertWiring(d, _params());
 
-        assertFalse(d.pool.paused(), "the pool the log calls dormant is not paused");
-        assertEq(d.harvester.lenderPool(), address(0), "and the assertion set REQUIRES it bears no risk");
-        assertGt(d.pool.maxDeposit(makeAddr("r36.stranger")), 0, "yet a stranger may deposit right now");
+        assertTrue(d.pool.paused(), "the pool the log calls dormant is now actually shut");
+        assertEq(d.harvester.lenderPool(), address(0), "and the assertion set still REQUIRES it bears no risk");
+        assertEq(d.pool.maxDeposit(makeAddr("r36.stranger")), 0, "so no stranger may deposit into it");
 
         address stranger = makeAddr("r36.stranger");
         usdc.mint(stranger, 1_000e6);
         vm.startPrank(stranger);
         usdc.approve(address(d.pool), 1_000e6);
-        uint256 shares = d.pool.deposit(1_000e6, stranger);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        d.pool.deposit(1_000e6, stranger);
         vm.stopPrank();
 
-        assertGt(shares, 0, "a stranger holds 100% of a pool wired into nothing that pays or charges it");
-        assertEq(d.pool.totalSupply(), shares, "and is the entire cohort");
+        assertEq(d.pool.totalSupply(), 0, "nobody holds a share of a pool wired into nothing");
 
-        // And the deployment still asserts clean over it.
+        // And the deployment asserts clean, now including the pool's own switch.
         _assertWiring(d, _params());
     }
 

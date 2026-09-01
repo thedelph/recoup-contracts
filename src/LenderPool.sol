@@ -341,6 +341,23 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         lastYieldAccrualAt = block.timestamp;
     }
 
+    /// @notice Hand ownership on. Refuses a handover to the sitting guardian.
+    /// @dev **Audit round 36 finding D4, carried three rounds, closed in round 40.** The third of
+    ///      the three pausable contracts, and it carried the same hole for the same reason: three
+    ///      copies of `setGuardian` refused `guardian_ == owner()`, and none of the three
+    ///      overrode the pair's other writer. The full argument and the measurement that settled
+    ///      the zero-guardian case are on `CollateralVault.transferOwnership` and
+    ///      `CreditManager.transferOwnership`; **this clause is byte-identical to theirs on
+    ///      purpose**, which is the same reason `GuardianSet`'s name and arity match theirs.
+    ///
+    ///      The consequence here is the pool's own `unpause`, which is `onlyOwner` while `pause`
+    ///      is owner-or-guardian - so a collapsed pair hands one key the pool's entry door in
+    ///      both directions.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == guardian) revert GuardianMustDifferFromOwner();
+        super.transferOwnership(newOwner);
+    }
+
     /// @dev Matches the live-authority contracts: renouncing would permanently freeze wiring.
     function renounceOwnership() public view override onlyOwner {
         revert RenounceDisabled();
@@ -361,6 +378,25 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         _setDepositCap(cap);
     }
 
+    /// @dev 🟥 **ZERO IS REFUSED, SO THERE IS NO "CLOSED" CAP SETTING AND `pause` IS THE ONLY
+    ///      LEVER THAT SHUTS THIS POOL.** Recorded here because a reader reaches for the cap
+    ///      first and it does not do the job - audit round 40, alongside finding D7.
+    ///
+    ///      The shape it leaves open is the **cap squat**, executed in `test/R40D7Capture.t.sol`:
+    ///      one address depositing `Config.DEFAULT_LENDER_POOL_DEPOSIT_CAP` drives `maxDeposit`
+    ///      to zero for everybody else, including the intended beta lender. Every apparent remedy
+    ///      fails on its own terms - the owner cannot evict a depositor, `pause()` shuts the
+    ///      honest lender out along with the squatter, and raising the cap reopens entry while
+    ///      leaving the squatter's existing share untouched, so the position is diluted rather
+    ///      than removed. Zero would at least freeze it, and zero reverts here.
+    ///
+    ///      **Closed as a practical matter by shipping the pool paused** (`DeployBase._wire`), so
+    ///      no squat can be established before the operator's own seeding transaction. It is not
+    ///      closed as a property of this contract, and it is not closed on the live Base Sepolia
+    ///      pool, which predates that line. The refusal of zero is deliberate and stays: a cap of
+    ///      zero would read as a configured limit rather than a closed door, which is the same
+    ///      "looks like a setting, acts like a switch" confusion `MockLockdown.lockTo` refuses
+    ///      `admin_ == address(0)` to avoid.
     function _setDepositCap(uint256 cap) private {
         if (cap == 0) revert ZeroAmount();
         if (cap > Config.GLOBAL_BORROW_CAP_MAX) {
@@ -374,9 +410,14 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     /// @dev Copied in shape from `CollateralVault.setGuardian`, including the refusal of
     ///      `owner()` and the reason for it: a single address holding both roles is exactly the
     ///      configuration the second key does not defend against. As there, the comparison is
-    ///      against the owner **at the time of the call**, so a later `transferOwnership` to the
-    ///      guardian collapses the pair - the G2 handover is such a transfer, so re-read the
-    ///      guardian after it. `DeployBase._assertWiring` is what re-reads it.
+    ///      against the owner **at the time of the call**.
+    ///
+    ///      🟥 **This continued "so a later `transferOwnership` to the guardian collapses the
+    ///      pair ... so re-read the guardian after it" until audit round 40**, which closed that
+    ///      hole in `transferOwnership` below on all three contracts. The G2 handover is still
+    ///      such a transfer and it now REVERTS rather than collapsing, so move or clear the
+    ///      guardian first. `DeployBase._assertWiring` still re-reads the pair after `_handOver`,
+    ///      now as belt-and-braces rather than as the only thing catching it.
     function setGuardian(address guardian_) external onlyOwner {
         if (guardian_ == owner()) revert GuardianMustDifferFromOwner();
         guardian = guardian_;
@@ -1201,6 +1242,31 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         return ok ? _maxDeposit(receiver, raw) : 0;
     }
 
+    /// @dev 🟥 **THIS FUNCTION CARRIES NO WIRING CONDITION, AND A CLOSED FINDING'S MITIGATION HAS
+    ///      BEEN LEANING ON ONE.** Audit round 3 finding 10 is recorded as re-mitigated by
+    ///      *"`maxDeposit`/`maxMint` return 0 until Phase 4"*. Read the body: the gates are
+    ///      `paused()`, the receiver, `_cashDeficit`, `totalClaimable`, `_entryPriceDeficit`, the
+    ///      deposit cap and `maximumShareSupply`. **Not one of them asks whether the pool is
+    ///      wired**, so this returns a live figure on a pool that funds nothing and is the loss
+    ///      sink for nothing. Verified by reading, audit round 40; the ledger cell has been
+    ///      struck. Nothing in this file ever claimed the Phase-4 gate - the claim lived only in
+    ///      the ledger - so there is no neighbouring comment to correct, which is worth saying
+    ///      because it means no reader of this contract could have caught it from here.
+    ///
+    ///      That gap is round 36 finding D7, and round 40 executed it: a stranger deposits into
+    ///      the unwired pool, carries no credit risk while the protocol runs on treasury money,
+    ///      and holds 100% of supply when the parked lender backlog is flushed. The take is the
+    ///      whole backlog. See `test/R40D7Capture.t.sol`.
+    ///
+    ///      **The mitigation actually in force is `paused()`, the first clause below, and it is
+    ///      placed by the DEPLOY SCRIPT rather than by this contract** - `DeployBase._wire` ships
+    ///      the pool paused and `_assertWiring` refuses a deployment where it is open. The two
+    ///      are not equivalent and the difference is the thing to hold on to: a wiring condition
+    ///      would be a property of the type, true of every deployment ever made, whereas a script
+    ///      line is true only of deployments that script makes. **The live Base Sepolia pool
+    ///      predates it and is open.** Pausing in this contract's constructor instead was measured
+    ///      and refused: +162 initcode, and roughly 190 fixtures that deposit straight after
+    ///      construction go red.
     function _maxDeposit(address receiver, uint256 raw) private view returns (uint256) {
         if (paused() || receiver == address(0) || receiver == address(this)) return 0;
         if (_cashDeficit(raw) != 0) return 0;

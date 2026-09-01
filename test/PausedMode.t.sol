@@ -10,6 +10,7 @@ import {DeployBase} from "../script/DeployBase.sol";
 import {Config} from "../src/Config.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
+import {LenderPool} from "../src/LenderPool.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
 import {LtvMath} from "../src/LtvMath.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
@@ -51,6 +52,19 @@ contract PausedModeTest is Test, DeployBase {
         farm = new MockFarm(bond, usdc);
         bond.setRewardPool(address(farm));
         vm.chainId(ANVIL_CHAIN_ID);
+    }
+
+
+    /// @dev **Round 40, D7.** `DeployBase._wire` now ships the `LenderPool` PAUSED, so every
+    ///      fixture below that seeds a lender has to open the door first, through the owner, the
+    ///      way a real operator's seed-and-flush operation does. Idempotent on purpose: several
+    ///      of these tests seed twice.
+    ///
+    ///      Deliberately NOT folded into the deploy helper. A fixture that silently unpauses
+    ///      would hide the shipped state from every test in this file, which is the shape that
+    ///      let "the LenderPool ships dormant" stand unexamined for five rounds.
+    function _openPoolForLenders(LenderPool pool) internal {
+        if (pool.paused()) pool.unpause();
     }
 
     // ── fixture ──────────────────────────────────────────────────────────────
@@ -147,6 +161,7 @@ contract PausedModeTest is Test, DeployBase {
         (Deployed memory d, address borrower) = _liveProtocol(50);
 
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -198,6 +213,7 @@ contract PausedModeTest is Test, DeployBase {
         d.vault.withdrawBonds(1);
         emit log("ALLOWED  CollateralVault.withdrawBonds");
 
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, 1e6);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), 1e6);
@@ -381,6 +397,7 @@ contract PausedModeTest is Test, DeployBase {
         (Deployed memory c, address cBorrower) = _liveProtocol(200);
         _wirePhase4(c);
         address cLender = makeAddr("cLender");
+        _openPoolForLenders(c.pool);
         usdc.mint(cLender, FLOAT);
         vm.startPrank(cLender);
         usdc.approve(address(c.pool), FLOAT);
@@ -399,6 +416,7 @@ contract PausedModeTest is Test, DeployBase {
         (Deployed memory d, address borrower) = _liveProtocol(200);
         _wirePhase4(d);
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -671,6 +689,7 @@ contract PausedModeTest is Test, DeployBase {
         _wirePhase4(d);
 
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -739,6 +758,7 @@ contract PausedModeTest is Test, DeployBase {
         _wirePhase4(d);
 
         address early = makeAddr("early");
+        _openPoolForLenders(d.pool);
         usdc.mint(early, FLOAT);
         vm.startPrank(early);
         usdc.approve(address(d.pool), FLOAT);
@@ -752,6 +772,7 @@ contract PausedModeTest is Test, DeployBase {
         d.vault.pause();
 
         address late = makeAddr("late");
+        _openPoolForLenders(d.pool);
         usdc.mint(late, FLOAT);
         vm.startPrank(late);
         usdc.approve(address(d.pool), FLOAT);
@@ -867,6 +888,7 @@ contract PausedModeTest is Test, DeployBase {
         _guarded(d);
 
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);

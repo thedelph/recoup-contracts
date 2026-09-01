@@ -147,9 +147,17 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: forge --version
 
+      # `--sizes` is the whole of the size guard on this side, and it is LOAD-BEARING rather
+      # than informational: forge exits non-zero when a contract exceeds the EIP-170 runtime
+      # limit of 24,576 bytes or the EIP-3860 initcode limit of 49,152, and a bare
+      # `forge build` does not. This step was a bare `forge build` until 2026-09-01, so the
+      # published tree had NO size guard at all: it could have published a CreditManager that
+      # no chain would accept and this workflow would have stayed green. That contract is the
+      # reason CreditWiring was split into a library, and it carries the tightest runtime
+      # margin here.
       - name: Build
         if: steps.scope.outputs.run == 'true'
-        run: forge build
+        run: forge build --sizes
 
       - name: Test
         if: steps.scope.outputs.run == 'true'

@@ -100,4 +100,60 @@ abstract contract MockLockdown {
         admin = admin_;
         operator = operator_;
     }
+
+    /// @notice Move or clear the second key. `admin` itself stays one-way and unrotatable.
+    ///
+    /// @dev **An open finding since audit round 38, closed in round 40 after passing through
+    ///      round 39 undispositioned.** It was filed as a convenience problem - "a
+    ///      `RECOUP_KEEPER` rotation strands the epoch job forever; recovery is the deploy key or
+    ///      a full mock redeploy" - and the convenience framing understates it in a way worth
+    ///      writing down, because it is what kept the finding looking optional for two rounds.
+    ///
+    /// @dev 🟥 **SIGN-CHECKED, AND THE SIGN IS THE OPPOSITE OF THE ONE THE FINDING WARNS ABOUT.** The
+    ///      warning was that `lockTo` being one-way is a security property and that a
+    ///      `setOperator` "puts a door back in it". Read against the shipped configuration, it
+    ///      does not:
+    ///
+    ///      - **Who can call it: `admin`, and nobody else.** `Deploy.s.sol` locks each mock with
+    ///        `lockTo(deployer, p.keeper)`, so `admin == lockAuthority == the deploy key`. That
+    ///        key already reaches **every** `gated` member of all three mocks directly. So this
+    ///        function hands no principal a capability it did not already hold; it only lets the
+    ///        holder delegate one it has.
+    ///      - **It is deliberately NOT `gated`.** `gated` admits `operator` as well, which would
+    ///        let the second key re-point itself - privilege escalation inside the gated set, and
+    ///        the one genuine way to build this wrong. `admin` only.
+    ///      - **It fails closed before lockdown.** While `admin` is zero, `msg.sender != admin` is
+    ///        true for every possible caller, because `msg.sender` is never the zero address. So
+    ///        this cannot be used to squat the operator slot in the window between the constructor
+    ///        and `lockTo` - the window audit round 38 measured at 40 transactions and a block
+    ///        boundary before the round-39 remediation narrowed it. That is a free property of
+    ///        the comparison, not a clause anybody has to remember.
+    ///      - **`admin` is untouched and `lockTo` stays one-way.** `MockAlreadyLocked` still
+    ///        refuses a second lock, so the property the file's own docstring names - "without the
+    ///        one-way check an admin could be replaced" - is exactly as true after this as before.
+    ///
+    /// @dev **What the one-way `operator` was actually buying was an INABILITY TO REVOKE, and that
+    ///      is the direction that matters.** `seedStakeFor` is `gated`, and this file's own
+    ///      neighbour says of it that unbacked credit "lets its holder withdraw collateral no bond
+    ///      backs". Until this function existed, a compromised keeper key could do that on the
+    ///      live testnet stack and there was **no revocation path at all** short of redeploying
+    ///      three contracts, moving three addresses, and rewriting the deployment record, the
+    ///      webapp's chain generator and the bytecode gate's rows. Passing `address(0)` here
+    ///      revokes in one transaction - **on a deployment made by a script that carries this
+    ///      contract, which the live Base Sepolia mocks predate entirely, so this is a control
+    ///      for the next deployment and not one in force on the current one.** So the door this
+    ///      adds opens outward: it is the incident
+    ///      response that was missing, not a new way in.
+    ///
+    ///      That is not hypothetical. `RECOUP_KEEPER_KEY` lives in `contracts/.env` on the
+    ///      development machine, in the same file as the deploy key and the NAV confirmer key.
+    ///
+    /// @dev **No event.** Nothing in this repository watches these mocks by log; `AssertLocked`
+    ///      reads `admin()` and `operator()` from the chain and compares them against the
+    ///      deployment record, which is the check that would actually catch a wrong value here,
+    ///      and it already runs. An event would cost bytes to be read by nothing.
+    function setOperator(address operator_) external {
+        if (msg.sender != admin) revert MockAdminRequired();
+        operator = operator_;
+    }
 }
