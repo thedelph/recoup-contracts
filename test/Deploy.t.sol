@@ -586,6 +586,19 @@ contract DeployTest is Test, EnvOverridable {
     ///      alone would also be satisfied by a harvester that had stopped accruing the lender
     ///      share at all, which would forfeit money owed to whoever eventually takes the risk.
     ///      The share must still be earned and still be owed - it simply has nowhere to go yet.
+
+    /// @dev **Round 40, D7.** `DeployBase._wire` now ships the `LenderPool` PAUSED, so every
+    ///      fixture below that seeds a lender has to open the door first, through the owner, the
+    ///      way a real operator's seed-and-flush operation does. Idempotent on purpose: several
+    ///      of these tests seed twice.
+    ///
+    ///      Deliberately NOT folded into the deploy helper. A fixture that silently unpauses
+    ///      would hide the shipped state from every test in this file, which is the shape that
+    ///      let "the LenderPool ships dormant" stand unexamined for five rounds.
+    function _openPoolForLenders(LenderPool pool) internal {
+        if (pool.paused()) pool.unpause();
+    }
+
     function test_deploy_shipsWithNoLenderExposure() public {
         (Deployed memory d, address borrower) = _liveProtocol();
         _assertWiring(d, _paramsOwnedHere());
@@ -646,6 +659,7 @@ contract DeployTest is Test, EnvOverridable {
         // Reachable end to end, which is the part three isolated tests could not show. A lender
         // funds the pool...
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -764,9 +778,18 @@ contract DeployTest is Test, EnvOverridable {
     ///      the deferral.** The change that actually closed it touched none of those 22 call sites.
     ///
     ///      **What made the gap reachable at all was a fresh borrow, and nothing else.**
-    ///      `setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is non-zero, so no
-    ///      pre-existing position could be carried into the gap and defaulted there. That is still
-    ///      true and is now belt to the braces below it.
+    ///      `setLiquiditySource` refuses while `totalDebt` is non-zero, so no pre-existing
+    ///      position could be carried into the gap and defaulted there. That is still true and is
+    ///      now belt to the braces below it.
+    ///
+    ///      🟥 **This passage used to put "or `pendingPrincipal`" into that guard AND re-affirm
+    ///      the pair as "still true" - audit round 40, item 7.** PR #242 deleted the
+    ///      `pendingPrincipal` clause on 2026-08-20; the setter **handles** that balance instead,
+    ///      best-effort delivering it to the outgoing source and parking the residue as
+    ///      `owedToSource[outgoing]`. The conclusion survives on the `totalDebt` half alone,
+    ///      which is the half this test is about, so only the citation moved. Recorded rather
+    ///      than quietly corrected because **re-affirming a deleted guard is worse than repeating
+    ///      one**: "that is still true" reads as having been re-checked, and it had not been.
     ///
     ///      Kept, rather than deleted, for what it makes unreachable: it moves the pointers directly
     ///      rather than through `_wirePhase4`, which is exactly what an operator transcribing them
@@ -780,6 +803,7 @@ contract DeployTest is Test, EnvOverridable {
         assertEq(d.credit.lenderPool(), address(d.pool), "the funding leg must carry the loss sink with it");
 
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -822,6 +846,7 @@ contract DeployTest is Test, EnvOverridable {
         (Deployed memory d, address borrower) = _liveProtocol();
 
         address lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -962,6 +987,7 @@ contract DeployTest is Test, EnvOverridable {
 
     function _fundALender(Deployed memory d) internal returns (address lender) {
         lender = makeAddr("lender");
+        _openPoolForLenders(d.pool);
         usdc.mint(lender, FLOAT);
         vm.startPrank(lender);
         usdc.approve(address(d.pool), FLOAT);
@@ -1795,7 +1821,13 @@ contract DeployTest is Test, EnvOverridable {
 
         assertEq(d.pool.guardian(), guardian, "the pool half of the guardian role is not wired");
         assertTrue(d.pool.guardian() != d.pool.owner(), "and it is a genuinely second key");
-        assertFalse(d.pool.paused(), "a deployment must not ship shut to lenders");
+        // 🟥 **This line asserted the OPPOSITE until round 40: "a deployment must not ship shut
+        // to lenders".** It was written as a guard against wiring the pool's guardian by
+        // accidentally pausing it, and what it actually pinned was round 36 finding D7 - a pool
+        // open to public USDC from the block it is deployed, wired into nothing that charges it.
+        // The capture is executed in `test/R40D7Capture.t.sol`; the profit is the entire parked
+        // lender backlog. Shipping shut IS the fix, so this asserts it.
+        assertTrue(d.pool.paused(), "a deployment must ship the pool shut - round 40, D7");
     }
 
     /// @dev The refusal, on the same branch. Caught before a broadcast rather than at the third
@@ -1957,6 +1989,45 @@ contract DeployTest is Test, EnvOverridable {
         vm.prank(owner);
         d.oracle.setNavConfirmer(makeAddr("someoneElsesConfirmer"));
         vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "oracle.navConfirmer"));
+        this.exposedAssertWiring(d, p);
+    }
+
+    /// @notice **The `pool.paused` post-condition refuses its own absence** - round 36 finding D7,
+    ///         closed in round 40.
+    ///
+    /// @dev 🟥 **This test exists because the assertion shipped with NO coverage and the audit
+    ///      caught it.** Deleting `if (!d.pool.paused()) revert WiringIncomplete("pool.paused");`
+    ///      from `_assertWiring` left the whole suite green at 253 passed, 0 failed. Every other
+    ///      `WiringIncomplete` label in that function has a `vm.expectRevert` test here - sixteen
+    ///      of them - and this one did not, so it was the one line a tidy-up could delete in
+    ///      silence.
+    ///
+    ///      `test_R40_D7_theDeployPathNowShutsTheWindow` in `R40D7Capture.t.sol` is not this
+    ///      test and does not replace it: it calls `exposedAssertWiring` only in the state where
+    ///      the pool IS paused, so it proves the assertion TOLERATES the fix and never that it
+    ///      REFUSES its absence. Those are different claims and only the second one keeps the
+    ///      line alive.
+    ///
+    ///      The unpaused state reached here is the exact shipping state D7 found: a pool bearing
+    ///      no credit risk, wired into nothing that pays or charges it, and open to public USDC.
+    ///      `R40D7Capture.t.sol` follows the money from there.
+    function test_assertWiringRejectsAnOpenLenderPool() public {
+        GovParams memory p = _params();
+        Deployed memory d = _deployProtocol(_externals(), p, address(this));
+
+        // The control first, so a green arm cannot be a refusal of everything.
+        this.exposedAssertWiring(d, p);
+        assertTrue(d.pool.paused(), "the deploy path ships it shut");
+
+        vm.prank(owner);
+        d.pool.unpause();
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "pool.paused"));
+        this.exposedAssertWiring(d, p);
+
+        // And it recovers, so the label is about the state rather than about the deployment
+        // having been touched at all.
+        vm.prank(owner);
+        d.pool.pause();
         this.exposedAssertWiring(d, p);
     }
 

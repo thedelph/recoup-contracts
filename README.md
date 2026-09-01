@@ -120,9 +120,11 @@ outright. Remappings are pinned in `foundry.toml` rather than auto-detected from
 on disk, so the build is byte-identical either way: verified from a cold clone, 4,997 bytes of
 `CreditWiring` initcode and two remappings in the metadata in both cases.
 
-On the current public tree, `forge test` gives 1,227 passed, 0 failed and 32 skipped across 61
-suites, 1,259 total. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or an
-explicit opt-in; nothing else is skipped. Counting test declarations in those fork files gives 29
+As of 2026-09-01, `forge test` on this tree gives 1,245 passed, 0 failed and 32 skipped across 62
+suites, 1,277 total. The figure is dated because it is derived from the test tree by a checker that
+does not live in this repository, so nothing here can hold it to the truth; it read 1,227 across 61
+suites until this sync. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
+an explicit opt-in; nothing else is skipped. Counting test declarations in those fork files gives 29
 rather than 32, because three of them subclass a fixture and inherit its suite. CI runs the full
 unit and invariant suite on every push and pull request.
 

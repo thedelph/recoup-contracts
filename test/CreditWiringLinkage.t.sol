@@ -149,6 +149,39 @@ contract AttestsThePullAndForgesTheSourceQuestion {
 ///      only that the call reverts but that the **counters and balances are where they started**:
 ///      the defect in every case is a number moving without money moving, or money moving without a
 ///      number, and a test that only asserts a revert cannot tell those apart.
+/// @notice **A PREVIOUS GENERATION OF `CreditWiring`, not a forgery.** Round 40, finding D5.
+///
+/// @dev This is the shape the version-blind attestation cannot see. Every earlier substitute in
+///      this file is a liar - a `STOP` byte, a zero word, an echo - and every one of them is
+///      caught, because the tag is the thing they cannot produce. This one is not lying. It
+///      returns the **real** `CreditWiring.WIRING_CHECKED`, from a body that genuinely ran to
+///      completion, because it is a faithful model of what this library looked like BEFORE audit
+///      round 27 added `checkLiquiditySourceSwap`'s two completeness probes.
+///
+///      `keccak256("recoup.CreditWiring.checked.v1")` has been the tag since round 24 and
+///      `git log -S` finds exactly one commit that has ever touched it (`a95657f`), while the
+///      clause sets moved in rounds 25, 26, 27 and 28. So four generations of this library all
+///      answer with the same word, and `_requireWiringRan` cannot tell them apart.
+///
+///      **Why this is reachable on a real chain and not only under `vm.etch`.** An earlier
+///      generation was really deployed, at its own CREATE2 address, and that address really holds
+///      that code forever. `EXTCODESIZE` passes on it, every selector resolves, and the tag
+///      matches. The precedent is this project's own `ReferralRegistry`, which is still live on
+///      Base Sepolia carrying stale defective bytecode.
+contract PreviousGenerationWiring {
+    bytes32 internal constant WIRING_CHECKED = keccak256("recoup.CreditWiring.checked.v1");
+
+    /// @dev The round-27 probes are absent. That is the entire diff, and it is invisible to the
+    ///      attestation because the attestation is on the RETURN VALUE, not on the body.
+    function checkLiquiditySourceSwap(address) external pure returns (bytes32) {
+        return WIRING_CHECKED;
+    }
+
+    function fundsAsALenderPool(address) external pure returns (bytes32, bool) {
+        return (WIRING_CHECKED, false);
+    }
+}
+
 contract CreditWiringLinkageTest is RiskParamsFixture {
     uint256 internal constant NAV = 25.15e8; // USD 8dp
     uint256 internal constant FLOAT = 100_000e6;
@@ -899,5 +932,101 @@ contract CreditWiringLinkageTest is RiskParamsFixture {
         vm.prank(admin);
         vm.expectRevert();
         credit.setLiquiditySource(address(liquidity));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ROUND 40, FINDING D5 - the attestation is VERSION-BLIND.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice **The attestation proves "a build of this library", not "this build" - executed.**
+    ///         An earlier generation, faithfully modelled, walks a wrong-but-coded liquidity
+    ///         source straight past a guard the current library refuses it at. Nothing reverts,
+    ///         nothing is logged, and `_requireWiringRan` is satisfied throughout.
+    /// @dev The pointer installed here answers neither `lend` nor `repayPrincipal`. `borrow` calls
+    ///      the first of those bare and `settlePrincipal` calls the second bare, so what this
+    ///      leaves behind is a manager that refuses every borrower with returndata length 0 - the
+    ///      exact failure audit round 27 added the probes to close.
+    ///
+    ///      🟥 **THIS SUITE CANNOT SAY WHICH OF THE TWO PROBES REFUSED, AND A ROUND WAS SPENT ON
+    ///      THAT.** `VaultOnlyLiquiditySource` is missing BOTH selectors, so the control below is
+    ///      satisfied by either arm of `CreditWiring.checkLiquiditySourceSwap` on its own.
+    ///      MEASURED, round 42 item 28: with the `lend` arm's `revert LiquiditySourceIncomplete()`
+    ///      deleted from `src/CreditWiring.sol` and the tree rebuilt under
+    ///      `FOUNDRY_PROFILE=neuter`, this file stays **25/25 green** while
+    ///      `SetterGuards.t.sol:test_R28_aFunderMissingLendIsRefusedAtWiringTime` goes **red** in
+    ///      the same invocation - so the green is coverage living next door, not a hole. The two
+    ///      single-selector stubs that CAN attribute a refusal are `SourceWithoutLend` and
+    ///      `SourceWithoutRepayPrincipal`, both in `SetterGuards.t.sol`. **Run that suite too
+    ///      before reading a neuter of either clause as uncaught.**
+    function test_R40_D5_anEarlierGenerationOfTheLibraryPassesTheAttestation() public {
+        address halfBuilt = address(new VaultOnlyLiquiditySource());
+        assertGt(halfBuilt.code.length, 0, "premise: wrong but CODED, so EXTCODESIZE cannot help");
+
+        // The control first, so the finding is a difference rather than an assertion. The CURRENT
+        // library refuses this pointer.
+        vm.prank(admin);
+        vm.expectRevert(CreditWiring.LiquiditySourceIncomplete.selector);
+        credit.setLiquiditySource(halfBuilt);
+        assertEq(credit.liquiditySource(), address(liquidity), "unmoved, as it should be");
+
+        // Now link the previous generation. Same tag, weaker body.
+        vm.etch(wiring, address(new PreviousGenerationWiring()).code);
+
+        vm.prank(admin);
+        credit.setLiquiditySource(halfBuilt);
+        assertEq(credit.liquiditySource(), halfBuilt, "INSTALLED - the attestation saw no difference");
+    }
+
+    /// @notice **CONTROL / NEUTER. The tag is what does the work, and one byte of it is enough.**
+    /// @dev Identical substitute, identical body, tag bumped to `.v2`. It is refused, and refused
+    ///      by `WiringLibraryUnverified` carrying the v2 word rather than by any clause. That is
+    ///      what makes the test above a statement about VERSION-blindness specifically, rather
+    ///      than about the attestation being weak in general: the mechanism works exactly as
+    ///      designed and the only thing it cannot see is a build that shares the constant.
+    ///
+    ///      It is also the whole of the proposed fix, measured. Bumping the constant costs **zero
+    ///      bytes** - `CreditWiring` 4,944 runtime / 4,997 initcode and `CreditManager` 22,079 /
+    ///      23,428 are byte-identical either way - because it is a `PUSH32` whichever string it
+    ///      hashes. What it does move is the library's own CREATE2 address: the initcode hash goes
+    ///      from `0xdeade73de1d8ac70af637801be7ad8adb711b27ac3f5553c42e490b17dbeac1d`, which is
+    ///      the value `foundry.toml` records, to `0x71eb44dc05650cf0196c3a006fe689d8ec6d1233507c24bea89549f8566b71f9`.
+    ///      Both measured on a clean `out/` in round 40.
+    function test_R40_D5_control_aBumpedTagIsRefused() public {
+        address halfBuilt = address(new VaultOnlyLiquiditySource());
+        vm.etch(wiring, address(new BumpedTagWiring()).code);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CreditManager.WiringLibraryUnverified.selector,
+                keccak256("recoup.CreditWiring.checked.v2")
+            )
+        );
+        credit.setLiquiditySource(halfBuilt);
+        assertEq(credit.liquiditySource(), address(liquidity), "refused on the tag alone");
+    }
+
+}
+
+/// @dev A liquidity source with code that answers neither `lend` nor `repayPrincipal`. Wrong but
+///      CODED, which is the case `EXTCODESIZE` waves through and the round-27 probes exist for.
+contract VaultOnlyLiquiditySource {
+    address public creditManager;
+
+    function setCreditManager(address who) external {
+        creditManager = who;
+    }
+}
+
+/// @dev `PreviousGenerationWiring` with the tag bumped. The neuter for the test above.
+contract BumpedTagWiring {
+    bytes32 internal constant WIRING_CHECKED = keccak256("recoup.CreditWiring.checked.v2");
+
+    function checkLiquiditySourceSwap(address) external pure returns (bytes32) {
+        return WIRING_CHECKED;
+    }
+
+    function fundsAsALenderPool(address) external pure returns (bytes32, bool) {
+        return (WIRING_CHECKED, false);
     }
 }

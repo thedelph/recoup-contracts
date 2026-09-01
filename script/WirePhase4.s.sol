@@ -342,17 +342,38 @@ contract WirePhase4 is DeployBase {
     ///      carry `whenPaused`, so a batch that fires against an unpaused protocol reverts
     ///      `ExpectedPause` and, being atomic, undoes itself.
     ///
-    ///      **Three reads, and they are the complete set of preconditions the six legs evaluate.**
-    ///      `settlePrincipal` no-ops at zero since round 21; `setLiquiditySource` refuses on
-    ///      `totalDebt`, on `pendingPrincipal` - which the settle leg zeroes immediately before it,
-    ///      inside the same atomic batch - and on `unsocialisedLoss`; `setLenderPool` refuses on
+    ///      **Three reads, and they are the complete set of the six legs' STATE preconditions -
+    ///      which is deliberately weaker than the claim that stood here until audit round 40,
+    ///      item 7.** `settlePrincipal` no-ops at zero since round 21; `setLiquiditySource`
+    ///      refuses on `totalDebt` and on `unsocialisedLoss`; `setLenderPool` refuses on
     ///      `unsocialisedLoss` and on an outgoing pool, of which there is none before Phase 4;
-    ///      `EpochHarvester.setLenderPool` likewise. So a batch this function accepts is a batch
-    ///      `executeBatch` will execute, and none of the three can rise again during the window:
-    ///      `borrow` is shut, `totalDebt` is its only source, and `unsocialisedLoss` only fills
-    ///      through `writeDownLoss` on a live position.
+    ///      `EpochHarvester.setLenderPool` likewise. None of the three can rise again during the
+    ///      window: `borrow` is shut, `totalDebt` is its only source, and `unsocialisedLoss` only
+    ///      fills through `writeDownLoss` on a live position.
+    ///
+    ///      🟥 **"So a batch this function accepts is a batch `executeBatch` will execute" used
+    ///      to close that paragraph. It is RETRACTED, and it has an executed counterexample.** It
+    ///      rested on `setLiquiditySource` refusing on `pendingPrincipal` - "which the settle leg
+    ///      zeroes immediately before it, inside the same atomic batch" - and PR #242 deleted
+    ///      that clause on 2026-08-20. The setter **handles** that balance instead, best-effort
+    ///      delivering it to the outgoing source and parking the residue as
+    ///      `owedToSource[outgoing]`. The refusal that is left lives in the **settle leg**, which
+    ///      is the hard delivery, and it turns on something no read in this function performs:
+    ///      whether the OUTGOING source will accept USDC. Every completeness probe this protocol
+    ///      runs on a swap is aimed at the INCOMING pointer.
+    ///
+    ///      MEASURED, with the outgoing `TreasuryLiquiditySource` blocked in `MockUSDC` on a book
+    ///      carrying `totalDebt == 0` and `pendingPrincipal == 500000000`: this function
+    ///      **accepted** the state and ran past `_assertCoreGraph` as well, and the committed
+    ///      batch then reverted in the settle leg with `Blocked(...)`, leaving `liquiditySource`
+    ///      unmoved, the protocol paused, and the timelock operation `Ready` - an armed replay,
+    ///      the round-21 shape. The identical batch with the settle leg dropped executed clean.
     ///
     ///      That is a claim about *this* list. Anyone adding a leg here owes this function a read.
+    ///      🟥 **And the inverse is the one that actually bit, so read it as the standing
+    ///      warning: a leg's own PRECONDITION changed underneath it.** No leg was added, removed
+    ///      or reordered. #242 corrected the source of truth in `CreditManager` and left four
+    ///      prose copies standing, this being one of them, for three audit rounds.
     ///
     ///      **And it is a claim about the legs' STATE, not about their targets - audit round 22,
     ///      finding 7 read the sentence above literally and found the gap on the other side of it.**

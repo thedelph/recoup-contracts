@@ -2437,11 +2437,15 @@ contract CreditManagerTest is RiskParamsFixture {
     ///      lenders really did fund, so every one of them has to say so in the wiring.
     ///
     ///      This has to run before any borrow, and not merely because it reads better there:
-    ///      `setLiquiditySource` refuses while `totalDebt` or `pendingPrincipal` is non-zero.
-    ///      That guard is precisely what makes the current pointer a sound answer to "whose
-    ///      money funded this", which is what the round-11 fix leans on, so a fixture that
-    ///      swapped the source out from under a live loan would be proving something about a
-    ///      state the protocol does not permit.
+    ///      `setLiquiditySource` refuses while `totalDebt` is non-zero. That guard is precisely
+    ///      what makes the current pointer a sound answer to "whose money funded this", which is
+    ///      what the round-11 fix leans on, so a fixture that swapped the source out from under a
+    ///      live loan would be proving something about a state the protocol does not permit.
+    ///
+    ///      🟥 **This sentence read "`totalDebt` or `pendingPrincipal`" until audit round 40,
+    ///      item 7.** PR #242 deleted the `pendingPrincipal` clause on 2026-08-20 and the setter
+    ///      handles that balance rather than refusing it. Nothing this fixture rests on depended
+    ///      on the deleted half: "before any borrow" is exactly the `totalDebt` condition.
     function _poolFundsTheBook() internal returns (MockLenderPool pool) {
         pool = new MockLenderPool(usdc);
         usdc.mint(address(pool), FLOAT);
