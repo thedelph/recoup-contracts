@@ -7,7 +7,7 @@ below is written against it. Analysis published here before that date was writte
 earlier lender pool, credit manager and collateral vault, and does not describe this source. This record is organised by present effect, not by discovery date. Historical internal review notes are
 in [`AUDITS.md`](AUDITS.md); the code-level integration tour is in [`REVIEW.md`](REVIEW.md).
 The section "Open findings from internal review round 45, at the audit commit" was added on
-2026-09-07 and is written against the same source at commit `b66023d`, the commit handed to the
+2026-09-07 and is written against the same source at commit b66023d, the commit handed to the
 external auditors.
 
 Internal adversarial review, unit tests, invariant campaigns and mainnet fork tests are evidence, but
@@ -36,10 +36,10 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Base mainnet | No Recoup contracts are deployed |
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty, and not wired as `CreditManager`'s liquidity source in the protocol-to-pool direction; the pool's own pointers to the manager and the harvester are set, and it is open to any depositor at the full 25,000 USDC cap |
-| Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits` - the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below - and lacks 26 selectors this source has, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live pool reads 124.885415 USDC parked with nobody to deliver it to |
+| Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacks 26 selectors this source has, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live pool reads 124.885415 USDC parked with nobody to deliver it to |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
 | Current-source parity | **None, deliberately.** This source is current as of 2026-08-31 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
-| External audit | In progress from 2026-09-07 over `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit `b66023d`; not completed |
+| External audit | In progress from 2026-09-07 over `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d; not completed |
 | Third-party funds | Not accepted |
 
 The mock assets have no real value, and their mint and test-control functions are permissionless.
@@ -87,7 +87,7 @@ the two repair doors, `coverClaimDeficit` and `coverEntryPriceDeficit`, are defi
 cover is allowed and excess is refused.
 
 Closed in this source, not on the testnet: the Sepolia `LenderPool` predates this source and still
-carries `netDeposits`, the principal book these residuals were properties of, until it is redeployed.
+carries `netDeposits`, the principal book these residuals were properties of and which this source has removed, until it is redeployed.
 
 ### Round 21 F7: a queued withdrawal reserving against the whole book. CLOSED
 
@@ -106,7 +106,7 @@ The leverage multiplier is gone by construction, not by tuning, which is why the
 not apply to it.
 
 Closed in this source, not on the testnet: the Sepolia `LenderPool` still exposes the
-`serviceQueue` family and runs the reserve these numbers describe, until it is redeployed.
+`serviceQueue` family, removed from this source, and runs the reserve these numbers describe, until it is redeployed.
 
 ### Round 22 F12: uncollectable claims. Authority half CLOSED, receiver half ACCEPTED
 
@@ -166,7 +166,7 @@ six files in the audit scope, and the findings below came out of it. Each one ha
 reproduction in a test unless it is marked as a lead. **None of them is fixed in this source, and
 that is deliberate**: a fix written the week before an audit is what the audit exists to check, so
 they are disclosed here and to the auditors as known issues, with the candidate fixes named and
-their status given honestly. They are written against commit `b66023d`. Severities are assigned
+their status given honestly. They are written against commit b66023d. Severities are assigned
 by the author, not by an auditor.
 
 ### A frozen yield pot over a dust supply bricks the pool. Medium-high
@@ -187,8 +187,8 @@ lever. Two fixes are measured and neither is chosen: derecognise the pot on a su
 
 ### A socialised loss reopens the deposit cap, and the recovery of that loss is split with whoever fills it. Medium
 
-`depositCapUsage` is `_accountedCash + outstandingPrincipal - totalClaimable`, so `socialiseLoss(L)`
-frees `L` of headroom. A stranger deposits into that headroom at the fair post-loss price, and when
+`depositCapUsage` is `_accountedCash + outstandingPrincipal - totalClaimable`, so `socialiseLoss` of an amount L
+frees L of headroom. A stranger deposits into that headroom at the fair post-loss price, and when
 the closed workout's redemption lands later through the permissionless `workoutSettleAfterClose`
 into `recoverLoss`, the stranger takes 94 to 97 percent of it (measured on 6,000 and 4,000 USDC
 recoveries; with no entrant the loss bearer receives all of it). The epoch leg refuses a pot larger
@@ -244,7 +244,7 @@ permanent loss and the other two can never be discharged.
 
 ### The withdrawal-request "reserve" is a per-call pro-rata bound, not a reservation. Documentation
 
-`_unreservedIdle` is `executable - ceil(executable * queued / supply)`, re-derived on every call, so
+`_unreservedIdle` is the executable balance less the ceiling of executable times queued over supply, re-derived on every call, so
 a non-requester can unwind the reserved cash to 0.011 percent of itself in twelve fair-priced
 redeems while the requester's whole-request value stays exactly at book. The request door caps a
 controller at their own fraction of cash; the sync door caps a holder at all cash not reserved by

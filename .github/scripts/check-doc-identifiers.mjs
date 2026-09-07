@@ -121,6 +121,30 @@ const ACKNOWLEDGED_ABSENT = {
     "The delegated referral writer, deleted when the registry moved to partner self-registration. " +
     "README.md and KNOWN_RISKS.md both record its removal, and KNOWN_RISKS.md additionally records " +
     "that the stale Sepolia deployment still exposes it.",
+  serviceQueue:
+    "The FIFO withdrawal queue and its readers, deleted with the round 21 F7 closure when the pool " +
+    "moved to request-based servicing. KNOWN_RISKS.md records the removal and that the live Sepolia " +
+    "bytecode, which predates this source, still carries them.",
+  queueHead:
+    "The FIFO withdrawal queue and its readers, deleted with the round 21 F7 closure when the pool " +
+    "moved to request-based servicing. KNOWN_RISKS.md records the removal and that the live Sepolia " +
+    "bytecode, which predates this source, still carries them.",
+  queueLength:
+    "The FIFO withdrawal queue and its readers, deleted with the round 21 F7 closure when the pool " +
+    "moved to request-based servicing. KNOWN_RISKS.md records the removal and that the live Sepolia " +
+    "bytecode, which predates this source, still carries them.",
+  queuePosition:
+    "The FIFO withdrawal queue and its readers, deleted with the round 21 F7 closure when the pool " +
+    "moved to request-based servicing. KNOWN_RISKS.md records the removal and that the live Sepolia " +
+    "bytecode, which predates this source, still carries them.",
+  queueEntry:
+    "The FIFO withdrawal queue and its readers, deleted with the round 21 F7 closure when the pool " +
+    "moved to request-based servicing. KNOWN_RISKS.md records the removal and that the live Sepolia " +
+    "bytecode, which predates this source, still carries them.",
+  netDeposits:
+    "The principal book of the round 22 F3 cap accounting, deleted when cap usage moved to the " +
+    "recognised entry price. KNOWN_RISKS.md records the removal and that the live Sepolia bytecode, " +
+    "which predates this source, still carries it.",
 };
 
 /** Words that make a paragraph a record of an absence rather than a claim of a mechanism. */
