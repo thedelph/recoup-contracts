@@ -240,7 +240,11 @@ The pool-side fix is one sentence and is not in this source because the file is 
 `recoverLoss` should accept a previously recognised manager, which is the fallback the principal
 leg already has and the loss leg does not. Three manager-side workarounds that avoided touching the
 pool were built and all three were refused by execution - one turns a permanent refusal into a
-permanent loss and the other two can never be discharged.
+permanent loss and the other two can never be discharged. A second route reaches the same refusal:
+a late `workoutSettleAfterClose` tranche that arrives after a forced close, once the pool has been
+repointed to the new manager by an ordinary `setCreditManager`, is refused `NotCreditManager` in
+`recoverLoss` in the same way, so the tranche is never delivered to the lenders who bore the loss.
+Same root cause, same one-sentence fix.
 
 ### The withdrawal-request "reserve" is a per-call pro-rata bound, not a reservation. Documentation
 
@@ -321,8 +325,15 @@ and queued on the auction side rather than shipped, so the audited tree does not
   `if`s after one un-emitted write cost it 2^K records, and a 122-line contract reproduces the abort
   at K=32 on an allocation of exactly 2^32 times 12 bytes while a 13,076-line branchless contract
   lints in under a second. There is no result for that lint on this file.
-- Slither has not run on this tree. Its own `uninitialized-state` is the detector this file has
-  most wanted a reading from.
+- Slither 0.11.5 has run over the whole tree, and its scope includes `src/LenderPool.sol`, so unlike
+  the lint above it is not blind to this file on account of the assembly block. Its own
+  `uninitialized-state` detector reported nothing on this file or anywhere else, and in 0.11.5 that
+  detector has no inline-assembly skip. The unfiltered run found 269 results across 54 contracts,
+  12 of them High impact and 102 Medium; all 269 were triaged and none is a true positive. One
+  informational result on this file is real: the zero-argument `_entryAssets` overload has no
+  caller. It is private, compiles to no code, and is deleted after the audit freeze. The counts are
+  for the development tree at a later internal commit, a superset of the audited scope, not a
+  reading of this commit.
 
 ## Other pre-launch risks and dependencies
 
@@ -405,8 +416,11 @@ position yield to insurance, and a live position can temporarily block the trans
 - DexFi's owned and upgradeable contracts remain outside Recoup's control. The adapter seam and
   borrow caps limit that dependency but do not eliminate it, and an audit of this repository does
   not audit DexFi's contracts.
-- Slither's clean result covered the earlier collateral scope; it has not been rerun over the whole
-  credit and lender graph.
+- Slither had last been run over an earlier collateral scope. It has since been run over the whole
+  credit and lender graph: 269 raw results, all triaged, none a true positive, and 44 left under a
+  configuration that records a reason for every detector it mutes. Slither now runs in the
+  development tree's CI on every contracts change, and a committed baseline of those 44 fails the
+  build on any finding that appears or disappears.
 - The external audit remains a hard gate before third-party capital regardless of internal review
   count or CI status.
 
