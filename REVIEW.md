@@ -108,8 +108,8 @@ permanently whitelisted unwind address or notice before revocation.
 
 ## Why believe any of it works?
 
-Run it. Ten integration tests execute against the **live** DexFi contracts on a Base mainnet fork,
-fork-at-latest, no archive node needed:
+Run it. The six suites under `test/fork/` execute against the **live** DexFi contracts on a Base
+mainnet fork, fork-at-latest, no archive node needed:
 
 ```sh
 RUN_FORK_TESTS=true forge test --match-contract Fork -vv
@@ -138,12 +138,15 @@ testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Seven suite files declaring 66 `invariant_*` functions, fuzzed over randomised call sequences:
-`test/*.invariants.t.sol`. Sixty of those names are distinct; the gap is the frame guard
+Seven suite files declaring 72 `invariant_*` functions, fuzzed over randomised call sequences:
+`test/*.invariants.t.sol`. Sixty-four of those names are distinct; the gap is the frame guard
 `invariant_theHandlerNeverDropsAFrame`, declared once in each of the seven campaign contracts,
-across the fourteen contracts those seven files hold - one handler and one campaign each. Counted
-by declaration rather than by assertion, which is the only basis on which all four of those numbers
-agree; `grep -c "function invariant_" test/*.invariants.t.sol` reproduces them.
+plus `invariant_everyInHandlerPropertyHeld`, declared in three of them, across the fourteen
+contracts those seven files hold - one handler and one campaign each. An eighth campaign lives
+outside that glob in `test/CanonicalCashModel.t.sol` with nine more declarations, so the tree-wide
+count is 81. Counted by declaration rather than by assertion, which is the only basis on which all
+of those numbers agree; `grep -c "function invariant_" test/*.invariants.t.sol` reproduces the
+per-file figures. Measured on 2026-09-12; the figures read 66 and 60 at the 2026-09-01 sync.
 
 The one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no
 state

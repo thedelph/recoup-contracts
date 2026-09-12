@@ -46,6 +46,22 @@ contract R40D7CaptureTest is Test, DeployBase {
     uint256 internal constant NAV = 25.15e8;
     uint256 internal constant EPOCH_YIELD = 1_000e6;
 
+    /// @dev Round 57 (round-57 item 131, audit agent A6): the DeployBase inheritor round-49's census named as an unreached door.
+    ///      Hermetic on all three seams - the fallback, never `super` - so the first reader added to
+    ///      this contract cannot hand `contracts/.env` a vote. Nothing here reads a seam today; the
+    ///      repository's environment census printed it `direct` on every one.
+    function _envOrAddress(string memory, address fallbackValue) internal pure override returns (address) {
+        return fallbackValue;
+    }
+
+    function _envOrString(string memory, string memory fallbackValue) internal pure override returns (string memory) {
+        return fallbackValue;
+    }
+
+    function _envOrBytes32(string memory, bytes32 fallbackValue) internal pure override returns (bytes32) {
+        return fallbackValue;
+    }
+
     function setUp() public {
         usdc = new MockUSDC();
         bond = new MockBond();
@@ -55,11 +71,8 @@ contract R40D7CaptureTest is Test, DeployBase {
     }
 
     function _externals() internal view returns (Externals memory) {
-        return Externals({
-            bond: IDexFiBond(address(bond)),
-            farm: IDexFiFarm(address(farm)),
-            usdc: IERC20(address(usdc))
-        });
+        return
+            Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
     }
 
     function _paramsOwnedHere() internal view returns (GovParams memory p) {
@@ -284,9 +297,7 @@ contract R40D7CaptureTest is Test, DeployBase {
 
         // Drive the pool directly from the harvester to read the refusal reason.
         vm.prank(address(d.harvester));
-        vm.expectRevert(
-            abi.encodeWithSelector(LenderPool.YieldExceedsCapital.selector, backlog, dust)
-        );
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.YieldExceedsCapital.selector, backlog, dust));
         d.pool.distributeYield(backlog);
 
         // And through the real permissionless door the flush delivers nothing and says so.
@@ -295,6 +306,61 @@ contract R40D7CaptureTest is Test, DeployBase {
         d.harvester.flushLenderYield();
         assertEq(d.harvester.pendingLenderYield(), backlog, "still parked");
         console.log("refused: backlog", backlog, "against capital", dust);
+    }
+
+    /// @notice The other end of the same guard (external review, 33audits M-05): a backlog that
+    ///         is larger than a pool FULL AT THE HARD CEILING used to be refused forever, because
+    ///         the cap is a constant and `maxDeposit` reads zero for everybody. Through the real
+    ///         harvester, each permissionless flush now delivers exactly `capital`, the harvester
+    ///         decrements `pendingLenderYield` by what it measured leaving, and the backlog drains
+    ///         to zero over successive flushes.
+    /// @dev The refutation above is unchanged and this test is its bound from the other side: the
+    ///      clamp fires only with 250,000 USDC of real lender capital in the pool, never for a cent.
+    function test_R40_D7_theBacklogAboveTheHardCeilingDrainsThroughTheRealHarvester() public {
+        (Deployed memory d, address borrower) = _liveProtocol();
+        _reopenAsBeforeTheFix(d);
+
+        d.pool.setDepositCap(Config.GLOBAL_BORROW_CAP_MAX);
+        _enter(d.pool, honestLender, Config.GLOBAL_BORROW_CAP_MAX);
+        assertEq(d.pool.maxDeposit(attacker), 0, "fixture: the pool is full at the hard ceiling");
+
+        // Four epochs at a lender share of 25% each: a backlog well above the ceiling.
+        vm.prank(borrower);
+        d.credit.borrow(LOAN);
+        uint256 epochYield = 400_000e6;
+        for (uint256 i = 0; i < 4; i++) {
+            vm.warp(block.timestamp + Config.MIN_EPOCH_GAP + 1);
+            farm.setPendingYield(address(d.adapter), epochYield);
+            d.harvester.harvest();
+        }
+        uint256 backlog = d.harvester.pendingLenderYield();
+        assertGt(backlog, Config.GLOBAL_BORROW_CAP_MAX, "premise: the backlog is not above the ceiling");
+        _settleAndSwitch(d, borrower);
+
+        uint256 flushes;
+        while (d.harvester.pendingLenderYield() != 0) {
+            uint256 pending = d.harvester.pendingLenderYield();
+            uint256 capital = d.pool.totalAssets();
+            uint256 harvesterBefore = usdc.balanceOf(address(d.harvester));
+            vm.prank(attacker); // permissionless; whoever calls it, the pool is paid
+            d.harvester.flushLenderYield();
+            uint256 delivered = harvesterBefore - usdc.balanceOf(address(d.harvester));
+            assertEq(delivered, pending > capital ? capital : pending, "delivered other than min(pending, capital)");
+            assertEq(d.harvester.pendingLenderYield(), pending - delivered, "the counter moved by other than delivery");
+            ++flushes;
+            console.log("flush", flushes, "delivered", delivered);
+            // To the end of the stream, not a fixed five days: the first delivery is rated over
+            // the whole accrual window since deployment (rule 1 of `_rateStream`), which is
+            // longer than the floor here, and a later epoch never shortens a running stream.
+            vm.warp(d.pool.yieldStreamEndsAt() + 1);
+            if (flushes > 16) break;
+        }
+        assertEq(d.harvester.pendingLenderYield(), 0, "the backlog did not drain");
+        assertGt(flushes, 1, "premise: one flush took the lot, so the clamp was never exercised");
+        assertEq(
+            d.pool.totalAssets(), Config.GLOBAL_BORROW_CAP_MAX + backlog, "the pool did not receive the whole backlog"
+        );
+        console.log("drained: backlog", backlog, "in flushes", flushes);
     }
 
     /// @notice CONTROL / NEUTER. Does the DEPLOY WINDOW buy the attacker anything? Identical

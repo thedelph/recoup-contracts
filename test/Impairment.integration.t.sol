@@ -493,9 +493,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertTrue(sawWriteDown, string.concat(scenario, ": the fill never recognised a loss"));
         assertGt(markWrites, 0, string.concat(scenario, ": no mark was written before the loss was booked"));
 
-        assertEq(
-            lowestMark, residual, string.concat(scenario, ": the mark fell below the shortfall this fill leaves")
-        );
+        assertEq(lowestMark, residual, string.concat(scenario, ": the mark fell below the shortfall this fill leaves"));
         assertEq(
             lowestReserve,
             residual,
@@ -549,15 +547,11 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertGt(unmarkedMinimum, markedQuote, "fixture: the stale mark must move the execution price");
 
         vm.prank(bidder);
-        vm.expectRevert(
-            abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, stranger, bidder)
-        );
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, stranger, bidder));
         pool.serviceWithdrawalRequest(stranger, serviceableBefore, 0);
 
         vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, markedQuote, unmarkedMinimum)
-        );
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, markedQuote, unmarkedMinimum));
         pool.serviceWithdrawalRequest(stranger, serviceableBefore, unmarkedMinimum);
 
         // One bounded, permissionless call, made by somebody who knows no borrower address and
@@ -870,9 +864,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         // The premise, asserted rather than assumed: this NAV really is in the band where a floor
         // fill clears the loan outright. If the parameters ever move so that it is not, this test
         // stops testing what it says and says so instead of passing quietly.
-        assertGt(
-            _ordinaryTriggerNav(), _floorParityNav(), "fixture: this NAV must sit above floor parity"
-        );
+        assertGt(_ordinaryTriggerNav(), _floorParityNav(), "fixture: this NAV must sit above floor parity");
 
         uint256 shares = pool.balanceOf(lender);
         uint256 exitBefore = pool.previewRedeem(shares);
@@ -1033,15 +1025,11 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertGt(unmarkedMinimum, markedQuote, "fixture: the live mark did not move the request price");
 
         vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, lender, stranger)
-        );
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.UnauthorizedRequestOperator.selector, lender, stranger));
         pool.serviceWithdrawalRequest(lender, serviceableBefore, 0);
 
         vm.prank(lender);
-        vm.expectRevert(
-            abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, markedQuote, unmarkedMinimum)
-        );
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.AssetsBelowMinimum.selector, markedQuote, unmarkedMinimum));
         pool.serviceWithdrawalRequest(lender, serviceableBefore, unmarkedMinimum);
 
         // ONE call, by anyone, with no capital.
@@ -1192,8 +1180,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         vm.warp(pool.yieldStreamEndsAt() + 1);
 
         emit log_named_uint(
-            "MEASURED share-price gain with a surviving loan on the books",
-            pool.totalAssets() - assetsAfterTheLoss
+            "MEASURED share-price gain with a surviving loan on the books", pool.totalAssets() - assetsAfterTheLoss
         );
         assertEq(pool.totalAssets(), assetsAfterTheLoss + tranche, "recognised in full, not deferred");
         assertEq(pool.outstandingPrincipal(), loan, "and no loan was re-recognised or written off to pay for it");
@@ -1567,9 +1554,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         vm.mockCall(address(pool), abi.encodeWithSelector(ILenderPool.totalImpairment.selector), abi.encode(marked));
 
         vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.PoolImpairmentOutstanding.selector, address(pool), marked)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.PoolImpairmentOutstanding.selector, address(pool), marked));
         credit.setLiquiditySource(address(next));
     }
 
@@ -1600,6 +1585,38 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     /// @dev Drive a workout to the point where the auction holds the lot and has accrued yield as
     ///      `claimableOf[auction]`, then force the workout closed so a migration is legal at all.
     ///      Lifted from the round-21 PoC so the fixture is not re-invented here.
+    ///
+    ///      🟥 **RE-FIXTURED BY ROUND 55, ITEM 215, AND THE ORDER IS NOW THE POINT.** It used to
+    ///      stream the epoch and settle BEFORE the forced close, and every one of the five tests
+    ///      below then read that pre-close accrual as the strand. Since the forced branch now
+    ///      claims and sweeps this contract's free balance into the fund before `writeDownLoss`, a
+    ///      pre-close accrual is spent by the close itself: `claimableOf(auction)` is zero
+    ///      afterwards, leg-one `claimSurplusFor` reverts `NothingToClaim`, and there is no strand
+    ///      left to strand. Weakening the five to accept that would have deleted the round-21
+    ///      property rather than moved it.
+    ///
+    ///      **So the strand is now formed the way it forms in production, from accrual AFTER the
+    ///      close.** The lot stays parked under this contract's ledger entry and keeps earning
+    ///      until `disposeWorkoutLot`, so a second epoch lands on exactly the same claim, on a
+    ///      manager the pointer can then be moved off. Two epochs rather than one, deliberately:
+    ///      the first is still streamed before the close so these tests keep exercising a forced
+    ///      close that has real yield to spend, and the helper now asserts the close spent it - the
+    ///      round-55 behaviour, checked from the round-21 fixture rather than assumed by it.
+    ///
+    ///      Round 54's agent A2 INFERRED that the round-21 property survives this way and did not
+    ///      execute it; this helper and
+    ///      `test_R55_215_theRound21StrandStillFormsFromAccrualAfterTheClose` execute it.
+    ///
+    ///      🟥 **Round 55 also added the disposal at the end, and it is fixture rather than
+    ///      subject.** The close pops the queue and leaves the lot PARKED under the auction's
+    ///      ledger entry; `CollateralVault.setCreditManager` now refuses a repoint over that, which
+    ///      is the third arm both its siblings already carried. So the owner-gated
+    ///      `disposeWorkoutLot` - the call the refusal points at, and the same call a DexFi
+    ///      redemption requires anyway - is now a precondition of every migration below. It comes
+    ///      AFTER the post-close epoch above, not before it, because the strand is what that epoch
+    ///      forms and the lot has to still be parked to earn it. It does not touch `claimableOf`,
+    ///      which is the quantity every test in this section measures, and that is asserted here
+    ///      rather than assumed.
     function _workoutThenIdle(uint256 epochYield) internal returns (uint256 accrued) {
         uint256 id = _openAuctionAt(_crashedNav());
         skip(Config.AUCTION_DURATION + 1);
@@ -1608,13 +1625,38 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
         _streamYieldTo(epochYield);
         credit.settle(address(auction));
-        accrued = credit.claimableOf(address(auction));
+        uint256 spentByTheClose = credit.claimableOf(address(auction));
+        assertGt(spentByTheClose, 0, "fixture: the pre-close epoch reached the lot");
 
         skip(Config.WORKOUT_MAX_DURATION + 1);
+        uint256 principalBefore = credit.pendingPrincipal();
         auction.closeWorkout(id);
         assertEq(auction.openWorkoutCount(), 0, "fixture: workout still open");
         assertEq(auction.liveAuctionCount(), 0, "fixture: auction still live");
         assertEq(credit.totalDebt(), 0, "fixture: debt outstanding blocks the migration");
+        // Round 55, item 215, asserted here rather than only in its own file: the close spent the
+        // pre-close accrual on this default instead of leaving it for a later sweep.
+        assertEq(credit.claimableOf(address(auction)), 0, "the close left the lot's own yield behind");
+        assertGe(
+            credit.pendingPrincipal() - principalBefore,
+            spentByTheClose,
+            "the close did not put the lot's yield behind the funder"
+        );
+
+        // The strand the five tests below need, formed AFTER the close from the same parked lot.
+        _streamYieldTo(epochYield);
+        credit.settle(address(auction));
+        accrued = credit.claimableOf(address(auction));
+        assertGt(accrued, 0, "fixture: the parked lot stopped earning at the close");
+
+        // Round 55, item 220: the parked lot now blocks the vault's manager door. Dispose it, and
+        // assert the claim this section is about is untouched by that. This must come AFTER the
+        // post-close epoch above - the lot has to still be parked to earn the strand.
+        assertEq(vault.bondCount(address(auction)), BONDS, "fixture: the lot is not parked");
+        vm.prank(admin);
+        auction.disposeWorkoutLot(id, stranger);
+        assertEq(vault.bondCount(address(auction)), 0, "fixture: the lot is still parked");
+        assertEq(credit.claimableOf(address(auction)), accrued, "fixture: the disposal moved the claim");
     }
 
     function _streamYieldTo(uint256 amount) internal {
@@ -1630,11 +1672,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
     function _freshManager() internal returns (CreditManager) {
         return new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
     }
 
@@ -1772,7 +1810,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertEq(auction.rewardOf(keeper), owed, "fixture: the reward is the keeper's");
 
         // Nothing above the reward, so there is nothing free to sweep.
-        vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
+        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
         vm.prank(stranger);
         auction.sweepFreeBalanceToInsurance();
 
@@ -1894,6 +1932,145 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Audit round 55, item 215. The two legs round 54's agent A2 INFERRED and
+    // did not execute, executed here.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice The round-21 strand still forms after the forced close spends the lot's pre-close
+    ///         accrual, because the lot stays parked and keeps earning until `disposeWorkoutLot`.
+    /// @dev 🟥 **THIS REPLACES AN INFERENCE.** Round 54's agent A2 read `_workoutThenIdle` and
+    ///      REASONED that the five round-21 strand tests would still hold under this fix "since the
+    ///      lot stays parked and earning until `disposeWorkoutLot`", and said in terms that it did
+    ///      not re-fixture or execute them. An inference about whether a property survives a change
+    ///      is the one thing a preserved measurement cannot substitute for, so this walks it: a
+    ///      first epoch is spent by the close on its own default, the lot is still in custody
+    ///      afterwards, a SECOND epoch lands on the same claim, and round 21's strand then forms and
+    ///      is recovered by the same two permissionless legs from an address with no role.
+    ///
+    ///      The five tests above now form their strand this way through `_workoutThenIdle`; this
+    ///      one states the property on its own so a future change to that helper cannot quietly
+    ///      take it with it.
+    function test_R55_215_theRound21StrandStillFormsFromAccrualAfterTheClose() public {
+        uint256 id = _openAuctionAt(_crashedNav());
+        skip(Config.AUCTION_DURATION + 1);
+        auction.expireToWorkout(id);
+
+        // A first epoch BEFORE the close. Under this fix the close spends it on its own default,
+        // which is the state that made the inference necessary in the first place.
+        _streamYieldTo(400e6);
+        credit.settle(address(auction));
+        uint256 spentByTheClose = credit.claimableOf(address(auction));
+        assertGt(spentByTheClose, 0, "fixture: nothing accrued before the close");
+
+        skip(Config.WORKOUT_MAX_DURATION + 1);
+        uint256 principalBefore = credit.pendingPrincipal();
+        auction.closeWorkout(id);
+        assertEq(credit.claimableOf(address(auction)), 0, "the close left the pre-close accrual behind");
+        assertGe(
+            credit.pendingPrincipal() - principalBefore, spentByTheClose, "the close did not spend it on this default"
+        );
+
+        // EXECUTED, not read: the lot is still in custody under this contract's ledger entry after
+        // the close, so it is still earning.
+        assertEq(vault.bondCount(address(auction)), BONDS, "the lot left custody at the close");
+        _streamYieldTo(400e6);
+        credit.settle(address(auction));
+        uint256 accrued = credit.claimableOf(address(auction));
+        emit log_named_uint("MEASURED accrual on the parked lot AFTER the forced close", accrued);
+        assertGt(accrued, 0, "the parked lot stopped earning at the close");
+
+        // Round 55, item 220, and the ORDER is the point: the lot is still parked, and the vault's
+        // manager door now refuses a repoint over that. Dispose it first - the owner-gated call the
+        // refusal points at - and only then repoint. This has to come AFTER the post-close epoch
+        // above, because that epoch is what forms the strand and the lot must still be parked to
+        // earn it. The disposal moves bonds, not the settled claim, and that is asserted rather
+        // than assumed.
+        vm.prank(admin);
+        auction.disposeWorkoutLot(id, stranger);
+        assertEq(vault.bondCount(address(auction)), 0, "the lot is still parked after the disposal");
+        assertEq(credit.claimableOf(address(auction)), accrued, "the disposal moved the claim");
+
+        // Round 21's strand, on that post-close accrual: repoint, and the claim sits on a manager
+        // the auction's own call site no longer asks.
+        CreditManager incoming = _migrate();
+        assertEq(credit.claimableOf(address(auction)), accrued, "the claim vanished rather than stranded");
+        vm.expectRevert(CreditManager.NothingToClaim.selector);
+        auction.sweepWorkoutYieldToInsurance();
+
+        // And round 21's pair still recovers it, from an address with no role at all.
+        vm.prank(stranger);
+        credit.claimSurplusFor(address(auction));
+        assertEq(usdc.balanceOf(address(auction)), accrued, "leg one did not deliver to the auction");
+        vm.prank(stranger);
+        auction.sweepFreeBalanceToInsurance();
+        assertGe(incoming.insuranceFund(), accrued, "leg two did not reach insurance");
+    }
+
+    /// @notice With the LenderPool as funder, the forced close takes the lot's own yield off what
+    ///         the pool socialises, and `outstandingPrincipal` falls by exactly that smaller figure.
+    /// @dev 🟥 **THIS REPLACES AN INFERENCE TOO.** Round 54's agent A2 recorded the LenderPool leg
+    ///      as "READ, not executed": it derived from `writeDownLoss`'s arithmetic and from the
+    ///      frozen `socialiseLoss` body that the pool would be short by the identical amount, and
+    ///      said so. `LenderPool.sol` is frozen for the external audit and is not edited here; it is
+    ///      exercised through the fixture's real pool, which is this file's liquidity source and
+    ///      loss sink.
+    ///
+    ///      The comparison is the whole test. The same position is closed twice from one snapshot:
+    ///      once with an epoch streamed into the workout and once with none, and the difference
+    ///      between the two socialised figures IS the lot's yield. Asserting only the fixed arm
+    ///      would pass against a change that moved the money somewhere else entirely.
+    function test_R55_215_theLenderPoolBearsTheLotsYieldLessLossOnAForcedClose() public {
+        uint256 id = _openAuctionAt(_crashedNav());
+        skip(Config.AUCTION_DURATION + 1);
+        auction.expireToWorkout(id);
+        assertEq(credit.lenderPool(), address(pool), "fixture: the pool is not the loss sink");
+
+        uint256 beforeTheEpoch = vm.snapshotState();
+
+        // ARM ONE: the lot earns during the workout, which is the ordinary case.
+        _streamYieldTo(400e6);
+        credit.settle(address(auction));
+        uint256 lotYield = credit.claimableOf(address(auction));
+        assertGt(lotYield, 0, "fixture: the lot earned nothing");
+
+        skip(Config.WORKOUT_MAX_DURATION + 1);
+        uint256 residual = credit.currentDebtOf(alice);
+        uint256 principalOutBefore = pool.outstandingPrincipal();
+        uint256 socialisedBefore = pool.lifetimeSocialisedLoss();
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+
+        (,,,,,,, uint256 writtenDown,,,) = auction.workouts(id);
+        uint256 socialised = pool.lifetimeSocialisedLoss() - socialisedBefore;
+        uint256 principalWrittenOff = principalOutBefore - pool.outstandingPrincipal();
+        emit log_named_uint("MEASURED residual at the forced close", residual);
+        emit log_named_uint("MEASURED the lot's own yield", lotYield);
+        emit log_named_uint("MEASURED socialised onto the pool", socialised);
+        assertEq(socialised, writtenDown, "the pool bore something other than what the auction recorded");
+        assertEq(principalWrittenOff, socialised, "outstandingPrincipal did not fall by the socialised figure");
+        assertLe(socialised + lotYield, residual + 2, "the pool bore more than the uncovered part");
+
+        // ARM TWO, the control: the identical position with no epoch at all. The pool bears the
+        // WHOLE residual, and the gap between the two arms is the lot's yield.
+        vm.revertToState(beforeTheEpoch);
+        skip(Config.WORKOUT_MAX_DURATION + 1);
+        uint256 residualControl = credit.currentDebtOf(alice);
+        uint256 principalOutControl = pool.outstandingPrincipal();
+        uint256 socialisedBeforeControl = pool.lifetimeSocialisedLoss();
+        vm.prank(stranger);
+        auction.closeWorkout(id);
+        uint256 socialisedControl = pool.lifetimeSocialisedLoss() - socialisedBeforeControl;
+        emit log_named_uint("MEASURED socialised with no yield on the lot", socialisedControl);
+        assertEq(socialisedControl, residualControl, "the control did not socialise the whole residual");
+        assertEq(
+            principalOutControl - pool.outstandingPrincipal(),
+            socialisedControl,
+            "outstandingPrincipal did not fall by the whole residual in the control"
+        );
+        assertGt(socialisedControl, socialised, "the lot's yield did not reduce what the pool bore");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Audit round 22, finding 2: the exit that empties the book
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1986,10 +2163,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         // The conservation identity. Two wei of tolerance for the floors on the way through and no
         // more.
         assertApproxEqAbs(
-            paid + residue,
-            LENDER_DEPOSIT,
-            2,
-            "a lender was destroyed by a liquidation that realised no loss at all"
+            paid + residue, LENDER_DEPOSIT, 2, "a lender was destroyed by a liquidation that realised no loss at all"
         );
     }
 
@@ -2257,7 +2431,9 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         uint256 creditBalanceBefore = usdc.balanceOf(address(credit));
         vm.prank(address(credit));
         pool.lend(1e6);
-        assertEq(usdc.balanceOf(address(credit)), creditBalanceBefore + 1e6, "a borrow-sized lend executes after the request");
+        assertEq(
+            usdc.balanceOf(address(credit)), creditBalanceBefore + 1e6, "a borrow-sized lend executes after the request"
+        );
 
         emit log_named_uint(
             "R21F7 fixed: former halt request, bps of book", Math.mulDiv(formerHaltAssets, Config.BPS, book)
@@ -2366,9 +2542,15 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///
     ///      The window is opened by the transaction that creates the obligation. `closeWorkout`
     ///      writes `w.writtenDown` and in the same block decrements `workoutsOpenFor` and pops
-    ///      `_openWorkouts`, so the `_openWorkouts.length != 0` refusal in `setCreditManager` - the
-    ///      only thing standing between the write-off and the repoint - is emptied by that same
-    ///      call. The control below asserts that refusal in the state where it does still bind.
+    ///      `_openWorkouts`, so the `_openWorkouts.length != 0` refusal in `setCreditManager` is
+    ///      emptied by that same call. The control below asserts that refusal in the state where it
+    ///      does still bind.
+    ///
+    ///      🟥 **That refusal is no longer "the only thing standing between the write-off and the
+    ///      repoint", and this docstring said so until round 55.** The vault's manager door now
+    ///      also counts the LOT the close leaves parked, so the migration below disposes first.
+    ///      The finding is untouched: the window is one owner call wider than it was, not closed,
+    ///      and the fix for it is still the recorded bearer rather than a setter guard.
     function test_R22_theLateTrancheFollowsTheManagerThatBoreTheLoss() public {
         uint256 id = _openAuctionAt(_crashedNav());
         skip(Config.AUCTION_DURATION + 1);
@@ -2388,7 +2570,10 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         uint256 writtenDown = pool.lifetimeSocialisedLoss();
         assertGt(writtenDown, 0, "fixture: the pool did not bear the loss");
 
-        // The ordinary migration, which the emptied counters now allow.
+        // The ordinary migration, which the emptied counters now allow - once round 55's third arm
+        // is satisfied by the disposal a DexFi redemption needs anyway.
+        vm.prank(admin);
+        auction.disposeWorkoutLot(id, stranger);
         CreditManager incoming = _migrate();
         LenderPool poolB = _poolForNewEra(incoming);
         assertEq(auction.creditManager(), address(incoming), "fixture: the auction did not repoint");
@@ -2423,17 +2608,16 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         (uint256 id, uint256 writtenDown) = _forceCloseOntoThePool();
 
         // A whole new era: fresh manager first - which repoints this auction at it - and then the
-        // fresh auction the immutable one has to be replaced by.
+        // fresh auction the immutable one has to be replaced by. Round 55: the disposal that used
+        // to sit between the two now has to precede BOTH, because the vault's manager door counts
+        // the parked lot as well as its auction door.
+        vm.prank(admin);
+        auction.disposeWorkoutLot(id, admin); // both vault doors refuse a repoint over a parked lot
         CreditManager incoming = _migrate();
         LiquidationAuction auctionB = new LiquidationAuction(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         vm.startPrank(admin);
-        auction.disposeWorkoutLot(id, admin); // the vault refuses an auction repoint over a live lot
         vault.setLiquidationAuction(address(auctionB));
         incoming.setLiquidationAuction(address(auctionB));
         auctionB.setCreditManager(address(incoming));
@@ -2585,8 +2769,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
         vm.warp(pool.yieldStreamEndsAt() + 1);
         emit log_named_uint(
-            "MEASURED lender redeem value after a recovery they never lost",
-            pool.previewRedeem(pool.balanceOf(lender))
+            "MEASURED lender redeem value after a recovery they never lost", pool.previewRedeem(pool.balanceOf(lender))
         );
         assertEq(
             pool.previewRedeem(pool.balanceOf(lender)),
@@ -2600,9 +2783,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         uint256 treasuryBefore = usdc.balanceOf(address(treasury));
         vm.prank(stranger);
         credit.flushPrincipalTo(address(treasury));
-        assertEq(
-            usdc.balanceOf(address(treasury)) - treasuryBefore, writtenDown, "the bearer was never made whole"
-        );
+        assertEq(usdc.balanceOf(address(treasury)) - treasuryBefore, writtenDown, "the bearer was never made whole");
         assertEq(credit.totalOwedToSources(), 0, "and the park must clear");
     }
 
@@ -2685,10 +2866,10 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
         // The sweep runs first, and finds nothing free to take.
         vm.prank(stranger);
-        vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
+        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
         auction.sweepWorkoutYieldToInsurance();
         vm.prank(stranger);
-        vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
+        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
         auction.sweepFreeBalanceToInsurance();
 
         // The borrower is still paid in full afterwards.
@@ -2717,11 +2898,24 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     ///      because the money is in the insurance fund and `fundInsurance` has no reverse leg. So
     ///      finding 18 closes the ordering hazard *after* the close (see the test above) and leaves
     ///      it open *before* the close: a stranger who sweeps while the workout is open still ends
-    ///      the borrower's claim to that epoch, for the price of one transaction. Closing that too
-    ///      means the sweeps must stop taking yield attributable to lots whose workout is still
-    ///      open - which contradicts `sweepWorkoutYieldToInsurance`'s own stated premise and the
-    ///      fixture audit round 22 finding 14 certified one PR earlier, so it is a design decision
-    ///      and not a patch. Carried, not silently accepted.
+    ///      the borrower's claim to that epoch, for the price of one transaction.
+    ///
+    ///      🟥 **THAT RESIDUAL IS CLOSED. Audit round 51 took the decision this paragraph
+    ///      described and declined.** It went on: "closing that too means the sweeps must stop
+    ///      taking yield attributable to lots whose workout is still open - which contradicts
+    ///      `sweepWorkoutYieldToInsurance`'s own stated premise and the fixture audit round 22
+    ///      finding 14 certified one PR earlier, so it is a design decision and not a patch.
+    ///      Carried, not silently accepted." Both sweeps now reserve exactly that, as a third
+    ///      term. What forced the decision was a SECOND door onto the same money that round 22
+    ///      did not know about: `sweepFreeBalanceToInsurance`, which `closeWorkout`'s own note
+    ///      says cannot reach the manager, opened by an entitled borrower's ordinary
+    ///      `claimWorkoutYield` realising the whole shared pot into raw balance. A bound that
+    ///      shuts one door and not the other is not a bound.
+    ///
+    ///      **What the decision costs, so it is not rediscovered as a defect:**
+    ///      `sweepFreeBalanceToInsurance` is refused for ANY money, a donation included, while
+    ///      any workout is open - bounded by `WORKOUT_MAX_DURATION`. A function that cannot tell
+    ///      a donation from a live borrower's backing must refuse both.
     function test_R22_aSweepBeforeTheCloseCannotBookMoneyTheProtocolCannotPay() public {
         uint256 id = _openAuctionAt(_crashedNav());
         skip(Config.AUCTION_DURATION + 1);
@@ -2729,14 +2923,16 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
         _streamYieldTo(1_000e6);
 
-        // A stranger sweeps while the workout is still open. Nothing is booked yet, so the whole
-        // of the lot's accrual so far leaves for the insurance fund.
+        // **Audit round 51 closed the residual this test was written around, and this is where it
+        // shows.** A stranger still tries to sweep while the workout is open, and both sweeps now
+        // reserve what still-OPEN workouts have already earned - so there is nothing above the
+        // reserve to take and the call is refused. The state the rest of this test was built to
+        // examine, money gone before anybody could close, is no longer reachable through a sweep.
         uint256 insuranceBefore = credit.insuranceFund();
+        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
         vm.prank(stranger);
         auction.sweepWorkoutYieldToInsurance();
-        uint256 swept = credit.insuranceFund() - insuranceBefore;
-        emit log_named_uint("MEASURED swept to insurance mid-workout, before anyone could close", swept);
-        assertGt(swept, 0, "fixture: the sweep took nothing, there is no hazard to test");
+        assertEq(credit.insuranceFund(), insuranceBefore, "the mid-workout sweep must take nothing");
 
         // The debt is then repaid in full, so this close is clean and would have booked the lot's
         // whole accrual since the workout opened.
@@ -2753,14 +2949,15 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         uint256 reachable = _reachableBackingForWorkoutYield();
         emit log_named_uint("MEASURED booked to the borrower by the clean close", owed);
         emit log_named_uint("MEASURED money the auction could actually pay it with", reachable);
-        assertEq(owed, 0, "the close booked an entry the money for was already spent");
-        assertEq(auction.totalWorkoutYieldOwed(), 0, "and the running total carries the same phantom");
+        assertGt(owed, 0, "the close must book the whole accrual the sweep could not take");
+        assertEq(auction.totalWorkoutYieldOwed(), owed, "and the running total must carry exactly it");
         assertGe(reachable, auction.totalWorkoutYieldOwed(), "what is booked must be backed");
 
-        // The residual, asserted rather than described: the borrower gets nothing, and the reason
-        // is that a stranger chose the moment.
-        vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
+        // The residual is gone, asserted rather than described: the borrower is paid in full, and
+        // the reason is that a stranger no longer gets to choose the moment.
+        uint256 borrowerBefore = usdc.balanceOf(alice);
         auction.claimWorkoutYield(id);
+        assertEq(usdc.balanceOf(alice) - borrowerBefore, owed, "the borrower must be paid in full");
     }
 
     /// @notice The same bound, from the other side: a **partial** sweep must leave exactly the
@@ -2768,16 +2965,22 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     /// @dev The one-arm version above cannot tell a correct bound from a `yieldOwed` hard-wired to
     ///      zero. Here a second epoch lands after the sweep, so the honest answer is strictly
     ///      between the two failure modes and the test says which.
+    ///
+    ///      **Audit round 51: the sweep is now refused and the bound is unchanged by that.** The
+    ///      four assertions below are exactly as they were - the point of this arm is that the
+    ///      clamp is not hard-wired to zero, and that stays true whether the sweep took the first
+    ///      epoch or was refused it. Only the attempt's outcome moved.
     function test_R22_theBoundLeavesExactlyWhatTheSweepDidNotTake() public {
         uint256 id = _openAuctionAt(_crashedNav());
         skip(Config.AUCTION_DURATION + 1);
         auction.expireToWorkout(id);
 
         _streamYieldTo(1_000e6);
+        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
         vm.prank(stranger);
         auction.sweepWorkoutYieldToInsurance();
 
-        // A second epoch, after the sweep. This one is still here.
+        // A second epoch, after the refused sweep. Both are still here.
         _streamYieldTo(400e6);
         uint256 reachable = _reachableBackingForWorkoutYield();
         assertGt(reachable, 0, "fixture: the second epoch never reached the lot");
@@ -2812,8 +3015,22 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
     /// @notice CONTROL: a **forced** close still sends the lot's yield to insurance, because there
     ///         the premise holds - the debt was written off and somebody did lose it.
-    /// @dev The two arms differ by one thing only: whether the debt was repaid. Before this commit
-    ///      they were identical, which is the finding stated as a comparison.
+    /// @dev The two arms differ by one thing only: whether the debt was repaid. Before round 22's
+    ///      commit they were identical, which is the finding stated as a comparison.
+    ///
+    ///      🟥 **RE-FIXTURED BY ROUND 55, ITEM 215: the snapshot moved ABOVE the close and the
+    ///      assertion is unchanged in substance.** It used to sweep after the close and assert the
+    ///      fund gained; the close now does that sweep itself, so the same money moves one call
+    ///      earlier and the later sweep correctly finds nothing. The property this control exists
+    ///      for - a forced close's lot yield reaches insurance, unlike a clean close's - is
+    ///      asserted here at the close rather than deleted.
+    ///
+    ///      🟥 **`writtenDown > 0` was NOT a safe way to say "this close was forced", and the fix
+    ///      is what showed it.** On this fixture a 1,000.000000 epoch leaves the lot's accrual
+    ///      LARGER than the residual, so the fund now covers the whole write-down and
+    ///      `writeDownLoss` returns zero - the same value a CLEAN close returns, for the opposite
+    ///      reason. The forcedness of the close is `currentDebtOf` at the close being non-zero,
+    ///      which is what the branch itself keys on, so that is what is read here.
     function test_R22_control_aForcedCloseStillFundsInsurance() public {
         uint256 id = _openAuctionAt(_crashedNav());
         skip(Config.AUCTION_DURATION + 1);
@@ -2822,19 +3039,35 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         credit.settle(address(auction));
 
         skip(Config.WORKOUT_MAX_DURATION + 1);
+        uint256 residual = credit.currentDebtOf(alice);
+        uint256 lotYield = credit.claimableOf(address(auction));
+        uint256 insuranceBefore = credit.insuranceFund();
+        uint256 principalBefore = credit.pendingPrincipal();
+        assertGt(residual, 0, "control: this close was not forced");
+        assertGt(lotYield, 0, "fixture: the lot earned nothing to send anywhere");
+
         vm.prank(stranger);
         auction.closeWorkout(id);
-        (,,,,,,, uint256 writtenDown,,, uint256 owed) = auction.workouts(id);
-        assertGt(writtenDown, 0, "control: this close was not forced");
+        (,,,,,,,,,, uint256 owed) = auction.workouts(id);
         assertEq(owed, 0, "a forced close credited the defaulter");
 
-        uint256 insuranceBefore = credit.insuranceFund();
+        // The lot's yield reached the fund AT the close. Part of it was then spent on this very
+        // default (`pendingPrincipal`, the funder made whole) and the excess stayed in the fund,
+        // which is where the old post-close sweep put the whole of it.
+        uint256 keptInFund = credit.insuranceFund() - insuranceBefore;
+        uint256 spentOnThisDefault = credit.pendingPrincipal() - principalBefore;
+        emit log_named_uint("MEASURED insurance gained by a forced close's lot yield", keptInFund);
+        emit log_named_uint("MEASURED of it spent on this default at the close", spentOnThisDefault);
+        assertGt(credit.insuranceFund(), insuranceBefore, "the close stopped funding insurance on a real default");
+        assertGe(keptInFund + spentOnThisDefault + 2, lotYield, "the close left part of the lot's yield behind");
+        assertGe(spentOnThisDefault, residual, "the funder was not made whole by a lot that could cover it");
+
+        // Round 55, item 215: there is nothing left over for a later sweep, because the close
+        // already pulled the pot. The revert is the MANAGER's, which shares this contract's
+        // selector, so it is named on the contract it comes from.
+        vm.expectRevert(CreditManager.NothingToClaim.selector);
         vm.prank(stranger);
         auction.sweepWorkoutYieldToInsurance();
-        emit log_named_uint(
-            "MEASURED insurance gained by a forced close's lot yield", credit.insuranceFund() - insuranceBefore
-        );
-        assertGt(credit.insuranceFund(), insuranceBefore, "the sweep stopped working on a real default");
 
         vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
         auction.claimWorkoutYield(id);
@@ -2908,10 +3141,7 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         return _twoCleanClosesInner(second, false);
     }
 
-    function _twoCleanClosesInner(address second, bool sweepMidWorkout)
-        internal
-        returns (uint256 idA, uint256 idB)
-    {
+    function _twoCleanClosesInner(address second, bool sweepMidWorkout) internal returns (uint256 idA, uint256 idB) {
         _seatSecondBorrower(second);
         _borrowAtCeilingAs(alice);
         _borrowAtCeilingAs(second);
@@ -2931,6 +3161,12 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
         _streamYieldTo(1_000e6);
         if (sweepMidWorkout) {
+            // **Audit round 51: the attempt stays and its outcome changed.** Both sweeps now
+            // reserve what still-OPEN workouts have earned, so a stranger sweeping between the
+            // expiry and the closes takes nothing and is refused. Keeping the call here rather
+            // than deleting it is what makes the two arms of this helper still differ by exactly
+            // one thing, and what would notice if the refusal ever stopped holding.
+            vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
             vm.prank(stranger);
             auction.sweepWorkoutYieldToInsurance();
         }
@@ -3003,22 +3239,25 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         assertEq(auction.totalWorkoutYieldOwed(), 0, "CONTROL: the ledger must close out at zero");
     }
 
-    /// @notice **The residual the fix leaves, written down rather than left to be rediscovered.**
-    ///         Once a mid-workout sweep has taken money the lots generated, what is left is
-    ///         allocated to whoever closes first, and a later close books nothing.
-    /// @dev MEASURED on the sequence in `_twoCleanCloses`: 400.000000 booked to the first close and
-    ///      **0** to the second, where before the fix both were booked ~700.000000 and the excess
-    ///      was met out of a later epoch that belonged to the insurance fund.
+    /// @notice **The residual round 23 finding 4 wrote down is GONE, and this is the test that
+    ///         used to record it.** With the mid-workout sweep refused there is no shortfall for
+    ///         the ordering clamp to allocate, so both clean closes book their own lot's share and
+    ///         both borrowers are paid in full.
+    /// @dev It read, before audit round 51: "MEASURED on the sequence in `_twoCleanCloses`:
+    ///      400.000000 booked to the first close and **0** to the second". That measurement was
+    ///      correct and its premise was that a stranger could take the first epoch out from under
+    ///      two open workouts - the residual round 22 disclosed and deliberately did not close,
+    ///      "because closing it means the sweeps must stop taking yield attributable to open
+    ///      workouts". Round-51 item 154 found a second, undisclosed door onto the same money -
+    ///      `sweepFreeBalanceToInsurance`, which `closeWorkout`'s own note says cannot reach it,
+    ///      opened by an entitled borrower's ordinary `claimWorkoutYield` - and the reserve that
+    ///      closes both doors closes round 22's residual with them.
     ///
-    ///      This is not a new hazard, it is the old one arriving somewhere visible. The money the
-    ///      second borrower is missing left in `sweepWorkoutYieldToInsurance`, which is
-    ///      permissionless, takes the whole realisable claim and never advances `yieldIndexAtOpen`
-    ///      - the residual round 22 disclosed and deliberately did not close, because closing it
-    ///      means the sweeps must stop taking yield attributable to open workouts. What the clamp
-    ///      decides is only who absorbs a shortfall that already happened, and the ordering answer
-    ///      is the only one available to a function whose own docstring forbids it doing new work.
-    ///      **The alternative is worse in the direction that matters**: the shipped behaviour paid
-    ///      the second borrower out of the first borrower's money or insurance's.
+    ///      **The clamp itself is untouched and is still what backs the booking**; what changed is
+    ///      that nothing legitimate can now create the shortfall it allocates. Its own arithmetic
+    ///      is still exercised by `test_R23_04_twoCleanClosesCannotBookTheSameClaimTwice` above,
+    ///      which asserts the two closes cannot book the same claim twice whatever was swept.
+    ///      MEASURED after the reserve: both closes book ~700.000000 and both are paid.
     function test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst() public {
         address bob = makeAddr("bob");
         (uint256 idA, uint256 idB) = _twoCleanCloses(bob);
@@ -3028,12 +3267,15 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         emit log_named_uint("MEASURED booked to the close that ran first", owedA);
         emit log_named_uint("MEASURED booked to the close that ran second", owedB);
         assertGt(owedA, 0, "the first close must still book what is actually there");
-        assertEq(owedB, 0, "the second close must book nothing rather than a phantom");
+        assertGt(owedB, 0, "and the second must no longer absorb a shortfall that cannot happen");
 
         // What is booked is paid, in full, which is the property the ledger owes either way.
         uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 bobBefore = usdc.balanceOf(bob);
         auction.claimWorkoutYield(idA);
         assertEq(usdc.balanceOf(alice) - aliceBefore, owedA, "the first borrower was short-paid");
+        auction.claimWorkoutYield(idB);
+        assertEq(usdc.balanceOf(bob) - bobBefore, owedB, "the second borrower was short-paid");
         assertEq(auction.totalWorkoutYieldOwed(), 0, "the ledger must close out at zero");
         vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
         auction.claimWorkoutYield(idB);
@@ -3050,6 +3292,340 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         uint256 borrowerBefore = usdc.balanceOf(alice);
         auction.claimWorkoutYield(id);
         assertEq(usdc.balanceOf(alice) - borrowerBefore, owed, "and payable in full");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audit round 55, item 215. The reserve term the shared helper uses.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice A clean close's booking against a bearer that has since been DETACHED is still money
+    ///         owed to a named borrower, so no sweep may fund insurance out of it, and the borrower
+    ///         is still paid in full.
+    /// @dev 🟥 **THIS TEST EXISTS BECAUSE A NEUTER WAS NEARLY READ AS FINDING NOTHING, AND THE
+    ///      CORRECTION IS THE POINT.** Round 55 hoisted the three-term reserve into
+    ///      `LiquidationAuction._fundInsuranceWithFree`, and its middle term is the AGGREGATE
+    ///      `totalWorkoutYieldOwed` rather than round-53 item 178's per-manager
+    ///      `workoutYieldOwedOn[cm]`. Narrowing it to the live manager's slice was neutered under
+    ///      `forge test --force`: `R54A02_ForcedCloseIgnoresLotYield`, `Impairment.integration`,
+    ///      `LiquidationAuction` and `R51A02_OverRealisationDoor` came back GREEN across all 165
+    ///      tests, gas moving by 50, and reading only that run said the clause had no falsifier.
+    ///      It has exactly one, and it is in a different file:
+    ///      `LiquidationAuction.invariants.t.sol::test_handlerCanReachEveryStateTheInvariantsCheck`
+    ///      went red at `and the sweep must not take a booked pot: 2 != 1`. **A neuter measured over
+    ///      a subset of suites reports the subset, not the tree**, which is worth as much as the
+    ///      clause itself.
+    ///
+    ///      This is still worth having, for two reasons the tripwire cannot give. That assertion
+    ///      names neither the term nor the case, so a reader who breaks the reserve is told a ghost
+    ///      counter moved rather than that a borrower's money was taken; and it lives behind a
+    ///      campaign file, so reaching it costs a full invariant run rather than milliseconds.
+    ///
+    ///      The two questions are genuinely different and the distinction is what this holds.
+    ///      Round 53 asks how much a clean close may BOOK, and clamps it against the pot its own
+    ///      bearer backs, which is right. This asks how much of the cash sitting on the auction is
+    ///      already owed to somebody, and a booking whose bearer was detached afterwards is exactly
+    ///      the case where the two answers differ: the money is owed, and the live pot does not back
+    ///      it. Reserve only the live slice and the auction hands a borrower's money to insurance.
+    ///
+    ///      Under the narrowed term this goes red twice over: the sweep succeeds where it must
+    ///      refuse, and the borrower is then short.
+    function test_R55_215_aDetachedBearersBookingIsStillReservedAgainstBothSweeps() public {
+        (uint256 id,) = _cleanCloseAfterAnEpoch(400e6);
+        (,,,,,,,,,, uint256 owed) = auction.workouts(id);
+        assertGt(owed, 0, "fixture: the clean close booked the borrower nothing");
+        assertEq(auction.totalWorkoutYieldOwed(), owed, "fixture: the aggregate does not carry it");
+
+        // Round 55, item 220: a clean close leaves the lot parked under this contract's ledger
+        // entry just as a forced one does, so the vault's manager door refuses the repoint until
+        // the owner disposes it. Fixture rather than subject - it moves bonds, and the quantity
+        // this test is about is the USDC booking, which is asserted unchanged across it.
+        vm.prank(admin);
+        auction.disposeWorkoutLot(id, stranger);
+        assertEq(auction.totalWorkoutYieldOwed(), owed, "the disposal moved the booking");
+
+        // The bearer of that booking is detached from here on. `workoutYieldOwedOn[incoming]` is
+        // zero for the rest of this test while `totalWorkoutYieldOwed` still carries `owed`.
+        CreditManager incoming = _migrate();
+        assertEq(auction.creditManager(), address(incoming), "fixture: the repoint did not take");
+
+        // Round 21's leg one, so the cash the booking is owed out of is sitting HERE rather than on
+        // the manager. That is what puts it in front of `sweepFreeBalanceToInsurance`, which never
+        // touches a manager and can only ever move what the auction already holds.
+        vm.prank(stranger);
+        credit.claimSurplusFor(address(auction));
+        uint256 held = usdc.balanceOf(address(auction));
+        assertGe(held, owed, "fixture: the booking is not backed by cash on the auction");
+
+        // Neither sweep may take it. Asserted on the money rather than on the revert, so this is
+        // still the right test if a future change makes a sweep take part of a balance instead of
+        // refusing the whole of it.
+        vm.prank(stranger);
+        try auction.sweepFreeBalanceToInsurance() {} catch {}
+        vm.prank(stranger);
+        try auction.sweepWorkoutYieldToInsurance() {} catch {}
+        emit log_named_uint("MEASURED held by the auction after both sweeps", usdc.balanceOf(address(auction)));
+        assertGe(usdc.balanceOf(address(auction)), owed, "a sweep took a detached bearer's booking");
+        assertEq(incoming.insuranceFund(), 0, "the borrower's money reached the live insurance fund");
+
+        // And the borrower is paid the whole of it, which is the property the reserve exists for.
+        uint256 borrowerBefore = usdc.balanceOf(alice);
+        auction.claimWorkoutYield(id);
+        assertEq(usdc.balanceOf(alice) - borrowerBefore, owed, "the borrower was not paid in full");
+        assertEq(auction.totalWorkoutYieldOwed(), 0, "the aggregate counter was not spent to zero");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // External review (33audits, 2026-09-11), L-01: the reviewers' proof of concept, kept as
+    // the regression. Their version asserted `LenderPool.NotCreditManager` on the settle; the
+    // fix is `LenderPool.wasCreditManager`, so the same call now lands. The second half - the
+    // way back is refused `PrincipalOutstanding` once the successor has lent - is kept as it
+    // was, because it is why the recovery leg has to accept a former manager rather than wait
+    // for a repoint that can never come.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Repointing the pool to a new manager leaves the former manager able to deliver a
+    ///         recovery it correctly routed: `recoverLoss` recognises the manager that recognised
+    ///         the loss, not only the live pointer.
+    function test_L01_managerMigrationNoLongerStrandsPostCloseRecovery() public {
+        (uint256 id, uint256 writtenDown) = _forceCloseOntoThePool();
+        assertEq(credit.lossBearerOf(alice), address(pool), "fixture: the pool bore the loss");
+
+        // One step the reviewers' tree did not need: the wiring doors here refuse a migration
+        // while the closed lot is still parked on the auction, so the disposal a DexFi
+        // redemption requires anyway comes first. The recovery leg is downstream of it.
+        vm.prank(admin);
+        auction.disposeWorkoutLot(id, makeAddr("dexfiRedemptionDesk"));
+        CreditManager incoming = _migrate();
+        vm.startPrank(admin);
+        pool.setCreditManager(address(incoming)); // the pool now names the successor
+        incoming.setLiquiditySource(address(pool));
+        incoming.setLenderPool(address(pool));
+        vm.stopPrank();
+
+        uint256 poolCashBefore = usdc.balanceOf(address(pool));
+        _fund(payer, writtenDown);
+        vm.prank(payer);
+        auction.workoutSettleAfterClose(id, writtenDown);
+
+        assertEq(usdc.balanceOf(address(pool)) - poolCashBefore, writtenDown, "the bearer received the tranche");
+        assertEq(pool.lifetimeLossRecovered(), writtenDown, "booked as a loss recovery");
+        assertEq(usdc.balanceOf(payer), 0, "the relayer paid");
+        assertEq(usdc.balanceOf(address(incoming)), 0, "the successor paid nothing");
+        (,,,,,,, uint256 stillWrittenDown,,,) = auction.workouts(id);
+        assertEq(stillWrittenDown, 0, "the write-down is discharged");
+
+        // The repair the old docstring named - repoint back - is still unavailable while the
+        // successor has credit, which is exactly why the leg cannot wait for it.
+        oracle.setNav(NAV);
+        vm.prank(alice);
+        vault.depositBonds(BONDS);
+        vm.prank(alice);
+        incoming.borrow(500e6); // inside the 25% LTV ceiling
+        uint256 live = pool.outstandingPrincipal(); // read before the prank
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.PrincipalOutstanding.selector, live));
+        pool.setCreditManager(address(credit));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // External review (33audits, 2026-09-11), H-03: the reviewers' loop, kept as the pin that
+    // states the relationship. `maxRequestRedeem` recomputes a request's slice against a base
+    // the previous service already shrank, so stepped service captures more than one slice of
+    // the opening cash. That arithmetic is right. What it is measured against here is the
+    // synchronous door: `maxRedeem` is bounded by all unreserved executable cash, so an un-queued
+    // holder takes at least the loop's total in ONE `redeem`. The request door's per-call slice
+    // is a reservation against lending and other exits, not a cap; the docstrings say so now.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Stepped request service captures more than a single pro-rata slice, and no more
+    ///         than one synchronous `redeem` of the same shares delivers from the same state.
+    /// @dev Snapshot BEFORE `requestWithdrawal`: once the shares are escrowed `balanceOf` is zero
+    ///      and `maxRedeem` reads zero by construction. Three figures are logged - the fair
+    ///      single-shot slice, the loop's total, one `redeem` - and the assertion that pins the
+    ///      design is the last inequality. If a future change made the sync door deliver less
+    ///      than the loop, the request door would have become a way out the sync door is not,
+    ///      and that is the moment a cumulative entitlement would be owed.
+    function test_H03_steppedRequestServiceReachesNoMoreThanOneSyncRedeem() public {
+        address attacker = makeAddr("attacker");
+        uint256 stake = 5_000e6; // remaining headroom under the deposit cap
+        _lend(attacker, stake);
+
+        // Principal at risk is what makes a cash exit senior rather than neutral.
+        uint256 debt = _maxBorrowAtCeiling();
+        vm.prank(alice);
+        credit.borrow(debt);
+        assertGt(pool.outstandingPrincipal(), 0, "fixture: no principal at risk");
+
+        uint256 attackerShares = pool.balanceOf(attacker);
+        uint256 before = vm.snapshotState();
+
+        // Arm one: the sync door, once.
+        uint256 syncShares = pool.maxRedeem(attacker);
+        uint256 syncQuoted = pool.previewRedeem(syncShares);
+        vm.prank(attacker);
+        uint256 syncPaid = pool.redeem(syncShares, attacker, attacker);
+        uint256 sharesLeftAfterSync = pool.balanceOf(attacker);
+
+        // Arm two: the request door, serviced in steps until it reads zero.
+        vm.revertToState(before);
+        vm.prank(attacker);
+        pool.requestWithdrawal(attackerShares, attacker);
+        uint256 fairOnce = pool.previewRedeem(pool.maxRequestRedeem(attacker));
+        assertGt(fairOnce, 0, "fixture: nothing was serviceable");
+
+        uint256 captured;
+        uint256 calls;
+        for (uint256 i = 0; i < 64; i++) {
+            uint256 serviceable = pool.maxRequestRedeem(attacker);
+            if (serviceable == 0) break;
+            vm.prank(attacker);
+            captured += pool.serviceWithdrawalRequest(attacker, serviceable, 0);
+            ++calls;
+        }
+
+        emit log_named_uint("MEASURED fair single-shot pro-rata slice ", fairOnce);
+        emit log_named_uint("MEASURED captured by stepped service     ", captured);
+        emit log_named_uint("MEASURED stepped service calls           ", calls);
+        emit log_named_uint("MEASURED one sync redeem, quoted         ", syncQuoted);
+        emit log_named_uint("MEASURED one sync redeem, paid           ", syncPaid);
+        emit log_named_uint("MEASURED shares left after the sync door ", sharesLeftAfterSync);
+
+        // The reviewers' arithmetic, reproduced: stepped service beats the single slice.
+        assertGt(captured, fairOnce, "stepped service captured no more than the fair slice");
+        // And the relationship the design rests on: it beats nothing the sync door does not
+        // already deliver in one call, from the same state, for the same shares.
+        assertEq(syncPaid, syncQuoted, "the sync door paid other than it quoted");
+        assertLe(captured, syncPaid, "DEFECT: stepped request service reaches cash one sync redeem cannot");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // External review (33audits, 2026-09-11), H-01: the reviewers' proof of concept, kept as the
+    // regression with its two final assertions swapped. Their version showed the first workout's
+    // late recovery reaching Pool B, which bore the SECOND loss, because `lossBearerOf` keyed the
+    // bearer by borrower and the second default overwrote the first. The manager now records the
+    // bearer per write-down, `recoveryBearerOf[auction][auctionId]`, and the auction passes its
+    // id back on the recovery leg.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice A second default by the same borrower no longer overwrites the first workout's
+    ///         recovery destination: the late recovery for the first workout reaches the pool
+    ///         that bore it, and the pool that bore the second loss receives nothing from it.
+    function test_H01_aLaterDefaultDoesNotRedirectAnEarlierWorkoutsRecovery() public {
+        (uint256 oldId, uint256 oldLoss) = _forceCloseOntoThePool();
+        assertEq(credit.lossBearerOf(alice), address(pool), "fixture: the pool bore the first loss");
+
+        LenderPool poolB = _poolForNewEra(credit);
+        oracle.setNav(NAV);
+        vm.prank(alice);
+        vault.depositBonds(BONDS);
+
+        uint256 newId = _openAuctionAt(_crashedNav());
+        skip(Config.AUCTION_DURATION + 1);
+        auction.expireToWorkout(newId);
+        skip(Config.WORKOUT_MAX_DURATION + 1);
+        vm.prank(stranger);
+        auction.closeWorkout(newId);
+        (,,,,,,, uint256 newLoss,,,) = auction.workouts(newId);
+        assertGt(newLoss, 0, "fixture: the second close wrote nothing down");
+        // The borrower's LATEST bearer is pool B, for readers; the routing records are per id and
+        // internal (the manager binds on the size limit), so they are asserted by where the two
+        // recoveries land rather than read back.
+        assertEq(credit.lossBearerOf(alice), address(poolB), "the reader view names the latest bearer");
+
+        uint256 oldPoolBefore = usdc.balanceOf(address(pool));
+        uint256 newPoolBefore = usdc.balanceOf(address(poolB));
+        _fund(payer, oldLoss);
+        vm.prank(payer);
+        auction.workoutSettleAfterClose(oldId, oldLoss);
+
+        assertEq(usdc.balanceOf(address(pool)) - oldPoolBefore, oldLoss, "pool A, which bore the loss, was not paid");
+        assertEq(usdc.balanceOf(address(poolB)) - newPoolBefore, 0, "pool B was paid for a loss it did not bear");
+        assertEq(pool.lifetimeLossRecovered(), oldLoss, "pool A booked the recovery");
+        (,,,,,,, uint256 oldStill,,,) = auction.workouts(oldId);
+        assertEq(oldStill, 0, "the first write-down is discharged");
+
+        // And the second workout's recovery still reaches the pool that bore THAT loss.
+        _fund(payer, newLoss);
+        vm.prank(payer);
+        auction.workoutSettleAfterClose(newId, newLoss);
+        assertEq(usdc.balanceOf(address(poolB)) - newPoolBefore, newLoss, "pool B was not paid its own recovery");
+        assertEq(usdc.balanceOf(address(pool)) - oldPoolBefore, oldLoss, "pool A took pool B's recovery");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // External review (33audits, 2026-09-11), L-02: `_settle` stamps the index before its
+    // `owed == 0` return, so a settle whose slice floors to zero discards the sub-unit remainder;
+    // held by decision (about $0.432 per victim per stream against ~1,500x that in gas). The
+    // reviewers' one-line fix - stamp only when `bonds == 0 || owed != 0` - was refuted by
+    // execution before they proposed it, and this test is the pin: under the one-liner a settle
+    // that floors to zero leaves the index stale, `settleForVault` runs against the OLD count in
+    // front of a top-up, and the next settle prices the whole stale delta at the larger count.
+    // The credit that mints is backed by nothing. Green on the shipped code; red under the
+    // one-liner with the unbacked figure in the assertion message.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice A zero-floored settle in front of a top-up never credits more than was streamed:
+    ///         after both holders are settled at the end of the stream, everything credited plus
+    ///         everything still undistributed is at most the pot.
+    /// @dev The shipped code destroys the floored remainders (the sum lands BELOW the pot, which
+    ///      is the accepted Low); the refuted one-liner mints credit ABOVE it. The rate is chosen
+    ///      so a one-bond position's per-second slice floors to zero: a 1.000000 pot over the
+    ///      stream window across 101 bonds is under one wei per bond per second.
+    function test_L02_aZeroFlooredSettleBeforeATopUpCreditsNoMoreThanWasStreamed() public {
+        address victim = makeAddr("victim");
+        bond.mint(victim, 2_000);
+        vm.startPrank(victim);
+        bond.setApprovalForAll(address(vault), true);
+        vault.depositBonds(1);
+        vm.stopPrank();
+
+        uint256 pot = 1e6;
+        usdc.mint(harvester, pot);
+        vm.startPrank(harvester);
+        usdc.approve(address(credit), pot);
+        credit.receiveYield(pot);
+        credit.distributeYield(pot);
+        vm.stopPrank();
+        credit.settle(victim); // level the index at the start of the stream
+
+        // The grind: a stranger settles the one-bond position every second for a while. Each
+        // slice floors to zero, so the shipped code stamps the index over a remainder it did not
+        // pay, and the one-liner leaves the index where it was.
+        for (uint256 i = 0; i < 60; i++) {
+            skip(1);
+            vm.prank(stranger);
+            credit.settle(victim);
+        }
+        // Shipped: every slice floored to zero and the index moved anyway, so nothing was
+        // credited. Under the one-liner the index waits and a wei eventually pays out; the
+        // difference that matters is measured after the top-up, not here.
+        emit log_named_uint("MEASURED credited to the victim by the grind", credit.claimableOf(victim));
+
+        // The top-up. The vault settles against the OLD count (1 bond) first, then the count
+        // becomes 1,000 - and from here the shipped code and the one-liner diverge.
+        vm.prank(victim);
+        vault.depositBonds(999);
+        assertEq(vault.bondCount(victim), 1_000, "fixture: topped up");
+
+        vm.warp(credit.streamEndsAt() + 1);
+        credit.settle(victim);
+        credit.settle(alice);
+
+        uint256 credited = credit.totalClaimable();
+        uint256 undistributed = credit.undistributedYield();
+        emit log_named_uint("MEASURED pot streamed                  ", pot);
+        emit log_named_uint("MEASURED credited to both holders      ", credited);
+        emit log_named_uint("MEASURED still undistributed           ", undistributed);
+        if (credited + undistributed > pot) {
+            emit log_named_uint("MEASURED UNBACKED credit (wei)         ", credited + undistributed - pot);
+        } else {
+            emit log_named_uint("MEASURED destroyed remainders (wei)    ", pot - credited - undistributed);
+        }
+        assertLe(
+            credited + undistributed,
+            pot,
+            "DEFECT: the manager credited yield it never received (the refuted one-liner's shape)"
+        );
     }
 }
 

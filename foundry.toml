@@ -67,13 +67,64 @@ remappings = [
     "forge-std/=lib/forge-std/src/",
 ]
 
-# Public immutables use lowerCamelCase as part of the external API surface
 [lint]
 # Keep compilation and linting separate. Foundry's automatic post-build pass emits thousands of
 # advisory lint diagnostics here, and the hosted runner was terminated three times after solc had
-# already succeeded. Run `forge lint` explicitly when lint work is in scope.
+# already succeeded.
+#
+# "Thousands" now has a number, and the deferral beside it - "run `forge lint` explicitly when lint
+# work is in scope", which nothing tracked from the day it was written - was discharged by audit
+# round 44. MEASURED at 8b730d8 on forge 1.8.1, with the two entries below excluded: **5,200
+# diagnostics over the 98 `.sol` files, of which 4,896 are in `test/`, 236 in `src/` and 68 in
+# `script/`.** The excluded pair adds 119 more that are measurable and at least one that is not.
+# The census, the nine detectors that fired zero times tree-wide, and a disposition for every
+# `high` and `med` hit in `src/` are all recorded by audit round 44.
+#
+# CI gates `--severity high med` over `src/` only, as the contracts job's last step before Slither,
+# and its steady state is ZERO. It is not a gate over `test/` or `script/`; both are triaged in the document
+# instead, and the step says so on every run.
 lint_on_build = false
-exclude_lints = ["screaming-snake-case-immutable"]
+
+# EVERY ENTRY HERE IS A LINT THAT IS WRONG ABOUT THIS CODEBASE, never one that is merely loud.
+# `--severity` handles volume; this list handles wrongness, and the two must not be confused.
+# **No `high` or `med` lint may ever appear here.** Those get a per-site
+# `// forge-lint: disable-next-line(<id>)` carrying a written reason - 66 of them in `src/` today,
+# costing zero runtime bytes, MEASURED - which is what stops the gate being bought green by
+# omission. An entry needs the convention the lint contradicts AND a hit count at a stated commit.
+#
+# `screaming-snake-case-immutable` (info, 26 in `src/` and 93 in `test/` at 8b730d8): public
+# immutables here are part of the external API surface and use lowerCamelCase, so their getters read
+# like every other getter.
+#
+# `missing-events-arithmetic` (low, 2 measurable hits in `src/` and 0 in `test/`/`script/` at
+# 8b730d8): two reasons, and the second one is the binding one.
+#   1. WRONG. It reports a write as event-less when the emit is the statement immediately above it.
+#      MEASURED: `LenderPool._setDepositCap`, whose previous line is
+#      `emit DepositCapSet(depositCap, cap)`; and `CreditManager`'s `lastAccrualAt = endAt`, a clock
+#      advanced from `block.timestamp` rather than from any caller input. The third,
+#      `DirectCallAdapter.unreportedYield += farmPaid`, is the deliberate carry `_settleFarmPayout`
+#      documents.
+#   2. IT CANNOT BE RUN. On `src/LenderPool.sol` the pass blows up: 126 to 380 seconds and then an
+#      abort on a single allocation of 8.9, 17.9 or 35.8 GB, MEASURED three times at 8b730d8 on
+#      forge 1.8.1 on a 64 GB box. 🟥 **It is CONSTRUCT-driven, not size-driven, and this comment
+#      said the opposite for two rounds.** REFUTED by execution in audit round 45 and corrected
+#      here in round 46: the lint's `merge_write_states` folds an `if`'s two arms back together
+#      with `extend` and no deduplication, so K sequential fall-through `if`s after one un-emitted
+#      write cost 2^K pending-write records, and 2^32 of them at 12 bytes each is exactly the
+#      51,539,607,552 the allocator prints. A purpose-built 57-line contract with 32 such `if`s
+#      dies; a branchless 13,076-line one with 3,840 candidate writes lints correctly in under a
+#      second. The old "slices below roughly 160 of its 187 members stop reproducing it" is
+#      retired with the claim it supported - slicing members out removed branches along with them,
+#      which is why the boundary looked like size. A 57-line reproducer and an upstream report are
+#      prepared by audit round 45 and not yet filed. Removing the inline assembly still
+#      does not stop it, and no other file in `src/`, `test/` or `script/` reproduces it. While it
+#      is enabled, ANY run whose severity set includes `low` and whose paths include
+#      `LenderPool.sol` dies partway through and takes every later diagnostic with it. That is where
+#      the round-43 tree-wide figure of 5,048 came from: the run that produced it exited 127
+#      mid-stream, and the ten "detectors that fired zero times" it reported were nine.
+#      🟥 `--only-lint` OVERRIDES this list, so an explicit `--only-lint missing-events-arithmetic`
+#      still crashes. That is deliberate on forge's part and is how the crash was isolated.
+exclude_lints = ["screaming-snake-case-immutable", "missing-events-arithmetic"]
 
 # These are forge's current defaults, written down rather than inherited. `fail_on_revert`
 # is the one that matters: every invariant suite here wraps its interesting actions in

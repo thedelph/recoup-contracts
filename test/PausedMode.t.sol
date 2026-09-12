@@ -46,6 +46,22 @@ contract PausedModeTest is Test, DeployBase {
     MockBond internal bond;
     MockFarm internal farm;
 
+    /// @dev Round 57 (round-57 item 131, audit agent A6): the DeployBase inheritor round-49's census named as an unreached door.
+    ///      Hermetic on all three seams - the fallback, never `super` - so the first reader added to
+    ///      this contract cannot hand `contracts/.env` a vote. Nothing here reads a seam today; the
+    ///      repository's environment census printed it `direct` on every one.
+    function _envOrAddress(string memory, address fallbackValue) internal pure override returns (address) {
+        return fallbackValue;
+    }
+
+    function _envOrString(string memory, string memory fallbackValue) internal pure override returns (string memory) {
+        return fallbackValue;
+    }
+
+    function _envOrBytes32(string memory, bytes32 fallbackValue) internal pure override returns (bytes32) {
+        return fallbackValue;
+    }
+
     function setUp() public {
         usdc = new MockUSDC();
         bond = new MockBond();
@@ -53,7 +69,6 @@ contract PausedModeTest is Test, DeployBase {
         bond.setRewardPool(address(farm));
         vm.chainId(ANVIL_CHAIN_ID);
     }
-
 
     /// @dev **Round 40, D7.** `DeployBase._wire` now ships the `LenderPool` PAUSED, so every
     ///      fixture below that seeds a lender has to open the door first, through the owner, the
@@ -70,7 +85,8 @@ contract PausedModeTest is Test, DeployBase {
     // ── fixture ──────────────────────────────────────────────────────────────
 
     function _externals() internal view returns (Externals memory) {
-        return Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
+        return
+            Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
     }
 
     /// @dev This contract keeps ownership, because every question here is about what the

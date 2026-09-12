@@ -418,7 +418,9 @@ contract R36TestnetLockdownHarness is DeployTestnet {
     {
         bytes32 k = keccak256(bytes(key));
         if (_addrSet[k]) return _addr[k];
-        return super._envOrAddress(key, fallbackValue);
+        // The fallback and never `super`, the `R39AssertLockedHarness` shape: forge auto-loads
+        // `contracts/.env`, so a fall-through reads the deploy box. Round-49 item 136.
+        return fallbackValue;
     }
 
     function _envOrString(string memory key, string memory fallbackValue)
@@ -430,7 +432,7 @@ contract R36TestnetLockdownHarness is DeployTestnet {
     {
         bytes32 k = keccak256(bytes(key));
         if (_strSet[k]) return _str[k];
-        return super._envOrString(key, fallbackValue);
+        return fallbackValue;
     }
 }
 
@@ -563,11 +565,31 @@ contract R36TestnetLockdownTest is Test {
 ///      post-condition to a function nothing executes would have moved the hole one contract over,
 ///      so `DeployLocal` got the same `_afterBroadcast` split `DeployTestnet` has, and this is the
 ///      harness that drives it.
-/// @dev No environment overrides are needed: `DeployLocal` has no chain guard and `_readParams`
-///      supplies the local operator addresses on chain id 31337, which is what `forge test` runs.
+/// @dev **Hermetic since round-49 item 136, and it was not before.** `DeployLocal` has no chain
+///      guard and `_readParams` supplies the local operator addresses on chain id 31337, so this
+///      harness installs nothing - but with no override at all it reached `_resolveParams`
+///      through `DeployBase._envOrAddress`, which is `vm.envOr`, and forge auto-loads
+///      `contracts/.env` into every `forge test`. On the deploy box that file names every
+///      operator, so the "local defaults" this suite was asserting over were whatever the box
+///      held, and CI, with no `.env`, was asserting over the real defaults. Same shape as the
+///      `R39AssertLockedHarness` round 48 fixed, one contract below it. The two overrides return
+///      the fallback and never `super`, so an empty environment is what every run sees.
 contract R39LocalLockdownHarness is DeployLocal {
     Deployed private _lastDeployed;
     GovParams private _lastParams;
+
+    function _envOrAddress(string memory, address fallbackValue) internal pure override returns (address) {
+        return fallbackValue;
+    }
+
+    function _envOrString(string memory, string memory fallbackValue)
+        internal
+        pure
+        override
+        returns (string memory)
+    {
+        return fallbackValue;
+    }
 
     function exposedDeployLocalStack() external {
         (Deployed memory d, GovParams memory p) = _deployLocalStack(address(this));

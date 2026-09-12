@@ -47,8 +47,17 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///
 ///      Forge isolates EVM state per test function, so these mappings are private to the function
 ///      that wrote them. `set()` is called on the object under test - a script instance, or `this`
-///      - and `_envOrAddress`/`_envOrString` read it back. **Nothing overridden falls through to
-///      the real `vm.envOr`**, so a test that installs nothing behaves exactly as it did.
+///      - and `_envOrAddress`/`_envOrString` read it back. **Nothing here reaches the real
+///      `vm.envOr` at all**: an uninstalled key returns its fallback, which is what an empty
+///      environment returns and the state CI runs in. Until round-49 item 136 an uninstalled key
+///      fell through to `super`, and forge auto-loads `contracts/.env` into every `forge test`,
+///      so on the deploy box two tests in this file were reading the box: MEASURED at `73b474a`
+///      with a stranger `.env` naming every `RECOUP_*` key, `test_mainnet_requiresTheCustodyDecisionToBeRecorded`
+///      walked past the custody gate on the box's `RECOUP_CUSTODY_MODE` and died calling the live
+///      Base USDC address in a chain-free EVM, and `test_wirePhase4_scriptEntrypointWiresAndAssertsInOneRun`
+///      failed `WiringIncomplete("vault.guardian")` against the box's `RECOUP_GUARDIAN`. Both
+///      were green in CI on every run. The `R39AssertLockedHarness` shape, applied to the seam
+///      every harness in this file is built on.
 ///
 ///      **`forge test` in this repo now contains no `vm.setEnv` call at all.** Keep it that way:
 ///      one writer is enough to bring the race back, and it will come back as somebody else's test
@@ -83,7 +92,7 @@ abstract contract EnvOverridable is DeployBase {
     {
         bytes32 k = keccak256(bytes(key));
         if (_addressOverridden[k]) return _addressOverride[k];
-        return super._envOrAddress(key, fallbackValue);
+        return fallbackValue;
     }
 
     function _envOrString(string memory key, string memory fallbackValue)
@@ -95,7 +104,7 @@ abstract contract EnvOverridable is DeployBase {
     {
         bytes32 k = keccak256(bytes(key));
         if (_stringOverridden[k]) return _stringOverride[k];
-        return super._envOrString(key, fallbackValue);
+        return fallbackValue;
     }
 }
 
@@ -280,10 +289,13 @@ contract DeployTest is Test, EnvOverridable {
     ///
     ///      **The residual, stated rather than left to be discovered.** The seam's base
     ///      implementation - the single `return vm.envOr(key, fallbackValue)` in `DeployBase` - is
-    ///      no longer covered by any assertion, because the only way to assert it from inside
-    ///      `forge test` is the cheatcode being removed. It is exercised on every real `forge
-    ///      script` run and by nothing here. A test that installs no override still reaches it, so
-    ///      a seam that stopped reading the environment would break a deploy and not this suite.
+    ///      covered by no assertion and, since round-49 item 136, reached by no test in this file
+    ///      at all: `EnvOverridable` returns the fallback for an uninstalled key rather than
+    ///      falling through, because the fall-through read the deploy box's `contracts/.env`. The
+    ///      only way to assert the base implementation from inside `forge test` is the cheatcode
+    ///      round 30 removed. It is exercised on every real `forge script` run and by nothing
+    ///      here, so a seam that stopped reading the environment would break a deploy and not
+    ///      this suite.
     ///
     ///      Every other test in this file passes `GovParams` and `Deployed` in directly and reads
     ///      no environment at all. Keep it that way; the two `_install*` helpers at the bottom
@@ -1880,6 +1892,121 @@ contract DeployTest is Test, EnvOverridable {
         this.exposedDeployProtocol(_externals(), p, address(this));
     }
 
+    /// @notice A NAV confirmer that is the incoming owner is refused before the first creation.
+    /// @dev Round-47 item 79's script-side half. `NAVOracle` now refuses `setNavConfirmer(owner)`
+    ///      and `transferOwnership(navConfirmer)` by name, the way both siblings already did. The
+    ///      deploy path sets the confirmer while the DEPLOYER owns the oracle and then `_handOver`
+    ///      transfers to `p.owner`, so `p.navConfirmer == p.owner` would be accepted at the
+    ///      wiring step and die inside `_handOver`, after roughly forty million gas of contract
+    ///      creations. Where `p.owner == deployer` - every local deploy - the same shape dies one
+    ///      step earlier at `setNavConfirmer`, which is why the rule sits beside
+    ///      `GuardianMustDifferFromOwner` ahead of the local early-return rather than behind it: it
+    ///      mirrors a rule a contract enforces, so a local deploy that broke it would otherwise
+    ///      revert mid-wiring with no indication which role was wrong. Without the oracle change
+    ///      this refuses a shape that would have succeeded; with it, a shape that would have failed
+    ///      late.
+    ///
+    ///      🟥 **That sentence used to end "rather than beside `NavKeysMustDiffer` behind it", and
+    ///      the example is SPENT: round-50 item 142 moved `NavKeysMustDiffer` above the return as
+    ///      well, on exactly the criterion this paragraph states.** The criterion is what was worth
+    ///      writing down and is unchanged; the clause is simply no longer an instance of the other
+    ///      side of it. Its local arm is `test/R50DeployParamGates.t.sol`.
+    ///
+    ///      Falsifier: red before the guard as `next call did not revert as expected`, the whole
+    ///      nine-contract set deployed and handed over with one party holding both roles.
+    function test_deploy_aNavConfirmerEqualToTheIncomingOwnerIsRefusedBeforeTheFirstCreation() public {
+        vm.chainId(8453);
+        GovParams memory p = _params();
+
+        // Control: distinct roles deploy, wire and hand over off the local chain.
+        this.exposedDeployProtocol(_externals(), p, address(this));
+
+        p.navConfirmer = p.owner;
+        vm.expectRevert(NavConfirmerMustDifferFromOwner.selector);
+        this.exposedDeployProtocol(_externals(), p, address(this));
+
+        // And on the local chain too, ahead of the early-return, for the reason above.
+        vm.chainId(ANVIL_CHAIN_ID);
+        vm.expectRevert(NavConfirmerMustDifferFromOwner.selector);
+        this.exposedValidateParams(p, address(this));
+    }
+
+    /// @notice A keeper that is the incoming owner is refused before the first creation.
+    /// @dev Round-49 item 133's script-side half, the mirror of the confirmer test above one key
+    ///      over: `NAVOracle.setKeeper` now refuses its owner and `transferOwnership` refuses its
+    ///      keeper, so `p.keeper == p.owner` would be accepted at `_wire`'s `setKeeper` (the
+    ///      deployer owns the oracle at that instant) and die inside `_handOver`. Same placement,
+    ///      ahead of the local early-return, for the same reason.
+    ///
+    ///      Falsifier, MEASURED with the script clause deleted and the oracle clause in place:
+    ///      the deploy arm died late, `KeysMustDiffer()` out of `_handOver` rather than
+    ///      `KeeperMustDifferFromOwner()` before the first creation, and the local arm did not
+    ///      revert at all.
+    function test_deploy_aKeeperEqualToTheIncomingOwnerIsRefusedBeforeTheFirstCreation() public {
+        vm.chainId(8453);
+        GovParams memory p = _params();
+
+        // Control: distinct roles deploy, wire and hand over off the local chain.
+        this.exposedDeployProtocol(_externals(), p, address(this));
+
+        p.keeper = p.owner;
+        vm.expectRevert(KeeperMustDifferFromOwner.selector);
+        this.exposedDeployProtocol(_externals(), p, address(this));
+
+        vm.chainId(ANVIL_CHAIN_ID);
+        vm.expectRevert(KeeperMustDifferFromOwner.selector);
+        this.exposedValidateParams(p, address(this));
+    }
+
+    /// @notice **REFUSED, and pinned so the refusal is read rather than re-derived.** A confirmer
+    ///         or a keeper equal to the DEPLOYING key, with a distinct incoming owner, is not
+    ///         hoisted into `_validateParams`. Round-49 item 134 proposed it.
+    /// @dev The shape is `test_R36_refuted_theGuardianCannotBeTheDeployingKeyButTheErrorNamesTheWrongRole`
+    ///      one role over, and round 36 filed that as a legibility defect and refused a deployer
+    ///      rule for it. The two clauses `_validateParams` does hoist are about the deployment's
+    ///      END STATE: `p.owner` keeps the oracle after `_handOver`, so `navConfirmer == owner`
+    ///      and `keeper == owner` are collapses the finished deployment would carry. The deployer
+    ///      keeps no role after `_handOver`, so `navConfirmer == deployer` is a collapse only for
+    ///      the span of `_wire`, and the oracle refuses it there because the deployer happens to
+    ///      be its owner at that instant - the same transient the guardian hits. Refusing it by
+    ///      name in the script would entrench a rule about the wrong instant, and refusing it for
+    ///      two of the three roles while the guardian keeps the round-36 tripwire would have the
+    ///      same function say two things about one shape.
+    ///
+    ///      What the late death costs is legibility, not a nonce: `forge script` runs `run()` once,
+    ///      in simulation, before a single transaction goes out (round 38's measurement, recorded
+    ///      beside the deploy procedure), so nothing is broadcast when `_wire` reverts. The error
+    ///      is `KeysMustDiffer()` with no role named, after every creation. Like the round-36
+    ///      pin, the assertion is on the SELECTOR and on where it comes from, so a future edit
+    ///      that hoists a deployer rule fails here and is read.
+    function test_deploy_refused_aConfirmerOrKeeperEqualToTheDeployingKeyDiesInsideWireUnnamed()
+        public
+    {
+        vm.chainId(8453);
+
+        GovParams memory c = _params();
+        c.navConfirmer = address(this);
+        assertTrue(c.navConfirmer != c.owner, "premise: no end-state collision with the owner");
+        // `_validateParams` accepts it - there is no deployer rule for the confirmer.
+        this.exposedValidateParams(c, address(this));
+        // And it dies anyway, inside `_wire` at `setNavConfirmer(deployer)`, under the oracle's
+        // own unnamed error, after every contract has been created.
+        uint256 before = gasleft();
+        vm.expectRevert(NAVOracle.KeysMustDiffer.selector);
+        this.exposedDeployProtocol(_externals(), c, address(this));
+        emit log_named_uint("gas spent before the confirmer arm's late death", before - gasleft());
+
+        // The keeper, one setter earlier in `_wire`, since round-49 item 133's owner clause.
+        GovParams memory k = _params();
+        k.keeper = address(this);
+        assertTrue(k.keeper != k.owner, "premise: no end-state collision with the owner");
+        this.exposedValidateParams(k, address(this));
+        before = gasleft();
+        vm.expectRevert(NAVOracle.KeysMustDiffer.selector);
+        this.exposedDeployProtocol(_externals(), k, address(this));
+        emit log_named_uint("gas spent before the keeper arm's late death", before - gasleft());
+    }
+
     function test_deploy_aGuardianEqualToTheIncomingOwnerIsRefused() public {
         GovParams memory p = _params();
         p.guardian = p.owner;
@@ -2105,6 +2232,14 @@ contract DeployTest is Test, EnvOverridable {
         this.exposedValidateParams(p, address(this));
     }
 
+    /// @dev 🟥 **Through `_validateNewDeployment` since round 51, and the trailing assertion is the
+    ///      whole reason the clause moved.** The four sink collisions are rules about the act of
+    ///      MAKING a deployment: they protect the INTERIM sink, the live sink of a live adapter for
+    ///      the span between the adapter's constructor and `_wire`'s last call, and a deployment
+    ///      that already exists has no interim sink. Asking them of one refused the Phase-4
+    ///      switchover over a value the chain had already fixed, which is round 38's deadlock one
+    ///      variable over. `_validateParams` therefore accepts these same parameters now, and that
+    ///      acceptance is asserted rather than left implied.
     function test_validateRejectsTreasuryEqualToDeployer() public {
         vm.chainId(8453);
         GovParams memory p = _params();
@@ -2113,16 +2248,56 @@ contract DeployTest is Test, EnvOverridable {
         vm.expectRevert(
             abi.encodeWithSelector(DeployBase.YieldRecipientCollision.selector, address(this), "deployer")
         );
+        this.exposedValidateNewDeployment(p, address(this));
+
         this.exposedValidateParams(p, address(this));
     }
 
+    /// @dev Same move, same pair; see the note on the deployer arm above.
     function test_validateRejectsTreasuryEqualToOwner() public {
         vm.chainId(8453);
         GovParams memory p = _params();
         p.yieldRecipient = owner;
 
         vm.expectRevert(abi.encodeWithSelector(DeployBase.YieldRecipientCollision.selector, owner, "owner"));
+        this.exposedValidateNewDeployment(p, address(this));
+
         this.exposedValidateParams(p, address(this));
+    }
+
+    /// @notice The permanent sink is held to the same rule as the interim one.
+    /// @dev Round-49 finding, two audit agents converging on it. The two sinks were checked
+    ///      asymmetrically: `yieldRecipient`, which `_wire`'s last line repoints to the harvester
+    ///      and is therefore only the INTERIM sink, was refused at both collisions by name, while
+    ///      `protocolFeeWallet`, the sink the harvester pays the protocol fee to for the life of
+    ///      the deployment, accepted both. RED before the pair, MEASURED at `73b474a`: both arms
+    ///      `next call did not revert as expected`, and the agents' own shape deployed the whole
+    ///      nine-contract set with `harvester.protocolFeeWallet()` reading the deployer and then
+    ///      the owner.
+    /// @dev Through `_validateNewDeployment` since round 51; see the note two tests up. The deploy
+    ///      path arm below is unchanged and is what actually holds the rule where it is meant to
+    ///      bite - `_deployProtocol` calls `_validateNewDeployment` and always did.
+    function test_validateRejectsProtocolFeeWalletEqualToDeployerOrOwner() public {
+        vm.chainId(8453);
+        GovParams memory p = _params();
+        p.protocolFeeWallet = address(this);
+        vm.expectRevert(
+            abi.encodeWithSelector(DeployBase.ProtocolFeeWalletCollision.selector, address(this), "deployer")
+        );
+        this.exposedValidateNewDeployment(p, address(this));
+
+        p = _params();
+        p.protocolFeeWallet = owner;
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.ProtocolFeeWalletCollision.selector, owner, "owner"));
+        this.exposedValidateNewDeployment(p, address(this));
+
+        // And the address rules alone accept the same parameters, which is what lets a live
+        // deployment whose harvester already pays its own owner be switched over at all.
+        this.exposedValidateParams(p, address(this));
+
+        // And through the deploy path, before the first creation.
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.ProtocolFeeWalletCollision.selector, owner, "owner"));
+        this.exposedDeployProtocol(_externals(), p, address(this));
     }
 
     /// @notice **Round 29's open finding 1: the deployment that reports itself healthy with no
@@ -2354,6 +2529,11 @@ contract DeployTest is Test, EnvOverridable {
     ///      it also pins the ORDER: the custody check is the last thing that runs before the
     ///      script starts resolving operators. Nothing is deployed, because the resolution reverts
     ///      one statement before the `Externals` struct that names the live Base addresses.
+    ///
+    ///      The variable is `RECOUP_CUSTODY_MODE`, not `RECOUP_CUSTODY_ADAPTER`. Audit round 47
+    ///      item 84: the latter is the *address* `WirePhase4.s.sol` reads, and the two scripts are
+    ///      consecutive runbook steps, so one name could not serve both. This is the string side
+    ///      and it moved; the address side did not, because that is the one an operator types.
     function test_mainnet_requiresTheCustodyDecisionToBeRecorded() public {
         DeployMainnetHarness script = new DeployMainnetHarness();
         vm.chainId(script.baseChainId());
@@ -2362,11 +2542,11 @@ contract DeployTest is Test, EnvOverridable {
         vm.expectRevert(DeployMainnet.CustodyDecisionUnrecorded.selector);
         script.run();
 
-        script.setEnvString("RECOUP_CUSTODY_ADAPTER", "safe");
+        script.setEnvString("RECOUP_CUSTODY_MODE", "safe");
         vm.expectRevert(DeployMainnet.CustodyDecisionUnrecorded.selector);
         script.run();
 
-        script.setEnvString("RECOUP_CUSTODY_ADAPTER", "direct");
+        script.setEnvString("RECOUP_CUSTODY_MODE", "direct");
         vm.expectRevert(DeployBase.OwnerRequired.selector);
         script.run();
     }
@@ -2574,6 +2754,46 @@ contract DeployTest is Test, EnvOverridable {
         vm.clearMockedCalls();
     }
 
+    // ── the settlement token's decimals ──────────────────────────────────────
+
+    /// @notice `_deployProtocol` refuses a USDC whose `decimals()` is not 6, before the first
+    ///         `new`.
+    /// @dev Audit round 47's item 97. `Config.USDC_TO_NAV_SCALE` is `1e2` and its own comment
+    ///      derives it as `10^(NAV_DECIMALS - USDC's 6 dp)`; nothing in the tree ever asked the
+    ///      token whether that 6 is true. **The direction is what makes it a row**: a token with
+    ///      MORE decimals overflows nothing and simply mis-scales every price by the difference,
+    ///      and a token with FEWER decimals does the same the other way. Neither reverts. So the
+    ///      guard is a deploy-time assertion of the constant the whole NAV path is scaled on, and
+    ///      both directions are exercised here because both fail open.
+    ///
+    ///      `vm.mockCall` on the fixture's `MockUSDC`, whose real `decimals()` is 6 - asserted
+    ///      first as the control, so a mock that silently failed to apply cannot read as the
+    ///      guard working. The premise correction beside the row: there is NO `RECOUP_USDC`
+    ///      environment variable anywhere in this repository, so the reachable party is a future
+    ///      edit to `Config.USDC_BASE` or a fork fixture, and the guard constrains the tree rather
+    ///      than an operator.
+    function test_deploy_refusesAUsdcWithEighteenDecimals() public {
+        assertEq(usdc.decimals(), 6, "fixture: the control token is six-decimal");
+        vm.mockCall(address(usdc), abi.encodeWithSignature("decimals()"), abi.encode(uint8(18)));
+        vm.expectRevert(
+            abi.encodeWithSelector(DeployBase.UsdcDecimalsWrong.selector, address(usdc), uint8(18))
+        );
+        this.exposedDeployProtocol(_externals(), _params(), address(this));
+        vm.clearMockedCalls();
+    }
+
+    /// @dev Fewer decimals is the arm the row named as the one that fails open: with two, every
+    ///      six-decimal figure the protocol books is ten thousand times the token it moves.
+    function test_deploy_refusesAUsdcWithTwoDecimals() public {
+        assertEq(usdc.decimals(), 6, "fixture: the control token is six-decimal");
+        vm.mockCall(address(usdc), abi.encodeWithSignature("decimals()"), abi.encode(uint8(2)));
+        vm.expectRevert(
+            abi.encodeWithSelector(DeployBase.UsdcDecimalsWrong.selector, address(usdc), uint8(2))
+        );
+        this.exposedDeployProtocol(_externals(), _params(), address(this));
+        vm.clearMockedCalls();
+    }
+
     // ── the mint-receiver implementation graph ───────────────────────────────
 
     /// @notice The five `mintReceiverImplementation` post-conditions PR #339 added to
@@ -2648,6 +2868,41 @@ contract DeployTest is Test, EnvOverridable {
         (Deployed memory d, GovParams memory p, address impl) = _mintReceiverGraph();
         vm.mockCall(impl, abi.encodeWithSignature("usdc()"), abi.encode(makeAddr("otherUsdc")));
         vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "mintReceiver.usdc"));
+        this.exposedAssertWiring(d, p);
+    }
+
+    // ── the adapter's farm ───────────────────────────────────────────────────
+
+    /// @notice `adapter.farm` is anchored to the bond's own `rewardPool()`.
+    /// @dev Round-47 item 96, which is round-46 item 19's hand-listed pointer set showing its
+    ///      shape: the list checks what somebody remembered to add, and nobody had added the farm.
+    ///      `mintReceiver.farm` above was asserted against `d.adapter.farm()`, so the two agreed
+    ///      with each other and with nothing on chain - an adapter built on the wrong farm passed
+    ///      the whole census.
+    ///
+    ///      The anchor is chain-derived rather than a parameter: the real bond's `rewardPool()` IS
+    ///      `Config.DEXFI_FARM` (asserted live in `test/fork/CollateralVault.fork.t.sol` and
+    ///      `test/fork/DexFiMintAttempt.fork.t.sol`), and every mock fixture that reaches
+    ///      `_assertCoreGraph` calls `bond.setRewardPool(farm)` first. Same `vm.mockCall` idiom as
+    ///      the mint-receiver block, same unmocked control through `_mintReceiverGraph`, same
+    ///      fully encoded payload so a pass names the clause.
+    function test_assertWiring_catchesAnAdapterBuiltOnAnotherFarm() public {
+        (Deployed memory d, GovParams memory p,) = _mintReceiverGraph();
+        vm.mockCall(address(d.adapter), abi.encodeWithSignature("farm()"), abi.encode(makeAddr("otherFarm")));
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "adapter.farm"));
+        this.exposedAssertWiring(d, p);
+    }
+
+    /// @dev The live direction, and the consequence the guard carries: DexFi replacing the bond's
+    ///      reward pool makes `WirePhase4.assertOnly()` refuse until the adapter is redeployed
+    ///      against the new one. That is correct - an adapter staking into a pool the bond no
+    ///      longer pays is the state the census exists to name - and this is the test that says
+    ///      so rather than leaving it to be discovered by the health report going red.
+    function test_assertWiring_catchesABondWhoseRewardPoolIsNoLongerTheAdaptersFarm() public {
+        (Deployed memory d, GovParams memory p,) = _mintReceiverGraph();
+        assertEq(bond.rewardPool(), address(d.adapter.farm()), "fixture: anchored to start");
+        bond.setRewardPool(makeAddr("replacementRewardPool"));
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.WiringIncomplete.selector, "adapter.farm"));
         this.exposedAssertWiring(d, p);
     }
 

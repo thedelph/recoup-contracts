@@ -18,6 +18,7 @@ import {ICollateralVault} from "../src/interfaces/ICollateralVault.sol";
 import {ICreditManager} from "../src/interfaces/ICreditManager.sol";
 import {ICustodyAdapter} from "../src/interfaces/ICustodyAdapter.sol";
 import {IEpochHarvester} from "../src/interfaces/IEpochHarvester.sol";
+import {ILenderPool} from "../src/interfaces/ILenderPool.sol";
 import {IDexFiBond} from "../src/interfaces/IDexFiBond.sol";
 import {IDexFiFarm} from "../src/interfaces/IDexFiFarm.sol";
 import {INAVOracle} from "../src/interfaces/INAVOracle.sol";
@@ -822,6 +823,67 @@ contract EpochHarvesterTest is RiskParamsFixture {
         fresh.harvest();
     }
 
+    /// @notice **`harvest` runs with no protocol fee wallet set, and the fee is recoverable in
+    ///         full afterwards.** Audit round 47, item 85.
+    /// @dev `harvest` used to open with `if (protocolFeeWallet == address(0)) revert
+    ///      NotWired("protocolFeeWallet");` beside the `custodyAdapter` check above, and that
+    ///      line bought nothing while costing the property this contract's header claims:
+    ///      `harvest` never pays the fee wallet, it accrues into `pendingProtocolFee`, and the
+    ///      one leg that does pay - `flushProtocolFee` - carries the identical check itself. So
+    ///      the pointer was already guarded where a missing pointer can do harm, and guarding it
+    ///      here as well let the fee wallet hold the permissionless epoch shut for borrowers,
+    ///      lenders and insurance too.
+    ///
+    ///      **Nothing in the suite asserted that revert.** The round-46 record said at least one
+    ///      test did; deleting the line turned NOTHING red across 75 suites and 1,308 tests, so
+    ///      the guard was never exercised. That is the reason this test exists rather than a
+    ///      fixture literal being updated: the behaviour it removes had no coverage in either
+    ///      direction, and a deletion with no test is indistinguishable from a deletion with no
+    ///      effect. Neutered by restoring the line - this test then reverts `NotWired`.
+    ///
+    ///      The second half is the part that makes the deletion safe rather than merely
+    ///      convenient. An epoch run with no fee wallet does not lose the fee: it sits in
+    ///      `pendingProtocolFee`, a later `setProtocolFeeWallet` sees `outgoing == address(0)` and
+    ///      therefore parks nothing, and the permissionless `flushProtocolFee` pays the live
+    ///      counter in full. Both counters are asserted so a future park-on-first-set would fail
+    ///      here rather than strand the money behind `flushProtocolFeeTo(address(0))`.
+    function test_harvest_runsWithNoProtocolFeeWalletAndTheFeeIsRecoverable() public {
+        EpochHarvester unwired = new EpochHarvester(usdc, ICreditManager(address(credit)), admin);
+        vm.startPrank(admin);
+        unwired.setCustodyAdapter(ICustodyAdapter(address(adapter)));
+        // Both adapter pointers, and they are genuinely two things: `harvester` is who may
+        // CALL `claimYield`, `yieldRecipient` is where `_trySweepUsdc` SENDS the money. Setting
+        // only the first left the sweep going to the fixture's harvester, so the fresh one saw
+        // an empty balance and emitted `ZeroYieldEpoch` - which is what this assertion caught.
+        adapter.setHarvester(address(unwired));
+        adapter.setYieldRecipient(address(unwired));
+        credit.setEpochHarvester(address(unwired));
+        vm.stopPrank();
+        assertEq(unwired.protocolFeeWallet(), address(0), "premise: no fee wallet is wired");
+
+        farm.setPendingYield(address(adapter), YIELD);
+        vm.prank(caller); // permissionless, and by a stranger on purpose
+        unwired.harvest();
+
+        uint256 toBorrowers = (YIELD * Config.SPLIT_BORROWER_BPS) / Config.BPS;
+        uint256 toLenders = (YIELD * Config.SPLIT_LENDER_BPS) / Config.BPS;
+        uint256 toInsurance = (YIELD * Config.SPLIT_INSURANCE_BPS) / Config.BPS;
+        uint256 toProtocol = YIELD - toBorrowers - toLenders - toInsurance;
+
+        assertEq(unwired.epochCount(), 1, "the epoch ran with no fee wallet set");
+        assertEq(unwired.pendingLenderYield(), toLenders, "the lender share still accrued");
+        assertEq(unwired.pendingProtocolFee(), toProtocol, "the fee accrued rather than being lost");
+
+        vm.prank(admin);
+        unwired.setProtocolFeeWallet(feeWallet);
+        assertEq(unwired.totalOwedProtocolFee(), 0, "nothing was parked against address(0)");
+
+        vm.prank(makeAddr("anybody"));
+        unwired.flushProtocolFee();
+        assertEq(usdc.balanceOf(feeWallet), toProtocol, "the fee was paid in full afterwards");
+        assertEq(unwired.pendingProtocolFee(), 0, "and the counter is clear");
+    }
+
     // ── the lender share ─────────────────────────────────────────────────────
 
     /// @dev The pool cannot accept yield until Phase 4, so the share accrues rather
@@ -1053,10 +1115,101 @@ contract EpochHarvesterTest is RiskParamsFixture {
     }
 
     function test_flushLenderYield_revertsWithNothingPending() public {
+        // A coded pool with `distributeYield`, since round 48: `setLenderPool` now refuses a
+        // codeless address, and a `makeAddr` stood here. Deployed on its own line, because a
+        // `new` inside the pranked call is the CREATE that consumes the prank.
+        address pool = address(new AcceptingPool(usdc));
         vm.prank(admin);
-        harvester.setLenderPool(makeAddr("pool"));
+        harvester.setLenderPool(pool);
         vm.expectRevert(EpochHarvester.NothingToFlush.selector);
         harvester.flushLenderYield();
+    }
+
+    // ── the completeness probe (audit round 48, finding 83) ───────────────
+
+    /// @dev A `void` call to a codeless address succeeds silently, so the probe below would pass
+    ///      an EOA if this clause were not in front of it. RED before the probe: the setter took
+    ///      the `makeAddr` that used to stand in the test above.
+    function test_setLenderPool_refusesACodelessAddress() public {
+        address nobody = makeAddr("nobody");
+        vm.prank(admin);
+        vm.expectRevert(EpochHarvester.LenderPoolIncomplete.selector);
+        harvester.setLenderPool(nobody);
+        assertEq(harvester.lenderPool(), address(0), "the pointer must not have moved");
+    }
+
+    /// @dev Round-49 finding, from the harvester campaign. The credit manager is the one other
+    ///      contract answering `distributeYield(uint256)`, and there the probe is STATE-CHANGING:
+    ///      it re-rates the whole borrower stream (`lastDistributeAt`, `streamEndsAt`, `yieldRate`
+    ///      all move) on a setter that documents itself as moving nothing, every flush into it then
+    ///      reverts `FlushDeliveredNothing`, and the repoint away parks the lender share against
+    ///      the manager forever. RED before the clause, MEASURED at `73b474a`: `next call did not
+    ///      revert as expected` - the manager was accepted as the pool and `lastDistributeAt` had
+    ///      moved to `block.timestamp`.
+    function test_setLenderPool_refusesTheCreditManagerBeforeTheProbe() public {
+        // A live stream: one funded epoch, three days in.
+        farm.setPendingYield(address(adapter), YIELD);
+        harvester.harvest();
+        assertGt(credit.undistributedYield(), 0, "premise: a pot is streaming");
+        skip(3 days);
+        uint256 ldBefore = credit.lastDistributeAt();
+        uint256 endBefore = credit.streamEndsAt();
+        uint256 rateBefore = credit.yieldRate();
+
+        vm.prank(admin);
+        vm.expectRevert(EpochHarvester.LenderPoolIncomplete.selector);
+        harvester.setLenderPool(address(credit));
+
+        assertEq(harvester.lenderPool(), address(0), "the pointer must not have moved");
+        assertEq(credit.lastDistributeAt(), ldBefore, "and the borrower stream was not re-rated");
+        assertEq(credit.streamEndsAt(), endBefore, "its end did not move");
+        assertEq(credit.yieldRate(), rateBefore, "nor its rate");
+    }
+
+    /// @dev Control: a real `LenderPool` NOT yet pointed at this harvester is accepted. The probe
+    ///      calls `distributeYield(0)` and the real pool refuses it by NAME - `NotEpochHarvester`,
+    ///      four bytes - which is precisely the answer the probe wants: the selector exists. This
+    ///      is the wiring order the deploy script uses, so it must not be refused.
+    function test_setLenderPool_acceptsARealPoolNotYetPointedHere() public {
+        LenderPool pool = new LenderPool(IERC20(address(usdc)), admin);
+        assertTrue(pool.epochHarvester() != address(harvester), "premise: the pool does not know this harvester");
+        vm.prank(admin);
+        harvester.setLenderPool(address(pool));
+        assertEq(harvester.lenderPool(), address(pool), "a real pool is accepted before it points back");
+        assertEq(usdc.allowance(address(harvester), address(pool)), 0, "the probe left an allowance");
+    }
+
+    /// @dev Control: against a pool that ALREADY points here, the probe's `distributeYield(0)`
+    ///      is refused `ZeroAmount` before the pool touches anything - `nonReentrant`, then the
+    ///      sender check, then the zero check, read off the frozen `LenderPool.sol` - so the probe
+    ///      moves no money, leaves no allowance and emits no `YieldDistributed`. `vm.recordLogs`
+    ///      is what makes the last of those a measurement rather than a reading.
+    function test_setLenderPool_probeMovesNoMoneyAndEmitsNoDistribution() public {
+        LenderPool pool = new LenderPool(IERC20(address(usdc)), admin);
+        vm.prank(admin);
+        pool.setEpochHarvester(address(harvester));
+        // Something in the harvester's balance, so "moved no money" is not vacuous.
+        usdc.mint(address(harvester), YIELD);
+        uint256 harvesterBefore = usdc.balanceOf(address(harvester));
+        uint256 poolBefore = usdc.balanceOf(address(pool));
+
+        vm.recordLogs();
+        vm.prank(admin);
+        harvester.setLenderPool(address(pool));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(harvester.lenderPool(), address(pool));
+        assertEq(usdc.balanceOf(address(harvester)), harvesterBefore, "the probe moved money out");
+        assertEq(usdc.balanceOf(address(pool)), poolBefore, "the probe moved money in");
+        assertEq(usdc.allowance(address(harvester), address(pool)), 0, "the probe left an allowance");
+        bytes32 distributed = ILenderPool.YieldDistributed.selector;
+        uint256 fromPool;
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != distributed, "the probe distributed something");
+            if (logs[i].emitter == address(pool)) fromPool++;
+        }
+        assertEq(fromPool, 0, "the pool emitted nothing at all during the probe");
+        assertGt(logs.length, 0, "the setter's own LenderPoolSet was recorded, so the log capture is not vacuous");
     }
 
     // ── solvency ─────────────────────────────────────────────────────────────

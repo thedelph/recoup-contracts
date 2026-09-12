@@ -26,6 +26,40 @@ import {NAVOracle} from "../src/NAVOracle.sol";
 ///      non-view `invariant_` writes, so a mirror kept on the invariant contract silently degrades
 ///      to its `setUp` value. Anything of the form "compare against what I saw last time" is
 ///      therefore recorded inside the handler call that saw it.
+///
+///      **Audit round 47 added `staleClearedByANewPrice`, the recovery ghost, and here is what it
+///      is worth as a number.** Four neuters, all at the `foundry.toml` defaults of 256 runs x 500
+///      depth and **UNSEEDED** - `foundry.toml` pins no seed and CI runs a bare `forge test` - each
+///      run with `FOUNDRY_PROFILE=neuter forge test --force`:
+///
+///      | | the one changed thing | result |
+///      |---|---|---|
+///      | baseline | nothing | **0 of 14 fail**, walk reach **170** |
+///      | N5 | the ghost's own increment in `_observeCommon`, deleted | **1 of 14 fail**: `the feed never came back from stale: 0 <= 0` |
+///      | N6c | the ghost's INPUT blinded - `_snap()`'s `stale` field pinned `false` | **1 of 14 fail**: the same assertion, from a different site |
+///      | N6 | `NAVOracle._accept`: `lastUpdated = block.timestamp` deleted outright | **2 of 14 fail** |
+///      | N6b | the same write allowed only while the feed is not ALREADY stale, so it goes stale once and can never come back | **2 of 14 fail** |
+///
+///      Gas moved on every one, which is the tell that the change reached the run rather than a
+///      stale artifact answering for it: the tripwire passes at 198,963,569 and fails at
+///      199,872,655 (N5), 202,981,196 (N6c), 197,590,206 (N6) and 198,944,702 (N6b).
+///
+///      **N6 and N6b are the interesting pair, and not for the reason they were run.** Both are
+///      src-side and both turn this file red, but in both the tripwire aborts on the PRE-EXISTING
+///      `assertGt(wentStale(), 0)` rather than on the new assertion - because removing the recovery
+///      leaves the feed exactly ONE stale transition instead of about 170, and `wentStale` can only
+///      see a transition that a `wait_` happens to straddle, the other three actions warping before
+///      they snap. One transition, and one action in five being a `wait_`: whether the pre-existing
+///      ghost is reached at all becomes a coin flip. **So `wentStale > 0` was never evidence that
+///      the feed goes stale. It was evidence that the feed goes stale REPEATEDLY, which is a
+///      property of the very recovery nobody was counting.** N5 and N6c are the attributing
+///      neuters for exactly that reason: they leave the repetition intact.
+///
+///      **And N6c is the argument for the ghost, executed rather than asserted.** With `s.stale`
+///      pinned false, `invariant_stalenessOnlyClearsOnARealPriceChange` - the violation counter
+///      that has stood here since round 25 - **passes**, because a counter asserted equal to zero
+///      is most easily satisfied by never reaching the transition it counts. The only assertion in
+///      the repository that notices is the new one.
 contract NavOracleHandler is Test {
     NAVOracle public immutable oracle;
 
@@ -80,6 +114,29 @@ contract NavOracleHandler is Test {
     uint256 public cancels;
     uint256 public postsRefused;
     uint256 public wentStale;
+    /// @notice The recovery: calls after which `isStale()` went true -> false **because a new
+    ///         price landed**. The legal half of the transition `staleClearedWithoutAChange`
+    ///         counts the illegal half of.
+    /// @dev **Audit round 46 finding 08, added in round 47, and the gap it closes is a shape rather
+    ///      than a number.** This campaign had a ghost for going stale and a violation counter for
+    ///      clearing wrongly, and nothing at all for clearing rightly - so the one transition that
+    ///      restores a paused `borrow` was reached and counted by nobody. **MEASURED at `6a52129`:
+    ///      170 times in the 3,000-call walk below. Round 46 filed 150 - the walk is deterministic,
+    ///      so neither figure is a sample and one of them is simply wrong; re-derive it from the
+    ///      `-vv` log line the test emits rather than quoting either.** That is coverage by luck:
+    ///      the walk is reproducible, but nothing in the file would have noticed the day it stopped
+    ///      happening, and `invariant_stalenessOnlyClearsOnARealPriceChange` would have gone on
+    ///      passing over an empty set. **`assertEq(violations, 0)` is satisfied most easily by never reaching
+    ///      the transition at all**, which is why a violation counter needs a coverage ghost beside
+    ///      it and not instead of it.
+    ///
+    ///      The pair partitions every stale -> fresh transition, and that is what makes it a
+    ///      partition rather than two counters that happen to sit together: `isStale()` is
+    ///      `lastUpdated == 0 || now > lastUpdated + NAV_STALENESS`, so clearing it requires
+    ///      `lastUpdated` to advance, and `_accept` advances `lastUpdated` only on a price that
+    ///      actually changed. Every clearing therefore lands in exactly one of the two, and their
+    ///      sum is the whole transition count.
+    uint256 public staleClearedByANewPrice;
 
     uint256 private constant BOOTSTRAP = 25.15e8; // USD 8dp, the real 2026-07-24 snapshot
 
@@ -261,6 +318,7 @@ contract NavOracleHandler is Test {
 
         bool staleNow = oracle.isStale();
         if (s.stale && !staleNow && navNow == s.navPerBond) staleClearedWithoutAChange++;
+        if (s.stale && !staleNow && navNow != s.navPerBond) staleClearedByANewPrice++;
         if (!s.stale && staleNow) wentStale++;
     }
 
@@ -398,6 +456,48 @@ contract NAVOracleInvariants is StdInvariant, Test {
         assertGt(handler.cancels(), 0, "nothing was ever cancelled");
         assertGt(handler.postsRefused(), 0, "no post was ever refused");
         assertGt(handler.wentStale(), 0, "the feed never went stale");
+        assertGt(handler.staleClearedByANewPrice(), 0, "the feed never came back from stale");
+
+        // ── and the recovery DRIVEN, not hoped for ───────────────────────────
+        //
+        // **Audit round 46 finding 08 called the transition above "reached 150 of 3,000 times by
+        // luck", and the assertion one line up does not fix that on its own.** The walk is a
+        // keccak chain, so it is deterministic and the 150 is reproducible - but it is an accident
+        // of the chain rather than a thing the test does, and a `_warp` bound or a `_drawNav`
+        // weighting edited two years from now could take it to zero while every assertion here
+        // stayed green. So the transition is also constructed: stale the feed on purpose, post a
+        // real price, and require the ghost to move by **exactly one**. The two assertions are
+        // different claims - the first says the campaign's own walk reaches the recovery, the
+        // second says the file can reach it whatever the walk does - and neither implies the other.
+        uint256 clearedBefore = handler.staleClearedByANewPrice();
+        // Printed rather than described, because "150 of 3,000" is the figure round 46 filed and a
+        // figure in prose is one edit to `_warp` or `_drawNav` away from being wrong with nothing
+        // to say so. Read it off a `-vv` run.
+        emit log_named_uint("MEASURED staleClearedByANewPrice over the 3,000-call walk", clearedBefore);
+
+        // Any live pending is cancelled first, so the post below cannot be diverted into parking
+        // one. `_warp(0)` is a no-op: the seed is `% 8 == 0`, which is the zero-seconds branch.
+        handler.cancel(0, true);
+
+        // `_warp` caps a single wait at just under three days and `NAV_STALENESS` is eight, which
+        // is deliberate - one lucky jump must not be able to do all the work. Four of them is
+        // 11.99 days. The seed is `% 8 == 7`, so it takes the non-zero branch.
+        for (uint256 i; i < 4; ++i) {
+            handler.wait_(3 days - 1);
+        }
+        assertTrue(oracle.isStale(), "premise: the feed has to be stale before it can recover");
+
+        // Seed 6,400 is `_drawNav` kind 0 at 10,100 bps - a real change of +1%, well inside
+        // `NAV_MAX_DEVIATION_BPS` and further inside a budget prorated over twelve days, so it is
+        // accepted rather than parked. Asserted on the oracle as well as on the ghost, so a ghost
+        // that had come loose from the mechanism could not answer for it.
+        handler.post(6_400, 0);
+        assertFalse(oracle.isStale(), "an accepted price must clear staleness");
+        assertEq(
+            handler.staleClearedByANewPrice() - clearedBefore,
+            1,
+            "the recovery must be reachable by construction and not only by luck"
+        );
     }
     // -- the frame guard ------------------------------------------------------
 

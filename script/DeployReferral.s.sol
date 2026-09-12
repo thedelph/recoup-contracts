@@ -109,9 +109,14 @@ contract DeployReferralRegistry is Script {
         // Public-chain deployment is disabled, not merely awaiting an operator confirmation. A
         // stray command and the previously documented confirmation phrase must both fail off anvil.
         // Local chain-id 31337 runs need no ceremony so tests and local rehearsals can construct it.
+        //
+        // Round 54 (round-54 item 200): `run()` CALLS `validateBroadcastApproval` rather than
+        // restating its two lines, so the pure function the regression suite pins IS the path a
+        // broadcast takes. Before this, `validateBroadcastApproval` was dead code and
+        // `test_deploy_legacyConfirmationCannotBypassLiveDeploymentDisable` pinned a duplicate;
+        // MEASURED, deleting the gate line from `run()` alone left that test green.
         if (block.chainid != ANVIL_CHAIN_ID) {
-            _requireLiveDeploymentEnabled();
-            if (!isConfirmed(vm.envOr("RECOUP_REFERRAL_CONFIRM", string("")))) revert ConfirmationMissing();
+            validateBroadcastApproval(_envOrString("RECOUP_REFERRAL_CONFIRM", ""));
         }
 
         bytes32[] memory reserved = _reservedCodes();
@@ -139,5 +144,20 @@ contract DeployReferralRegistry is Script {
 
     function _requireLiveDeploymentEnabled() internal pure {
         if (!LIVE_DEPLOYMENT_ENABLED) revert LiveDeploymentDisabled();
+    }
+
+    /// @dev Round 55 (round-55 item 246, sublead j). The phrase read through a seam, the
+    ///      `DeployBase._envOrString` precedent, so a harness can put the exact phrase in front of
+    ///      `run()` WITHOUT `vm.setEnv` - the writer the repository's environment census refuses,
+    ///      and whose process-global leak masked a gate reorder in round 54's own measurement.
+    ///      This is the only environment read in the file; a real run reads the real environment
+    ///      here, and that residual is the same one `DeployBase` records for its own seam.
+    function _envOrString(string memory key, string memory fallbackValue)
+        internal
+        view
+        virtual
+        returns (string memory)
+    {
+        return vm.envOr(key, fallbackValue);
     }
 }

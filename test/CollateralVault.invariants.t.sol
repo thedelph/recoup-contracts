@@ -100,6 +100,64 @@ contract VaultHandler is Test {
     uint256 public seizesDone;
     uint256 public reassignsDone;
 
+    /// @dev The in-handler property record. Two fields, so a failure carries its own message
+    ///      rather than only a count.
+    ///
+    ///      **Why these are recorded and not asserted, MEASURED 2026-09-09 on forge 1.8.1. The
+    ///      rule is ASYMMETRIC and must not be restated in either blanket form.** A
+    ///      THREE-argument forge-std assertion inside a handler reverts with the assertion's own
+    ///      message, is indistinguishable from an ordinary business revert, and under the global
+    ///      `fail_on_revert = false` is DISCARDED SILENTLY. A TWO-argument one reverts with a
+    ///      string beginning "assertion failed", which forge 1.8.1 picks out of the discarded
+    ///      frame and reports as `failure_type: "handler_assertion"`, naming the handler and the
+    ///      selector. 🟥 **A MESSAGE IS SUFFICIENT to make an in-handler assertion invisible; ITS
+    ///      ABSENCE IS NOT SUFFICIENT to guarantee reporting** - a message-less `assertEq` inside
+    ///      `RegistryHandler.register`'s catch block went unreported at
+    ///      `(runs: 256, calls: 128000, reverts: 62346)`, and THAT READING IS UNEXPLAINED.
+    ///      Position, and possibly the campaign, is a third variable nobody has isolated.
+    ///      `CreditHandler.firstBrokenProperty` in `CreditManager.invariants.t.sol` carries the
+    ///      fullest statement of the same rule.
+    ///
+    ///      **All nine assertions that used to stand in the five actions below carried a message**,
+    ///      which is the sufficient condition, so every one of them could have failed invisibly
+    ///      for as long as this suite existed while rolling back the frame that tripped it and
+    ///      silently truncating the state space.
+    ///
+    ///      🟥 **The evidence this paragraph used to quote was the OTHER variant and is corrected
+    ///      here rather than deleted.** It read: planting `assertEq(uint256(1), uint256(2))` at
+    ///      the top of a handler action in `RiskParams.invariants.t.sol`, observed through one
+    ///      invariant that is NOT the frame guard, gave
+    ///      `[PASS] (runs: 256, calls: 128000, reverts: 128000)`. Re-run under control at that
+    ///      site with one argument changed and nothing else, both `--force`: the message-LESS form
+    ///      quoted there goes RED as `failure_type: "handler_assertion"`, and it is
+    ///      `assertEq(uint256(1), uint256(2), "planted with a message")` that reproduces the
+    ///      quoted figure verbatim. The conclusion stood; the evidence beside it named the wrong
+    ///      variant.
+    ///
+    ///      Three repairs exist and this is the third. `assert(cond)` raises Panic(0x01), which
+    ///      forge 1.8.1 DOES report as a `handler_assertion` failure naming this contract and the
+    ///      offending selector - measured, suite red - but it discards the frame and carries no
+    ///      message. `assertions_revert = false` makes the whole `vm.assert*` family report -
+    ///      measured, suite red - but it is a whole-suite semantic change across every test in the
+    ///      tree and is not this file's to take. Recording keeps the message, keeps the frame, and
+    ///      is the idiom `RiskParams.invariants.t.sol::propose` already documents in prose:
+    ///      "Counting it and asserting the count from the suite has neither problem."
+    ///
+    ///      **The one hole, and why it is already covered.** A record written here is lost if the
+    ///      SAME frame reverts later for an unrelated reason. That case is exactly a dropped frame,
+    ///      and `invariant_theHandlerNeverDropsAFrame` is red on the first one - so the two guards
+    ///      compose and neither has to be trusted alone.
+    string public firstBrokenProperty;
+    uint256 public brokenProperties;
+
+    /// @dev Records rather than reverts. See `firstBrokenProperty`. The FIRST message is kept
+    ///      because it is the one with a live counterexample behind it; later ones only add noise.
+    function _mustHold(bool ok, string memory what) private {
+        if (ok) return;
+        if (brokenProperties == 0) firstBrokenProperty = what;
+        ++brokenProperties;
+    }
+
     constructor(
         CollateralVault vault_,
         DirectCallAdapter adapter_,
@@ -168,7 +226,7 @@ contract VaultHandler is Test {
             ghostTotalBondCount += amount;
             ++depositsDone;
         } catch (bytes memory err) {
-            assertEq(bytes4(err), CollateralVault.BondDepositsArePaused.selector, "unexpected depositBonds revert");
+            _mustHold(bytes4(err) == CollateralVault.BondDepositsArePaused.selector, "unexpected depositBonds revert");
             ++depositsRefusedByTheirOwnSwitch;
         }
     }
@@ -230,7 +288,7 @@ contract VaultHandler is Test {
             ghostMintedByEth += units;
             ++ethDepositsDone;
         } catch (bytes memory err) {
-            assertEq(bytes4(err), Pausable.EnforcedPause.selector, "unexpected depositETH revert");
+            _mustHold(bytes4(err) == Pausable.EnforcedPause.selector, "unexpected depositETH revert");
             ++ethDepositsRefusedByThePause;
         }
     }
@@ -309,9 +367,8 @@ contract VaultHandler is Test {
             // Typed rather than swallowed: the LTV refusal is the behaviour under test
             // and needs counting, and anything else reaching here is a fixture fault
             // that a bare `catch {}` would hide for as long as the suite exists.
-            assertEq(
-                bytes4(err),
-                CollateralVault.WithdrawalExceedsMaxLtv.selector,
+            _mustHold(
+                bytes4(err) == CollateralVault.WithdrawalExceedsMaxLtv.selector,
                 "unexpected withdrawBonds revert"
             );
             ++withdrawsRefusedByLtv;
@@ -379,13 +436,13 @@ contract VaultHandler is Test {
 
         vm.prank(auction);
         try vault.seize(a, winner) returns (uint256 got) {
-            assertTrue(liquidatable || held == 0, "seized a position that was not liquidatable");
-            assertEq(got, held, "seize must move the whole position");
+            _mustHold(liquidatable || held == 0, "seized a position that was not liquidatable");
+            _mustHold(got == held, "seize must move the whole position");
             ghostTotalBondCount -= held;
             ghostSeizedToWinners += held;
             if (held != 0) ++seizesDone;
         } catch {
-            assertFalse(liquidatable && held != 0, "refused a genuinely liquidatable position");
+            _mustHold(!(liquidatable && held != 0), "refused a genuinely liquidatable position");
         }
     }
 
@@ -399,11 +456,11 @@ contract VaultHandler is Test {
 
         vm.prank(auction);
         try vault.reassign(a, auction) returns (uint256 moved) {
-            assertTrue(liquidatable || held == 0, "reassigned a position that was not liquidatable");
-            assertEq(moved, held, "reassign must move the whole claim");
+            _mustHold(liquidatable || held == 0, "reassigned a position that was not liquidatable");
+            _mustHold(moved == held, "reassign must move the whole claim");
             if (held != 0) ++reassignsDone;
         } catch {
-            assertFalse(liquidatable && held != 0, "refused a genuinely liquidatable position");
+            _mustHold(!(liquidatable && held != 0), "refused a genuinely liquidatable position");
         }
     }
 
@@ -518,6 +575,24 @@ contract CollateralVaultInvariants is RiskParamsFixture {
     ///      invariant here and is what lets the `try`/`catch` idiom work at all.
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
+
+    /// @notice Every property the five handler actions check held on every frame that ran.
+    /// @dev **This invariant is the whole reason those nine checks are worth anything.** They used
+    ///      to be forge-std assertions inside the handler, which revert - and under
+    ///      `fail_on_revert = false` a reverting handler call is DISCARDED, so each of them could
+    ///      have been failing since the day it was written and this suite would have reported four
+    ///      green invariants over the top of it. **All nine carried a MESSAGE, which is the
+    ///      sufficient condition for that suppression; the rule is asymmetric rather than blanket
+    ///      and `VaultHandler.firstBrokenProperty` states it in full**, with the measurement and
+    ///      the two rejected repairs.
+    ///
+    ///      Asserted from the suite rather than in the handler, which is the only place the check
+    ///      both survives the frame and can carry its message. The message IS the original
+    ///      assertion's message, moved rather than rewritten, so a failure here reads exactly as
+    ///      the in-handler assertion would have.
+    function invariant_everyInHandlerPropertyHeld() public view {
+        assertEq(handler.brokenProperties(), 0, handler.firstBrokenProperty());
+    }
 
     function invariant_accountingMatchesFarmStake() public view {
         (uint256 staked,) = farm.userInfo(address(adapter));

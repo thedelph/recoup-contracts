@@ -27,13 +27,38 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///      filesystem and needs no `fs_permissions` grant. The real run reads the file.
 contract R39AssertLockedHarness is AssertMockStackLocked {
     string private _record;
+    mapping(bytes32 => address) private _addressOverride;
+    mapping(bytes32 => bool) private _addressOverridden;
 
     function setRecord(string memory json) external {
         _record = json;
     }
 
+    /// @dev Same two-argument shape as `EnvOverridable.setEnvAddress` in `Deploy.t.sol`, so a
+    ///      call site reads like the `vm.setEnv` it replaces, and for the same reason: `forge
+    ///      test` contains no `vm.setEnv` and must stay that way.
+    function setEnvAddress(string memory key, address value) external {
+        bytes32 k = keccak256(bytes(key));
+        _addressOverride[k] = value;
+        _addressOverridden[k] = true;
+    }
+
     function _readRecord() internal view override returns (string memory) {
         return _record;
+    }
+
+    /// @dev 🟥 **Defaults to the FALLBACK and never to `super`, which is what makes this harness
+    ///      hermetic and is the one place it differs from `EnvOverridable`.** Round-47 item 95:
+    ///      the entrypoint read `RECOUP_KEEPER` over the record, forge auto-loads `contracts/.env`
+    ///      into every `forge test`, and `.env` on the machine that runs deploys sets that key.
+    ///      MEASURED before this override, with `RECOUP_KEEPER=0x...BEEF` in a `.env` beside the
+    ///      worktree's `foundry.toml`: 4 of this file's 7 tests went red as
+    ///      `MockOperatorNotKeeper("MockUSDC", 0xC0FFEE, 0xBEEF)`, so the harness result was a
+    ///      property of the box. An override that fell through to `super` would still be.
+    function _envOrAddress(string memory key, address fallbackValue) internal view override returns (address) {
+        bytes32 k = keccak256(bytes(key));
+        if (_addressOverridden[k]) return _addressOverride[k];
+        return fallbackValue;
     }
 }
 
@@ -45,12 +70,23 @@ contract R39AssertLockedTest is Test {
     MockFarm internal farm;
 
     address internal constant KEEPER = address(0xC0FFEE);
-    address internal constant VAULT = address(0xFA017);
-    address internal constant ADAPTER = address(0xADA97E);
     address internal constant ROLELESS = address(0xBAD);
+
+    /// @dev 🟥 **These were `address(0xFA017)` and `address(0xADA97E)`, two literals with NO CODE,
+    ///      and round-51 item 150's second lead is that the entrypoint was green over them.** The
+    ///      record's two `contracts.*` rows were parsed and then used only as arguments to
+    ///      `bond.whitelistContains(...)` and `usdc.blocked(...)`, so nothing ever asked whether
+    ///      either address held code - and this fixture, which is the only thing that executes four
+    ///      of the five assertion groups, could not have told the two states apart. They are
+    ///      deployed contracts now. `assertLockedOnChain()` refuses a codeless row by name since
+    ///      round 51, so leaving them as literals would turn this whole suite red.
+    address internal vaultRow;
+    address internal adapterRow;
 
     function setUp() public {
         probe = new R39AssertLockedHarness();
+        vaultRow = address(new NoLockdownSurface());
+        adapterRow = address(new NoLockdownSurface());
 
         // Deployed and locked BY THIS TEST CONTRACT, so `admin`, `lockAuthority` and the record's
         // `deployer` are all `address(this)` - which is what a correct deploy produces.
@@ -63,7 +99,7 @@ contract R39AssertLockedTest is Test {
 
         bond.setRewardPool(address(farm));
         bond.setWhitelisted(address(farm), true);
-        bond.setWhitelisted(ADAPTER, true);
+        bond.setWhitelisted(adapterRow, true);
 
         probe.setRecord(_json());
     }
@@ -72,17 +108,7 @@ contract R39AssertLockedTest is Test {
     ///      `chainId` is 31337 so the entrypoint's first assertion, which refuses a record aimed at
     ///      a different chain, passes rather than short-circuiting everything behind it.
     function _json() internal view returns (string memory) {
-        return string.concat(
-            '{"chainId":31337,',
-            '"deployer":"', vm.toString(address(this)), '",',
-            '"operators":{"keeper":"', vm.toString(KEEPER), '"},',
-            '"mocks":{"MockUSDC":"', vm.toString(address(usdc)),
-            '","MockBond":"', vm.toString(address(bond)),
-            '","MockFarm":"', vm.toString(address(farm)), '"},',
-            '"contracts":{"CollateralVault":"', vm.toString(VAULT),
-            '","DirectCallAdapter":"', vm.toString(ADAPTER), '"},',
-            '"seededPosition":{"bonds":0}}'
-        );
+        return _jsonFor(address(usdc), KEEPER);
     }
 
     /// @notice The whole entrypoint, against a correctly locked stack.
@@ -122,7 +148,7 @@ contract R39AssertLockedTest is Test {
     ///      one-transaction window is permanent and survives the lockdown. The admin can still make
     ///      it, which is what lets this test create the condition the entrypoint must catch.
     function test_R39_aTamperedConfigurationIsRefused() public {
-        bond.setWhitelisted(ADAPTER, false);
+        bond.setWhitelisted(adapterRow, false);
         vm.expectRevert(
             abi.encodeWithSelector(
                 AssertMockStackLocked.ConfigurationTampered.selector,
@@ -180,16 +206,68 @@ contract R39AssertLockedTest is Test {
         probe.assertLockedOnChain();
     }
 
+    // ── the environment against the record (round-47 item 95) ────────────────
+
+    /// @notice 🟥 **THE FALSIFIER. Before the fix this test's entrypoint call PASSED against a
+    ///         keeper nobody committed.**
+    /// @dev The record is the committed side; that is its whole point. The entrypoint read
+    ///      `_envOrAddress("RECOUP_KEEPER", record)`, so an environment value that matched the
+    ///      CHAIN made the record irrelevant: here the record names `committedKeeper`, the stack
+    ///      is locked to `KEEPER`, the environment says `KEEPER`, and the old read certified the
+    ///      stack against the environment and never looked at the record. MEASURED red before the
+    ///      fix as `next call did not revert as expected`. After it the disagreement is named
+    ///      with both values, environment first.
+    function test_R48_aKeeperInTheEnvironmentThatMatchesTheChainButNotTheRecordIsRefused() public {
+        address committed = makeAddr("committedKeeper");
+        probe.setRecord(_jsonFor(address(usdc), committed));
+        probe.setEnvAddress("RECOUP_KEEPER", KEEPER);
+        vm.expectRevert(
+            abi.encodeWithSelector(AssertMockStackLocked.KeeperEnvDisagreesWithRecord.selector, KEEPER, committed)
+        );
+        probe.assertLockedOnChain();
+    }
+
+    /// @dev The other direction: the record is right and the environment is the stranger. Before
+    ///      the fix this reverted too, but as `MockOperatorNotKeeper`, which reads as the CHAIN
+    ///      being wrong and names a redeploy as the remedy when the remedy is a stale `.env`.
+    function test_R48_aStrangerKeeperInTheEnvironmentIsRefusedByName() public {
+        address stranger = makeAddr("strangerKeeper");
+        probe.setEnvAddress("RECOUP_KEEPER", stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(AssertMockStackLocked.KeeperEnvDisagreesWithRecord.selector, stranger, KEEPER)
+        );
+        probe.assertLockedOnChain();
+    }
+
+    /// @dev Not forbidden outright, on purpose: the documented `deploy && assert` command runs
+    ///      both halves against one `.env`, and the deploy half needs `RECOUP_KEEPER` in it. An
+    ///      environment that agrees with the record is the state that command is in.
+    function test_R48_aKeeperInTheEnvironmentThatAgreesWithTheRecordIsTolerated() public {
+        probe.setEnvAddress("RECOUP_KEEPER", KEEPER);
+        probe.assertLockedOnChain();
+    }
+
+    /// @dev With no override installed the harness reads the fallback and nothing else, so this
+    ///      passes whatever `contracts/.env` says on the machine running it. That is the property
+    ///      the harness lacked: see the measurement on `R39AssertLockedHarness._envOrAddress`.
+    function test_R48_theHarnessReadsNoEnvironmentAtAll() public {
+        probe.assertLockedOnChain();
+    }
+
     function _jsonWith(address usdcAddress) internal view returns (string memory) {
+        return _jsonFor(usdcAddress, KEEPER);
+    }
+
+    function _jsonFor(address usdcAddress, address keeperAddress) internal view returns (string memory) {
         return string.concat(
             '{"chainId":31337,',
             '"deployer":"', vm.toString(address(this)), '",',
-            '"operators":{"keeper":"', vm.toString(KEEPER), '"},',
+            '"operators":{"keeper":"', vm.toString(keeperAddress), '"},',
             '"mocks":{"MockUSDC":"', vm.toString(usdcAddress),
             '","MockBond":"', vm.toString(address(bond)),
             '","MockFarm":"', vm.toString(address(farm)), '"},',
-            '"contracts":{"CollateralVault":"', vm.toString(VAULT),
-            '","DirectCallAdapter":"', vm.toString(ADAPTER), '"},',
+            '"contracts":{"CollateralVault":"', vm.toString(vaultRow),
+            '","DirectCallAdapter":"', vm.toString(adapterRow), '"},',
             '"seededPosition":{"bonds":0}}'
         );
     }

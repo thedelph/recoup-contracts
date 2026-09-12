@@ -289,7 +289,19 @@ contract DeployMainnet is DeployBase {
 
         // The custody decision (direct-call vs a Safe-based backend) is a human
         // judgement that depends on DexFi's whitelist answer. Force it to be stated.
-        string memory custody = _envOrString("RECOUP_CUSTODY_ADAPTER", "");
+        //
+        // **Named `RECOUP_CUSTODY_MODE`, and audit round 47 item 84 is why.** This read
+        // used to take `RECOUP_CUSTODY_ADAPTER`, which `WirePhase4.s.sol` reads as the
+        // *deployed adapter's address* - two meanings on one name, across two consecutive
+        // runbook steps, with no single environment value satisfying both. forge auto-loads
+        // `contracts/.env` into every `forge script` and `forge test`, so an address left
+        // there for the wiring step silently reached this string comparison. It failed
+        // closed (`CustodyDecisionUnrecorded`, refusing to deploy rather than deploying the
+        // wrong thing), which is why it was never hit. The *string* side was renamed rather
+        // than the address side: the address form is what an operator types under time
+        // pressure and what the runbook names, so moving it would have moved the dangerous
+        // half.
+        string memory custody = _envOrString("RECOUP_CUSTODY_MODE", "");
         if (keccak256(bytes(custody)) != keccak256(bytes("direct"))) revert CustodyDecisionUnrecorded();
 
         // _resolveParams enforces the rest: owner, treasury, keeper and fee wallet

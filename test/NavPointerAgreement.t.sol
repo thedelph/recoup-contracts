@@ -166,12 +166,20 @@ contract NavPointerAgreementTest is RiskParamsFixture {
     function test_constructor_refusesAReaderThatDisagreesWithItsOwnVault() public {
         vm.expectRevert(abi.encodeWithSelector(CreditManager.NavOracleVaultMismatch.selector, address(oracle)));
         new CreditManager(
-            usdc, ICollateralVault(address(vault)), INAVOracle(address(foreign)), IRiskParams(address(riskParams)), admin
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(foreign)),
+            IRiskParams(address(riskParams)),
+            admin
         );
 
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NavOracleVaultMismatch.selector, address(oracle)));
         new LiquidationAuction(
-            usdc, ICollateralVault(address(vault)), INAVOracle(address(foreign)), IRiskParams(address(riskParams)), admin
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(foreign)),
+            IRiskParams(address(riskParams)),
+            admin
         );
     }
 
@@ -384,7 +392,11 @@ contract NavPointerAgreementTest is RiskParamsFixture {
 
         vm.expectRevert(abi.encodeWithSelector(LiquidationAuction.NavOracleVaultMismatch.selector, address(oracle)));
         new LiquidationAuction(
-            usdc, ICollateralVault(address(vault)), INAVOracle(address(foreign)), IRiskParams(address(riskParams)), admin
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(foreign)),
+            IRiskParams(address(riskParams)),
+            admin
         );
 
         NavLyingAuction liar = new NavLyingAuction(address(vault), address(foreign));
@@ -397,9 +409,7 @@ contract NavPointerAgreementTest is RiskParamsFixture {
         // Nothing moved, and the graph still prices off one feed.
         assertEq(vault.liquidationAuction(), address(auction), "the vault's auction moved");
         assertEq(address(auction.navOracle()), address(vault.navOracle()), "auction disagrees with the vault");
-        assertEq(
-            auction.navOracle().navPerBond(), vault.navOracle().navPerBond(), "two answers to one price"
-        );
+        assertEq(auction.navOracle().navPerBond(), vault.navOracle().navPerBond(), "two answers to one price");
     }
 
     /// @notice The manager-side half, which is the quiet one: `borrow`'s staleness gate.
@@ -412,7 +422,11 @@ contract NavPointerAgreementTest is RiskParamsFixture {
     function test_theStalenessGateCannotBeSplitInTwo() public {
         vm.expectRevert(abi.encodeWithSelector(CreditManager.NavOracleVaultMismatch.selector, address(oracle)));
         new CreditManager(
-            usdc, ICollateralVault(address(vault)), INAVOracle(address(foreign)), IRiskParams(address(riskParams)), admin
+            usdc,
+            ICollateralVault(address(vault)),
+            INAVOracle(address(foreign)),
+            IRiskParams(address(riskParams)),
+            admin
         );
 
         NavLyingManager liar = new NavLyingManager(address(vault), address(foreign));
@@ -507,6 +521,32 @@ contract TwoFacedNavManager {
     ///      A stub that fails an OLDER check makes a test red for the wrong reason, which is the
     ///      note `FourSelectorManager` in `SetterGuards.t.sol` already carries.
     function yieldAccruedOn(uint256, uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    /// @dev Round 55 added `resolveBounty` and `currentDebtOf` to the tail probes on this pointer -
+    ///      the two selectors every exit calls bare - for the reason the note above gives.
+    function resolveBounty(uint256, bool) external {}
+
+    function currentDebtOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    /// @dev Round 56 (item 236) added the four members whose absence strands work to the same
+    ///      door, for the reason the notes above give. `accYieldPerBond` is the public variable
+    ///      above; `writeDownLoss` is not a view, so the door reads its SHAPE and it refuses by name
+    ///      the way the genuine manager's zero-amount call does.
+    error ZeroAmount();
+
+    function writeDownLoss(address, uint256, uint256) external pure returns (uint256) {
+        revert ZeroAmount();
+    }
+
+    function claimableOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function pendingYieldOf(address) external pure returns (uint256) {
         return 0;
     }
 }

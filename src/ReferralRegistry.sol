@@ -112,6 +112,8 @@ contract ReferralRegistry {
     ///      creates the address, and any failure reverts the whole deployment instead of leaving a
     ///      live half-seeded registry on a namespace that can only be claimed once.
     constructor(bytes32[] memory reservedCodes) {
+        // FALSE (audit round 44). House loop idiom; zero is the intended start.
+        // forge-lint: disable-next-line(uninitialized-local)
         for (uint256 i; i < reservedCodes.length; ++i) {
             bytes32 code = reservedCodes[i];
             if (!isCanonical(code)) revert MalformedCode(code);
@@ -280,8 +282,12 @@ contract ReferralRegistry {
         // zero must also be zero, or `bytes32("AB\x00C")` would pass as "AB" while carrying a
         // different value, giving two distinct codes that print identically.
         bool ended;
+        // FALSE (audit round 44). House loop idiom; zero is the intended start.
+        // forge-lint: disable-next-line(uninitialized-local)
         for (uint256 i; i < 32; ++i) {
             uint8 c = uint8(code[i]);
+            // FALSE (audit round 44). `ended` is false until a terminator is seen, which is the meaning.
+            // forge-lint: disable-next-line(uninitialized-local)
             if (ended) {
                 if (c != 0) return false;
                 continue;
@@ -302,6 +308,8 @@ contract ReferralRegistry {
         // A code filling all 32 bytes never sets `ended`, and is over the maximum anyway.
         if (!ended) length = 32;
 
+        // FALSE (audit round 44). `length` counts up from zero; an empty code has length zero.
+        // forge-lint: disable-next-line(uninitialized-local)
         return length >= Config.REFERRAL_CODE_MIN_LENGTH && length <= Config.REFERRAL_CODE_MAX_LENGTH;
     }
 }

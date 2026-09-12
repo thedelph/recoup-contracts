@@ -144,7 +144,12 @@ contract MockFarm is IDexFiFarm, MockLockdown {
 
     error FarmDown();
 
-    function withdraw(uint256 amount) external {
+    /// @dev `virtual` since audit round 43, for the same reason as `emergencyWithdraw` below and
+    ///      subject to the same no-op guarantee: no signature, selector or ABI entry changes.
+    ///      `MintAttemptReceiver.releaseMint` calls this BEFORE it measures what it forwards, and
+    ///      the adapter measures its own balance across the whole of `releaseMint`, so this is the
+    ///      one other place where the two windows differ and a `min` clamp can bite.
+    function withdraw(uint256 amount) external virtual {
         if (revertOnWithdraw) revert FarmDown();
         if (amount > staked[msg.sender]) revert InsufficientStake(amount, staked[msg.sender]);
         uint256 pending = pendingYield[msg.sender];
@@ -160,7 +165,20 @@ contract MockFarm is IDexFiFarm, MockLockdown {
         }
     }
 
-    function emergencyWithdraw() external {
+    /// @dev `virtual` since audit round 43, and the reason is a reachability result rather than a
+    ///      convenience. `DirectCallAdapter._emergencyRecover` measures its own USDC balance across
+    ///      `MintAttemptReceiver.emergencyRecoverAll()` and clamps the child's report to that delta.
+    ///      The only window in which the adapter's balance can fall inside the adapter's
+    ///      measurement but OUTSIDE the child's own - which is what the clamp is for - runs from the
+    ///      adapter's `usdcBefore` read to the child's `_tryTransferUsdc` read, and the only
+    ///      external code that gets control in it is this function and the ERC-1155 transfer it
+    ///      makes. A re-entrant USDC cannot reach the clamp at all: the child measures the same
+    ///      window the token moves in, so its report shrinks with the delta. Nothing else in the
+    ///      tree overrides this; `R34AccountingIdentity.t.sol` does, once.
+    ///
+    ///      No signature, selector or ABI entry changes, so the mock-gating allowlist reads the
+    ///      same surface and every existing construction of this mock is unaffected.
+    function emergencyWithdraw() external virtual {
         uint256 amount = staked[msg.sender];
         staked[msg.sender] = 0;
         pendingYield[msg.sender] = 0;

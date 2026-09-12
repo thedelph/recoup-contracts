@@ -69,6 +69,12 @@ interface ICustodyAdapter {
     ///      uncorroborated whenever a bond moved in the same block.
     function farmYieldDelivered() external view returns (uint256);
 
+    /// @notice The slice of `farmYieldDelivered` forwarded to the adapter's WIRED harvester.
+    ///         Round-55 item 219: `EpochHarvester` seeds and corroborates on this one, because the
+    ///         counter above counts what was forwarded to whoever the recipient was, and yield that
+    ///         landed elsewhere proves nothing about an epoch on a contract that did not receive it.
+    function farmYieldDeliveredToHarvester() external view returns (uint256);
+
     /// @notice The CollateralVault this adapter is bound to. The vault reads this
     ///         to reject a custody swap to an adapter wired for a different vault.
     function vault() external view returns (address);

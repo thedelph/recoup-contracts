@@ -70,7 +70,6 @@ contract NAVOracle is INAVOracle, Ownable {
     uint256 public override navPerBond;
     /// @inheritdoc INAVOracle
     /// @dev Zero until the first accepted post, which `isStale()` reports as stale.
-    // slither-disable-next-line uninitialized-state
     uint256 public override lastUpdated;
 
     /// @notice The price the deviation budget is measured from, and when it was set.
@@ -85,9 +84,17 @@ contract NAVOracle is INAVOracle, Ownable {
 
     // ── Roles ────────────────────────────────────────────────────────────────
 
+    /// @dev The owner clause is round-49 finding 133, the mirror of the one on `setNavConfirmer`
+    ///      below and refused for the same reason: the owner holds `cancelPendingNav`, so an owner
+    ///      who is also the keeper can park a value and discard it, and the round-13 asymmetry -
+    ///      the keeper opens a review window and cannot close it - collapses onto one hand. Same
+    ///      sanctioned route, transfer ownership away first; same reused error. Round 48 closed
+    ///      the confirmer door and left this one open on purpose, so that its closure did not
+    ///      widen its own row.
     function setKeeper(address keeper_) external onlyOwner {
         if (keeper_ == address(0)) revert ZeroAddress();
         if (keeper_ == navConfirmer) revert KeysMustDiffer();
+        if (keeper_ == owner()) revert KeysMustDiffer();
         keeper = keeper_;
         emit KeeperSet(keeper_);
     }
@@ -95,11 +102,38 @@ contract NAVOracle is INAVOracle, Ownable {
     /// @dev Rejecting `keeper == navConfirmer` matters more than it looks: without it
     ///      the two-key requirement silently collapses to one key, and that pair is
     ///      the entire mitigation for the attack PRD §9 calls the worst realistic one.
+    ///
+    ///      **And `confirmer == owner()` is refused for the same reason - audit round 48,
+    ///      finding 79.** The owner is a key on the second-key path too: it holds `cancelPendingNav`,
+    ///      so an owner who is also the confirmer both decides what a parked value becomes and
+    ///      can discard it, which is one party. `CollateralVault`, `LenderPool` and
+    ///      `CreditManager` all refuse the identical owner-collapse by name, and this was the one
+    ///      two-key contract - the one with the most at stake in the model - that accepted it.
+    ///      Unconditional, like the siblings: the sanctioned way to make the current owner the
+    ///      confirmer is to transfer ownership away first. `KeysMustDiffer` is reused rather than
+    ///      a new error declared, because it is the same statement about the same pair.
     function setNavConfirmer(address confirmer_) external onlyOwner {
         if (confirmer_ == address(0)) revert ZeroAddress();
         if (confirmer_ == keeper) revert KeysMustDiffer();
+        if (confirmer_ == owner()) revert KeysMustDiffer();
         navConfirmer = confirmer_;
         emit NavConfirmerSet(confirmer_);
+    }
+
+    /// @notice Hand ownership over, refusing the two addresses that would collapse the keys.
+    /// @dev The other door into the collapses the two setters refuse above - the confirmer is
+    ///      audit round 48, finding 79; the keeper is round-49 finding 133 - and the mirror of
+    ///      `CollateralVault.transferOwnership`'s guardian rule. Handing ownership to the sitting
+    ///      confirmer puts `cancelPendingNav` and `confirmNav` in one hand, and handing it to the
+    ///      sitting keeper puts `cancelPendingNav` and `postNav` there, without either setter ever
+    ///      having been asked. Unconditional, like the vault's: the sanctioned handover to either
+    ///      sitting key is two calls, move the key first and then transfer. A fresh owner and the
+    ///      one-step terminal `transferOwnership(0xdEaD)` this contract uses instead of
+    ///      `renounceOwnership` are both unaffected, and both are pinned by test.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == navConfirmer) revert KeysMustDiffer();
+        if (newOwner == keeper) revert KeysMustDiffer();
+        super.transferOwnership(newOwner);
     }
 
     /// @dev Renouncing would permanently freeze keeper management and brick the feed.
@@ -263,6 +297,12 @@ contract NAVOracle is INAVOracle, Ownable {
     /// @dev A never-posted oracle reads as stale, so consumers gating on `isStale()`
     ///      need no separate zero-NAV check. Staleness window is 8 days; second-level
     ///      timestamp drift is immaterial at that scale.
+    // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `timestamp` finding on `isStale`. The
+    // EQUALITY Slither objects to is not a clock read: `lastUpdated == 0` is the never-posted
+    // sentinel, and the clock arm is a strict `>` over an 8-day window. The detector taints the
+    // whole condition because `block.timestamp` appears in it.
+    // 🟥 SCOPE: above a function DECLARATION, so it suppresses `timestamp` for the whole function,
+    // not just the line below it.
     // slither-disable-next-line timestamp
     function isStale() external view returns (bool) {
         return lastUpdated == 0 || block.timestamp > lastUpdated + Config.NAV_STALENESS;
@@ -302,11 +342,24 @@ contract NAVOracle is INAVOracle, Ownable {
         // keying `lastUpdated` off every accepted post let a keeper hold a wrong price
         // indefinitely with `isStale()` never tripping and the second key never
         // consulted - PRD §9 names keeper compromise as the worst realistic attack.
-        if (nav != navPerBond) lastUpdated = block.timestamp;
+        //
+        // **Round-55 item 246(e): the budget clock moves with the freshness clock, and for the
+        // same reason.** `anchorAt` used to be written on every accept, so a zero-delta repost
+        // re-anchored the deviation budget at zero while leaving `lastUpdated` alone - and the
+        // keeper's min-age gate keys on `lastUpdated`, so after one same-price post every later
+        // fire was still "due", reposted the unchanged price, and the next REAL move was measured
+        // over one cron interval (166 bps at four-hourly) rather than over the time since the price
+        // last changed. Four of the seven posts accepted on Base Sepolia were larger than that.
+        // A zero-delta accept is now indistinguishable from silence for the budget, which is the
+        // bound the docstring already claims: the budget caps at `NAV_DEVIATION_MAX_ELAPSED`, so a
+        // keeper that stays silent a day gets exactly what a keeper reposting all day now gets.
+        if (nav != navPerBond) {
+            lastUpdated = block.timestamp;
+            anchorAt = block.timestamp;
+        }
 
         navPerBond = nav;
         anchorNav = nav;
-        anchorAt = block.timestamp;
         emit NAVPosted(nav, block.timestamp);
     }
 
@@ -338,6 +391,12 @@ contract NAVOracle is INAVOracle, Ownable {
     ///
     ///      `LtvMath.exceedsLtv` avoids division for exactly this reason and says so;
     ///      this is the same discipline applied to the same class of comparison.
+    // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `timestamp` findings on `_withinBudget`.
+    // The clock is an INPUT to a budget rather than a deadline: `elapsed` is clamped to
+    // `NAV_DEVIATION_MAX_ELAPSED` and enters a cross-multiplied comparison, so a proposer moving
+    // the timestamp by seconds moves the allowance by a proportional and bounded amount, and moving
+    // it backwards only tightens it. The second key is what bounds the abuse, not the clock.
+    // 🟥 SCOPE: above a function DECLARATION, so it suppresses `timestamp` for the whole function.
     // slither-disable-next-line timestamp
     function _withinBudget(uint256 nav) private view returns (bool) {
         uint256 anchor = anchorNav;
@@ -349,6 +408,12 @@ contract NAVOracle is INAVOracle, Ownable {
             <= Config.NAV_MAX_DEVIATION_BPS * elapsed * anchor;
     }
 
+    // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `timestamp` finding on
+    // `_allowedDeviationBps`, which had NO written reason before this line. Same argument as
+    // `_withinBudget` above and the same arithmetic: `elapsed` is clamped to
+    // `NAV_DEVIATION_MAX_ELAPSED` and scales a bps allowance proportionally. This function is a
+    // view for callers and operators; nothing gates on it.
+    // 🟥 SCOPE: above a function DECLARATION, so it suppresses `timestamp` for the whole function.
     // slither-disable-next-line timestamp
     function _allowedDeviationBps() private view returns (uint256) {
         uint256 elapsed = block.timestamp - anchorAt;

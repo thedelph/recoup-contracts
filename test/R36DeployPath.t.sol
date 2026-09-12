@@ -279,7 +279,11 @@ contract R36DeployPathTest is Test, DeployBase {
     ///         `GuardianMustDifferFromOwner()` from inside `_wire`, about an owner
     ///         (`p.owner`) that the value does not in fact collide with.
     /// @dev The assertion is deliberately on the SELECTOR and on where it comes from, so a future
-    ///      edit that adds a named deployer rule to `_validateParams` fails here and is read.
+    ///      edit that adds a named deployer rule to the deploy path fails here and is read.
+    /// @dev 🟥 **The contrast arm moved to `_validateNewDeployment` in round 51.** The four sink
+    ///      collisions are rules about the act of MAKING a deployment and now live with the
+    ///      contract-owner guardian rule; the shape of the contrast is unchanged, because the
+    ///      guardian arm below is a `_validateParams` acceptance either way.
     function test_R36_refuted_theGuardianCannotBeTheDeployingKeyButTheErrorNamesTheWrongRole()
         public
     {
@@ -288,7 +292,7 @@ contract R36DeployPathTest is Test, DeployBase {
         vm.expectRevert(
             abi.encodeWithSelector(DeployBase.YieldRecipientCollision.selector, deployer, "deployer")
         );
-        this.exposedValidateParams(yr, deployer);
+        this.exposedValidateNewDeployment(yr, deployer);
 
         GovParams memory g = _params();
         g.guardian = deployer;
@@ -447,12 +451,28 @@ contract R36DeployPathTest is Test, DeployBase {
         vm.expectRevert(abi.encodeWithSelector(DeployBase.NavKeysMustDiffer.selector));
         this.exposedValidateParams(bad, deployer);
 
+        // 🟥 **This arm used to be `yieldRecipient == owner` and round 51 moved that clause onto
+        // the deploy path, for the reason this very test is about one variable over.** The sink
+        // collisions protect the INTERIM sink - the live sink of a live adapter between the
+        // adapter's constructor and `_wire`'s last call - and a deployment that already exists has
+        // no interim sink, while `_assertCoreGraph` REQUIRES the environment to name the fee wallet
+        // the chain holds. Same two-constraints-on-one-variable shape, same fix, one function down.
+        // Replaced here rather than deleted, by another rule that was its own finding (round-47
+        // item 79) and that the switchover does keep, so the arm still counts three.
+        bad = _params();
+        bad.navConfirmer = bad.owner;
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.NavConfirmerMustDifferFromOwner.selector));
+        this.exposedValidateParams(bad, deployer);
+
+        // And the moved rule, asserted on both sides so the move is visible from here: the address
+        // rules accept the collision, and the deploy path still refuses it.
         bad = _params();
         bad.yieldRecipient = bad.owner;
+        this.exposedValidateParams(bad, deployer);
         vm.expectRevert(
             abi.encodeWithSelector(DeployBase.YieldRecipientCollision.selector, bad.owner, "owner")
         );
-        this.exposedValidateParams(bad, deployer);
+        this.exposedValidateNewDeployment(bad, deployer);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -481,7 +501,6 @@ contract R36DeployPathTest is Test, DeployBase {
     function test_R36_recoupOwnerNoLongerDefaultsToTheBroadcastingKey() public {
         address eoaDeployer = makeAddr("r36.broadcastingKey");
         assertEq(eoaDeployer.code.length, 0, "premise: a real broadcasting key is an EOA");
-        _emptyEnvironment = true;
 
         GovParams memory p = _readParams(eoaDeployer);
         assertEq(p.owner, address(0), "RECOUP_OWNER unset resolves to zero, like the other five");
@@ -520,7 +539,6 @@ contract R36DeployPathTest is Test, DeployBase {
         // NAME the broadcasting key as the owner, and then `_handOver` is skipped and every
         // ownership assertion passes over a protocol that key owns. That is now a choice somebody
         // typed into the environment, which is the whole of what this fix changes.
-        _emptyEnvironment = false;
         GovParams memory q = _params();
         q.owner = deployer;
         q.guardian = makeAddr("r36.g");
@@ -692,22 +710,21 @@ contract R36DeployPathTest is Test, DeployBase {
     // Fixture
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @dev Backs the `_envOrAddress` seam with storage instead of the process environment, so this
-    ///      suite reads no `.env` and sets none. `vm.setEnv` writes one table shared by the whole
-    ///      `forge test` process, which is the race round 30 removed; see `EnvOverridable` in
-    ///      `Deploy.t.sol`. When true, every read returns its fallback - which is what an empty
-    ///      environment does, and is the state the owner-default finding is about.
-    bool internal _emptyEnvironment;
-
-    function _envOrAddress(string memory key, address fallbackValue)
+    /// @dev Every read returns its fallback, which is what an empty environment does and is the
+    ///      state the owner-default finding is about. This suite reads no `.env` and sets none:
+    ///      `vm.setEnv` writes one table shared by the whole `forge test` process, which is the
+    ///      race round 30 removed (see `EnvOverridable` in `Deploy.t.sol`), and a fall-through to
+    ///      `super` reads the deploy box, because forge auto-loads `contracts/.env` - round-49
+    ///      item 136. The flag that used to gate the fallback is gone with the fall-through it
+    ///      gated; the two tests that set it read the same values they always did.
+    function _envOrAddress(string memory, address fallbackValue)
         internal
-        view
+        pure
         virtual
         override
         returns (address)
     {
-        if (_emptyEnvironment) return fallbackValue;
-        return super._envOrAddress(key, fallbackValue);
+        return fallbackValue;
     }
 
     function exposedAssertCoreGraph(Deployed memory d, GovParams memory p) external view {

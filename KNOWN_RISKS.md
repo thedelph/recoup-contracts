@@ -2,13 +2,16 @@
 # Known risks and activation gates
 
 This is the launch-critical and material current security posture for the public contracts. The
-core protocol executable logic in this repository is current as of 2026-08-31, and everything
-below is written against it. Analysis published here before that date was written against an
+core protocol executable logic in this repository is current as of 2026-09-12, and everything
+below is written against it. Analysis published here before 2026-08-31 was written against an
 earlier lender pool, credit manager and collateral vault, and does not describe this source. This record is organised by present effect, not by discovery date. Historical internal review notes are
 in [`AUDITS.md`](AUDITS.md); the code-level integration tour is in [`REVIEW.md`](REVIEW.md).
 The section "Open findings from internal review round 45, at the audit commit" was added on
-2026-09-07 and is written against the same source at commit b66023d, the commit handed to the
-external auditors.
+2026-09-07 and was written against the source at commit b66023d, the commit handed to the
+external auditors; where the 2026-09-12 sync changes what a sentence in it says, the change is
+marked in place and names the tree it is true of. The section "External review, 33audits
+preliminary issues #45 to #54 (2026-09-11)" records the disposition of the ten issues the external
+reviewers filed against b66023d.
 
 Internal adversarial review, unit tests, invariant campaigns and mainnet fork tests are evidence, but
 they are not an external audit.
@@ -36,10 +39,10 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Base mainnet | No Recoup contracts are deployed |
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty, and not wired as `CreditManager`'s liquidity source in the protocol-to-pool direction; the pool's own pointers to the manager and the harvester are set, and it is open to any depositor at the full 25,000 USDC cap |
-| Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacks 26 selectors this source has, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live pool reads 124.885415 USDC parked with nobody to deliver it to |
+| Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047 against the 2026-09-01 source, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacked 26 selectors that source had, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy; the 2026-09-12 sync adds `wasCreditManager` to the pool and changes the signatures of `writeDownLoss` and `recoverWrittenDownLoss` on the manager, so the gap is wider than that reading. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live pool reads 124.885415 USDC parked with nobody to deliver it to |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
-| Current-source parity | **None, deliberately.** This source is current as of 2026-08-31 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
-| External audit | In progress from 2026-09-07 over `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d; not completed |
+| Current-source parity | **None, deliberately.** This source is current as of 2026-09-12 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
+| External audit | In progress from 2026-09-07 over `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d. Ten preliminary issues, #45 to #54, were filed on 2026-09-11; their disposition in this source is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below. Not completed |
 | Third-party funds | Not accepted |
 
 The mock assets have no real value, and their mint and test-control functions are permissionless.
@@ -163,11 +166,14 @@ semantics.
 
 In the week before the external audit, a twelve-reader internal adversarial pass was run over the
 six files in the audit scope, and the findings below came out of it. Each one has an executed
-reproduction in a test unless it is marked as a lead. **None of them is fixed in this source, and
-that is deliberate**: a fix written the week before an audit is what the audit exists to check, so
-they are disclosed here and to the auditors as known issues, with the candidate fixes named and
-their status given honestly. They are written against commit b66023d. Severities are assigned
-by the author, not by an auditor.
+reproduction in a test unless it is marked as a lead. **None of them was fixed at commit b66023d,
+and that was deliberate**: a fix written the week before an audit is what the audit exists to check, so
+they were disclosed here and to the auditors as known issues, with the candidate fixes named and
+their status given honestly. They were written against commit b66023d. Severities are assigned
+by the author, not by an auditor. The external reviewers' preliminary issues of 2026-09-11 then
+confirmed three of them and executed the lead, and the 2026-09-12 sync fixes the migrated-manager
+High, corrects the withdrawal-request documentation and carries the open-workout reserve the lead
+was about; each of those headings says so below, and the others still stand in this source.
 
 ### A frozen yield pot over a dust supply bricks the pool. Medium-high
 
@@ -223,8 +229,29 @@ and drought epoch second, which the stream-clock tests cover only from cold. Rea
 exit; the triggering block is the harvester's or a stranger's `flushLenderYield`. The fix is not
 sign-checked: bounding the epoch leg by the funded amount preserves the recovery here but lets a
 drought epoch on a large tail pay out faster than rule 1 intends, so the honest fix is two rates.
+The external reviewers' M-04 restates the unbounded window together with the gross entry pricing;
+a 30-day ceiling on the epoch leg was built, measured and held, and the measurement is in the
+external review section below. Still open in this source.
 
-### Recovery of a written-down loss is undeliverable after a manager migration. High
+### Recovery of a written-down loss is undeliverable after a manager migration. High, fixed in this source since 2026-09-12
+
+**Fixed by the one sentence the paragraph below asks for.** `LenderPool.setCreditManager` stamps
+`wasCreditManager` for the incoming manager, `recoverLoss` accepts the live manager or a former
+one, and it pulls the USDC from and credits `msg.sender` rather than the live pointer. Nothing else
+on the pool reads the mapping. The external reviewers filed the same gap as their L-01, rated Low;
+this record keeps it at High. Regressions: `test_L01_managerMigrationNoLongerStrandsPostCloseRecovery`
+in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) (the reviewers' own
+reproduction with the expected revert removed), `test_R46_theRecoveryLandsAfterALegalPoolRepoint`,
+`test_R46_theOnlyRouteIntoTheRecoveryIsTheAuctionAndItIsOpen` and
+`test_R46_aFormerManagerReachesNoOtherManagerGatedLeg` in
+[`test/R46AuctionRepointRecovery.t.sol`](test/R46AuctionRepointRecovery.t.sol) (the first two were the
+pins that asserted the refusal), and
+`test_regression_aLateTrancheAfterARepointFollowsTheBearerEvenAfterThePoolMovesOn` in
+[`test/R55A01_WorkoutLifecycle.t.sol`](test/R55A01_WorkoutLifecycle.t.sol) for the second route. A
+former manager reaches no other manager-gated leg of the pool. The auction-side twin the paragraph
+below calls "not yet synced" is in this source too: `setLiquidationAuction` stamps
+`wasLiquidationAuction` and `recoverWrittenDownLoss` accepts a former auction. The paragraph below
+is kept as written on 2026-09-07 and describes commit b66023d.
 
 `LenderPool.recoverLoss` accepts only the manager the pool currently points at, and
 `setCreditManager` is allowed to move that pointer while a recovery is still owed. After a legal
@@ -246,17 +273,26 @@ repointed to the new manager by an ordinary `setCreditManager`, is refused `NotC
 `recoverLoss` in the same way, so the tranche is never delivered to the lenders who bore the loss.
 Same root cause, same one-sentence fix.
 
-### The withdrawal-request "reserve" is a per-call pro-rata bound, not a reservation. Documentation
+### The withdrawal-request "reserve" is a per-call pro-rata bound, not a reservation. Documentation, corrected in this source since 2026-09-12
 
 `_unreservedIdle` is the executable balance less the ceiling of executable times queued over supply, re-derived on every call, so
 a non-requester can unwind the reserved cash to 0.011 percent of itself in twelve fair-priced
-redeems while the requester's whole-request value stays exactly at book. The request door caps a
-controller at their own fraction of cash; the sync door caps a holder at all cash not reserved by
-someone else (114.59 against 236.30 USDC in the same state). The per-call bound is the intended
-semantics, and no code change is proposed: a checkpointed cash floor is the refused F7 shape. What is
-wrong is the wording of the `queueCashReserve`, `unreservedIdle` and `available` docstrings in
-`LenderPool`, which overstate it as a reservation; they are left as they are in this source because
-the file is under audit, and are corrected at fix verification.
+redeems while the requester's whole-request value stays exactly at book. The sync door caps a
+holder at all cash not reserved by someone else (114.59 against 236.30 USDC in the same state). The
+per-call bound is the intended semantics, and no code change is proposed: a checkpointed cash floor
+is the refused F7 shape. What is wrong is the wording, and the previous revision of this paragraph
+was wrong in the same direction: it said the request door "caps a controller at their own fraction
+of cash", which is true of one service call and false cumulatively. The external reviewers' H-03
+measured that: in their state a single fair slice is 4,874,250,000, stepped service reaches
+4,999,999,999 over seven calls, and one synchronous `redeem` of the same shares from the same
+snapshot quotes and pays 5,000,000,000 and leaves no shares
+(`test_H03_steppedRequestServiceReachesNoMoreThanOneSyncRedeem` in
+[`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol)). The per-call slice in
+`maxRequestRedeem` is a reservation for requesters against `lend` and other exits, not a cap on
+cumulative conversion, and a cumulative cap on the request door would make it strictly tighter than
+`redeem` for no protection. The file header, the `maxRequestRedeem` docstring and the
+`queueCashReserve` docstring in `LenderPool` are corrected in this source to say so; at commit
+b66023d they overstated the bound as a reservation.
 
 ### `CreditWiring.sourceStillAnswersToUs` reverts instead of answering false on a dirty word. Low
 
@@ -287,15 +323,25 @@ other invariant ran green) and then confirmed in the production code by reading.
 reads `maxDeposit(r) > 0` and assumes every smaller amount is accepted is wrong below the floor. A
 distinct floor error is deferred until after the audit.
 
-### Lead, not a finding: `sweepWorkoutYieldToInsurance`
+### Lead, executed by the external reviewers as M-01 and M-02, fixed in this source since 2026-09-12: `sweepWorkoutYieldToInsurance`
 
 `sweepWorkoutYieldToInsurance` is in `LiquidationAuction`, outside the audit scope. Two readers
 independently thought it shortcuts the round 22 F18 bound for gas, and one found a dead
 `NothingToClaim` line beside it. F18 is the double-booking bound in the table below, and a sweep
 that shortcuts it would be the same money counted twice from the other end, landing in the pool's
-numbers. Nobody executed it. It is recorded here as a lead so that it is not lost, not as a finding.
+numbers. Nobody executed it at the time, and it was recorded here as a lead so that it was not lost.
+The external reviewers executed it against commit b66023d as their M-01, and its sibling route
+through `claimSurplusFor` and `sweepFreeBalanceToInsurance` as M-02; both reproduce there. In this
+source both pre-close sweeps go through `_fundInsuranceWithFree`, whose owed line is
+`totalUnclaimedRewards + totalWorkoutYieldOwed + _openWorkoutAccrual`, the third term being the
+accrual on every open workout's bonds read from the manager's accumulator rather than from where the
+cash sits, so a sweep that would take it reverts `NothingUnreserved` whichever door it uses.
+Regressions: `test_R51_154_regression_aStrangerCannotSweepAnOpenWorkoutsBacking` and
+`test_R51_154_regression_theSiblingSweepReachesItWithNoClaimInFront` in
+[`test/R51A02_OverRealisationDoor.t.sol`](test/R51A02_OverRealisationDoor.t.sol), and the walk in
+[`test/R56A02_SweepVersusF18.t.sol`](test/R56A02_SweepVersusF18.t.sol).
 
-### A forced workout close socialises a loss the lot's own accrued yield would cover. Medium, found in internal review round 54, outside the audit scope
+### A forced workout close socialises a loss the lot's own accrued yield would cover. Medium, found in internal review round 54, outside the audit scope, fixed in this source since 2026-09-12
 
 Found the night before the audit began, in `LiquidationAuction` rather than in the six audited
 files, and recorded here because it lands in the pool's numbers. When a workout closes forced,
@@ -308,10 +354,21 @@ window, the lot's accrual was 499,999,999, the residual 628,750,000, the write-d
 nothing from insurance, and the sweep then banked 499,999,999. With the pool as funder that comes
 through `socialiseLoss` and reduces `outstandingPrincipal` by more than it needed to. The bound is
 what streams to the lot over the auction plus the workout window, up to about fourteen days. Both
-pre-close sweeps refuse an open lot's accrual by design, so no order of permissionless calls puts
-the yield in front of the write-down; the fix is to have the forced close spend the auction's free
-balance, the closing lot's own accrual included, before socialising, and it is built, sign-checked
-and queued on the auction side rather than shipped, so the audited tree does not carry it.
+pre-close sweeps refuse an open lot's accrual by design since this sync; at b66023d the owed line
+had two terms and the external reviewers' M-01 and M-02 reproduce there, so on that commit a
+stranger's sweep could put the yield in front of the write-down. The fix is to have the forced
+close spend the auction's free balance, the closing lot's own accrual included, before socialising.
+It is in this source: the forced branch of `closeWorkout` claims and sweeps the free balance into
+the insurance fund before `writeDownLoss` reads the residual, and the clean branch is unchanged
+(`test_R55_215_aForcedCloseSpendsTheLotsOwnYieldBeforeSocialising` in
+[`test/R54A02_ForcedCloseIgnoresLotYield.t.sol`](test/R54A02_ForcedCloseIgnoresLotYield.t.sol)). At
+b66023d it was built and queued on the auction side rather than shipped, so the audited tree does
+not carry it. The reviewers' M-03, two clean closes where the first takes the shared residual, is a
+different mechanism on the same function and is also closed here: the shortfall that ordering used
+to allocate can no longer be created once the open-workout accrual is reserved, and the owed ledger
+is kept per bearer, so `test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst` in
+[`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol), which at b66023d asserted
+that the second close booked nothing, now asserts that both closes book and are paid.
 
 ### Tooling coverage on `LenderPool`
 
@@ -334,6 +391,49 @@ and queued on the auction side rather than shipped, so the audited tree does not
   caller. It is private, compiles to no code, and is deleted after the audit freeze. The counts are
   for the development tree at a later internal commit, a superset of the audited scope, not a
   reading of this commit.
+
+## External review, 33audits preliminary issues #45 to #54 (2026-09-11)
+
+The external reviewers filed ten preliminary issues against commit b66023d on 2026-09-11, each with
+a Foundry reproduction written against this repository's own test fixtures. All ten reproduce at
+b66023d. Four of them (H-02, M-01, M-02, M-03) had been fixed in the development tree between
+2026-09-03 and 2026-09-07 and had not been synced to this repository; two (L-01, L-02) were already
+disclosed above; one (M-04) was disclosed in parts; and three (H-01, H-03, M-05) were new. The table
+below is the status of each issue **in this source from the 2026-09-12 sync on**, which is the
+first sync since the issues were filed. Every function and test it names is in `src/` or `test/`
+here. Byte figures are the runtime deltas of the fix against the source immediately before it,
+measured with `forge build --sizes` on a clean build; "earlier" means the fix is in this sync but
+landed in the development tree before the issues were filed, so its delta is not itemised.
+
+| Issue | Title as filed | Status in this source | Runtime bytes |
+|---|---|---|---|
+| #45 H-01 | Borrower-keyed recovery provenance redirects an earlier workout's recovery | **Fixed.** `writeDownLoss` and `recoverWrittenDownLoss` on `ICreditManager` take the auction id, and `CreditManager` records the bearer and the funder per auction and id in `recoveryBearerOf` and `recoveryFunderOf` and routes the recovery through them; `lossBearerOf` and `lossFunderOf` stay as the borrower's latest record. `LiquidationAuction` passes the id at `closeWorkout`, `workoutSettleAfterClose` and `_settleFill`. Regression: `test_H01_aLaterDefaultDoesNotRedirectAnEarlierWorkoutsRecovery` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol), the reviewers' reproduction with its last two assertions reversed: the first workout's pool is paid 628,750,000 and the second's 0, then the second is paid its own. The two records are internal because making them public getters put the manager under 2,000 bytes of runtime margin | `CreditManager` +307, `LiquidationAuction` +17 |
+| #46 H-02 | Auction replacement orphans a closed workout's recovery leg | **Fixed, earlier.** This is the auction-side twin the previous revision of this file called fixed but not yet synced. `setLiquidationAuction` stamps `wasLiquidationAuction`, and `recoverWrittenDownLoss` accepts the live auction or a former one; `checkAuctionSwap` is unchanged, so no fourth clause was added to the migration guard. Regressions: `test_R46_theRecoveryLandsAfterALegalAuctionRepoint` and `test_R46_aFormerAuctionReachesNoOtherAuctionGatedLeg` in [`test/R46AuctionRepointRecovery.t.sol`](test/R46AuctionRepointRecovery.t.sol), `test_R22_theReturnLegSurvivesAMigrationToAFreshAuction` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) | earlier |
+| #47 H-03 | Repeated request service converts more than a requester's pro-rata cash into senior claims | **Documentation; the arithmetic is confirmed and the benchmark is disputed.** Measured in `test_H03_steppedRequestServiceReachesNoMoreThanOneSyncRedeem` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol), in the reviewers' state: a single fair slice is 4,874,250,000, stepped service reaches 4,999,999,999 over seven calls, and one synchronous `redeem` of the same shares from the same snapshot quotes and pays 5,000,000,000 and leaves no shares. The stepped loop therefore reaches no more than the synchronous door already allows an un-queued holder, and the exit price already nets `exitReserve` for known impairment. The per-call slice in `maxRequestRedeem` is a reservation for requesters against `lend` and other exits, not a cumulative cap; the file header and the `maxRequestRedeem` and `queueCashReserve` docstrings are corrected in this source, and the "reserve" paragraph above is corrected with them. A cumulative cap on the request door was not built: it would make that door strictly tighter than `redeem` for no protection | 0 |
+| #48 M-01 | Permissionless yield sweep can confiscate an open workout's borrower yield | **Fixed, earlier.** `_fundInsuranceWithFree`, which both pre-close sweeps go through, owes `totalUnclaimedRewards + totalWorkoutYieldOwed + _openWorkoutAccrual`; the third term is the accrual on every open workout's bonds, read from the manager's accumulator, so `sweepWorkoutYieldToInsurance` reverts `NothingUnreserved` rather than moving it. Regressions: `test_R51_154_regression_aStrangerCannotSweepAnOpenWorkoutsBacking` in [`test/R51A02_OverRealisationDoor.t.sol`](test/R51A02_OverRealisationDoor.t.sol), `test_R56A02_81_negative_walk00_sweepWorkoutYieldFirst` in [`test/R56A02_SweepVersusF18.t.sol`](test/R56A02_SweepVersusF18.t.sol) | earlier |
+| #49 M-02 | Realised open-workout yield bypasses the dedicated sweep protection | **Fixed, earlier, by the same reserve.** It is derived from the accumulator and not from where the cash sits, so realising the yield onto the auction through `claimSurplusFor` and taking it with `sweepFreeBalanceToInsurance` is refused the same way. Regressions: `test_R51_154_regression_theSiblingSweepReachesItWithNoClaimInFront` in [`test/R51A02_OverRealisationDoor.t.sol`](test/R51A02_OverRealisationDoor.t.sol), `test_R56A02_81_negative_walk02_claimSurplusForFirst` in [`test/R56A02_SweepVersusF18.t.sol`](test/R56A02_SweepVersusF18.t.sol) | earlier |
+| #50 M-03 | First clean workout close captures shared residual yield | **Fixed, earlier.** The shortfall that close ordering allocated can no longer be created once the open-workout accrual is reserved, and the owed ledger is kept per bearer. The public test at b66023d, `test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst`, asserted that the second close booked nothing, which was a pinned disclosure of the round 22 F18 residual and is what the reviewers' reproduction restates; it now asserts that both closes book and are paid, beside `test_R23_04_twoCleanClosesCannotBookTheSameClaimTwice` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol). The forced-close fix the reviewers asked about is separate and is in this source; see the round 54 paragraph above | earlier |
+| #51 M-04 | Uncapped stream duration plus gross entry pricing lets a timed flush overcharge new lenders | **Confirmed; a ceiling was built, measured and held.** The gross entry pricing is the disclosed F10 decision above and the unbounded window is the drought item above. A 30-day ceiling on the epoch leg of `_rateStream` was built on a separate branch with the stream-clock tests updated, and is deliberately not in this source: with a 180-day gap, a 1,000.000000 pot and two equal holders, a holder staked for exactly 30 days after the flush takes 499.999999 with the ceiling against 83.333333 without it, and a 3,000.000000 newcomer is whole after 30 days rather than 180. The ceiling moves the transfer from the newcomer to the incumbent rather than removing it, which is the same shape the drought item's "honest fix is two rates" sentence refuses. `_rateStream` is unchanged here and the decision is open with the reviewers | 0 |
+| #52 M-05 | A lender-yield backlog above the deposit-cap ceiling can never be delivered | **Fixed.** `distributeYield` clamps the streamable amount to capital only in the terminal state where the cap is at `GLOBAL_BORROW_CAP_MAX` and `depositCapUsage` has reached it; every other oversize offer still reverts `YieldExceedsCapital`, so the one-cent capture the refusal exists for stays refused. The harvester's `_push` decrements `pendingLenderYield` by measured delivery, so the remainder stays pending and drains over successive flushes. Regressions in [`test/LenderPool.t.sol`](test/LenderPool.t.sol): the reviewers' three, `test_distributeYield_theHardCeilingAdmitsNoMoreCapital`, `test_distributeYield_aBacklogAboveTheHardCeilingIsClampedNotRefused` and `test_distributeYield_anOfferOfExactlyCapitalIsAcceptedInFull`, plus `test_distributeYield_aBacklogAboveTheHardCeilingDrainsOverSuccessiveFlushes` (900,000 drained in three flushes) and `test_distributeYield_belowTheHardCeilingTheRefusalIsUnchanged`; and `test_R40_D7_theBacklogAboveTheHardCeilingDrainsThroughTheRealHarvester` in [`test/R40D7Capture.t.sol`](test/R40D7Capture.t.sol), 400,000 through `flushLenderYield` in two flushes | `LenderPool` +60 |
+| #53 L-01 | Manager migration strands post-close loss recoveries with no unblocked repair path | **Fixed; rated High here.** `LenderPool.setCreditManager` stamps `wasCreditManager`, and `recoverLoss` accepts the live manager or a former one and pulls from and credits `msg.sender`. The parked-tranche alternative the reviewers proposed, a pool-side balance drained by a permissionless flush, was built and refused by execution: +561 runtime bytes as built, and the drain calls `recoverLoss` from the retired manager, so it is dischargeable only by pointing the pool back, which reverts `PrincipalOutstanding` once the successor has lent. Regressions: `test_L01_managerMigrationNoLongerStrandsPostCloseRecovery` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol); `test_R46_theRecoveryLandsAfterALegalPoolRepoint`, `test_R46_theOnlyRouteIntoTheRecoveryIsTheAuctionAndItIsOpen` and `test_R46_aFormerManagerReachesNoOtherManagerGatedLeg` in [`test/R46AuctionRepointRecovery.t.sol`](test/R46AuctionRepointRecovery.t.sol); `test_regression_aLateTrancheAfterARepointFollowsTheBearerEvenAfterThePoolMovesOn` in [`test/R55A01_WorkoutLifecycle.t.sol`](test/R55A01_WorkoutLifecycle.t.sol) | `LenderPool` +72 |
+| #54 L-02 | Permissionless settle discards a borrower's sub-unit yield accrual | **Held; accepted Low.** The one-line skip the reviewers propose was re-executed on a scratch copy of `_settle` at this source and not committed: 336 wei of unbacked credit on a 1.000000 pot (1,000,335 credited plus 1 undistributed against 1,000,000 streamed), for the same reason as the 925,925 wei measured against the original proposal, a zero-floored settle before a top-up leaves the index stale and the next settle prices the stale delta at the larger bond count. The shipped code destroys 2 wei in the same trace. The remainder-carry alternative was measured at +198 bytes and makes `pendingYieldOf` under-report. Pinned by `test_L02_aZeroFlooredSettleBeforeATopUpCreditsNoMoreThanWasStreamed` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) | 0 |
+
+Measured on this source with `forge build --sizes` on a clean build: `CreditManager` 22,518 bytes
+of runtime with 2,058 of EIP-170 margin and 23,867 of initcode with 25,285 of EIP-3860 margin;
+`LiquidationAuction` 21,022 / 3,554 and 22,437 / 26,715; `LenderPool` 20,619 / 3,957 and 21,991 /
+27,161. `CreditManager` is the contract that binds.
+
+Of the six audited files, this sync changes `src/LenderPool.sol` only (L-01, M-05 and the H-03
+docstrings), and `src/LenderPool.sol` additionally differs from b66023d by the `transferOwnership`
+guardian guard the 2026-09-01 sync carried. `src/CreditWiring.sol`, `src/Config.sol` and
+`src/LtvMath.sol` are byte-identical to b66023d; `src/TreasuryLiquiditySource.sol` and
+`src/ProtocolFeeSplitter.sol` differ from it in comments only. The other fixes above are in
+`src/CreditManager.sol`, `src/LiquidationAuction.sol` and `src/interfaces/ICreditManager.sol`,
+outside the audited six.
+
+**The fix-verification tree for these issues is this repository's head from this commit on.** A
+reviewer verifying a fix should read the function and run the test named in its row here, not the
+development tree, which is not published.
 
 ## Other pre-launch risks and dependencies
 
@@ -417,16 +517,18 @@ position yield to insurance, and a live position can temporarily block the trans
   borrow caps limit that dependency but do not eliminate it, and an audit of this repository does
   not audit DexFi's contracts.
 - Slither had last been run over an earlier collateral scope. It has since been run over the whole
-  credit and lender graph: 269 raw results, all triaged, none a true positive, and 44 left under a
-  configuration that records a reason for every detector it mutes. Slither now runs in the
-  development tree's CI on every contracts change, and a committed baseline of those 44 fails the
-  build on any finding that appears or disappears.
+  credit and lender graph: 269 raw results, all triaged, none a true positive, and 45 left under a
+  configuration that records a reason for every detector it mutes (44 when this sentence was written
+  on 2026-09-10; one more accepted finding was recorded later that day, and the H-01 fix moved one
+  fingerprint without changing the count). Slither now runs in the development tree's CI on every
+  contracts change, and a committed baseline of those 45 fails the build on any finding that appears
+  or disappears. This repository does not run Slither itself.
 - The external audit remains a hard gate before third-party capital regardless of internal review
   count or CI status.
 
 ## What this source contains
 
-This repository is a curated publication of the protocol's contracts, current as of 2026-08-31.
+This repository is a curated publication of the protocol's contracts, current as of 2026-09-12.
 
 It contains the round-22 remediation in full - F4 (`setYieldRecipient` redirecting a full epoch's gross yield, closed by an
 `owedToRecipient` balance drained by a permissionless `flushYieldTo`), F5 (a blacklisted liquidity
@@ -434,7 +536,10 @@ source freezing `pendingPrincipal` and the escape from it together, closed by `o
 permissionless `flushPrincipalTo`), F8 (`workoutSettleAfterClose` resolving its payee from state
 `closeWorkout` can empty in the same block, closed by recording a `bearer` at every close) and F9
 (`lossBearerOf` recorded at write-down time) - and the round-23 remediation, including the
-entry-side EIP-5143 overloads.
+entry-side EIP-5143 overloads. Since 2026-09-12 it also carries the answers to the external
+reviewers' preliminary issues: F9's record is completed by per-workout records keyed by auction and
+id (`recoveryBearerOf`, `recoveryFunderOf`), and the recovery leg is deliverable from a former
+auction (`wasLiquidationAuction`) and to a former manager (`wasCreditManager`).
 
 **The published source no longer matches the deployed testnet bytecode, and that is worth knowing
 before you compare them.** `src/CreditManager.sol` once compiled to 23,833 bytes of runtime code,
@@ -475,9 +580,9 @@ accepted for the present pre-launch state.
 | Round 21 borrower stream cadence | Bond movement and zero-claim epochs can bypass the intended epoch gap and repeatedly re-rate borrower yield; the measured trace still had 35% unreleased after five days |
 | Round 22 F16 | Public callers can pin the lot or cap the price, but cannot bind both in one call; price monotonicity across a re-strike is not restored and the widened fuzz test is still owed |
 | Round 22 F17 | `LenderPool.claim` remains the unswept member of the delegated `*For` claim class |
-| Round 22 F18 | **Partly closed, and the closed half is in this source.** The insurance booking at a clean workout close is now bounded to what the lot could actually reach, rather than to what it generated. The **pre-close ordering hazard remains open**: a stranger sweeping mid-workout still changes what the close sees |
+| Round 22 F18 | **Closed in this source since 2026-09-12.** The insurance booking at a clean workout close is bounded to what the lot could actually reach, rather than to what it generated, and the pre-close ordering hazard is closed by the open-workout reserve: a stranger sweeping mid-workout is refused `NothingUnreserved` for any open lot's accrual, so the close sees what the lot earned. `test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst` now asserts both closes are paid, where at b66023d it asserted the second booked nothing. At b66023d the hazard was open, and the external reviewers' M-01 to M-03 reproduce it there |
 | Round 22 F19 | `claimSurplusFor` can front-run the auction's own sweep into a revert |
-| Round 22 F23 | `_settle` can advance a borrower's yield index past a payout that floors to zero; the proposed one-line fix was measured inert |
+| Round 22 F23 | `_settle` can advance a borrower's yield index past a payout that floors to zero; the proposed one-line fix was measured inert, and the external reviewers' L-02 restatement of it was re-measured on 2026-09-11 at this source: skipping the index stamp on a zero-floored payout mints 336 wei of unbacked credit on a 1.000000 pot (1,000,335 credited plus 1 undistributed against 1,000,000 streamed), because a stale index is revalued at a larger bond count after a top-up, against 925,925 wei on the original measurement; the shipped code destroys 2 wei in the same trace. Held as accepted Low; pinned by `test_L02_aZeroFlooredSettleBeforeATopUpCreditsNoMoreThanWasStreamed` |
 | Long-gap lender yield | A long delivery gap can defer several epochs and then stream about 3.10 epochs over five days rather than their original accrual windows |
 | Impairment refresh | A conservative stale-high mark persists until a permissionless refresh; `refreshImpairments` can report apparent progress when `impair` no-ops |
 | Balance-probe stipend | The pool reads the asset's balance through a 30,000-gas probe (`_tryRawBalance`); if the USDC contract is ever upgraded to a proxy shape whose `balanceOf` costs more than that, all four ERC-4626 maxima read zero and `deposit`, `withdraw` and `redeem` revert, while the withdrawal-request, service and claim doors keep paying in full - so a synchronous exit silently becomes a two-step one, and the probe's answer can also depend on what warmed storage earlier in the same transaction |
@@ -490,7 +595,7 @@ accepted for the present pre-launch state.
 | Pending NAV anchor | A pending value can remain confirmable after the accepted anchor moves; exact-value confirmation and expiry bound the exposure but do not remove it |
 | Stale view | `collateralValue()` is an ungated stale-NAV view; callers must not treat it as a borrow-authorisation result |
 | Pool manager binding | `LenderPool.setCreditManager` has no vault or code/interface binding check and can install an EOA as both authoriser and principal payee |
-| Recovery-era binding | Written-down-loss recovery follows the current pool/source rather than the loss-time bearer, and post-close workout settlement follows the live auction manager; a migration can misroute recovery to the incoming era, make it operator-withdrawable or leave it unreachable. See "Recovery of a written-down loss is undeliverable after a manager migration" above for the pool-side case, which is a permanent refusal rather than a misroute |
+| Recovery-era binding | **Closed in this source since 2026-09-12, in three parts.** Written-down-loss recovery follows the bearer and funder recorded at write-down, keyed by auction and workout id (`recoveryBearerOf`, `recoveryFunderOf`), so a later default by the same borrower cannot redirect an earlier workout's recovery (the external reviewers' H-01); a former auction can still deliver it (`wasLiquidationAuction`, their H-02); and the pool accepts it from a former manager (`wasCreditManager`, their L-01). At b66023d recovery was keyed by borrower and the pool-side case was a permanent refusal; see "Recovery of a written-down loss is undeliverable after a manager migration" above. The zero-supply derecognition item above is unaffected |
 | Risk-parameter check | The deployment check can approve a liquidation-threshold transition that the on-chain setter would reject |
 | Insurance target | `INSURANCE_FUND_TARGET_BPS` has no consumer or enforcement path |
 | Pointer probes | Contract-graph probe coverage remains incomplete as a class and must be re-derived when interfaces change |

@@ -7,12 +7,17 @@ named as accepted or deferred. Current open risks are tracked separately in
 This file is the historical record. Each round is an internal 12-agent adversarial review pass, and
 rounds are appended newest first.
 
-**This log currently stops at round nine. As of 2026-08-31 the protocol had completed forty-two
+**This log currently stops at round nine. As of 2026-09-12 the protocol had completed fifty-eight
 rounds, and that number only rises.** It is dated on purpose: it is derived from the internal
 review record rather than from anything in this repository, so no check here can hold it to the
-truth, and an undated figure would go quietly wrong every time a round ran. It read thirty-nine
-until 2026-08-31, and thirty-nine had been correct for about two hours. A dated figure ages
-instead of going false, which is a state a reader can reason about.
+truth, and an undated figure would go quietly wrong every time a round ran. It read forty-two from
+2026-08-31 until 2026-09-12, and before that thirty-nine, which had been correct for about two
+hours when it was written. A dated figure ages instead of going false, which is a state a reader
+can reason about.
+
+The first external review began on 2026-09-07, over six files at commit b66023d, and filed ten
+preliminary issues on 2026-09-11. It is not part of this internal log; the disposition of each
+issue in the current source is recorded in [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
 That count is adversarial review passes as this file defines them, one per round. Remediation
 passes are numbered on their own sequence and run higher; the two are different bases and are not

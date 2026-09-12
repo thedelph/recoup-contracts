@@ -42,6 +42,9 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     error NotWired(string what);
     error NothingToFlush();
     error FlushDeliveredNothing();
+    /// @notice The incoming lender pool has no code, or has no `distributeYield` to deliver into.
+    ///         See `setLenderPool` for what is probed and what is deliberately not.
+    error LenderPoolIncomplete();
 
     event LenderPoolSet(address indexed lenderPool);
 
@@ -221,7 +224,8 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     ///      the mark and subtracting is what makes that true without a second counter to keep in
     ///      step.
     ///
-    ///      Re-seeded on every custody swap. See `setCustodyAdapter`.
+    ///      Re-seeded when the custody pointer MOVES, and deliberately not when it does not.
+    ///      See `setCustodyAdapter`.
     uint256 public lastCorroboratedYield;
 
     constructor(IERC20 usdc_, ICreditManager creditManager_, address initialOwner) Ownable(initialOwner) {
@@ -255,9 +259,36 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     ///      pointer has to be re-derived when that pointer moves, not preserved across it.
     ///
     ///      The call also doubles as a shape check on the incoming adapter. An address that does
-    ///      not answer `farmYieldDelivered()` reverts here, at wiring time and under the owner's
-    ///      hand, rather than inside the permissionless `harvest` where a revert freezes every
-    ///      borrower's write-down.
+    ///      not answer the counter the re-seed reads - `farmYieldDeliveredToHarvester()` since
+    ///      round 55 (item 219), not the every-path `farmYieldDelivered()` this sentence used to
+    ///      name - reverts here, at wiring time and under the owner's hand, rather than inside the
+    ///      permissionless `harvest` where a revert freezes every borrower's write-down. Audit
+    ///      round 54 (item 216) narrowed that to a pointer that MOVES, which costs the shape check
+    ///      nothing: the only address the re-seed now skips is the one already wired, and it
+    ///      answered this same call on the way in.
+    ///
+    ///      **So any custody REPAIR adapter must carry `farmYieldDeliveredToHarvester()` as well as
+    ///      the two views the vault probes (round 57, item 223).** After a break-glass exit the
+    ///      vault admits only an adapter already staked with the rescued units, and the repair is
+    ///      wired on both sides; an adapter that answers `vault()` and `stakedBalance()` but not
+    ///      this counter installs on the vault and then reverts HERE, bare, with EMPTY returndata -
+    ///      MEASURED by `test_R57A02_223_limit_aRepairWithoutTheHarvesterCounterCannotBeHarvested`.
+    ///      A `DirectCallAdapter` carries it; a hand-built repair contract must too, or the vault
+    ///      and this harvester are left pointing at different adapters, which is the frozen-stream
+    ///      residual this docstring's "What this does not check" paragraph describes, except that
+    ///      no setter call can clear it, because the right address is the one this read refuses.
+    ///
+    ///      **The re-seed is skipped on a NON-move, and that is the whole of round-54 item 216.**
+    ///      The paragraph above is written for a pointer that moves. Called with the address
+    ///      already wired - an idempotent re-wire, which is the shape a deploy or repair script
+    ///      produces - the unconditional form jumped the mark to the live counter and thereby
+    ///      discarded the corroboration of farm USDC already sitting in this contract and not yet
+    ///      epoched, so the next `harvest` emitted `EpochDeclinedUncorroborated` over a real farm
+    ///      epoch. MEASURED: 500.000000 delivered, one idempotent call, epoch declined with
+    ///      `epochCount` still zero. Nothing was lost; an epoch was delayed by an owner call that
+    ///      changed no pointer. `CustodyAdapterSet` is still emitted on the non-move, ahead of the
+    ///      early return, so the `topic0` pointer-pair watch sees the re-wire; only
+    ///      `CorroborationWatermarkSeeded` is withheld, because nothing was seeded.
     ///
     /// @dev **Audit round 21's census: this was the one adapter pointer in the protocol with no
     ///      binding check at all**, while `CollateralVault.setCustodyAdapter` - the twin, on the
@@ -291,11 +322,23 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         address boundVault = adapter.vault();
         address liveVault = address(creditManager.vault());
         if (boundVault != liveVault) revert AdapterVaultMismatch(boundVault);
+        ICustodyAdapter current = custodyAdapter;
         custodyAdapter = adapter;
-        lastCorroboratedYield = adapter.farmYieldDelivered();
         // Two events, one move. The first shares a `topic0` with the vault's half of this pointer
         // pair so one filter sees both; the second carries the watermark that used to ride on it.
+        // `CustodyAdapterSet` is emitted unconditionally, ahead of the non-move return below, so
+        // that pointer-pair watch still sees an idempotent re-wire happen.
         emit CustodyAdapterSet(address(adapter));
+        // Audit round 54 (item 216), shipped round 55: re-seed only when the pointer MOVES. On a
+        // genuine move the re-seed is mandatory - a fresh adapter's counter starts at zero and a
+        // carried mark declines every epoch forever, which is the round-11 property this setter
+        // exists for. On a NON-move, which is the shape a deploy or repair script produces, it
+        // jumped the mark to the live counter and discarded the corroboration of farm USDC already
+        // sitting here and not yet epoched, declining the next epoch for nothing.
+        if (adapter == current) return;
+        // Round-55 item 219: the mark is held against the HARVESTER-BOUND counter, not the
+        // every-path one - see `harvest`.
+        lastCorroboratedYield = adapter.farmYieldDeliveredToHarvester();
         emit CorroborationWatermarkSeeded(address(adapter), lastCorroboratedYield);
     }
 
@@ -333,9 +376,77 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     /// @dev `nonReentrant` because it reaches `_tryDeliverLenderYield`, which makes an
     ///      external call to the outgoing pool. Without it that pool could re-enter
     ///      `harvest` and move the counter the helper is mid-way through writing - and now also
-    ///      the counter the park below reads.
+    ///      the counter the park below reads. The probe below is a second external call, to the
+    ///      INCOMING address, under the same guard.
+    ///
+    ///      **The completeness probe this setter owed and did not have - audit round 48,
+    ///      finding 83, the WEAK form.** Round 46 (#411) MEASURED that a `TreasuryLiquiditySource`
+    ///      installed here was accepted, accrued the lender share, and left it parked under
+    ///      `owedToPool[treasury]` on the repoint that corrected the pointer, where
+    ///      `flushLenderYieldTo(treasury)` reverts forever: `_push`'s `try` swallows the missing
+    ///      selector and measures delivery at zero, so a wrong-but-coded pointer strands rather
+    ///      than refuses. Owner-shaped, and the same shape `CreditManager.setLiquiditySource`
+    ///      gained a probe for in round 27; this is its twin.
+    ///
+    ///      **One member, counted from the type.** `ILenderPool` declares twenty-three functions
+    ///      and this contract reaches exactly one of them, `distributeYield`, through `_push`;
+    ///      that is the one probed and the only one that can strand anything here. The probe is
+    ///      `distributeYield(0)` and it reads the SHAPE of the answer: the real pool refuses by
+    ///      name with four bytes, `NotEpochHarvester` if it does not yet point here or
+    ///      `ZeroAmount` if it does, both raised before it touches any state - `nonReentrant`,
+    ///      then the sender check, then the zero check, read off the frozen `LenderPool.sol` - so
+    ///      against the genuine pool the probe is free in either wiring order. A treasury has no
+    ///      such function and no fallback, so the call returns EMPTY returndata, and empty is what
+    ///      is refused. A call that succeeds outright is accepted too, which is what a test pool
+    ///      answering `transferFrom(0)` does. The code-length clause in front of it is
+    ///      load-bearing on its own: solc emits an `EXTCODESIZE` check before a `void` external
+    ///      call and reverts with empty returndata OUTSIDE the `try`, which would surface as a
+    ///      bare revert rather than as this contract's named refusal.
+    ///
+    ///      **What is deliberately NOT probed, so nobody reads more into this than it does.** A
+    ///      contract with a fallback passes: its fallback answers the selector with success or
+    ///      with returndata, and this probe cannot tell that from a pool. The weak form was
+    ///      chosen over the strong one - `ILenderPool(pool).epochHarvester() == address(this)` -
+    ///      on the same wiring-order grounds `setCustodyAdapter` gives for refusing its own
+    ///      strong form: the deploy script sets this pointer before the pool points back, so the
+    ///      strong probe would refuse the documented order. And a pool that LATER stops
+    ///      recognising this harvester still parks its share, by design: that is the round-11
+    ///      case, handled by `owedToPool` and never by a guard here.
+    ///
+    ///      **Why this cannot recreate the round-11 deadlock.** That deadlock was a guard on this
+    ///      setter conditioned on a counter only a failing delivery could clear, so the repoint
+    ///      and the delivery were mutually unsatisfiable. This probe conditions on nothing but the
+    ///      incoming address's shape - no counter, no state of the outgoing pool, nothing the
+    ///      outgoing pool can influence - so whatever the outgoing pool does, the owner can always
+    ///      name an address that passes, and the repoint can never be blocked by the pool it is
+    ///      escaping.
+    ///
+    ///      **Why it runs before the outgoing pool is touched.** A pointer that is going to be
+    ///      refused is refused before any share is delivered or parked on the way past, exactly
+    ///      as `CreditManager.setLiquiditySource` orders its probe ahead of its delivery leg. Put
+    ///      after `_tryDeliverLenderYield(outgoing)`, a refusal would revert that delivery too -
+    ///      harmless, since a revert undoes it, but it would make the refusal cost an external
+    ///      call to a pool that had nothing to do with it.
+    // FALSE (audit round 44). `onlyOwner` is a storage read and a revert with no external call.
+    // forge-lint: disable-next-line(non-reentrant-not-first)
     function setLenderPool(address lenderPool_) external onlyOwner nonReentrant {
         if (lenderPool_ == address(0)) revert ZeroAddress();
+        if (lenderPool_.code.length == 0) revert LenderPoolIncomplete();
+        // Round-49 finding: the credit manager is the one other contract answering
+        // `distributeYield(uint256)`, and there the probe below is STATE-CHANGING - it re-rates the
+        // whole borrower stream - so the manager passed as a pool, every flush into it delivered
+        // nothing, and the repoint away parked the lender share against it forever. Refused before
+        // the probe, so no call is made. Reuses the completeness error: a pool that is the manager
+        // is not a pool.
+        if (lenderPool_ == address(creditManager)) revert LenderPoolIncomplete();
+        // ACCEPTED (audit round 48). Under `nonReentrant`, and a zero-amount probe whose success
+        // or four-byte refusal both mean "the selector exists"; only empty returndata is refused.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
+        try ILenderPool(lenderPool_).distributeYield(0) {}
+        catch (bytes memory reason) {
+            if (reason.length == 0) revert LenderPoolIncomplete();
+        }
+
         address outgoing = lenderPool;
         if (outgoing != address(0) && outgoing != lenderPool_) {
             _tryDeliverLenderYield(outgoing);
@@ -420,9 +531,32 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
     function harvest() external nonReentrant {
         ICustodyAdapter adapter = custodyAdapter;
         if (address(adapter) == address(0)) revert NotWired("custodyAdapter");
-        if (protocolFeeWallet == address(0)) revert NotWired("protocolFeeWallet");
+        // **No `protocolFeeWallet` check here, and audit round 47 item 85 removed the one that
+        // used to be on this line.** It bought nothing and cost the property this contract's
+        // header claims. `harvest` never pays the fee wallet: the protocol share is ACCRUED into
+        // `pendingProtocolFee` at the foot of this function, deliberately, because "the protocol's
+        // fee is the last thing that should be able to stop borrowers' debt being written down".
+        // The only leg that pays that wallet is `flushProtocolFee`, which carries its own
+        // `NotWired("protocolFeeWallet")` and is permissionless - so the pointer was already
+        // guarded exactly where a missing pointer can actually do harm. Guarding it here as well
+        // let an unset or un-reset fee wallet hold the permissionless epoch shut for borrowers,
+        // lenders and insurance alike, which is the same deadlock shape `setLenderPool` and
+        // `_tryDeliverLenderYield` have each been bitten by once. Note `lenderPool` is not checked
+        // here either, and for the same reason.
+        //
+        // Nothing is stranded by its absence. An epoch that runs with no fee wallet set accrues
+        // `pendingProtocolFee` as usual; a later `setProtocolFeeWallet` sees `outgoing ==
+        // address(0)`, parks nothing, and `flushProtocolFee` then pays the live counter in full.
 
         uint256 nextAllowed = lastHarvestAt + Config.MIN_EPOCH_GAP;
+        // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `timestamp` finding on `harvest`, whose
+        // comparison is the line below. `lastHarvestAt != 0` is a never-harvested SENTINEL, not a
+        // clock read; the clock arm is a strict `<` against a `MIN_EPOCH_GAP` cadence measured in
+        // days, so proposer-level drift cannot move which side of it a call lands on.
+        // 🟥 SCOPE, wider than the line number reads: this is node-level and still over-broad,
+        // because Slither drops a result when ANY of its elements starts on an ignored line.
+        // `harvest()` spans a couple of hundred lines and holds exactly ONE timestamp comparison
+        // today; a second one added anywhere inside it is silently covered too.
         // slither-disable-next-line timestamp
         if (lastHarvestAt != 0 && block.timestamp < nextAllowed) {
             revert EpochGapNotElapsed(nextAllowed);
@@ -450,6 +584,9 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // clock narrower than the check that reads it, so the gate never closed. With that gone
         // there is no remaining question this figure answers, and keeping it would be a signal
         // nothing consumes - the shape a later reader reintroduces a branch from.
+        // ACCEPTED (audit round 44). `harvest` is `nonReentrant` and `adapter` is the owner-set
+        // custody adapter.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         try adapter.claimYield() {} catch {}
         // All three carried balances come off the top. They are this contract's USDC but not this
         // epoch's yield, and counting any of them as `claimed` would pay it out a second time -
@@ -540,7 +677,16 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // `epochCount`, not `lastDistributeAt`, not a cent. That is the point of the shape: the
         // donated USDC stays in this contract's balance and is counted into `claimed` by the next
         // real epoch, so the griefer's money ends up paying borrowers and nothing is stranded.
-        uint256 delivered = adapter.farmYieldDelivered();
+        // **Round-55 item 219: the corroboration signal is bound to the recipient.** This used to
+        // read `farmYieldDelivered()`, which counts farm USDC forwarded to WHOEVER `yieldRecipient`
+        // is. With the recipient pointed elsewhere that counter moved, the money landed elsewhere,
+        // and a stranger's donation here was run as an epoch - round 11's purchase, reopened by a
+        // wiring order. `farmYieldDeliveredToHarvester` moves only for USDC forwarded to the
+        // adapter's wired `harvester`, so a mis-pointed recipient, a pre-handover sink, or the
+        // handover settle itself corroborates nothing, and the epoch is declined below exactly as a
+        // donation is. A per-epoch read rather than a check at `setCustodyAdapter`, because the
+        // recipient is a setter on the adapter and can move after this contract was wired.
+        uint256 delivered = adapter.farmYieldDeliveredToHarvester();
         // Saturating, not a bare subtraction. The mark is re-seeded on every custody swap, so it
         // can only sit at or below the live adapter's counter and this can only underflow if an
         // adapter breaks its own monotonicity promise. But an underflow here would revert the one
@@ -589,6 +735,8 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
 
         // Non-zero by the branch above, so no guard needed on the approval.
         usdc.forceApprove(address(creditManager), toBorrowers);
+        // ACCEPTED (audit round 44). `harvest` is `nonReentrant` and `creditManager` is owner-set.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         creditManager.receiveYield(toBorrowers);
         // Unconditional, and correctly so now. This line writes `lastDistributeAt`, and round 11
         // recorded it as the open finding; the corroboration floor above is the fix. It works by
@@ -596,10 +744,14 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         // skips the write - which is what the one-line `if (corroborated != 0)` here would do, and
         // a borrower share delivered into `undistributedYield` with nothing rating it is money
         // stranded, not money protected. Anything reaching this line has been funded by the farm.
+        // ACCEPTED (audit round 44). `harvest` is `nonReentrant` and `creditManager` is owner-set.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         creditManager.distributeYield(toBorrowers);
 
         if (toInsurance != 0) {
             usdc.forceApprove(address(creditManager), toInsurance);
+            // ACCEPTED (audit round 44). `harvest` is `nonReentrant` and `creditManager` is owner-set.
+            // forge-lint: disable-next-line(reentrancy-no-eth)
             creditManager.fundInsurance(toInsurance);
         }
         if (toLenders != 0) {
@@ -708,6 +860,9 @@ contract EpochHarvester is IEpochHarvester, Ownable, ReentrancyGuard {
         uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.forceApprove(pool, amount);
         // A pool that reverts must not be able to trap the share - see setLenderPool.
+        // ACCEPTED (audit round 44). `_push` is private and reached only from `nonReentrant`
+        // `harvest`; `pool` is the owner-set lender pool and the delivery is measured, not trusted.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         try ILenderPool(pool).distributeYield(amount) {} catch {}
         usdc.forceApprove(pool, 0); // leave no standing allowance
 

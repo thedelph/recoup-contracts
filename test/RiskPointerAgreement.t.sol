@@ -169,9 +169,7 @@ contract RiskPointerAgreementTest is RiskParamsFixture {
     ///      `LiquidationAuction` both take the vault as an `immutable` constructor argument, so the
     ///      reference is already in hand at the moment the mismatch would be introduced.
     function test_constructor_refusesAReaderThatDisagreesWithItsOwnVault() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.RiskParamsVaultMismatch.selector, address(riskParams))
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.RiskParamsVaultMismatch.selector, address(riskParams)));
         new CreditManager(
             usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(foreign)), admin
         );
@@ -379,9 +377,7 @@ contract RiskPointerAgreementTest is RiskParamsFixture {
 
         // The migration round 20 executed, in the order it executed it. It does not get past the
         // constructor now, and would not get past `setCreditManager` if it did.
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.RiskParamsVaultMismatch.selector, address(riskParams))
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.RiskParamsVaultMismatch.selector, address(riskParams)));
         new CreditManager(
             usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(foreign)), admin
         );
@@ -568,6 +564,32 @@ contract TwoFacedManager {
     ///      A stub that fails an OLDER check makes a test red for the wrong reason, which is the
     ///      note `FourSelectorManager` in `SetterGuards.t.sol` already carries.
     function yieldAccruedOn(uint256, uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    /// @dev Round 55 added `resolveBounty` and `currentDebtOf` to the tail probes on this pointer -
+    ///      the two selectors every exit calls bare - for the reason the note above gives.
+    function resolveBounty(uint256, bool) external {}
+
+    function currentDebtOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    /// @dev Round 56 (item 236) added the four members whose absence strands work to the same
+    ///      door, for the reason the notes above give. `accYieldPerBond` is the public variable
+    ///      above; `writeDownLoss` is not a view, so the door reads its SHAPE and it refuses by name
+    ///      the way the genuine manager's zero-amount call does.
+    error ZeroAmount();
+
+    function writeDownLoss(address, uint256, uint256) external pure returns (uint256) {
+        revert ZeroAmount();
+    }
+
+    function claimableOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function pendingYieldOf(address) external pure returns (uint256) {
         return 0;
     }
 }

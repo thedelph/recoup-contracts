@@ -32,6 +32,82 @@ contract RegistryHandler is Test {
     uint256 public ghostRejectedRebinds;
     uint256 public ghostRejectedSelfReferrals;
 
+    /// @dev The in-handler property record. Two fields, so a failure carries its own message
+    ///      rather than only a count.
+    ///
+    ///      **Why these are recorded and not asserted, MEASURED 2026-09-09 on forge 1.8.1 against
+    ///      this file's own pre-conversion commit.** A forge-std assertion inside a handler
+    ///      reverts, and under the global `fail_on_revert = false` a reverting handler call is
+    ///      DISCARDED - so the two assertions that used to stand in the two actions below could
+    ///      fail invisibly for as long as this suite existed, while rolling back the frame that
+    ///      tripped them. Measured at a REAL site rather than argued: flipping `register`'s
+    ///      `assertEq(bytes4(err), ReferralRegistry.CodeTaken.selector, ...)` to `assertNotEq`
+    ///      makes the property false on every contested registration, and
+    ///      `invariant_aRegisteredCodeNeverChangesOwner` still reported
+    ///      `[PASS] (runs: 256, calls: 128000, reverts: 62848)` - close to half the campaign's
+    ///      frames thrown away and nothing red. With the recorder in place the same flip is red on
+    ///      the first frame, carrying "unexpected register revert".
+    ///
+    ///      🟥 **THE BLANKET FORM OF THAT CLAIM IS FALSE, and the correction is worth more than the
+    ///      claim.** forge 1.8.1 DOES report SOME in-handler assertion failures: a bare
+    ///      `assertEq(uint256(1), uint256(2))` at the top of `register` turns this suite RED with
+    ///      `[FAIL: assertion failed: 1 != 2] RegistryHandler::register`. **The discriminator is
+    ///      the MESSAGE**, isolated by changing that one argument and nothing else at the same
+    ///      site: `assertEq(uint256(1), uint256(2), "planted with a message")` is green again at
+    ///      `(runs: 256, calls: 128000, reverts: 63994)`. A two-argument forge-std assertion
+    ///      reverts with a string beginning "assertion failed", which forge picks out of the
+    ///      discarded frame; a three-argument one reverts with the assertion's own message instead and
+    ///      is indistinguishable from an ordinary business revert. **Both assertions this
+    ///      conversion touched carried a message**, which is why the hazard was total here - and
+    ///      why a session that probes it with a message-less one-liner will measure the opposite
+    ///      and conclude there is nothing to fix. The message is a SUFFICIENT suppressor and not
+    ///      the only one: that same message-LESS one-liner planted inside `register`'s catch block
+    ///      rather than at the top of the function was not reported either,
+    ///      `(runs: 256, calls: 128000, reverts: 62346)`. That reading is unexplained and is
+    ///      recorded rather than smoothed over.
+    ///
+    ///      **The truncation half is what bites in THIS file, and it bites the permanence claim.**
+    ///      Both assertions sit in a `catch`, on the residual branch left after the expected
+    ///      refusals have been counted - so a wrong one does not merely fail quietly, it discards
+    ///      the frame that reached the contested state. This handler draws codes from a six-entry
+    ///      pool precisely so `CodeTaken` and contested registrations happen often, and every ghost
+    ///      that records a contest (`ghostFirstOwner`, `knownCodes`, `ghostFirstCode`,
+    ///      `boundActors`) dies with the frame. The invariants below are quantified over exactly
+    ///      those ghosts, so a silent truncation here thins the set they read and leaves them
+    ///      passing over less than they appear to.
+    ///
+    ///      Three repairs exist and this is the third. `assert(cond)` raises Panic(0x01), which
+    ///      forge 1.8.1 DOES report as a `handler_assertion` failure naming the contract and the
+    ///      offending selector - measured for `CollateralVault.invariants.t.sol` on 2026-09-09 and
+    ///      recorded on `VaultHandler.firstBrokenProperty`, not re-measured here - but it discards
+    ///      the frame and carries no message, and `bind`'s
+    ///      residual branch is reached after two other selectors have already been peeled off, so
+    ///      a nameless failure would not say which of the two actions raised it. `assertions_revert
+    ///      = false` makes the whole `vm.assert*` family report, but it is a whole-suite semantic
+    ///      change across every test in the tree and is not a test file's to take. Recording keeps
+    ///      the message, keeps the frame, and is the idiom `RiskParams.invariants.t.sol::propose`
+    ///      already documents in prose: "Counting it and asserting the count from the suite has
+    ///      neither problem."
+    ///
+    ///      **The one hole, and why it is already covered.** A record written here is lost if the
+    ///      SAME frame reverts later for an unrelated reason. That case is exactly a dropped frame,
+    ///      and `invariant_theHandlerNeverDropsAFrame` is red on the first one - so the two guards
+    ///      compose and neither has to be trusted alone.
+    string public firstBrokenProperty;
+    uint256 public brokenProperties;
+
+    /// @dev Records rather than reverts. See `firstBrokenProperty`. The FIRST message is kept
+    ///      because it is the one with a live counterexample behind it; later ones only add noise.
+    ///
+    ///      `private`, and non-view, on purpose. `targetContract(address(handler))` takes every
+    ///      external non-view function as a fuzz action whether it was written to be one or not,
+    ///      so a public recorder would let the fuzzer write the very field the suite reads.
+    function _mustHold(bool ok, string memory what) private {
+        if (ok) return;
+        if (brokenProperties == 0) firstBrokenProperty = what;
+        ++brokenProperties;
+    }
+
     constructor(ReferralRegistry registry_) {
         registry = registry_;
         for (uint256 i; i < 5; ++i) {
@@ -79,7 +155,7 @@ contract RegistryHandler is Test {
                 knownCodes.push(code);
             }
         } catch (bytes memory err) {
-            assertEq(bytes4(err), ReferralRegistry.CodeTaken.selector, "unexpected register revert");
+            _mustHold(bytes4(err) == ReferralRegistry.CodeTaken.selector, "unexpected register revert");
         }
     }
 
@@ -101,7 +177,7 @@ contract RegistryHandler is Test {
             } else if (sel == ReferralRegistry.SelfReferral.selector) {
                 ++ghostRejectedSelfReferrals;
             } else {
-                assertEq(sel, ReferralRegistry.CodeNotRegistered.selector, "unexpected bind revert");
+                _mustHold(sel == ReferralRegistry.CodeNotRegistered.selector, "unexpected bind revert");
             }
         }
     }
@@ -137,6 +213,27 @@ contract ReferralRegistryInvariants is Test {
     ///      invariant here and is what lets the `try`/`catch` idiom work at all.
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
+
+    /// @notice Every property the two handler actions check held on every frame that ran.
+    /// @dev **This invariant is the whole reason those two checks are worth anything.** They used
+    ///      to be forge-std assertions inside the handler, which revert - and under
+    ///      `fail_on_revert = false` a reverting handler call is DISCARDED, so each of them could
+    ///      have been failing since the day it was written and this suite would have reported every
+    ///      other invariant green over the top of it. `RegistryHandler.firstBrokenProperty` carries
+    ///      the measurement and the two rejected repairs.
+    ///
+    ///      **It composes with the frame guard rather than duplicating it.** The guard says no
+    ///      frame died; this says nothing a frame observed was wrong. A residual `catch` branch is
+    ///      exactly where the two meet: before this line, a wrong selector reaching it produced a
+    ///      dropped frame the guard would report and a message nobody would ever see.
+    ///
+    ///      Asserted from the suite rather than in the handler, which is the only place the check
+    ///      both survives the frame and can carry its message. The message IS the original
+    ///      assertion's message, moved rather than rewritten, so a failure here reads exactly as
+    ///      the in-handler assertion would have.
+    function invariant_everyInHandlerPropertyHeld() public view {
+        assertEq(handler.brokenProperties(), 0, handler.firstBrokenProperty());
+    }
 
     function invariant_aRegisteredCodeNeverChangesOwner() public view {
         uint256 n = handler.knownCodeCount();

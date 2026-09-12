@@ -306,8 +306,14 @@ contract SetterGuardsTest is RiskParamsFixture {
     ///      genuinely present; refusing the follow leaves `start` shut against the manager the
     ///      vault names; and the follow succeeds today.
     ///
-    ///      **This test passes before this commit as well as after it.** It is a sign check on a
-    ///      change that was considered and not made, not a regression on one that was.
+    ///      **This test passed before round 21's commit as well as after it.** It is a sign check
+    ///      on a change that was considered and not made, not a regression on one that was.
+    ///
+    ///      🟥 **Round 55 changed the shape of part 3 and not the conclusion.** The vault's manager
+    ///      door now carries the same `heldLot` arm, so the state part 3 used to measure at the
+    ///      follow - a lot still parked - is no longer reachable there. A `bondCount` clause on the
+    ///      return leg would now be vacuous rather than harmful, and part 2 carries the argument on
+    ///      its own. Recorded in the body rather than silently re-asserted.
     ///
     ///      **Audit round 22, finding 8, engaged with rather than worked around.** That finding is
     ///      about money leaving with the pointer this test insists must be free to move: the state
@@ -329,8 +335,17 @@ contract SetterGuardsTest is RiskParamsFixture {
         );
         assertEq(credit.totalDebt(), 0, "fixture: the write-down cleared the book");
 
-        // The vault's manager pointer moves over a parked lot: it reads the two queue counters,
-        // not the ledger, and round 21 did not ask it to change.
+        // ROUND 55. The vault's manager pointer used to move over a parked lot: it read the two
+        // queue counters and not the ledger, and round 21 did not ask it to change. Round 55 did,
+        // because a repoint there strands the lot's post-close accrual on the detached manager.
+        // So this leg refuses first, and the owner-gated disposal is what clears it. That changes
+        // the SHAPE of part 3 below and not this test's conclusion.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.AuctionHasLiveWork.selector, heldLot));
+        vault.setCreditManager(address(managerB));
+        vm.prank(admin);
+        auction.disposeWorkoutLot(parkedId, stranger);
+
         vm.prank(admin);
         vault.setCreditManager(address(managerB));
         assertEq(vault.creditManager(), address(managerB), "the vault moved");
@@ -342,9 +357,16 @@ contract SetterGuardsTest is RiskParamsFixture {
         vm.expectRevert(LiquidationAuction.NotCreditManager.selector);
         auction.start(alice, keeper);
 
-        // Part 3: the follow is available, and a `bondCount` clause here would have refused it on
-        // the same non-zero `heldLot` the other two setters now refuse on.
-        assertEq(vault.bondCount(address(auction)), heldLot, "the lot is still parked at the follow");
+        // Part 3, RE-STATED at round 55. Until this round the lot was still parked at the follow,
+        // and a `bondCount` clause on the return leg would have refused it on the same non-zero
+        // `heldLot` the other two setters refuse on - harmful, and that was the argument. Now the
+        // vault's own manager door will not move until the lot is gone, and nothing can park
+        // another one in the gap: `start` is gated on THIS pointer, and the manager the auction
+        // still names has just been detached, so it cannot liquidate. A clause here would
+        // therefore be VACUOUS rather than harmful. The reason not to add it is part 2's, which
+        // does not depend on the count at all: the return leg must be free to follow, or `start`
+        // stays shut against the manager the vault names.
+        assertEq(vault.bondCount(address(auction)), 0, "the lot cannot still be parked at the follow");
         vm.prank(admin);
         auction.setCreditManager(address(managerB));
         assertEq(auction.creditManager(), address(managerB), "the return leg followed, as it must");
@@ -370,7 +392,13 @@ contract SetterGuardsTest is RiskParamsFixture {
         VaultOnlyAdapter stub = new VaultOnlyAdapter(address(vault));
 
         vm.prank(admin);
-        vm.expectRevert();
+        // Round-54 item 223, shipped round 55: the ENCODED form, naming the selector that did not
+        // answer, where the bare `vm.expectRevert()` that stood here pinned "anything reverts" over an
+        // EMPTY revert - and, because this stub answers `vault()`, was really pinning the SECOND probe
+        // while reading as though it covered the setter.
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.AdapterDoesNotAnswer.selector, ICustodyAdapter.stakedBalance.selector)
+        );
         vault.setCustodyAdapter(ICustodyAdapter(address(stub)));
 
         assertEq(address(vault.custodyAdapter()), address(adapter), "the pointer did not move");
