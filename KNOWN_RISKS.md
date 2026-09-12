@@ -167,6 +167,95 @@ The scope is deliberately narrower than historical loss-bearer ownership:
 A true loss-era entitlement system would require separate snapshot, claim and queue-ownership
 semantics.
 
+The three residuals below came out of a further internal adversarial review, dated 2026-09-12, read
+over what happens to a lender on the worst day this design permits. None of them is a bug report.
+Each is a deliberate property of the design, each is pinned in this tree by a test that asserts the
+behaviour rather than forbidding it, and each is held rather than fixed, because in every case the
+fix is either a change to a file under external audit or a larger piece of accounting than is
+prudent to write while that audit is open. They are recorded here because nothing a lender reads on
+the exit path says any of it. Severities are assigned by the author, not by an auditor, and every
+figure is an executed reproduction on the fixture its own sentence states.
+
+### Closing the last position destroys the yield still streaming to it. High, deliberate and held
+
+When a burn takes real supply to zero with no principal outstanding,
+`_derecogniseEmptyPoolResidual` writes the whole undelivered stream out of the book, and
+`_exitAssets` excludes `unreleasedYield`, so the lender closing the position is paid the principal
+and the tail is gone the moment the last share burns. The USDC stays in the contract as
+`unmanagedSurplus` and nothing reaches it afterwards. On a 10,000 USDC deposit with 8,500 lent, a
+sixty-day gap before the epoch lands and a 2,500 USDC lender share, one ordinary `redeem` destroys
+the whole 2,500.000000; a smaller fixture destroys 833.333335, and with two lenders each closing
+their own position the 1,000.000000 tail dies once and entirely rather than pro rata. `maxWithdraw`
+reports exactly the principal figure and never signals the forfeit, so nothing on the exit path
+warns. It is irrecoverable rather than merely mispriced: a later deposit, a fresh epoch, a lend and
+repay cycle with surplus, `reconcileCashDeficit`, `coverClaimDeficit` and `coverEntryPriceDeficit`
+each leave the dead figure unmoved by a wei, and there is no owner rescue on this pool, which is
+the same property that protects a lender from the owner. The exposure window is the larger of the
+time since the last epoch and `YIELD_STREAM_DURATION`, so it is not bounded by five days: one
+fixture rated a stream over 5,184,000 seconds because the keeper cadence had been interrupted. The
+avoidance is to leave `MIN_SUPPLY_FOR_YIELD` behind, wait the stream out and close after it, which
+returns 833.260175 of the 833.333335 in that fixture. The behaviour is deliberate and pinned by
+`test_stream_finalBurnPermanentlyDerecognisesTheOrphanedTail` in
+[`test/LenderPool.t.sol`](test/LenderPool.t.sol). A crystallise-on-final-exit variant, which pays
+the closing lender the pot instead of derecognising it, was costed at +97 runtime bytes on
+`LenderPool` and refused: it fails that pin and it is a change to a file under audit. Held as
+disclosed, not fixed; a reviewer should treat it as open.
+
+### A deposit between a socialised loss and its recovery takes a share of that recovery. High, deliberate and held
+
+The gross active-tail entry price defends the cohort against capital arriving after a recovery is
+delivered, and the tree asserts that directly in
+`test_R22F10_postDeliveryEntrantCannotDiluteTheRecoveryCohort` in
+[`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol), where an entrant
+depositing after `workoutSettleAfterClose` pays for the tail it is about to share. Nothing defends
+the window before delivery. An entrant that deposits after `socialiseLoss` has written the loss
+down and before `recoverLoss` delivers the redemption pays nothing for a tail that does not exist
+yet, and then owns its pro-rata slice of it when it arrives. On a 10,000 USDC position with a 1,500
+USDC entrant the loss bearer is 4,250.000000 worse off than the same fixture with no entrant, which
+returns 10,000.000000 whole, and at the deposit cap the figure is 7,989.999999. The entrant pays
+nothing for it: the profit is exactly the bearer's loss. The required hold is `YIELD_STREAM_DURATION`,
+432,000 seconds, inside a `WORKOUT_MAX_DURATION` of 1,209,600, so the anti-JIT stream removes the
+same-block take and does nothing about the five-day one. The door is wide open in that state and
+the senior machinery is inert while it is: in the measured fixture `maxDeposit` offers
+23,500.000000 against a pool worth 1,500.000000, and `minimumEntryAssets()`, `entryPriceDeficit()`
+and `entryPriceCashReserve()` all read zero, because `MAX_LENDER_SHARES_PER_ASSET` puts the entry
+floor out of reach at any realistic supply. The socialisation itself reopens the room, since
+`depositCapUsage` falls with `outstandingPrincipal`, which is the cap term the entrant arrives
+through. No malice is needed. This is the pre-delivery half of the disclosed post-delivery F10
+decision above, and it is held rather than fixed: closing entry inside `socialiseLoss` was costed
+at +38 runtime bytes and is not shippable as written, because it pauses the pool and six existing
+tests then fail on `EnforcedPause()`. The answers that would work are loss-cohort accounting, which
+is large, or a guardian pause taken operationally on `LossSocialised`, which costs nothing in
+bytecode but depends on a `guardian` being installed, and it ships as the zero address. Deliberate,
+held and disclosed.
+
+### During a liquidation or an open workout the exit price values that loan at zero. Medium-high, deliberate and held
+
+`CreditManager._impairmentFor` returns `currentDebtOf` in full for as long as an auction exists or
+a workout is open. It is the whole debt, not an expected shortfall, and `exitReserve` clamps it to
+`outstandingPrincipal`, so with a single borrower the exit assets become cash only and a lender who
+needs money during that window sells the loan at zero. On a 5,000 USDC deposit the leaver receives
+749.999998 and the lender who waits receives 9,250.000001 on the same position, a transfer of
+4,250.000002 while the protocol itself loses nothing. The modest version is the one most lenders
+would meet: one ordinary 225.000000 withdrawal burns 750.000001, thirty percent of the position at
+the zero-recovery price for fifteen percent of its value in cash. The mark is almost always
+pessimistic by construction, because `DEFAULT_MAX_LTV_BPS` and `DEFAULT_LIQUIDATION_THRESHOLD_BPS`
+sit at 2,500 and 5,000 against an auction that opens at 100 percent of NAV and floors at 68, so
+full recovery is the expected case and the pool quotes zero regardless, for six hours of auction
+and up to fourteen days of workout. The behaviour is deliberate and is pinned as such in
+[`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) by
+`test_impairment_isSetTheMomentTheAuctionOpens`, `test_impairment_isFlatAcrossExpiryToWorkout` and
+`test_impairment_isUnmovedByASupersedeAtARecoveredNav`, whose own assertion messages say a live
+auction reserves the whole debt, an open workout assumes zero recovery, and the mark tracks the
+debt rather than the collateral. What is not reproduced end to end is a full liquidation and
+workout: the full-debt mark is read from `_impairmentFor` and from the assertions of those three
+tests rather than from a single trace that runs the lifecycle through. This is therefore a severity
+disclosure rather than a bug report. What is missing is not the conservatism but the label:
+`previewRedeem` is indistinguishable from a permanent loss while the mark stands, and a lender
+acting on it takes an irreversible step against a number that is temporary by design. The avoidance
+is to wait the auction or workout out. Deliberate, held, and named here because nothing in the
+quote says so.
+
 ## Open findings from internal review round 45, at the audit commit
 
 In the week before the external audit, a twelve-reader internal adversarial pass was run over the
@@ -603,6 +692,9 @@ accepted for the present pre-launch state.
 | Long-gap lender yield | A long delivery gap can defer several epochs and then stream about 3.10 epochs over five days rather than their original accrual windows |
 | Impairment refresh | A conservative stale-high mark persists until a permissionless refresh; `refreshImpairments` can report apparent progress when `impair` no-ops |
 | Balance-probe stipend | The pool reads the asset's balance through a 30,000-gas probe (`_tryRawBalance`); if the USDC contract is ever upgraded to a proxy shape whose `balanceOf` costs more than that, all four ERC-4626 maxima read zero and `deposit`, `withdraw` and `redeem` revert, while the withdrawal-request, service and claim doors keep paying in full - so a synchronous exit silently becomes a two-step one, and the probe's answer can also depend on what warmed storage earlier in the same transaction |
+| Final-exit yield forfeit | The position that takes real supply to zero forfeits the whole undelivered stream, which stays in the contract as `unmanagedSurplus` with nothing able to reach it afterwards, and `maxWithdraw` quotes only the principal; deliberate and pinned. See "Closing the last position destroys the yield still streaming to it" above |
+| Pre-delivery entry to a socialised loss | A deposit landing after `socialiseLoss` and before `recoverLoss` pays nothing for the recovery tail and then takes its pro-rata slice of it; the stream bounds the take to a `YIELD_STREAM_DURATION` hold rather than to a block, and the cap headroom the loss frees is the door it arrives through. See "A deposit between a socialised loss and its recovery takes a share of that recovery" above |
+| Exit price during liquidation or workout | `_impairmentFor` marks the whole debt for as long as an auction exists or a workout is open, so a synchronous exit in that window sells the loan at zero and `previewRedeem` reads the same as a permanent loss; deliberate, conservative, and unlabelled on the exit path. See "During a liquidation or an open workout the exit price values that loan at zero" above |
 
 ### Oracle, wiring and migration
 
