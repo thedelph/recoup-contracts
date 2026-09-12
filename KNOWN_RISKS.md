@@ -102,11 +102,16 @@ candidate fixes were built and refused across five audit rounds, every one of th
 reserve that neither computing function read.
 
 The mechanism those numbers describe is not in this source. `_queueCashReserve` is
-`mulDiv(executableCash, requestedShares, totalSupply(), Ceil)`: a pro-rata slice of executable
-**cash**, taken per controller, with the entry-price reserve removed first because it is senior
-while principal can still be lost. A holder of a tenth of the supply reserves a tenth of the cash.
-The leverage multiplier is gone by construction, not by tuning, which is why the fifteen refusals do
-not apply to it.
+`mulDiv(executableCash, queuedShares, totalSupply(), Ceil)`: a pro-rata slice of executable
+**cash**, taken over every outstanding request at once rather than per controller, with the
+entry-price reserve removed first in `_executablePoolCash` because it is senior while principal can
+still be lost. The per-controller figure is a different function, `maxRequestRedeem`, which slices
+the same executable cash by that controller's own `requestedShares` and rounds Floor where the
+aggregate rounds Ceil. This paragraph named `requestedShares` in the aggregate formula and called it
+per-controller until 2026-09-12, which crossed the two; both are real names in
+[`src/LenderPool.sol`](src/LenderPool.sol) and they are not interchangeable. Requesters holding a
+tenth of the supply between them reserve a tenth of the cash. The leverage multiplier is gone by
+construction, not by tuning, which is why the fifteen refusals do not apply to it.
 
 Closed in this source, not on the testnet: the Sepolia `LenderPool` still exposes the
 `serviceQueue` family, removed from this source, and runs the reserve these numbers describe, until it is redeployed.
@@ -238,8 +243,12 @@ external review section below. Still open in this source.
 **Fixed by the one sentence the paragraph below asks for.** `LenderPool.setCreditManager` stamps
 `wasCreditManager` for the incoming manager, `recoverLoss` accepts the live manager or a former
 one, and it pulls the USDC from and credits `msg.sender` rather than the live pointer. Nothing else
-on the pool reads the mapping. The external reviewers filed the same gap as their L-01, rated Low;
-this record keeps it at High. Regressions: `test_L01_managerMigrationNoLongerStrandsPostCloseRecovery`
+on the pool reads the mapping. The external reviewers filed the same gap as their L-01 at Low and
+re-rated it to High on 2026-09-12, on the ground that the second half of their own reproduction
+disproves the premise the Low rested on: the acknowledged "retry once the pointer is repaired" is
+itself refused with `PrincipalOutstanding` once the successor manager has lent, so the refusal is
+permanent rather than a recoverable delay. This record rated it High throughout, and the two
+ratings now agree. Regressions: `test_L01_managerMigrationNoLongerStrandsPostCloseRecovery`
 in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) (the reviewers' own
 reproduction with the expected revert removed), `test_R46_theRecoveryLandsAfterALegalPoolRepoint`,
 `test_R46_theOnlyRouteIntoTheRecoveryIsTheAuctionAndItIsOpen` and
@@ -415,7 +424,7 @@ landed in the development tree before the issues were filed, so its delta is not
 | #50 M-03 | First clean workout close captures shared residual yield | **Fixed, earlier.** The shortfall that close ordering allocated can no longer be created once the open-workout accrual is reserved, and the owed ledger is kept per bearer. The public test at b66023d, `test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst`, asserted that the second close booked nothing, which was a pinned disclosure of the round 22 F18 residual and is what the reviewers' reproduction restates; it now asserts that both closes book and are paid, beside `test_R23_04_twoCleanClosesCannotBookTheSameClaimTwice` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol). The forced-close fix the reviewers asked about is separate and is in this source; see the round 54 paragraph above | earlier |
 | #51 M-04 | Uncapped stream duration plus gross entry pricing lets a timed flush overcharge new lenders | **Confirmed; a ceiling was built, measured and held.** The gross entry pricing is the disclosed F10 decision above and the unbounded window is the drought item above. A 30-day ceiling on the epoch leg of `_rateStream` was built on a separate branch with the stream-clock tests updated, and is deliberately not in this source: with a 180-day gap, a 1,000.000000 pot and two equal holders, a holder staked for exactly 30 days after the flush takes 499.999999 with the ceiling against 83.333333 without it, and a 3,000.000000 newcomer is whole after 30 days rather than 180. The ceiling moves the transfer from the newcomer to the incumbent rather than removing it, which is the same shape the drought item's "honest fix is two rates" sentence refuses. `_rateStream` is unchanged here and the decision is open with the reviewers | 0 |
 | #52 M-05 | A lender-yield backlog above the deposit-cap ceiling can never be delivered | **Fixed.** `distributeYield` clamps the streamable amount to capital only in the terminal state where the cap is at `GLOBAL_BORROW_CAP_MAX` and `depositCapUsage` has reached it; every other oversize offer still reverts `YieldExceedsCapital`, so the one-cent capture the refusal exists for stays refused. The harvester's `_push` decrements `pendingLenderYield` by measured delivery, so the remainder stays pending and drains over successive flushes. Regressions in [`test/LenderPool.t.sol`](test/LenderPool.t.sol): the reviewers' three, `test_distributeYield_theHardCeilingAdmitsNoMoreCapital`, `test_distributeYield_aBacklogAboveTheHardCeilingIsClampedNotRefused` and `test_distributeYield_anOfferOfExactlyCapitalIsAcceptedInFull`, plus `test_distributeYield_aBacklogAboveTheHardCeilingDrainsOverSuccessiveFlushes` (900,000 drained in three flushes) and `test_distributeYield_belowTheHardCeilingTheRefusalIsUnchanged`; and `test_R40_D7_theBacklogAboveTheHardCeilingDrainsThroughTheRealHarvester` in [`test/R40D7Capture.t.sol`](test/R40D7Capture.t.sol), 400,000 through `flushLenderYield` in two flushes | `LenderPool` +60 |
-| #53 L-01 | Manager migration strands post-close loss recoveries with no unblocked repair path | **Fixed; rated High here.** `LenderPool.setCreditManager` stamps `wasCreditManager`, and `recoverLoss` accepts the live manager or a former one and pulls from and credits `msg.sender`. The parked-tranche alternative the reviewers proposed, a pool-side balance drained by a permissionless flush, was built and refused by execution: +561 runtime bytes as built, and the drain calls `recoverLoss` from the retired manager, so it is dischargeable only by pointing the pool back, which reverts `PrincipalOutstanding` once the successor has lent. Regressions: `test_L01_managerMigrationNoLongerStrandsPostCloseRecovery` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol); `test_R46_theRecoveryLandsAfterALegalPoolRepoint`, `test_R46_theOnlyRouteIntoTheRecoveryIsTheAuctionAndItIsOpen` and `test_R46_aFormerManagerReachesNoOtherManagerGatedLeg` in [`test/R46AuctionRepointRecovery.t.sol`](test/R46AuctionRepointRecovery.t.sol); `test_regression_aLateTrancheAfterARepointFollowsTheBearerEvenAfterThePoolMovesOn` in [`test/R55A01_WorkoutLifecycle.t.sol`](test/R55A01_WorkoutLifecycle.t.sol) | `LenderPool` +72 |
+| #53 L-01 | Manager migration strands post-close loss recoveries with no unblocked repair path | **Fixed. High, re-rated by the auditor 2026-09-12** from the Low it was filed at, to the grade this record already carried. `LenderPool.setCreditManager` stamps `wasCreditManager`, and `recoverLoss` accepts the live manager or a former one and pulls from and credits `msg.sender`. The parked-tranche alternative the reviewers proposed, a pool-side balance drained by a permissionless flush, was built and refused by execution: +561 runtime bytes as built, and the drain calls `recoverLoss` from the retired manager, so it is dischargeable only by pointing the pool back, which reverts `PrincipalOutstanding` once the successor has lent. Regressions: `test_L01_managerMigrationNoLongerStrandsPostCloseRecovery` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol); `test_R46_theRecoveryLandsAfterALegalPoolRepoint`, `test_R46_theOnlyRouteIntoTheRecoveryIsTheAuctionAndItIsOpen` and `test_R46_aFormerManagerReachesNoOtherManagerGatedLeg` in [`test/R46AuctionRepointRecovery.t.sol`](test/R46AuctionRepointRecovery.t.sol); `test_regression_aLateTrancheAfterARepointFollowsTheBearerEvenAfterThePoolMovesOn` in [`test/R55A01_WorkoutLifecycle.t.sol`](test/R55A01_WorkoutLifecycle.t.sol) | `LenderPool` +72 |
 | #54 L-02 | Permissionless settle discards a borrower's sub-unit yield accrual | **Held; accepted Low.** The one-line skip the reviewers propose was re-executed on a scratch copy of `_settle` at this source and not committed: 336 wei of unbacked credit on a 1.000000 pot (1,000,335 credited plus 1 undistributed against 1,000,000 streamed), for the same reason as the 925,925 wei measured against the original proposal, a zero-floored settle before a top-up leaves the index stale and the next settle prices the stale delta at the larger bond count. The shipped code destroys 2 wei in the same trace. The remainder-carry alternative was measured at +198 bytes and makes `pendingYieldOf` under-report. Pinned by `test_L02_aZeroFlooredSettleBeforeATopUpCreditsNoMoreThanWasStreamed` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) | 0 |
 
 Measured on this source with `forge build --sizes` on a clean build: `CreditManager` 22,518 bytes
@@ -461,10 +470,18 @@ candidate that rejected that call is historical; current self-registration sourc
 referral programme has not launched, but the address must not be used as proof of current behaviour.
 
 The current creation/runtime sizes are 2,150/1,350 bytes, with keccak256 hashes
-`0x574a196d16ed1a5c2d1f41293e756628f3038ea49ab39a66c166c82cb51a7fba` and
-`0x07da903bdd0b827c5b8a8b8164a789ec28087119ca9e32d1f67478f9021d7a37`. Compiler metadata remains
-a 51-byte CBOR trailer with embedded IPFS digest
-`0x4d91b88c1f71ca44d584b8ae34d865bbc6c69d1b99eb89993497b7049e335df2`.
+`0xc2a69df82d6752fb9a784997d888448ecba1698c652bb016ce11b2c83cfb7de1` and
+`0x3f9a2b1592acbd3c056e88fd94ae712cb5af632dea9dac1789e79dc97c02465e`. Compiler metadata remains
+a 51-byte CBOR trailer, with embedded IPFS digest
+`0x4d91b88c1f71ca44d584b8ae34d865bbc6c69d1b99eb89993497b7049e335df2` before 2026-09-12 and
+`0xff2bc27f977efdde5278aefeda1758958b3d8e1790999470bbccce8a53578131` on this source. All three
+hashes were re-measured on 2026-09-12 on a clean `forge build` and all three had gone stale, while
+both byte counts stayed exactly right, which is the tell worth keeping. Solc hashes the whole
+metadata, and the metadata names every source in the contract's own compilation closure, which here
+is this contract and `Config.sol`; both have changed since the hashes were written, and the most
+recent change to this contract was four lint-suppression comments, which cost no runtime bytes at
+all. A byte count that has not moved is therefore no evidence that a hash has not moved with it.
+Re-measure all five figures from the build artifact rather than quoting them from here.
 
 A 2026-08-21 loopback-only Base Sepolia-fork rehearsal exposed chain ID 31337 and used one local
 deployment transaction, 16 constructor reservation logs and 841,101 gas. Reserved codes resolved to
