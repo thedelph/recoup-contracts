@@ -293,7 +293,7 @@ contract EntryStepReachabilityTest is RiskParamsFixture {
 
         vm.expectRevert(CreditManager.NotLiquidationAuction.selector);
         vm.prank(payer);
-        credit.recoverWrittenDownLoss(alice, 1e6);
+        credit.recoverWrittenDownLoss(alice, 1, 1e6);
     }
 
     // -- A. the epoch leg ----------------------------------------------------

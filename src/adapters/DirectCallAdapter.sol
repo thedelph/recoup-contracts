@@ -51,10 +51,12 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     error ZeroAddress();
     error RenounceDisabled();
     error NothingToFlush();
+    error NothingToRestake();
 
     event YieldRecipientSet(address indexed recipient);
     event HarvesterSet(address indexed harvester);
     event EmergencyUnstaked(address indexed to, uint256 amount);
+    event Restaked(uint256 amount);
     event YieldParked(address indexed recipient, uint256 amount, uint256 totalOwed);
     event YieldFlushed(address indexed recipient, uint256 amount);
     event MintAttemptExecuted(
@@ -210,6 +212,20 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///      a zeroed counter would decline every epoch forever.
     uint256 public farmYieldDelivered;
 
+    /// @notice Round-55 item 219: the slice of `farmYieldDelivered` that was forwarded to the
+    ///         WIRED harvester, and the counter `EpochHarvester` seeds and corroborates on.
+    /// @dev A second counter rather than a gate on the first, because `farmYieldDelivered` is
+    ///      the round-11 accounting figure - every farm-touching path, whoever received it - and
+    ///      twenty-seven shipped tests pin it that way. This one moves only when the recipient the
+    ///      sweep paid IS `harvester`, so yield forwarded to a pre-handover sink, to a mis-pointed
+    ///      recipient, or by `setYieldRecipient`'s own handover settle (which pays the OUTGOING
+    ///      recipient, correctly) proves nothing about an epoch on a contract that did not receive
+    ///      it. MEASURED without it: with the recipient elsewhere, a repair to the harvester moved
+    ///      the first counter by 500.000000 that went elsewhere and the next `harvest` ran a
+    ///      stranger's 10.000000 donation as epoch 1. Never decreases; a fresh adapter starts at
+    ///      zero, and `EpochHarvester.setCustodyAdapter` re-seeds against THIS counter.
+    uint256 public farmYieldDeliveredToHarvester;
+
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault();
         _;
@@ -277,11 +293,39 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
             // fix, so the recipient could never be repointed and every dollar of farm
             // yield was trapped in an immutable contract, growing with each exit.
             //
-            // `_trySweepUsdc` targets the *outgoing* recipient because the flip below
-            // has not happened yet, and `unreportedYield` is cleared only when the
-            // sweep actually moved the money it was tracking.
+            // The sweep targets the *outgoing* recipient because the flip below has not
+            // happened yet.
+            //
+            // 🟥 **This used to be a bare `if (_trySweepUsdc() != 0) unreportedYield = 0;` and it
+            // was the ONE farm-touching path that did not go through `_settleFarmPayout`. Round-50
+            // item 84.** `claimFarmRewards` is `farm.withdraw(0)` and nothing else - it settles
+            // nothing - so the claimed USDC was forwarded to the outgoing recipient with
+            // `farmYieldDelivered` UNMOVED, and the carried `unreportedYield` was zeroed without
+            // ever being counted. MEASURED, both wiring orders: 100.000000 of farm yield delivered
+            // against a watermark that did not move, where the control through `depositBonds`
+            // credits it. `_settleFarmPayout`'s own comment says it is "the one funnel every
+            // farm-touching path goes through, so a NEW path cannot deliver farm yield without also
+            // corroborating the epoch that pays it out" - and an OLD path was outside it.
+            //
+            // The direction is an under-count, which is the safe one and is why this survived: the
+            // harvester declines the epoch as uncorroborated and the same USDC is counted by the
+            // next real one. Where it bites is the Phase-3 handover, which IS a
+            // `setYieldRecipient` over an epoch of accrual.
+            //
+            // `_settleFarmPayout` performs the identical sweep, so nothing about the escape hatch
+            // changes: it is still best-effort, a reverting recipient still parks below, and on the
+            // failed branch the newly claimed amount now joins `unreportedYield` instead of being
+            // dropped - which the park immediately below then moves with the money, exactly as its
+            // own comment already says it does.
+            //
+            // ACCEPTED (audit round 44). `setYieldRecipient` is `onlyOwner`, and the callee is this
+            // contract's own `claimFarmRewards` reached by an external self-call. Re-entry would need the
+            // owner to be the attacker, which is the admin-key posture recorded for go-live rather than a
+            // reentrancy hole.
+            uint256 balBefore = usdc.balanceOf(address(this));
+            // forge-lint: disable-next-line(reentrancy-no-eth)
             try this.claimFarmRewards() {} catch {}
-            if (_trySweepUsdc() != 0) unreportedYield = 0;
+            _settleFarmPayout(_farmDelta(balBefore));
 
             // Read after the drain, exactly as `EpochHarvester.setLenderPool` reads its residue
             // after the delivery attempt: what is still free is precisely the part the outgoing
@@ -400,7 +444,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
 
         uint256 beforeBalance = usdc.balanceOf(address(this));
         uint256 reported = MintAttemptReceiver(payable(receiver)).flushFarmYield();
-        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
+        uint256 received = _farmDelta(beforeBalance);
         uint256 corroborated = reported < received ? reported : received;
         if (corroborated != 0) swept = _settleFarmPayout(corroborated);
 
@@ -455,8 +499,16 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         // already reads both quantities. That saving was considered and refused: the condition is
         // written down as it stands so a later reader does not have to re-derive it from a
         // boolean's provenance, and bytes are not the binding constraint on this contract.
+        // FALSE (audit round 44). The return value IS used: this is a tuple destructure that binds the
+        // stake and drops `pendingShare`, which this site deliberately does not read - the comment
+        // below says why `pendingShare` is not one of the terms.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 stakedAtReceiver,) = farm.userInfo(receiver);
         bool needsBondPath =
+            // FALSE on direction (audit round 44). An external donation can only move this predicate to
+            // the conservative side: a stray wei of bonds makes the recovery REQUIRE the whitelist it
+            // might not have needed, which fails closed. No donation opens a branch.
+            // forge-lint: disable-next-line(incorrect-strict-equality)
             stakedAtReceiver != 0 || bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID) != 0;
         if (needsBondPath && !bond.whitelistContains(address(this))) revert AdapterNotWhitelisted();
 
@@ -521,9 +573,14 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///      USDC pause or blacklist must never block a deposit. Un-swept USDC is
     ///      carried in `unreportedYield` and reported by the next successful claim.
     function stake(uint256 amount) external onlyVault returns (uint256 swept) {
+        swept = _depositAndSettle(amount);
+    }
+
+    /// @dev `stake`'s body, shared with `restakeLoose` so the two farm deposits cannot drift.
+    function _depositAndSettle(uint256 amount) private returns (uint256 swept) {
         uint256 balBefore = usdc.balanceOf(address(this));
         farm.deposit(amount);
-        swept = _settleFarmPayout(usdc.balanceOf(address(this)) - balBefore);
+        swept = _settleFarmPayout(_farmDelta(balBefore));
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -541,7 +598,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         farm.withdraw(amount);
         // On a failed sweep (USDC paused, recipient blacklisted) the exit still
         // succeeds and the yield is carried to the next successful claim.
-        swept = _settleFarmPayout(usdc.balanceOf(address(this)) - balBefore);
+        swept = _settleFarmPayout(_farmDelta(balBefore));
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -557,7 +614,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     function claimYield() external onlyClaimer returns (uint256 usdcAmount) {
         uint256 balBefore = usdc.balanceOf(address(this));
         farm.withdraw(0); // withdraw(0) = claim, verified on-chain behaviour
-        usdcAmount = _settleFarmPayout(usdc.balanceOf(address(this)) - balBefore);
+        usdcAmount = _settleFarmPayout(_farmDelta(balBefore));
     }
 
     /// @inheritdoc ICustodyAdapter
@@ -566,8 +623,24 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     }
 
     /// @inheritdoc ICustodyAdapter
+    // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `unused-return` finding on
+    // `stakedBalance`. Same disposition as the forge-lint line below and the same construct: a
+    // tuple destructure where the slot this site needs IS bound, and the discarded limb is a
+    // reward accumulator no caller of this function reads.
+    // 🟥 SCOPE: above a function DECLARATION, so it suppresses `unused-return` for the whole
+    // function - and it is measurably that wide, since nine sibling `farm.userInfo` destructures
+    // elsewhere in this file DO appear in the results and this one does not.
+    // 🟥 ORDERING: this site is the safe template and must stay one. The slither directive sits at
+    // the function header and the forge-lint directive stays strictly adjacent to its own
+    // statement below. A slither next-line directive placed between a forge-lint next-line
+    // directive and the statement under it silences the forge suppression - MEASURED, the gate
+    // residue went 0 to 4. Never insert a line between the two below. (The directive token itself
+    // is spelled out nowhere in this paragraph on purpose: Slither's ignore parser reads it out of
+    // ANY comment, so writing it in prose would plant a live directive here.)
     // slither-disable-next-line unused-return
     function stakedBalance() external view returns (uint256 staked) {
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (staked,) = farm.userInfo(address(this));
     }
 
@@ -582,6 +655,35 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         uint256 bal = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
         if (bal > 0) bond.safeTransferFrom(address(this), to, Config.DEXFI_BOND_TOKEN_ID, bal, "");
         emit EmergencyUnstaked(to, bal);
+    }
+
+    /// @notice The repair half of `emergencyUnstake`: stake every bond unit this adapter holds loose
+    ///         back into its farm, crediting no depositor.
+    /// @dev Round 57 (A1). Before this, the only paths that ever put units into this adapter's farm
+    ///      stake were `stake` and `mintBonds`, both `onlyVault`, and the vault reaches them only
+    ///      through `depositBonds` and `depositETH` - which credit a depositor and refuse while
+    ///      custody is insolvent. So units rescued by the hatch could be moved to any whitelisted
+    ///      address but never re-staked uncredited, and `CollateralVault.setCustodyAdapter` refuses
+    ///      every adapter not already staked with them (`CustodyWouldBeInsolvent`). The repair that
+    ///      setter's own comment names - "an adapter that has already been staked with the rescued
+    ///      bonds" - had no way to be built. MEASURED on the base tree: every shipped door refused and
+    ///      the ledger stayed frozen after the farm came back (`R57A01_HatchRepair.t.sol`).
+    ///
+    ///      Same farm (it came back): hatch to `address(this)` or send the units back here, then call
+    ///      this; no pointer moves. New farm: construct a repair adapter on it, hatch the old adapter
+    ///      straight into it, call this on the repair adapter, then point the harvester and the vault
+    ///      at it - one timelock batch.
+    ///
+    ///      Owner-only because WHEN to re-expose collateral to a farm that just misbehaved is the
+    ///      whole decision; a permissionless version would let a stranger push rescued units back into
+    ///      a farm that is still broken. It credits no `bondCount`, so it cannot double-credit: the
+    ///      ledger already records every unit the hatch took out. Settles the farm payout through the
+    ///      same funnel as every other farm-touching path.
+    function restakeLoose() external onlyOwner returns (uint256 amount) {
+        amount = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
+        if (amount == 0) revert NothingToRestake();
+        _depositAndSettle(amount);
+        emit Restaked(amount);
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
@@ -686,12 +788,16 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         private
         returns (MintSnapshot memory beforeMint, uint256 stakedDelta, uint256 autoDepositPaid)
     {
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (beforeMint.childStake,) = farm.userInfo(receiver);
         beforeMint.childLoose = bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID);
         beforeMint.childUsdc = usdc.balanceOf(receiver);
 
         bond.mint{value: msg.value}(data);
 
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 childStakeAfter,) = farm.userInfo(receiver);
         uint256 childLooseAfter = bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID);
         stakedDelta = childStakeAfter - beforeMint.childStake;
@@ -714,7 +820,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         uint256 reported = MintAttemptReceiver(payable(receiver)).releaseMint(
             stakedDelta, amount, autoDepositPaid
         );
-        uint256 received = usdc.balanceOf(address(this)) - adapterUsdcBefore;
+        uint256 received = _farmDelta(adapterUsdcBefore);
         childFarmPaid = reported < received ? reported : received;
 
         _requireReceiverRestored(receiver, beforeMint);
@@ -724,6 +830,8 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     }
 
     function _requireReceiverRestored(address receiver, MintSnapshot memory beforeMint) private view {
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 actualStake,) = farm.userInfo(receiver);
         uint256 actualLoose = bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID);
         if (actualStake != beforeMint.childStake || actualLoose != beforeMint.childLoose) {
@@ -742,11 +850,15 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         private
         returns (uint256 farmPaid)
     {
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 stakeBefore,) = farm.userInfo(address(this));
         uint256 usdcBefore = usdc.balanceOf(address(this));
         farm.deposit(amount);
-        farmPaid = usdc.balanceOf(address(this)) - usdcBefore;
+        farmPaid = _farmDelta(usdcBefore);
 
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 stakeAfter,) = farm.userInfo(address(this));
         uint256 looseAfter = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
         if (stakeAfter != stakeBefore + amount || looseAfter != adapterLooseBefore) {
@@ -784,6 +896,23 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///      subtraction** - that hides the drain instead of refusing it, and the read is then the
     ///      thing that is wrong.
     ///
+    ///      **That refusal is about THIS function and does not reach the farm windows, which audit
+    ///      round 46 saturated through `_farmDelta` and round 48 completed: every farm window is
+    ///      saturated (`_farmDelta` names them) and this one is the single deliberate exception.**
+    ///      The two differ on who
+    ///      holds the window and on what a revert costs. Here the window is an address the owner
+    ///      chose and the owner can un-choose, and the only thing refused is that one recovery.
+    ///      There the window is DexFi's farm, nobody can un-choose it, and the refusal takes the
+    ///      collateral paths with it - `withdrawBonds` and `depositBonds` MEASURED panicking
+    ///      `0x11`, `seize` measured in round 48, `disposeTo` and `depositETH` read off the vault.
+    ///      `_emergencyRecover` is the seventh: it has no recipient at all, so the farm is the only
+    ///      party in its window, and its docstring says why that puts it on the other side of
+    ///      this line. `_farmDelta` carries the full argument. **The census is of THIS contract's
+    ///      windows; the clone has one of its own inside `MintAttemptReceiver.recoverAll`, reached
+    ///      through this function, and round 49 found it bare and saturated it there** - the farm
+    ///      re-entering `flushMintAttemptYield` from inside `withdraw` has the clone forward its
+    ///      park mid-window, and that window is the clone's, not an owner-named recipient's.
+    ///
     ///      **What is silently wrong is the reporting, and it under-counts.** Re-entering
     ///      `flushMintAttemptYield` for a *different* clone carrying parked yield makes the inner
     ///      `_settleFarmPayout` sweep this contract's whole free balance - including the farm USDC
@@ -820,6 +949,9 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
             );
         }
 
+        // Bare, and NOT `_farmDelta`: the round-34 refusal above stands. The drain window here is
+        // an owner-named recovery recipient, so a panic is a correct refusal of a recipient
+        // blocking its own recovery rather than a stranger bricking a collateral path.
         uint256 received = usdc.balanceOf(address(this)) - usdcBefore;
         result.farmForwarded = reportedFarm < received ? reportedFarm : received;
         if (result.farmForwarded != 0) {
@@ -827,6 +959,28 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         }
     }
 
+    /// @dev **Saturated through `_farmDelta`, and this is NOT `_recoverTo`'s refusal** - audit
+    ///      round 48, finding 82, the seventh farm window. Round 46 (#407) put six windows
+    ///      behind `_farmDelta` and left this one bare because no falsifier had been written for
+    ///      it; `test_R48_emergencyRecoverySurvivesAFarmThatDrainsMoreThanTheCloneForwards` is
+    ///      that falsifier, and it panicked `0x11` against the bare subtraction.
+    ///
+    ///      The round-34 refusal recorded on `_recoverTo` does not apply here, and the reason is
+    ///      who holds the window. `_recoverTo`'s window contains an owner-named recovery recipient
+    ///      receiving native and USDC, so the only party that can re-enter `flushYieldTo` from
+    ///      inside it is a recipient the owner chose and can un-choose, and a panic is a correct
+    ///      refusal of that recipient blocking its own recovery. This path takes NO recipient:
+    ///      `emergencyRecoverAll` forwards nothing to anybody, and the only code that gets control
+    ///      inside the window is `farm.emergencyWithdraw()` and the ERC-1155 transfer it makes.
+    ///      That is DexFi's farm, which nobody here can un-choose, and it is the same party
+    ///      `_farmDelta` was written for. A bare subtraction here was the farm being able to
+    ///      refuse the protocol's own escape from a broken farm - the one recovery that exists
+    ///      precisely for when the farm misbehaves.
+    ///
+    ///      The residual is the one `_farmDelta` states: a drained window reports 0, so
+    ///      `farmForwarded` and the event's `farmYieldForwarded` under-count, in the direction
+    ///      `_settleFarmPayout` already calls safe. No money is lost - the drain pays a park to
+    ///      the recipient it was parked for.
     function _emergencyRecover(address receiver)
         private
         returns (RecoveryResult memory result)
@@ -836,7 +990,7 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         (result.bonds, reportedFarm, result.rawUsdcRemaining, result.nativeRemaining) =
             MintAttemptReceiver(payable(receiver)).emergencyRecoverAll();
 
-        uint256 received = usdc.balanceOf(address(this)) - usdcBefore;
+        uint256 received = _farmDelta(usdcBefore);
         result.farmForwarded = reportedFarm < received ? reportedFarm : received;
         if (result.farmForwarded != 0) {
             result.swept = _settleFarmPayout(result.farmForwarded);
@@ -848,10 +1002,18 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         returns (address receiver)
     {
         receiver = predictMintReceiver(beneficiary, attemptId);
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 staked,) = farm.userInfo(receiver);
         if (
             staked == 0 && farm.pendingShare(receiver) == 0
+                // FALSE on direction (audit round 44). This conjunction reverts `NothingToRecover` only when
+                // every balance is zero, so a donation makes recovery PROCEED rather than fail. The griefing
+                // the lint is about needs the equality to gate an action shut, and here it gates one open.
+                // forge-lint: disable-next-line(incorrect-strict-equality)
                 && bond.balanceOf(receiver, Config.DEXFI_BOND_TOKEN_ID) == 0
+                // FALSE on direction (audit round 44). Same conjunction, same reason as the line above.
+                // forge-lint: disable-next-line(incorrect-strict-equality)
                 && usdc.balanceOf(receiver) == 0 && receiver.balance == 0
         ) revert NothingToRecover(receiver);
 
@@ -904,8 +1066,8 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
     ///
     ///      The callers are named rather than counted, because a count written here goes
     ///      stale silently the next time a path is added and a symbol does not: `stake`,
-    ///      `unstake`, `claimYield`, `mintBonds`, `flushMintAttemptYield`, `_recoverTo`
-    ///      and `_emergencyRecover`. The two prose counts that stood here said three and
+    ///      `unstake`, `claimYield`, `mintBonds`, `flushMintAttemptYield`, `_recoverTo`,
+    ///      `_emergencyRecover` and `restakeLoose`. The two prose counts that stood here said three and
     ///      four while the tree had seven, which audit round 31 filed and which is why this
     ///      paragraph no longer carries a number.
     /// @param farmPaid USDC measured as arriving from the farm during the call.
@@ -938,6 +1100,9 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         // Counting it at the flush instead would let a donation move this number, which is the one
         // property round 11 built it for.
         farmYieldDelivered += swept;
+        // Round-55 item 219: the harvester-bound slice, see the counter's own docstring. Read
+        // AFTER the sweep so it names the recipient that was actually paid.
+        if (yieldRecipient == harvester) farmYieldDeliveredToHarvester += swept;
     }
 
     /// @dev Best-effort USDC sweep that never reverts the calling transaction.
@@ -948,8 +1113,12 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         uint256 amount = _freeBalance();
         if (amount == 0) return 0;
         // Low-level call so a reverting transfer (pause/blacklist) cannot brick exits.
-        // slither-disable-next-line unchecked-lowlevel
+        // ACCEPTED (audit round 44). The callee is the immutable USDC token, which does not call back.
+        // The boolean is ignored on purpose and the balance delta measured instead - stronger than the
+        // return value, and reverting here would brick bond custody on a token pause or blacklist.
+        // forge-lint: disable-start(reentrancy-no-eth)
         (bool ok,) = address(usdc).call(abi.encodeCall(IERC20.transfer, (yieldRecipient, amount)));
+        // forge-lint: disable-end(reentrancy-no-eth)
         // Not ignored any more: exits still succeed either way, but the amount has to
         // be reported or it leaves the protocol's accounting silently.
         //
@@ -985,5 +1154,52 @@ contract DirectCallAdapter is ICustodyAdapter, ERC1155Holder, Ownable {
         uint256 balance = usdc.balanceOf(address(this));
         uint256 owed = totalOwedToRecipients;
         return balance > owed ? balance - owed : 0;
+    }
+
+    /// @dev The USDC that arrived here across a call into DexFi's farm. Saturating, for the argument
+    ///      `_freeBalance` already makes one statement to its left: an underflow in this window
+    ///      reverts `stake`, `unstake` and `mintBonds` alike, which is every collateral path, and
+    ///      nothing outside this contract may be able to do that.
+    ///
+    ///      **The window is not hypothetical and it is not the token.** `flushYieldTo` is
+    ///      permissionless, moves USDC *out*, and this contract carries no `ReentrancyGuard` -
+    ///      deliberately, for the reason its own docstring gives. A park standing in
+    ///      `owedToRecipient` is reachable by the documented, intended route (a `yieldRecipient`
+    ///      that cannot receive USDC, then `setYieldRecipient` away from it), and a farm that
+    ///      re-enters `flushYieldTo(formerRecipient)` inside `deposit`/`withdraw` drops this
+    ///      contract's balance below `balBefore`. MEASURED at audit round 46, and the two halves of
+    ///      that are kept apart on purpose: `CollateralVault.withdrawBonds` and `depositBonds` were
+    ///      EXECUTED against the bare subtraction and panicked `0x11`; `seize` was executed under
+    ///      the fix in round 48 (`test_R48_seizeSurvivesTheSameDrainedWindow`) and `depositETH`
+    ///      through the R43 release-mint test and its round-48 drain-past-zero variant;
+    ///      `disposeTo` follows from reading the vault - it
+    ///      is the remaining call site of `unstake` - and was not separately run. `IDexFiFarm`'s
+    ///      own docstring says to treat farm behaviour as mutable at DexFi's discretion, and the
+    ///      farm is a proxy behind a single EOA.
+    ///
+    ///      **Eight windows are behind this helper, and one is deliberately not.** The eight:
+    ///      `stake`, `unstake`, `claimYield`, `_releaseFromReceiver`, `_stakeReleasedMint`,
+    ///      `flushMintAttemptYield` (round 46, #407), `_emergencyRecover` (round 48, finding
+    ///      82, whose falsifier panicked `0x11` against the bare subtraction it replaced) and
+    ///      `restakeLoose` (round 57, which shares `stake`'s body through `_depositAndSettle`). Named
+    ///      rather than counted in the sentence below on purpose; the count is here so a reader
+    ///      can check it against the tree.
+    ///
+    ///      **The residual is a known under-report, in the direction `_settleFarmPayout` already
+    ///      calls safe.** A drained window returns 0 rather than a negative, so `farmPaid` and
+    ///      therefore `farmYieldDelivered` under-count what really moved. That watermark is
+    ///      allowed to under-count and never to over-count - the whole argument is on
+    ///      `_settleFarmPayout` - so refusing the collateral path to protect the counter would be
+    ///      trading the load-bearing property for the reported one.
+    ///
+    ///      **`_recoverTo` deliberately does NOT use this, and it is the ONE exception**; its
+    ///      docstring holds the round-34 refusal that says why: there the drain window is an
+    ///      *owner-named* recovery recipient, so a revert is a correct refusal of a recipient
+    ///      blocking its own recovery, and the owner can flush the park or name another address.
+    ///      `_emergencyRecover` is not that case - it names no recipient, so only the farm can
+    ///      hold its window - and its docstring says so beside the call.
+    function _farmDelta(uint256 balBefore) private view returns (uint256) {
+        uint256 balAfter = usdc.balanceOf(address(this));
+        return balAfter > balBefore ? balAfter - balBefore : 0;
     }
 }

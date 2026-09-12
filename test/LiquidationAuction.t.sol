@@ -1945,7 +1945,23 @@ contract LiquidationAuctionTest is RiskParamsFixture {
     }
 
     /// @notice A workout lot keeps earning, and that yield belongs to the side of the
-    ///         ledger the default damaged.
+    ///         ledger the default damaged - **once the close has said which side that is.**
+    /// @dev **Audit round 51 moved this sweep behind the close, and this test says why rather than
+    ///      just recording that it did.** While the workout is still OPEN the protocol does not yet
+    ///      know whether the close will be clean, in which case the yield is the borrower's by
+    ///      round 22 finding 18, or forced, in which case it is insurance's. The open-workout
+    ///      reserve makes the sweep wait for that answer instead of racing it, so the two arms
+    ///      below are the whole statement: refused before the close, and delivered at it.
+    ///
+    ///      🟥 **RE-FIXTURED BY ROUND 55, ITEM 215. The snapshot moved above the close and the
+    ///      assertion did not change.** The second arm used to call this sweep after the close and
+    ///      assert the fund gained; the forced branch now makes the same claim and the same
+    ///      `fundInsurance` call itself, one call earlier, because the reserve that makes the first
+    ///      arm refuse also meant this lot's own yield could never reach the fund before
+    ///      `writeDownLoss` had already spent whatever was in it. The money still moves and still
+    ///      lands on the same side of the ledger; only the caller that delivers it changed. The
+    ///      permissionless sweep is still the door for anything that arrives later, and it
+    ///      correctly finds nothing here, which is asserted rather than skipped.
     function test_sweepWorkoutYieldToInsurance() public {
         uint256 id = _openAuction();
         skip(Config.AUCTION_DURATION);
@@ -1956,11 +1972,30 @@ contract LiquidationAuctionTest is RiskParamsFixture {
         skip(Config.YIELD_STREAM_DURATION);
         credit.accrueYield();
 
-        uint256 insuranceBefore = credit.insuranceFund();
-        auction.sweepWorkoutYieldToInsurance(); // permissionless
+        uint256 insuranceBeforeTheClose = credit.insuranceFund();
+        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
+        auction.sweepWorkoutYieldToInsurance();
+        assertEq(credit.insuranceFund(), insuranceBeforeTheClose, "nothing may leave while the workout is open");
 
-        assertGt(credit.insuranceFund(), insuranceBefore, "the default's own collateral pays it down");
+        // The debt is never repaid, so this close is forced and the yield really is insurance's.
+        skip(Config.WORKOUT_MAX_DURATION + 1);
+        uint256 principalBefore = credit.pendingPrincipal();
+        auction.closeWorkout(id);
+
+        // Delivered AT the close. Whatever the write-down did not spend on this default stays in
+        // the fund, so the two terms together are what the old post-close sweep used to move.
+        uint256 keptInFund = credit.insuranceFund() - insuranceBeforeTheClose;
+        uint256 spentOnThisDefault = credit.pendingPrincipal() - principalBefore;
+        emit log_named_uint("MEASURED kept in the fund at the close", keptInFund);
+        emit log_named_uint("MEASURED spent on this default at the close", spentOnThisDefault);
+        assertGt(keptInFund + spentOnThisDefault, 0, "the default's own collateral pays it down");
         assertEq(usdc.balanceOf(address(auction)), auction.totalUnclaimedRewards(), "nothing left behind");
+
+        // The permissionless door is still open and correctly has nothing to move: the close
+        // already pulled the pot, so the bare `claimSurplus` at the top of the sweep dies at the
+        // MANAGER's `NothingToClaim` (same selector as this contract's, named where it comes from).
+        vm.expectRevert(CreditManager.NothingToClaim.selector);
+        auction.sweepWorkoutYieldToInsurance();
     }
 
     function test_sweepWorkoutYield_revertsWithNothingToSweep() public {

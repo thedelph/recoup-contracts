@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+
 import {Config} from "../src/Config.sol";
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {DirectCallAdapter} from "../src/adapters/DirectCallAdapter.sol";
@@ -248,6 +250,48 @@ contract A6MintAttemptGriefTest is RiskParamsFixture {
             deployed := create2(0, add(code, 0x20), mload(code), salt)
         }
         require(deployed != address(0), "create2 failed");
+    }
+
+    /// @notice The literal above is one of three copies of OpenZeppelin's ERC-1167 bytes in this
+    ///         tree, and until audit round 43 nothing held this one to `Clones`.
+    /// @dev    🟥 AUDIT ROUND 41 RAISED THIS AS AN OPEN FINDING AND ITS DIAGNOSIS WAS RIGHT. It ran
+    ///         two falsifiers at this suite - a one-nibble mutation of the literal and a faithful
+    ///         simulation of an OpenZeppelin bump - and it stayed GREEN under both, because
+    ///         `test_A6_strangerCannotDeployAtTheAttemptReceiver` asserts only that a stranger's
+    ///         CREATE2 lands somewhere else, which is true of ANY init code: CREATE2 hashes the
+    ///         deployer in. The literal was decorative in every assertion that read it.
+    ///
+    ///         This is the assertion that couples them, and it is an ADDRESS comparison rather than
+    ///         a byte one on purpose. A CREATE2 address is `keccak(0xff, deployer, salt,
+    ///         keccak(initCode))`, so with the deployer and the salt held equal, two addresses agree
+    ///         if and only if the two INIT CODES agree. `Clones.predictDeterministicAddress` hashes
+    ///         OpenZeppelin's copy; `_cloneFrom` deploys ours. Equality is therefore a statement
+    ///         about the creation code, and it fails in BOTH directions the item asks for - a bump
+    ///         moves the prediction while the literal stands still, and an edit to the literal moves
+    ///         the deployment while the prediction stands still. Neither side can drift alone.
+    ///
+    ///         It also pins the RUNTIME, transitively: `impl`'s runtime is produced by that init
+    ///         code, and `DirectCallAdapter._mintReceiverRuntimeCodeHash` - the second copy of the
+    ///         literal, in `src/` - is what `_requireMintReceiverCode` checks every recovery and
+    ///         flush against.
+    function test_A6_theHandBuiltCloneAgreesWithOpenZeppelin() public {
+        address impl = address(adapter.mintReceiverImplementation());
+        bytes32 salt = keccak256("round 43: OZ coupling");
+
+        address predicted = Clones.predictDeterministicAddress(impl, salt, address(this));
+        address built = _cloneFrom(impl, salt);
+
+        assertEq(
+            built,
+            predicted,
+            "the hardcoded ERC-1167 creation code no longer matches the one Clones emits"
+        );
+
+        // And the runtime the two agree on is the one the adapter's own hash check expects, which
+        // is what makes this a statement about the production path rather than about a test helper.
+        address viaClones = Clones.clone(impl);
+        assertEq(built.codehash, viaClones.codehash, "runtime differs from a clone Clones made");
+        assertGt(built.code.length, 0, "the clone really deployed");
     }
 
     // -- the retry window, which is where the "one block" prior fails --------

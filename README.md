@@ -22,7 +22,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Base mainnet | No Recoup contracts deployed |
 | Lender pool | Source and testnet instance exist, but the pool is empty, unwired and blocked from activation |
 | Referral registry | Source fixed through partner self-registration; the carried-over Sepolia instance remains defective and unused, and live replacement is disabled and unauthorised |
-| External audit | Not completed |
+| External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11 and their disposition in this source is recorded in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). Not completed |
 
 For non-reserved referral codes, the only registration path now assigns the code to its caller. A
 partner's payout wallet or Safe must call `register(bytes32)` before the code is published;
@@ -59,6 +59,7 @@ CreditManager <--- NAVOracle             v
 | `CollateralVault`, `DirectCallAdapter` | Bond accounting and the only custody path that calls DexFi |
 | `NAVOracle`, `RiskParams` | Keeper-posted NAV and bounded, governable LTV/cap parameters |
 | `CreditManager`, `TreasuryLiquiditySource` | Debt accounting and the simple liquidity source used before pool activation |
+| `CreditWiring` | Deploy-time-linked library that `CreditManager` reaches by delegatecall for its wiring and migration probes; split out so the manager fits under the EIP-170 runtime limit |
 | `EpochHarvester` | Claims realised farm yield, splits it and applies the borrower share to debt |
 | `LiquidationAuction` | Public Dutch auction with a workout fallback for unfilled positions |
 | `LenderPool` | ERC-4626 USDC pool, impairment pricing and FIFO withdrawal queue; not approved for activation |
@@ -120,10 +121,11 @@ outright. Remappings are pinned in `foundry.toml` rather than auto-detected from
 on disk, so the build is byte-identical either way: verified from a cold clone, 4,997 bytes of
 `CreditWiring` initcode and two remappings in the metadata in both cases.
 
-As of 2026-09-01, `forge test` on this tree gives 1,245 passed, 0 failed and 32 skipped across 62
-suites, 1,277 total. The figure is dated because it is derived from the test tree by a checker that
-does not live in this repository, so nothing here can hold it to the truth; it read 1,227 across 61
-suites until this sync. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
+As of 2026-09-12, `forge test` on this tree gives 1,798 passed, 0 failed and 32 skipped across 137
+suites, 1,830 total, measured by running the suite alone on a fresh build of this repository. The
+figure is dated because it is derived from the test tree by a checker that does not live in this
+repository, so nothing here can hold it to the truth; it read 1,245 across 62 suites until this
+sync. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
 an explicit opt-in; nothing else is skipped. Counting test declarations in those fork files gives 29
 rather than 32, because three of them subclass a fixture and inherit its suite. CI runs the full
 unit and invariant suite on every push and pull request.

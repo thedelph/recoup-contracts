@@ -5,6 +5,7 @@ import {Script, console} from "forge-std/Script.sol";
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 import {CollateralVault} from "../src/CollateralVault.sol";
 import {CreditManager} from "../src/CreditManager.sol";
@@ -101,6 +102,29 @@ abstract contract DeployBase is Script {
     /// @dev Mirrors the check both contracts make. Catching it here means a misconfigured deploy
     ///      fails before it broadcasts rather than at the third wiring call.
     error GuardianMustDifferFromOwner();
+    /// @dev Round-47 item 79's script-side half. `NAVOracle` refuses a confirmer that is its
+    ///      owner and an ownership transfer to its confirmer, so a deployment whose incoming owner
+    ///      is the confirmer would die inside `_handOver`, after every contract had been created.
+    ///      Caught here, before the first one.
+    error NavConfirmerMustDifferFromOwner();
+    /// @dev Round-49 item 133's script-side half, the mirror one key over: `NAVOracle.setKeeper`
+    ///      now refuses its owner and `transferOwnership` refuses its keeper, so a deployment whose
+    ///      incoming owner is the keeper would die inside `_handOver` the same way. Caught here.
+    error KeeperMustDifferFromOwner();
+    /// @dev The settlement token is not six-decimal. Round-47 item 97: `Config.USDC_TO_NAV_SCALE`
+    ///      is derived from "USDC's 6 dp" and nothing ever asked the token. A token with fewer
+    ///      decimals does not revert anywhere - it mis-scales, which is the failing-open direction.
+    error UsdcDecimalsWrong(address usdc, uint8 actual);
+    /// @dev The settlement token did not ANSWER `decimals()`: the call reverted, returned no data, or
+    ///      returned something that is not a `uint8`. Round-52 item 167. Both reads of `decimals()`
+    ///      in this file were bare high-level calls, so a token in any of those three states killed
+    ///      the script with an EMPTY revert - on `_deployProtocol` and on all four `WirePhase4`
+    ///      entry points, `assertOnly()` included. Named separately from `UsdcDecimalsWrong` because
+    ///      that error carries the MEASURED answer, and zero is an answer a real token can give: a
+    ///      `Wrong(token, 0)` here would report a reading the token never made. The remedies differ
+    ///      too - `Wrong` is a token of the wrong scale, this is an address that is not a token at
+    ///      all (a typo, a proxy with no implementation, a fork or RPC on the wrong chain).
+    error UsdcDecimalsUnreadable(address usdc);
     /// @dev **The rule `_assertWiring` cannot make, and round 29's open finding 1 is why it has to
     ///      be here rather than there.** `_assertWiring` compares the deployed guardian against the
     ///      PARAMETER, which is the stronger check and the right one - and zero equals zero, so a
@@ -136,7 +160,24 @@ abstract contract DeployBase is Script {
     error MockOperatorWrong(address mock, address actual, address expected);
 
     error ProtocolFeeWalletRequired();
+    /// @dev Audit round 46, open item 69 (reasoned in audit round 45 and never executed
+    ///      until `test/R46E_SplitterLegIsNotSelf.t.sol`). `ProtocolFeeSplitter`'s constructor
+    ///      refuses a zero leg and two equal legs and is frozen for the 33Audits read; it does not
+    ///      refuse a leg equal to the splitter itself, because a leg is an address and its own is
+    ///      one. A self-leg's delivery is a self-transfer that succeeds, so that leg's share stays
+    ///      in the splitter as unsplit balance and is split again with the other leg on every later
+    ///      call. Deploy-time misconfiguration only: both legs are `immutable`, so the place to
+    ///      refuse it is here, where the deployed pointer is read back, not in a constructor that
+    ///      cannot change before the audit's fix-verification pass.
+    error SplitterLegIsSelf(address splitter, string leg);
     error YieldRecipientCollision(address recipient, string collidesWith);
+    /// @dev Round-49 finding, two agents converging on it: the two sinks were checked
+    ///      asymmetrically and the PERMANENT one had the weaker check. `yieldRecipient` is only
+    ///      the interim sink (`_wire` repoints it to the harvester) and was refused at both
+    ///      collisions by name; `protocolFeeWallet` is the sink the harvester pays the protocol
+    ///      fee to for the life of the deployment, and it accepted the deployer and the owner
+    ///      through the whole deploy. Same shape, same reason.
+    error ProtocolFeeWalletCollision(address wallet, string collidesWith);
     error OwnershipNotTransferred(address contractAddr, address actualOwner);
     /// @dev Raised when `_ownablesOf` meets a `Deployed` member it cannot enumerate: one that is
     ///      not a live contract (so the struct has grown a dynamic field, whose ABI encoding is an
@@ -151,6 +192,32 @@ abstract contract DeployBase is Script {
     ///      shown - which is what happened to `RiskParams`, the one holding the borrow ceiling and
     ///      the liquidation trigger for the whole book.
     error DeployedLabelsOutOfSync(uint256 labels, uint256 members);
+    /// @dev **Round-51, and it is round-50 item 134's own fix turned off one member at a time.**
+    ///      `_resolveOne`'s second line was `if (!vm.keyExistsJson(record, jsonPath)) return
+    ///      _required(name);`, and the comment above it argued that a record which does not name a
+    ///      contract "is the same failure as an unset variable and gets the same error". That is
+    ///      only true when the variable is ALSO unset. When it is set, the branch was not an error
+    ///      at all: it was silent reversion to the pre-fix, environment-only path for that member.
+    ///
+    ///      MEASURED before this error: a record carrying seven of the eight contract rows, plus an
+    ///      environment naming a SUPERSEDED generation's auction, resolved to the superseded auction
+    ///      with the other seven off the record and no warning of any kind. Item 134's fix is
+    ///      exactly as strong as the record's completeness, and the failure direction of an
+    ///      incomplete record must not be silent.
+    ///
+    ///      Named separately from `DeployedAddressMissing` because the remedies are opposite: that
+    ///      one says set the environment variable, this one says the committed record is
+    ///      incomplete and the environment cannot stand in for it. The JSON path is carried so the
+    ///      operator is told which row to add rather than which contract is unhappy.
+    ///
+    ///      **Round 54: declared here rather than on `WirePhase4`, because `AssertLocked` needs it
+    ///      too.** `WirePhase4._deploymentRecord` parsed `.chainId`, and `AssertLocked._readStack`
+    ///      parsed nine rows, with no `keyExistsJson` on any of them, so a record missing one of
+    ///      those rows died inside forge's parser as an unnamed `CheatcodeError(string)` before a
+    ///      line printed - the same shape round 51 named for the eight contract rows, one row
+    ///      earlier than every row it guards. `_requireRecordRow` is the one door; `name` is the
+    ///      environment variable where one exists and the record's own field name where none does.
+    error DeployedRecordRowMissing(string name, string jsonPath);
     error WiringIncomplete(string what);
     /// @dev The mirror image of `WiringIncomplete`, and audit round 11 is why it has to exist as
     ///      its own error rather than as a missing check. A pointer that is set too early is not a
@@ -210,6 +277,15 @@ abstract contract DeployBase is Script {
         return block.chainid == ANVIL_CHAIN_ID;
     }
 
+    /// @dev Round 54. The one door through which a deployment-record row is required before it is
+    ///      parsed. `vm.parseJson*` on an absent key dies inside the cheatcode as
+    ///      `CheatcodeError(string)`, which names no row and prints no line; this names the row
+    ///      first. Absence only: a row that is PRESENT and malformed still dies in the parser,
+    ///      and a present zero row is named by the reader that dereferences it (round-54 item 181).
+    function _requireRecordRow(string memory record, string memory name, string memory jsonPath) internal view {
+        if (!vm.keyExistsJson(record, jsonPath)) revert DeployedRecordRowMissing(name, jsonPath);
+    }
+
     // ── Parameters ───────────────────────────────────────────────────────────
 
     /// @notice The single door every script parameter comes through.
@@ -250,7 +326,11 @@ abstract contract DeployBase is Script {
         virtual
         returns (address)
     {
-        return vm.envOr(key, fallbackValue);
+        // Round 55 (round-55 item 225(i)). Read as a STRING and parsed here, rather than parsed by
+        // the cheatcode, so the raw text is in hand for `_addressFromRaw`'s two checks. The env
+        // read stays on this line on purpose: the repository's environment census classifies a
+        // seam by whether its body calls `vm.env*`, and this body still does.
+        return _addressFromRaw(key, vm.envOr(key, string("")), fallbackValue);
     }
 
     /// @dev The string half of the same seam, for the confirmation phrases. Same reasoning.
@@ -261,6 +341,138 @@ abstract contract DeployBase is Script {
         returns (string memory)
     {
         return vm.envOr(key, fallbackValue);
+    }
+
+    /// @dev The bytes32 half of the same seam. Round 56 (round-56 item 144, audit agent A6):
+    ///      `WirePhase4.queuePause()` and `executeQueuedPause()` read `RECOUP_SWITCHOVER_ATTEMPT`
+    ///      through a BARE `vm.envOr(key, bytes32(0))`, so no harness could override it and the
+    ///      environment census, keyed on the two seam names above, printed every harness reaching it
+    ///      `hermetic`. MEASURED at 8ab4d88: the variable set to a stranger value in the process
+    ///      environment - what forge's auto-loaded `contracts/.env` does - turned 4 of 32 tests red
+    ///      across `R51A01CeremonyTest` and `R53A02DeployPathFactsTest`. Same reasoning as the two
+    ///      above; zero runtime bytes, this is a script.
+    function _envOrBytes32(string memory key, bytes32 fallbackValue) internal view virtual returns (bytes32) {
+        return vm.envOr(key, fallbackValue);
+    }
+
+    // ── Addresses as TEXT (round 55, round-55 item 225(i)) ───────────────────
+
+    /// @dev A mixed-case address string whose case does not encode the EIP-55 checksum of its own
+    ///      hex. Named with the row or variable and the text, because the operator's remedy is to
+    ///      re-copy the address, not to set a different one.
+    ///
+    ///      **Why this exists.** Round 54 MEASURED (`R54A04_ScriptFirstAudit`) that neither
+    ///      `vm.parseAddress` nor `vm.parseJsonAddress` validates EIP-55: a checksummed string with
+    ///      one letter's case flipped parses to the same `address` as the correct one, so
+    ///      `_operatorAgainstRecord`'s `env != fromRecord` cannot see a wrong checksum on either
+    ///      side. A wrong checksum is the signature of a hand-transcribed address with a typo in it
+    ///      - a checksummed string with one hex digit changed fails its own checksum with
+    ///      probability about `1 - 2^-(letters)`, which for a typical address is above 99.9% - and
+    ///      that is exactly the input a deploy script should refuse rather than parse.
+    ///
+    ///      **What it refuses that the parser accepts, and what it does not.** Refused: a string
+    ///      carrying BOTH upper- and lower-case hex letters whose case pattern is not the EIP-55
+    ///      checksum of its lowercase form. Accepted unchanged: all-lowercase, all-uppercase, and a
+    ///      correct checksum - the same rule ethers' `getAddress` and viem's `isAddress` apply,
+    ///      because a single-case string encodes no checksum to check. So the committed record,
+    ///      whose `contracts` block is lowercase and whose `operators` block is checksummed, passes
+    ///      without an edit.
+    error AddressChecksumInvalid(string name, string raw);
+
+    /// @dev A string that is not `0x` plus forty hex digits at all. Round 55, the sibling of the
+    ///      checksum error, and stated because of what stood before it: `vm.envOr(key, address)`
+    ///      falls back to its default when the value does not PARSE. MEASURED in round 55 with no
+    ///      writer, by reading a variable every box sets and no address parser accepts:
+    ///      `vm.envOr("PATH", address(0x1111...))` returned `0x1111...` and `vm.envOr("PATH",
+    ///      uint256(7))` returned 7 (forge 1.8.1). So a `RECOUP_KEEPER=0xtypo` used to resolve
+    ///      silently to the record's row on the hold path and to zero on the deploy path. Now it
+    ///      is named with the text.
+    error AddressMalformed(string name, string raw);
+
+    /// @dev Whether `raw` is `0x` followed by exactly forty hex digits. The prefix is case-sensitive
+    ///      (`0X` is refused) because `vm.parseAddress` refuses it too, and this function is what
+    ///      stands in front of that call.
+    function _isHexAddress(string memory raw) internal pure returns (bool) {
+        bytes memory b = bytes(raw);
+        if (b.length != 42 || b[0] != "0" || b[1] != "x") return false;
+        for (uint256 i = 2; i < 42; ++i) {
+            if (!_isHexDigit(uint8(b[i]))) return false;
+        }
+        return true;
+    }
+
+    function _isHexDigit(uint8 c) private pure returns (bool) {
+        return (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46);
+    }
+
+    /// @notice Whether a well-formed address string satisfies EIP-55, with single-case strings
+    ///         accepted as carrying no checksum.
+    /// @dev A pure recompute over the text, the EIP-55 algorithm itself: keccak256 of the
+    ///      forty-character LOWERCASE hex (as ASCII, not as bytes20), then for each hex LETTER the
+    ///      matching nibble of the hash decides its case - `>= 8` upper, else lower. Digits carry
+    ///      no case and are skipped. Requires `_isHexAddress(raw)`; on anything else it returns
+    ///      false, and callers name malformation first so the two are never confused.
+    function _isEip55(string memory raw) internal pure returns (bool) {
+        if (!_isHexAddress(raw)) return false;
+        bytes memory b = bytes(raw);
+        bytes memory lower = new bytes(40);
+        bool anyUpper;
+        bool anyLower;
+        for (uint256 i = 0; i < 40; ++i) {
+            uint8 c = uint8(b[i + 2]);
+            if (c >= 0x41 && c <= 0x46) {
+                anyUpper = true;
+                lower[i] = bytes1(c + 32);
+            } else {
+                if (c >= 0x61 && c <= 0x66) anyLower = true;
+                lower[i] = bytes1(c);
+            }
+        }
+        // A single-case string encodes no checksum, so there is nothing to disagree with.
+        if (!anyUpper || !anyLower) return true;
+        bytes32 h = keccak256(lower);
+        for (uint256 i = 0; i < 40; ++i) {
+            uint8 c = uint8(b[i + 2]);
+            bool isLetter = (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+            if (!isLetter) continue;
+            uint8 nibble = (i % 2 == 0) ? uint8(h[i / 2]) >> 4 : uint8(h[i / 2]) & 0x0f;
+            bool wantUpper = nibble >= 8;
+            bool isUpper = c <= 0x46;
+            if (wantUpper != isUpper) return false;
+        }
+        return true;
+    }
+
+    /// @dev The one door from address TEXT to an `address`, for both sides of every comparison this
+    ///      script family makes: malformed is named, a wrong checksum is named, and only then is the
+    ///      parser asked. `name` is the environment variable or record row, for the message.
+    function _parseCheckedAddress(string memory name, string memory raw) internal pure returns (address) {
+        if (!_isHexAddress(raw)) revert AddressMalformed(name, raw);
+        if (!_isEip55(raw)) revert AddressChecksumInvalid(name, raw);
+        return vm.parseAddress(raw);
+    }
+
+    /// @dev The environment arm: an empty string is "unset" and takes the fallback, the way
+    ///      `vm.envOr(key, address)` did; anything else goes through the checked door.
+    function _addressFromRaw(string memory name, string memory raw, address fallbackValue)
+        internal
+        pure
+        returns (address)
+    {
+        if (bytes(raw).length == 0) return fallbackValue;
+        return _parseCheckedAddress(name, raw);
+    }
+
+    /// @dev The record arm: a PRESENT row read as text and pushed through the same door, so a
+    ///      wrong-checksum row is refused by name instead of parsing to an address the chain then
+    ///      contradicts. Presence is the caller's question (`_requireRecordRow`, `keyExistsJson`);
+    ///      a present row that is not a JSON string still dies in the parser, the stated residual.
+    function _recordAddress(string memory record, string memory name, string memory jsonPath)
+        internal
+        pure
+        returns (address)
+    {
+        return _parseCheckedAddress(name, vm.parseJsonString(record, jsonPath));
     }
 
     /// @notice Resolve operator addresses from the environment, then validate them.
@@ -343,6 +555,40 @@ abstract contract DeployBase is Script {
         // enforce in `setGuardian`, so a local deploy that broke it would revert mid-wiring with
         // no indication which of two roles was wrong.
         if (p.guardian != address(0) && p.guardian == p.owner) revert GuardianMustDifferFromOwner();
+        // Same placement and same reason. Round-47 item 79: `NAVOracle.setNavConfirmer` refuses
+        // its owner and `transferOwnership` refuses its confirmer, the way both siblings already
+        // did. `_wire` sets the confirmer while the deployer owns the oracle and `_handOver` then
+        // moves ownership to `p.owner`, so this shape is accepted at the wiring step and dies
+        // inside `_handOver` after every contract has been created - or, where the owner is the
+        // deployer, one step earlier at `setNavConfirmer` with no indication which role was
+        // wrong. A zero confirmer is refused by name below; a zero owner was refused above.
+        if (p.navConfirmer == p.owner) revert NavConfirmerMustDifferFromOwner();
+        // Round-49 item 133, the same rule one key over: `NAVOracle.setKeeper` refuses its owner
+        // and `transferOwnership` refuses its keeper, so this shape dies in the same two places.
+        if (p.keeper == p.owner) revert KeeperMustDifferFromOwner();
+        // Round-50 item 142, the third member of that family and the one that was left behind it.
+        // Two keys that are one key are not two keys, and `NAVOracle` enforces exactly this rule:
+        // `setNavConfirmer` reverts `KeysMustDiffer()` against the live keeper and `setKeeper`
+        // does the same against the live confirmer. So the criterion the two clauses above state
+        // for themselves - "it mirrors a rule a contract enforces, so a local deploy that broke it
+        // would revert mid-wiring" - applies to this one word for word, and it was sitting BELOW
+        // the early return. MEASURED with this line in its old position and `vm.chainId(31337)`:
+        // `DeployLocal` with `keeper == navConfirmer` got as far as `_wire`'s `setNavConfirmer`
+        // and died there on the oracle's own `KeysMustDiffer()`, after every contract in the graph
+        // had been created, rather than at this gate before the first one. The existing arm,
+        // `test_deploy_theOperatorRulesRunOnTheDeployPathOffTheLocalChain`, never saw it because it
+        // does what its name says - `vm.chainId(8453)` - where the clause below the return already
+        // fired. `R50DeployParamGates.t.sol` is the local arm.
+        //
+        // Guarded on both being non-zero, unlike the two clauses above it, and that is not
+        // decoration: off the local chain a zero keeper and a zero confirmer are each refused BY
+        // NAME a few lines below (`KeeperRequired`, `NavConfirmerRequired`), and an unguarded
+        // equality here would swallow that pair into a `NavKeysMustDiffer` that names neither of
+        // them. Locally both are filled with distinct constants by `_resolveParams`, so the guard
+        // costs nothing there and the rule still binds on any pair an operator names by hand.
+        if (p.keeper != address(0) && p.navConfirmer != address(0) && p.keeper == p.navConfirmer) {
+            revert NavKeysMustDiffer();
+        }
         if (_isLocal()) return;
 
         // **The contract-owner guardian rule is NOT here, and `_validateNewDeployment` below says
@@ -353,25 +599,56 @@ abstract contract DeployBase is Script {
         if (p.yieldRecipient == address(0)) revert YieldRecipientRequired();
         if (p.keeper == address(0)) revert KeeperRequired();
         if (p.navConfirmer == address(0)) revert NavConfirmerRequired();
-        // Two keys that are one key are not two keys. The oracle rejects this too;
-        // catching it here means a misconfigured deploy fails before it broadcasts.
-        if (p.navConfirmer == p.keeper) revert NavKeysMustDiffer();
+        // `NavKeysMustDiffer` used to stand on this line. Round-50 item 142 moved it above the
+        // local early return, where its two siblings already were; see the comment there for the
+        // criterion and the measurement. It is not restated here, because a rule written twice is
+        // a rule that will be edited once.
         if (p.protocolFeeWallet == address(0)) revert ProtocolFeeWalletRequired();
-        // A real treasury must be a distinct address. Routing harvested USDC to the
-        // key that signed the deploy is the default that looks fine and is not
-        // (PRD §4.4, and the yield-routing decision the audit locked in).
+        // 🟥 **THE FOUR SINK COLLISION CLAUSES USED TO STAND HERE AND ARE NOW IN
+        // `_validateNewDeployment`. Round-51, and it is the round-38 move one variable over.**
+        // Read the reasoning there; it is not restated, because a rule written twice is a rule that
+        // will be edited once.
         //
-        // **What these two rules actually protect, corrected in audit round 22 (F11-4).** They do
-        // not decide where a finished deployment's yield goes: `_wire` repoints the adapter at the
-        // `EpochHarvester` and `_assertCoreGraph` refuses any deployment that ends otherwise, so
-        // the shipped sink is never this address. They protect the *interim* one. Every line of
-        // `_deployProtocol` is a separate broadcast transaction, so between the adapter's
-        // constructor and `_wire`'s last call this address is the live sink of a live adapter
-        // already installed on the vault, and a deploy that stops part way through leaves it
-        // there. `test_deploy_theOperatorsYieldRecipientIsTheInterimSinkOnly` measures both halves
-        // of that. See the note at the constructor call site.
-        if (p.yieldRecipient == deployer) revert YieldRecipientCollision(p.yieldRecipient, "deployer");
-        if (p.yieldRecipient == p.owner) revert YieldRecipientCollision(p.yieldRecipient, "owner");
+        // **This is NOT round-50's refused ordinal 39, and the two are opposite directions.** That
+        // proposal moved `ProtocolFeeWalletCollision` UP, above the local early return, so a local
+        // deploy would be refused; it was refused on the measurement that a local `_deployProtocol`
+        // whose `protocolFeeWallet` is the deployer completes with every assertion green.
+        // `test_R50_142_...ProtocolFeeWalletCollisionHasNoContractMirror` still holds that
+        // measurement to the tree and is untouched: the clauses stay BELOW a local early return,
+        // just one function down.
+        //
+        // The local-default collision neither move has to survive is recorded so nobody re-derives
+        // it: `LOCAL_TREASURY` fills BOTH `yieldRecipient` and `protocolFeeWallet`, and no clause
+        // compares the two with each other - each is compared with `deployer` and with `p.owner`
+        // only - so the local defaults would not collide.
+    }
+
+    /// @notice `decimals()`, asked in a way that cannot die silently.
+    /// @dev **Round-52 item 167. The two reads of `decimals()` in this file were bare high-level
+    ///      calls, and a bare high-level call to a function that returns data has THREE ways to
+    ///      fail that all surface as one empty revert:** the callee reverts with no reason, the
+    ///      callee returns no data (a codeless address - solc skips the `EXTCODESIZE` check when
+    ///      return data is expected and lets the decode fail instead - or a fallback that
+    ///      returns nothing), or the callee returns data that does not decode as a `uint8`. MEASURED
+    ///      on all five entry points that reach the two sites: `_deployProtocol` directly,
+    ///      `DeployLocal`'s stack build, and `WirePhase4`'s `run()`, `queue()`, `executeQueued()`
+    ///      and `assertOnly()` each died `EvmError: Revert` with empty data.
+    ///
+    ///      **A low-level `staticcall` and not `try`/`catch`, and that is a measurement rather
+    ///      than a preference.** Solidity's `try` catches the external call's revert and does NOT
+    ///      catch a return-data decoding failure - that is raised in the caller, outside the
+    ///      `catch` - so the `try` form names the reverting token and still dies empty on the
+    ///      no-data one, which is the typo case. `R52A01_DecimalsUnreadable.t.sol` holds both halves.
+    ///
+    ///      The 32-byte length is exact because the ABI encoding of one `uint8` is exactly one
+    ///      word; the range check is what `abi.decode(ret, (uint8))` would have done by reverting
+    ///      empty, made into a named refusal instead. Zero runtime bytes: this is a script.
+    function _settlementDecimals(address token) internal view returns (uint8) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20Metadata.decimals, ()));
+        if (!ok || ret.length != 32) revert UsdcDecimalsUnreadable(token);
+        uint256 raw = abi.decode(ret, (uint256));
+        if (raw > type(uint8).max) revert UsdcDecimalsUnreadable(token);
+        return uint8(raw);
     }
 
     /// @notice `_validateParams`, plus the one rule that is about MAKING a deployment rather than
@@ -449,6 +726,62 @@ abstract contract DeployBase is Script {
         if (p.guardian == address(0) && p.owner.code.length > 0) {
             revert GuardianRequiredForContractOwner(p.owner);
         }
+
+        // **Round 51: the four sink collision clauses, moved down out of `_validateParams` for the
+        // reason stated at the top of this docstring, and it is the round-38 move one variable
+        // over.** They are rules about the act of MAKING a deployment, and the comment that stood
+        // over the first pair said so in terms - corrected in audit round 22 (F11-4) and carried
+        // here whole, because it is the reason the move is right rather than merely convenient:
+        //
+        //   A real treasury must be a distinct address. Routing harvested USDC to the key that
+        //   signed the deploy is the default that looks fine and is not (PRD §4.4, and the
+        //   yield-routing decision the audit locked in). These rules do not decide where a FINISHED
+        //   deployment's yield goes: `_wire` repoints the adapter at the `EpochHarvester` and
+        //   `_assertCoreGraph` refuses any deployment that ends otherwise, so the shipped sink is
+        //   never this address. They protect the INTERIM one. Every line of `_deployProtocol` is a
+        //   separate broadcast transaction, so between the adapter's constructor and `_wire`'s last
+        //   call this address is the live sink of a live adapter already installed on the vault,
+        //   and a deploy that stops part way through leaves it there.
+        //   `test_deploy_theOperatorsYieldRecipientIsTheInterimSinkOnly` measures both halves of
+        //   that. See the note at the constructor call site. The second pair is the round-49
+        //   finding: the permanent sink, held to the same rule as the interim one, because the sink
+        //   that outlives `_wire` was the one a deploy could route to its own key.
+        //
+        // A deployment that already EXISTS has no interim sink. That whole argument is about the
+        // forty transactions of a broadcast, and it can only be acted on at that moment.
+        //
+        // **What that cost while they sat one level up is a DEADLOCK, and it is round 38's shape
+        // reproduced exactly.** `_validateParams` is also a precondition of the Phase-4 switchover,
+        // through `_resolveParams` in `WirePhase4`'s `run()`, `queue()` and `executeQueued()`. Take
+        // a live deployment and have the owner run `EpochHarvester.setProtocolFeeWallet(owner)` -
+        // one ordinary owner transaction, refused by nothing in `src/`, and routing the protocol fee
+        // to the governance Safe that owns the graph is a normal thing for an operator to do. Now:
+        //
+        //   - `RECOUP_PROTOCOL_FEE_WALLET` naming the owner: `_validateParams` refused it with
+        //     `ProtocolFeeWalletCollision(wallet, "owner")`.
+        //   - `RECOUP_PROTOCOL_FEE_WALLET` naming anything else: `_assertCoreGraph` refuses with
+        //     `WiringIncomplete("harvester.protocolFeeWallet")`, because that clause requires the
+        //     environment to name what the chain holds.
+        //
+        // No value of one variable satisfies two constraints that disagree. And the amplifier is
+        // the same one round 38 recorded: `queuePause()` skips `_resolveParams` entirely, so the
+        // operator shuts `borrow` and `depositETH` FIRST and meets the wall afterwards - and the
+        // only scripted `unpause` is inside the batch `queue()` will not build. MEASURED end to end
+        // in `R51A01_HealthReport.t.sol`.
+        //
+        // **The switchover loses nothing by this move**, which is the half worth checking rather
+        // than asserting. `_assertCoreGraph` holds `harvester.protocolFeeWallet()` to
+        // `p.protocolFeeWallet` and holds the adapter's sink to the harvester outright, so the
+        // sinks are constrained there by the chain rather than by a parameter rule; and
+        // `YieldRecipientRequired` and `ProtocolFeeWalletRequired` stay in `_validateParams`, so a
+        // switchover still cannot proceed on an unset sink.
+        //
+        // Below the local early return, exactly as they were: nothing in `src/` mirrors any of the
+        // four, so enforcing them locally would refuse a local deploy that works today.
+        if (p.yieldRecipient == deployer) revert YieldRecipientCollision(p.yieldRecipient, "deployer");
+        if (p.yieldRecipient == p.owner) revert YieldRecipientCollision(p.yieldRecipient, "owner");
+        if (p.protocolFeeWallet == deployer) revert ProtocolFeeWalletCollision(p.protocolFeeWallet, "deployer");
+        if (p.protocolFeeWallet == p.owner) revert ProtocolFeeWalletCollision(p.protocolFeeWallet, "owner");
     }
 
     /// @notice Read the mock stack's lockdown back off whatever chain the caller is on.
@@ -536,6 +869,19 @@ abstract contract DeployBase is Script {
         returns (Deployed memory d)
     {
         _validateNewDeployment(p, deployer);
+
+        // **The settlement token must be six-decimal, and this is the only place that asks.**
+        // Round-47 item 97. The literal 6 is the "USDC's 6 dp" in the comment beside
+        // `Config.USDC_TO_NAV_SCALE`, which is `10^(NAV_DECIMALS - 6)` and is the constant every
+        // NAV-to-USDC conversion in the protocol is scaled on; `Config` carries no `USDC_DECIMALS`
+        // and is frozen for the external audit, so the figure is restated here rather than read.
+        // Before the first `new`, because a wrong token is a parameter error and should cost
+        // nothing, and because the direction fails OPEN: a token with fewer decimals reverts
+        // nowhere and mis-scales every price instead. There is no `RECOUP_USDC` environment
+        // variable, so the reachable party is a future edit to `Config.USDC_BASE` or a fork
+        // fixture; the guard constrains the tree, not an operator.
+        uint8 usdcDecimals = _settlementDecimals(address(e.usdc));
+        if (usdcDecimals != 6) revert UsdcDecimalsWrong(address(e.usdc), usdcDecimals);
 
         d.oracle = new NAVOracle(deployer);
         // Constructed before the three contracts that hold it, because they take it as an
@@ -928,14 +1274,27 @@ abstract contract DeployBase is Script {
     /// @notice The two legs that must be in force *before* the switchover window opens, as data.
     /// @dev **Split out of `_phase4Calls` by audit round 21, finding 2.** Inside the batch these
     ///      executed in the same transaction as the preconditions they were meant to protect, which
-    ///      is a zero-duration lock. Outside it they shut `borrow` and `depositBonds`/`depositETH`
-    ///      for the whole 48-hour maturity window, which is the only span in which anybody could
-    ///      have created the debt that blocks the switchover.
+    ///      is a zero-duration lock. Outside it they shut `borrow` and `depositETH` for the whole
+    ///      48-hour maturity window, which is the only span in which anybody could have created
+    ///      the debt that blocks the switchover.
     ///
-    ///      `CreditManager.borrow` is the only `whenNotPaused` function in that contract and the
+    ///      🟥 **"and `depositBonds`" USED TO STAND IN THAT SENTENCE, beside a claim that "the
     ///      vault's two deposits are the only ones in the protocol, which is why two legs is the
-    ///      whole list. Pausing does not stop `liquidate`, `writeDownLoss`, `flushSocialisedLoss`
-    ///      or any `LenderPool` entry point, and it is not meant to: resolution stays open, new
+    ///      whole list". BOTH HALVES ARE WRONG and audit round 50 item 146(c) corrects them.**
+    ///      `CollateralVault.depositBonds` has carried no `whenNotPaused` since round 25 - it is
+    ///      gated by `bondDepositsPaused`, a separate switch this batch does not touch - so
+    ///      `vault.pause()` shuts `depositETH` and nothing else. MEASURED: after a correctly
+    ///      executed `executeQueuedPause()`, a stranger deposited seven bonds.
+    ///
+    ///      **That is the design and it is deliberately not being changed here**, which is why the
+    ///      fix is the sentence rather than a third leg. Depositing collateral is the borrower's
+    ///      CURE: a position that has to be repaid or re-collateralised before the switchover can
+    ///      proceed must still be able to be. What the window has to stop is new DEBT, and
+    ///      `borrow` is the only `whenNotPaused` function in `CreditManager`. So the list is two
+    ///      legs because those are the two doors that create the state
+    ///      `_requireSwitchoverWindowShut` reads, not because they are every door in the protocol.
+    ///      Pausing also does not stop `liquidate`, `writeDownLoss`, `flushSocialisedLoss` or any
+    ///      `LenderPool` entry point, and that is the same principle: resolution stays open, new
     ///      risk does not.
     ///
     ///      `pure`, like `_phase4Calls`, and for the same reason.
@@ -1307,12 +1666,42 @@ abstract contract DeployBase is Script {
         if (address(d.liquidity.usdc()) != settlement) revert WiringIncomplete("liquidity.usdc");
         if (address(d.adapter.usdc()) != settlement) revert WiringIncomplete("adapter.usdc");
         if (d.pool.asset() != settlement) revert WiringIncomplete("pool.asset");
+        // **Round-50 item 146(b): the five lines above agree the six members share ONE settlement
+        // token and say nothing about what that token IS.** The six-decimal rule is checked in
+        // `_deployProtocol`, before the first `new`, and that covers a deployment this script
+        // makes. It does not cover the switchover, which runs against a graph this process did not
+        // create: `WirePhase4` reaches `_assertCoreGraph` through `run()`, `queue()`,
+        // `executeQueued()` and `assertOnly()`, and none of those four passes through
+        // `_deployProtocol`. So the one absolute in the settlement block was checked on the path
+        // where the token is a parameter and not on the path where it is already on chain.
+        //
+        // The same literal 6 and the same error, deliberately: `Config.USDC_TO_NAV_SCALE` is
+        // `10^(NAV_DECIMALS - 6)` and `Config` carries no `USDC_DECIMALS`, so the figure is
+        // restated rather than read, exactly as the deploy-path clause restates it. It fails OPEN
+        // in the direction that matters - a token with fewer decimals reverts nowhere and
+        // mis-scales every price - which is why an equality is the right shape here.
+        uint8 settlementDecimals = _settlementDecimals(settlement);
+        if (settlementDecimals != 6) revert UsdcDecimalsWrong(settlement, settlementDecimals);
 
         // The collateral token, same finding, two holders. Anchored on the vault for the reason
         // `WirePhase4._resolveDeployed` derives `riskParams` off it: the vault is the one member of
         // this graph with no setter anywhere and no replacement path.
         address collateral = address(d.vault.bond());
         if (address(d.adapter.bond()) != collateral) revert WiringIncomplete("adapter.bond");
+
+        // **The adapter's farm, anchored to the chain rather than to another member of this
+        // graph.** Round-47 item 96, which is round-46 item 19's hand-listed pointer set showing
+        // its shape: `mintReceiver.farm` below is asserted against `d.adapter.farm()`, so the two
+        // agreed with each other and with nothing on chain, and an adapter built on the wrong farm
+        // passed the whole census. MEASURED before this line: `bond.setRewardPool(other)` after a
+        // deploy left `_assertWiring` green. The anchor is the bond's own `rewardPool()`, which on
+        // the real bond IS `Config.DEXFI_FARM` (asserted live in `test/fork/CollateralVault.fork.t.sol`
+        // and `test/fork/DexFiMintAttempt.fork.t.sol`), and which every mock fixture reaching this
+        // function sets first. The consequence is deliberate: a DexFi reward-pool replacement now
+        // makes `WirePhase4.assertOnly()` refuse until the adapter is redeployed against the new
+        // pool, because an adapter staking into a pool the bond no longer pays is exactly the state
+        // this census exists to name.
+        if (address(d.adapter.farm()) != IDexFiBond(collateral).rewardPool()) revert WiringIncomplete("adapter.farm");
 
         // The receiver implementation is created inside the adapter constructor, so it is not a
         // separately owned or wired member of `Deployed`. It is still part of the immutable
@@ -1368,8 +1757,41 @@ abstract contract DeployBase is Script {
         if (d.harvester.protocolFeeWallet() != p.protocolFeeWallet) {
             revert WiringIncomplete("harvester.protocolFeeWallet");
         }
+        // Round 46, item 69: a fee wallet that IS a `ProtocolFeeSplitter` must not name itself as
+        // one of its legs. Probed rather than typed, because `protocolFeeWallet` is a plain address
+        // that has been an EOA on every deployment so far and a splitter on the one the fee split
+        // is for. Asserted here, in the shared list, so the Phase-4 assertion carries it too.
+        _assertNoSplitterLegIsTheSplitter(p.protocolFeeWallet);
         if (d.oracle.keeper() != p.keeper) revert WiringIncomplete("oracle.keeper");
         if (d.oracle.navConfirmer() != p.navConfirmer) revert WiringIncomplete("oracle.navConfirmer");
+
+        // **Round-51 item 144: the two lines above hold the oracle's keys to `GovParams`, and until
+        // this block nothing held the KEYS TO EACH OTHER anywhere on the health-report path.**
+        // `WirePhase4.assertOnly()` reads its parameters with `_readParams`, which deliberately does
+        // NOT run `_validateParams` - so of the three key rules that function enforces
+        // (`NavKeysMustDiffer`, `KeeperMustDifferFromOwner`, `NavConfirmerMustDifferFromOwner`),
+        // exactly none reached a switchover-time health report, while the guardian collapse WAS
+        // re-derived from the chain twenty lines below. MEASURED before this block: `assertOnly()`
+        // printed "Phase-4 wiring holds" over an oracle whose keeper and confirmer were one address,
+        // and over an oracle whose keeper was its own owner.
+        //
+        // **Anchored on the CHAIN, not on `p`.** Comparing `p.keeper` with `p.navConfirmer` here
+        // would be `_validateParams`' statement one indirection away, and this path exists precisely
+        // because `p` is whatever the operator typed. The oracle's own three reads cannot be moved
+        // by an environment variable.
+        //
+        // **Defence in depth, and saying so is the point rather than an apology.** `NAVOracle`
+        // refuses every door into this state: `setKeeper` reverts `KeysMustDiffer()` against the
+        // live confirmer and against its own owner, `setNavConfirmer` mirrors it, and
+        // `transferOwnership` refuses both keys. The PoC reaches the state with `vm.store` on slot 1
+        // and says so. What this block buys is that a census claiming the graph is healthy stops
+        // being silent about the one property PRD §9 names as the mitigation for the worst realistic
+        // attack on this protocol - and it costs three `staticcall`s on a `view` path and zero
+        // runtime bytes, because `DeployBase` is a script and is never deployed.
+        address oracleOwner = d.oracle.owner();
+        if (d.oracle.keeper() == d.oracle.navConfirmer()) revert NavKeysMustDiffer();
+        if (d.oracle.keeper() == oracleOwner) revert KeeperMustDifferFromOwner();
+        if (d.oracle.navConfirmer() == oracleOwner) revert NavConfirmerMustDifferFromOwner();
 
         // Go-live item G4, all three halves of the role, asserted as equality rather than as
         // non-zero.
@@ -1503,6 +1925,26 @@ abstract contract DeployBase is Script {
         if (actual != expected) revert OwnershipNotTransferred(contractAddr, actual);
     }
 
+    /// @dev Round 46, item 69. Asks `wallet` for `recoupWallet()` and `dexfiWallet()` by raw
+    ///      `staticcall` and refuses a leg that answers with the wallet's own address. An EOA
+    ///      answers nothing and passes; a contract that does not know the selector reverts and
+    ///      passes; only a splitter-shaped answer is compared. The returned word is compared raw
+    ///      rather than `abi.decode`d as an `address`, which is the shape audit round 45
+    ///      measured for `CreditWiring.sourceStillAnswersToUs`: a word with dirty high bits then
+    ///      compares unequal instead of reverting the whole assertion on a contract that was never
+    ///      a splitter. A deploy assertion that reverts on the wrong reason still fails, so this
+    ///      costs nothing in safety and buys a legible verdict.
+    function _assertNoSplitterLegIsTheSplitter(address wallet) private view {
+        if (_answersWithItself(wallet, "recoupWallet()")) revert SplitterLegIsSelf(wallet, "recoupWallet");
+        if (_answersWithItself(wallet, "dexfiWallet()")) revert SplitterLegIsSelf(wallet, "dexfiWallet");
+    }
+
+    function _answersWithItself(address wallet, string memory signature) private view returns (bool) {
+        (bool ok, bytes memory data) = wallet.staticcall(abi.encodeWithSignature(signature));
+        if (!ok || data.length != 32) return false;
+        return abi.decode(data, (bytes32)) == bytes32(uint256(uint160(wallet)));
+    }
+
     /// @notice Every `Ownable` in `Deployed`, enumerated from the struct itself.
     /// @dev **The anti-drift device, and it is the point of round 20's ownership finding.** Five
     ///      places in this repo needed "every contract the deploy script creates": `_handOver`,
@@ -1547,6 +1989,12 @@ abstract contract DeployBase is Script {
             if (word >> 160 != 0 || member.code.length == 0) revert DeployedMemberNotOwnable(i);
             (bool ok, bytes memory ret) = member.staticcall(abi.encodeCall(Ownable.owner, ()));
             if (!ok || ret.length != 32) revert DeployedMemberNotOwnable(i);
+            // Round 53: the answer is checked to BE an address here, because the high-level
+            // `Ownable(member).owner()` every caller performs next `abi.decode`s it as one and dies
+            // EMPTY on a word with dirty high bits - the wrong contract at a record row answering
+            // a colliding selector. The same range check `_answersWithItself` avoids needing by
+            // comparing raw, applied where a decode is unavoidable.
+            if (abi.decode(ret, (uint256)) > type(uint160).max) revert DeployedMemberNotOwnable(i);
             list[i] = member;
         }
     }

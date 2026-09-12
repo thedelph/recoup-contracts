@@ -30,8 +30,16 @@ import {ILenderPool} from "./interfaces/ILenderPool.sol";
 ///
 ///      **3. Requests have controllers, not positions.** Each controller has at most one live
 ///      request in an O(1) mapping. Monotonic request IDs identify events but create no priority,
-///      cursor, shared walk, or cross-controller veto. Each request owns the same fraction of cash
-///      as its shares own of supply, independent of pool leverage.
+///      cursor, shared walk, or cross-controller veto. On each service call a request may take
+///      the same fraction of the cash then executable as its remaining shares hold of supply,
+///      independent of pool leverage. That slice is PER CALL and is a reservation of cash for
+///      requesters against lending and against other exits; it is not a cap on what a request
+///      converts in total. Serviced in steps, the slices are recomputed against a base each step
+///      already shrank and sum to more than one slice of the opening cash - and the synchronous
+///      `redeem` door delivers at least that total in ONE call for an un-queued holder, because
+///      `maxRedeem` is bounded by all unreserved executable cash rather than by a fraction of it
+///      (external review, 33audits H-03, measured in `Impairment.integration.t.sol`). Requesting
+///      therefore never lets a lender out with more cash than the sync door already offers.
 ///
 ///      **4. Service timing belongs to the controller.** Only the controller or an operator they
 ///      approve may choose the amount and execution block. The receiver is fixed when the request
@@ -324,6 +332,29 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     ///      it is not the pool's money any more.
     uint256 public totalClaimable;
 
+    /// @notice Every manager this pool has ever been pointed at, the live one included. Read on the
+    ///         one inbound leg a former manager may still use: `recoverLoss`.
+    /// @dev A written-down loss is recorded against the manager that recognised it, and
+    ///      `CreditManager.recoverWrittenDownLoss` relays a late recovery from `lossBearerOf` - a
+    ///      record, not a live pointer. `setCreditManager` refuses only while principal or an
+    ///      impairment stands, and both read zero after a forced close, so the ordinary migration
+    ///      is permitted while a write-down is still recoverable. Gating `recoverLoss` on the live
+    ///      pointer alone then refused the retired manager's delivery forever: the acknowledged
+    ///      repair, pointing the pool back, reverts `PrincipalOutstanding` once the successor has
+    ///      lent, and every park on the manager side was built and refuted by execution (an
+    ///      `owedToSource` park breaks the books-agree identity; a pot of its own is dischargeable
+    ///      only through the same refused repoint). The mirror of `wasLiquidationAuction` on the
+    ///      manager: an outgoing party keeps its claim, rather than the repoint being refused.
+    ///
+    ///      **Inbound only, and that is the bound.** Read by `recoverLoss` and by nothing else.
+    ///      `lend`, `repayPrincipal`, `socialiseLoss`, `impair`, `releaseImpairment` and
+    ///      `setLossReserves` stay on the live pointer, so a former manager can open no new
+    ///      exposure and move no reserve here; the one thing it may do is pay USDC in, at its own
+    ///      expense, as a gain on a loss this pool already bore. Set in `setCreditManager`, which is
+    ///      `onlyOwner`, so the set is exactly the managers an owner has wired. Never cleared: the
+    ///      claim has to outlive the pointer or the leg is back where it started.
+    mapping(address => bool) public wasCreditManager;
+
     constructor(IERC20 usdc_, address initialOwner)
         ERC20("Recoup Lender Pool", "rcUSDC")
         ERC4626(usdc_)
@@ -528,6 +559,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         emit LossReservesSet(0, 0, exitReserve());
 
         creditManager = creditManager_;
+        // The incoming manager joins the set kept for `recoverLoss`, so a loss it recognises can
+        // still be recovered here after the next repoint. No new event: `CreditManagerSet` already
+        // records every address that enters this set.
+        wasCreditManager[creditManager_] = true;
         emit CreditManagerSet(creditManager_);
     }
 
@@ -667,6 +702,9 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     function _tryRawBalance() private view returns (bool ok, uint256 raw) {
         bytes memory data;
         (ok, data) = asset().staticcall{gas: BALANCE_READ_GAS}(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        // FALSE (audit round 44). The flagged constant is the `false` of a `(bool ok, uint256 raw)`
+        // sentinel return, not a condition being compared against a literal. `maxDeposit` reads `ok`.
+        // forge-lint: disable-next-line(boolean-cst)
         if (!ok || data.length < 32) return (false, 0);
         assembly ("memory-safe") {
             raw := mload(add(data, 0x20))
@@ -1197,10 +1235,15 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         );
     }
 
-    /// @notice Executable cash reserved pro rata for all currently requested shares.
+    /// @notice Executable cash reserved pro rata for all currently requested shares, at this
+    ///         instant. A reservation against `lend` and against synchronous exits, recomputed on
+    ///         every read; not a cumulative entitlement of the requesters.
     /// @dev The entry-price cash reserve is removed first because it is senior while principal can
     ///      still be lost. Both numerator and result are cash-denominated. Ceiling rounding gives
-    ///      the request side the one indivisible executable cash unit at the boundary.
+    ///      the request side the one indivisible executable cash unit at the boundary. The figure
+    ///      moves with executable cash and with `queuedShares`, so a request serviced in steps sees
+    ///      a fresh reserve each step; the header's rule 3 says why that is a bound on nothing the
+    ///      sync door does not already allow.
     function queueCashReserve() public view returns (uint256) {
         uint256 raw = _rawBalance();
         return _queueCashReserve(_executablePoolCash(raw));
@@ -1499,6 +1542,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         public
         override(ERC4626, IERC4626)
         whenNotPaused
+        // FALSE (audit round 44). `whenNotPaused` makes no external call, and its position here is
+        // DELIBERATE for the reason the doc comment above gives: it must answer `EnforcedPause()`
+        // rather than let the cap read below answer `DepositCapExceeded(assets, 0)`.
+        // forge-lint: disable-next-line(non-reentrant-not-first)
         nonReentrant
         returns (uint256)
     {
@@ -1523,6 +1570,9 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         public
         override(ERC4626, IERC4626)
         whenNotPaused
+        // FALSE (audit round 44). The exact-share twin of `deposit`, gated identically and for the
+        // same reasons.
+        // forge-lint: disable-next-line(non-reentrant-not-first)
         nonReentrant
         returns (uint256)
     {
@@ -1773,6 +1823,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         uint256 principal = amount > outstanding ? outstanding : amount;
         uint256 surplus = amount - principal;
 
+        // FALSE (audit round 44). `from` is not arbitrary: `repayPrincipal` reverts `NotCreditManager`
+        // above unless `msg.sender` IS `creditManager`, so this is exactly the `from == msg.sender` the
+        // lint asks for, written as a named revert rather than the literal comparison it matches on.
+        // forge-lint: disable-next-line(arbitrary-send-erc20)
         IERC20(asset()).safeTransferFrom(creditManager, address(this), amount);
         outstandingPrincipal = outstanding - principal;
         _accountedCash += amount;
@@ -1847,6 +1901,9 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         if (totalSupply() < MIN_SUPPLY_FOR_YIELD) {
             if (covered == 0) revert NoSharesOutstanding();
 
+            // FALSE (audit round 44). `distributeYield` reverts `NotEpochHarvester` above unless
+            // `msg.sender` IS `epochHarvester`, so `from` equals the caller.
+            // forge-lint: disable-next-line(arbitrary-send-erc20)
             IERC20(asset()).safeTransferFrom(epochHarvester, address(this), covered);
             _accountedCash += covered;
             if (covered == amount) lastYieldDistributeAt = block.timestamp;
@@ -1871,9 +1928,27 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         // than everything the pool holds is not an epoch this pool earned.
         //
         // Refusing is safe and is the designed behaviour, not an outage: `_push` wraps the call in
-        // `try`/`catch` and measures delivery, so the share stays in `pendingLenderYield` until
-        // there is capital to pay it to. Same reasoning as the guard above, one question further
-        // along.
+        // `try`/`catch` and measures delivery, so the share stays in `pendingLenderYield` while
+        // capital can still arrive to pay it to. Same reasoning as the guard above, one question
+        // further along.
+        //
+        // **"Until there is capital" used to stand there, and it assumed capital can always
+        // arrive. Above the hard ceiling it cannot** (external review, 33audits M-05). The cap is
+        // bounded by `Config.GLOBAL_BORROW_CAP_MAX`, a constant, and a pool full at that ceiling
+        // has `maxDeposit` at zero for everybody with no setting that reopens it; the harvester
+        // offers its whole backlog and cannot offer less. So a backlog larger than a pool that is
+        // as large as a pool can be was refused forever, with no owner lever and no other drain.
+        // In that one terminal state the offer is clamped to `capital` and the pool pulls exactly
+        // that: the harvester measures what left and keeps the remainder pending, and the next
+        // flush finds a pool that is larger by what it just delivered. Clamped ONLY there, on
+        // purpose: below the ceiling the refusal is what keeps a one-cent pool from taking a
+        // backlog, and a clamp in that state would hand it the same backlog in slow motion, one
+        // capital-sized bite per permissionless flush. The predicate is the cap being pinned at
+        // the constant AND the book consuming it, read off `depositCapUsage` rather than
+        // `maxDeposit` because a pause, a deficit or a price gate also zero the latter and every
+        // one of those is a state something can still change. `capital` itself can fall below the
+        // usage while an earlier delivery is still unreleased, which is why the clamp reads
+        // `capital` and not the cap.
         //
         // The exception is an existing claim liquidity deficit. Entry is already closed in that
         // state, so there is no just-in-time entrant to protect against, while rejecting the whole
@@ -1882,9 +1957,15 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         uint256 streamable = amount - covered;
         uint256 capital = _totalAssets(raw);
         if (liquidityDeficitBefore == 0 && streamable > capital) {
-            revert YieldExceedsCapital(streamable, capital);
+            if (capital == 0 || depositCap != Config.GLOBAL_BORROW_CAP_MAX || depositCapUsage() < depositCap) {
+                revert YieldExceedsCapital(streamable, capital);
+            }
+            streamable = capital;
+            amount = covered + streamable;
         }
 
+        // FALSE (audit round 44). Same guard as the sibling pull above: `from` equals `msg.sender`.
+        // forge-lint: disable-next-line(arbitrary-send-erc20)
         IERC20(asset()).safeTransferFrom(epochHarvester, address(this), amount);
         _accountedCash += amount;
 
@@ -2201,16 +2282,20 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     ///      made the pool that small. The closer sibling is `repayPrincipal`'s surplus, which has
     ///      no such guard either and for the same reason.
     function recoverLoss(uint256 amount) external nonReentrant {
-        if (msg.sender != creditManager) revert NotCreditManager();
+        // The live manager or a former one: see `wasCreditManager` for why this one leg is not
+        // gated on the live pointer alone and why every other manager-gated leg still is.
+        if (msg.sender != creditManager && !wasCreditManager[msg.sender]) revert NotCreditManager();
         if (amount == 0) revert ZeroAmount();
         _reconcileCashDeficit();
 
         uint256 claimDeficitBefore = claimSolvencyDeficit();
-        IERC20(asset()).safeTransferFrom(creditManager, address(this), amount);
+        // The caller pays. Pulled from `msg.sender`, never from the live pointer: a former manager
+        // delivering a recovery must not spend the successor's allowance.
+        IERC20(asset()).safeTransferFrom(msg.sender, address(this), amount);
         _accountedCash += amount;
 
         uint256 covered = amount > claimDeficitBefore ? claimDeficitBefore : amount;
-        if (covered != 0) emit ClaimDeficitCovered(creditManager, covered, claimDeficitBefore - covered);
+        if (covered != 0) emit ClaimDeficitCovered(msg.sender, covered, claimDeficitBefore - covered);
         uint256 streamable = amount - covered;
 
         // A gain with no holder is de-recognised permanently. A low but non-zero cohort keeps it
@@ -2315,10 +2400,18 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         return _requestOperators[controller][operator];
     }
 
-    /// @notice The most requested shares currently funded by this request's pro-rata cash.
-    /// @dev The cash slice is calculated independently for each controller. The conversion back to
-    ///      shares is deliberately the gross ERC-4626 conversion, while execution pays the live
-    ///      exit price through `previewRedeem`.
+    /// @notice The most requested shares this request's pro-rata slice of the cash executable NOW
+    ///         funds, for one service call. Recomputed per call, never accumulated.
+    /// @dev The cash slice is calculated independently for each controller and against the cash
+    ///      executable at the time of the call, so a request serviced in several calls takes a
+    ///      fresh slice of a base its earlier service already reduced: the sum over the calls
+    ///      exceeds one slice of the opening cash and tends toward the whole executable balance
+    ///      as the fraction and the call count grow. That is a reservation for requesters against
+    ///      lending and other exits, not a cap on cumulative conversion, and it is not a door the
+    ///      sync exit lacks: `maxRedeem` lets an un-queued holder take all unreserved executable
+    ///      cash in one `redeem`, which is at least what the stepped service reaches (measured,
+    ///      external review 33audits H-03). The conversion back to shares is deliberately the gross
+    ///      ERC-4626 conversion, while execution pays the live exit price through `previewRedeem`.
     function maxRequestRedeem(address controller) public view returns (uint256 shares) {
         uint256 requestedShares = _withdrawalRequests[controller].shares;
         if (requestedShares == 0 || claimLiquidityDeficit() != 0) return 0;

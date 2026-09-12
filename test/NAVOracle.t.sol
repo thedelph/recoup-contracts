@@ -51,6 +51,103 @@ contract NAVOracleTest is Test {
         oracle.setNavConfirmer(keeper);
     }
 
+    /// @dev Audit round 48, finding 79. The owner is a key on the second-key path too - it
+    ///      holds `cancelPendingNav` - so a confirmer that is the owner collapses the pair onto
+    ///      one party, and this was the one two-key contract that accepted that shape while
+    ///      `CollateralVault`, `LenderPool` and `CreditManager` all refuse it by name. RED before
+    ///      the guard: the setter accepted `admin`.
+    function test_setNavConfirmer_rejectsTheOwner() public {
+        vm.prank(admin);
+        vm.expectRevert(NAVOracle.KeysMustDiffer.selector);
+        oracle.setNavConfirmer(admin);
+        assertEq(oracle.navConfirmer(), confirmer, "the confirmer must not have moved");
+    }
+
+    /// @dev The same collapse from the other door: handing ownership to the sitting confirmer
+    ///      puts `cancelPendingNav` and `confirmNav` in one hand. RED before the override: the
+    ///      base `transferOwnership` accepted it.
+    function test_transferOwnership_rejectsTheSittingConfirmer() public {
+        vm.prank(admin);
+        vm.expectRevert(NAVOracle.KeysMustDiffer.selector);
+        oracle.transferOwnership(confirmer);
+        assertEq(oracle.owner(), admin, "ownership must not have moved");
+    }
+
+    /// @dev Control: the sanctioned handover to the current confirmer is two calls, mirroring
+    ///      `CollateralVault.transferOwnership`'s guardian rule - move the confirmer first, then
+    ///      transfer - and the feed still has two distinct keys afterwards.
+    function test_transferOwnership_isTwoCallsWhenTheConfirmerIsTheIncomingOwner() public {
+        address nextConfirmer = makeAddr("nextConfirmer");
+        vm.startPrank(admin);
+        oracle.setNavConfirmer(nextConfirmer);
+        oracle.transferOwnership(confirmer);
+        vm.stopPrank();
+        assertEq(oracle.owner(), confirmer, "the former confirmer is now the owner");
+        assertEq(oracle.navConfirmer(), nextConfirmer, "and the second key is a different address");
+        assertTrue(oracle.owner() != oracle.navConfirmer(), "two keys");
+        assertTrue(oracle.owner() != oracle.keeper(), "and the keeper is a third");
+    }
+
+    /// @dev Audit round 49, finding 133: the keeper collapse is the confirmer collapse one setter
+    ///      over. The owner holds `cancelPendingNav`, so an owner who is also the keeper can park
+    ///      a value and discard it - the round-13 asymmetry (the keeper opens a review window and
+    ///      cannot close it) collapses onto one hand. RED before the guard, MEASURED at `73b474a`:
+    ///      `setKeeper(admin)` was accepted, `next call did not revert as expected`.
+    function test_setKeeper_rejectsTheOwner() public {
+        vm.prank(admin);
+        vm.expectRevert(NAVOracle.KeysMustDiffer.selector);
+        oracle.setKeeper(admin);
+        assertEq(oracle.keeper(), keeper, "the keeper must not have moved");
+    }
+
+    /// @dev The same collapse from the other door: handing ownership to the sitting keeper puts
+    ///      `postNav` and `cancelPendingNav` in one hand. RED before the clause: the override
+    ///      refused only the confirmer and accepted the keeper.
+    function test_transferOwnership_rejectsTheSittingKeeper() public {
+        vm.prank(admin);
+        vm.expectRevert(NAVOracle.KeysMustDiffer.selector);
+        oracle.transferOwnership(keeper);
+        assertEq(oracle.owner(), admin, "ownership must not have moved");
+    }
+
+    /// @dev Control: the sanctioned handover to the current keeper is two calls, move the keeper
+    ///      first and then transfer, and the feed still has three distinct keys afterwards.
+    function test_transferOwnership_isTwoCallsWhenTheKeeperIsTheIncomingOwner() public {
+        address nextKeeper = makeAddr("nextKeeper");
+        vm.startPrank(admin);
+        oracle.setKeeper(nextKeeper);
+        oracle.transferOwnership(keeper);
+        vm.stopPrank();
+        assertEq(oracle.owner(), keeper, "the former keeper is now the owner");
+        assertEq(oracle.keeper(), nextKeeper, "and the posting key is a different address");
+        assertTrue(oracle.owner() != oracle.keeper(), "two keys");
+        assertTrue(oracle.owner() != oracle.navConfirmer(), "and the confirmer is a third");
+    }
+
+    /// @dev Control, and a pin for finding 80's terminal path: a handover to a fresh owner
+    ///      still works, and so does the one-step `transferOwnership(0xdEaD)` that this contract
+    ///      reaches instead of `renounceOwnership`. The override refuses exactly two addresses,
+    ///      the sitting confirmer and the sitting keeper, and nothing else.
+    function test_transferOwnership_toAFreshOwnerAndThenToTheTerminalSinkStillWorks() public {
+        address fresh = makeAddr("fresh");
+        vm.prank(admin);
+        oracle.transferOwnership(fresh);
+        assertEq(oracle.owner(), fresh);
+
+        address dead = 0x000000000000000000000000000000000000dEaD;
+        vm.prank(fresh);
+        oracle.transferOwnership(dead);
+        assertEq(oracle.owner(), dead, "the terminal sink is still reachable in one step");
+
+        // And the feed keeps working under a burnt owner: the keys it needs are the two it has.
+        // Same shape as `test_postNav_withinBudgetTakesEffect`: a day on, +5% inside the budget.
+        vm.warp(block.timestamp + 1 days);
+        uint256 next = NAV * 105 / 100;
+        _post(next);
+        assertEq(oracle.navPerBond(), next, "an ordinary post lands with the owner burnt");
+        assertEq(oracle.pendingNav(), 0);
+    }
+
     function test_postNav_onlyKeeper() public {
         vm.prank(outsider);
         vm.expectRevert(NAVOracle.NotKeeper.selector);

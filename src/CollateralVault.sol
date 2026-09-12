@@ -41,7 +41,20 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error ZeroAddress();
     error AdapterHasLivePosition(uint256 staked);
     error AdapterVaultMismatch(address adapterVault);
+    /// @notice Round-54 item 223, shipped round 55: the incoming adapter did not answer one of the
+    ///         two views `setCustodyAdapter` probes, or answered one with something that is not a
+    ///         single word. Carries the selector so the operator is told WHICH, where both probes
+    ///         used to die with EMPTY returndata that named neither the function nor the reason.
+    error AdapterDoesNotAnswer(bytes4 selector);
+    /// @notice Round-55 item 218: the incoming adapter's stake does not cover the ledger it would
+    ///         take over, so installing it would leave custody insolvent (a break-glass repoint to
+    ///         an empty adapter). A pre-staked repair adapter is admitted.
+    error CustodyWouldBeInsolvent(uint256 incomingStake, uint256 ledger);
     error NavStale();
+    /// @notice Round 56 (A1): custody does not back the ledger, so a deposit here would be
+    ///         withdrawable by somebody else's ledger entry. Same four bytes as
+    ///         `CreditManager.CustodyInsolvent`, which is the same statement about the same state.
+    error CustodyInsolvent();
     error RenounceDisabled();
     /// @notice `pause()` accepts the owner or the guardian; this is neither.
     error NotOwnerOrGuardian();
@@ -57,7 +70,6 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     error CreditManagerNotVirgin(address incoming);
     error CreditManagerVaultMismatch(address creditManagerVault);
     error PositionNotLiquidatable(uint256 ltvBps);
-    error CreditManagerHasUndistributedYield(uint256 undistributed);
     error AuctionHasLiveWork(uint256 outstanding);
     error LiquidationAuctionVaultMismatch(address auctionVault);
     error CreditManagerRiskParamsMismatch(address managerRiskParams);
@@ -224,10 +236,27 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      helper is written out rather than reusing that one's reasoning by reference.
     ///
     ///      What catching costs: an adapter that genuinely holds a position, whose farm is down,
-    ///      reads as idle and can be repointed away from. What it buys is the repoint being
-    ///      possible at all, which round 21 measured it was not - `setCustodyAdapter`,
-    ///      `depositBonds` and `custodyIsSolvent()` all reverting **permanently**, on a contract
-    ///      that cannot be replaced and is holding third-party collateral.
+    ///      reads as idle here and so gets past the OUTGOING check. Round 21 wrote that what it
+    ///      buys is "the repoint being possible at all", against a state it measured -
+    ///      `setCustodyAdapter`, `depositBonds` and `custodyIsSolvent()` all reverting
+    ///      **permanently**, on a contract that cannot be replaced and is holding third-party
+    ///      collateral.
+    ///
+    ///      **That sentence stopped being true in the very state it was written for, and round 57
+    ///      (item 223) corrects it here rather than the code.** Round 55 (item 218) added
+    ///      `CustodyWouldBeInsolvent` on the INCOMING side of `setCustodyAdapter`: with a live
+    ///      ledger under the dead farm the outgoing stake reads 0 here, and the incoming clause then
+    ///      refuses every adapter not already staked with at least `totalBondCount` units - MEASURED
+    ///      as `CustodyWouldBeInsolvent(0, 100)` by `R56A02_DeadFarmRepoint`. That refusal is KEPT by
+    ///      decision (round 57, item 223): an empty adapter installed over a non-empty ledger strands
+    ///      every exit, which is worse than the pointer staying where it is. What the catch still
+    ///      buys is narrower and still worth having: neither of the two repoints that remain
+    ///      legitimate is welded shut by an outgoing adapter that cannot answer - a repoint over an
+    ///      EMPTY ledger (`R56A02_DeadFarmRepoint`'s control), and the one repair the incoming clause
+    ///      admits, an adapter already staked with the rescued units, which round 57 made buildable
+    ///      with `DirectCallAdapter.restakeLoose`. Only this setter reads through this helper;
+    ///      `custodyIsSolvent()`, and through it both deposit paths, still read the live adapter
+    ///      bare and revert for as long as its farm does.
     ///
     ///      The trade is one-sided because the bonds do not move either way. `bondCount` is
     ///      untouched by a repoint, the units stay in the farm under the outgoing adapter, and
@@ -298,23 +327,61 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      the paragraph below, which was stale in the other direction. Nothing in CI derives this
     ///      count; the grep above is the whole of the check.
     ///
-    ///      "Bare" is true of every site except one: the `stakedBalance` read inside
-    ///      `_outgoingStake` is wrapped in `try`/`catch`, which is round 21's fix and the reason
-    ///      the sentence that follows had to be rewritten too.
+    ///      **Neither incoming probe is a bare high-level call any more.** Round-54 item 223 moved
+    ///      both through `_probe` below; what stays bare is nothing on this path. The one
+    ///      `try`/`catch` here is the OUTGOING read inside `_outgoingStake`, which is round 21's
+    ///      fix and must keep catching for the reason that helper gives at length.
     ///
     ///      What the probe does close is the way back, and **the guarantee is stronger than this
     ///      docstring used to claim**. It said "an adapter that answers `stakedBalance()` at
     ///      install answers it at the next repoint too, so the escape hatch survives" - which
     ///      made the escape contingent on the outgoing adapter still answering. Since
     ///      `_outgoingStake` catches, it is not contingent on anything: an outgoing adapter that
-    ///      cannot answer at all reads as idle and is repointed away from. That sentence was
+    ///      cannot answer at all reads as idle and passes the outgoing check. That sentence was
     ///      written before the `catch` existed and was left standing after it, which is the same
     ///      defect as the count above pointing the other way. That, and not the count, is the
-    ///      property worth having.
+    ///      property worth having. **Passing the outgoing check is not the same as being
+    ///      repointed away from**: since round 55 the incoming `CustodyWouldBeInsolvent` clause still
+    ///      refuses an adapter that does not back the ledger, so over a live ledger only a
+    ///      pre-staked repair gets through - see `_outgoingStake`, and round 57's item 223.
     ///
-    ///      Bare rather than `try`/`catch` with an error of its own, following `LiquidationAuction
-    ///      .setCreditManager`'s `totalBountyParked()` probe: this path is `onlyOwner`, so failing
-    ///      loudly with no data costs nothing a named error would buy.
+    ///      **Named rather than bare, and why this diverges from `CreditWiring._probe` (round-54
+    ///      item 223, shipped round 55).** Both incoming probes used to be bare high-level calls
+    ///      that reverted with EMPTY returndata on an address missing the member - the argument
+    ///      being that `onlyOwner` makes a loud failure enough. It is not, for a reason the tests
+    ///      exposed rather than the reasoning: the shipped `SetterGuards` stub answers `vault()`,
+    ///      so the file's one bare `vm.expectRevert()` was pinning the SECOND probe while reading
+    ///      as though it covered the setter, and empty returndata cannot tell an operator which of
+    ///      eight selectors their adapter is missing. Both now go through `_probe`, which raises
+    ///      `AdapterDoesNotAnswer(selector)`.
+    ///
+    ///      `CreditWiring._probe` deliberately does the opposite - a function pointer plus
+    ///      `try`/`catch`, so that "the probe still reads a genuine revert and not a returndata
+    ///      length" - and that is right THERE and wrong here. Its three members share one
+    ///      signature `(address) -> uint256`, so a function pointer types them; ours are two
+    ///      different zero-argument views, so there is no single pointer type to take. Its
+    ///      targets have already had three member calls taken off them by the time it runs, so
+    ///      an address with no code has already reverted; ours is the FIRST read of the incoming
+    ///      address, and a `staticcall` to a codeless account succeeds with empty returndata,
+    ///      which the length check below is what turns into a named refusal. And it wants a
+    ///      genuine revert because its members can legitimately revert on the probe argument;
+    ///      ours cannot, so "answered with one word" is exactly the property we want and a
+    ///      returndata length is the honest way to read it.
+    ///
+    ///      **The `code.length == 0` clause `AssertLocked._readAddress` carries is deliberately
+    ///      NOT copied**, because it could not change any outcome here: a `staticcall` to a
+    ///      codeless account returns success with empty returndata, so `ret.length != 32` already
+    ///      names it with the same error and the same selector. `AssertLocked` carries the clause
+    ///      because it has a distinct `NoCodeAt` to raise and a script has room for the
+    ///      distinction; here it would be runtime bytes that no caller could ever tell apart.
+    ///      `test_R54A04_198_named_aCodelessAddressIsNamedOnVault` is what holds that claim.
+    ///
+    ///      **Form A was costed and rejected.** It named only the `stakedBalance()` probe and left
+    ///      `vault()` a bare high-level call, at `CollateralVault` runtime +135 against this
+    ///      form's +156. Twenty-one bytes is not the reason to leave the FIRST probe - the one an
+    ///      address answering nothing at all hits, and the one a dirty high word dies in - unable
+    ///      to say what happened. Re-derive both figures from the size gate rather than quoting
+    ///      them.
     function setCustodyAdapter(ICustodyAdapter adapter) external onlyOwner {
         if (address(adapter) == address(0)) revert ZeroAddress();
         ICustodyAdapter current = custodyAdapter;
@@ -323,15 +390,47 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
             uint256 staked = _outgoingStake(current);
             if (staked != 0) revert AdapterHasLivePosition(staked);
         }
-        address boundVault = adapter.vault();
+        // The first of the two views. Decoded as a word and range-checked before it is narrowed,
+        // the `AssertLocked._asAddress` way, rather than `abi.decode`d straight to an `address`:
+        // a 32-byte answer whose high 96 bits are set is the wrong contract answering a colliding
+        // selector, and decoding it as an address reverts EMPTY rather than naming anything.
+        uint256 word = abi.decode(_probe(adapter, ICustodyAdapter.vault.selector), (uint256));
+        if (word > type(uint160).max) revert AdapterDoesNotAnswer(ICustodyAdapter.vault.selector);
+        // Casting to `uint160` is safe because the line directly above refuses any word above
+        // `type(uint160).max`, which is precisely the range this narrows into. The check and the cast
+        // are one clause; splitting them is what would make it unsafe.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        address boundVault = address(uint160(word));
         if (boundVault != address(this)) revert AdapterVaultMismatch(boundVault);
         // The second of the two views, probed for the reason given above. Its value is discarded:
         // a fresh adapter's balance is whatever it is, and this is testing only that the call
-        // answers at all.
-        // slither-disable-next-line unused-return
-        adapter.stakedBalance();
+        // answers at all. `_probe` returns the word rather than swallowing it, so there is no
+        // unused-return suppression to carry here any more.
+        uint256 incoming = abi.decode(_probe(adapter, ICustodyAdapter.stakedBalance.selector), (uint256));
+        // **Round-55 item 218: the incoming adapter must back the ledger it is taking over.** After
+        // a break-glass `emergencyUnstake` the outgoing stake is zero while `totalBondCount` is
+        // not, so the outgoing check above passes and a fresh, empty adapter was ACCEPTED over an
+        // insolvent ledger - after which every withdrawal, fill and disposal still reverts inside
+        // the farm and nothing on this contract re-stakes the rescued bonds without crediting a
+        // depositor. Keyed on the INCOMING stake rather than on `totalBondCount` alone, so the one
+        // repair that can exist - an adapter that has already been staked with the rescued bonds -
+        // is admitted, and an empty one over a non-empty ledger is named for what it is. Round 57:
+        // that repair had no way to be built until `DirectCallAdapter.restakeLoose`, the owner's
+        // uncredited re-stake of units the adapter holds loose; a short rescue is still refused.
+        if (incoming < totalBondCount) revert CustodyWouldBeInsolvent(incoming, totalBondCount);
         custodyAdapter = adapter;
         emit CustodyAdapterSet(address(adapter));
+    }
+
+    /// @dev One completeness probe on the INCOMING adapter: the call must succeed and answer
+    ///      exactly one word, or the selector that did not answer is named. Low-level on purpose -
+    ///      see the divergence from `CreditWiring._probe` set out in `setCustodyAdapter`'s
+    ///      docstring. Never used on the outgoing pointer, which must keep CATCHING
+    ///      (`_outgoingStake`) so a dead adapter cannot weld the vault shut.
+    function _probe(ICustodyAdapter adapter, bytes4 sel) private view returns (bytes memory ret) {
+        bool ok;
+        (ok, ret) = address(adapter).staticcall(abi.encodeWithSelector(sel));
+        if (!ok || ret.length != 32) revert AdapterDoesNotAnswer(sel);
     }
 
     /// @dev The manager-pointer twin of `_outgoingStake`. See the `totalDebt` call site in
@@ -420,6 +519,49 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
             (uint256 liveAuctions, uint256 openWorkouts) = _outgoingAuctionWork(auction);
             if (liveAuctions != 0) revert AuctionHasLiveWork(liveAuctions);
             if (openWorkouts != 0) revert AuctionHasLiveWork(openWorkouts);
+
+            // **Audit round 55, and the third arm both siblings already carry.**
+            // `setLiquidationAuction` below and `CreditWiring.checkAuctionSwap` each count
+            // the parked *lot* as well as the two queue counters, because "counting queue
+            // entries is not the same as counting assets": `closeWorkout` pops the queue
+            // and leaves the lot parked under the auction's own ledger entry, and only the
+            // owner-gated `disposeWorkoutLot` clears it. This setter read the two counters
+            // and stopped.
+            //
+            // What that waves through, MEASURED at round 54: a zero-debt migration over a
+            // lot that is CLOSED but still parked. The close settles, so the booking itself
+            // is safe (round 46's settle-before-book) - but yield keeps streaming to the
+            // parked bonds, and everything that streams between the close and the repoint
+            // strands on the detached manager. Afterwards `pendingYieldOf(auction)` there
+            // is a **phantom**, because a detached manager prices the vault's LIVE bond
+            // count against its own frozen accumulator; `claimSurplusFor(auction)` moves
+            // only the amount settled at the close and leaves the phantom behind; `settle`
+            // reverts `Detached`; and both sweeps read the live manager. The loser is the
+            // insurance fund, bounded by what streams inside that window.
+            //
+            // Read off `liquidationAuction` - the current auction pointer, which is the
+            // address that holds the ledger entry - and not off the outgoing manager.
+            // `bondCount` is this contract's own storage, so it is a plain getter that
+            // cannot revert and needs no `try`, unlike the two counters above; both
+            // siblings read it bare for that reason.
+            //
+            // **It cannot deadlock.** The only call that clears `bondCount[auction]` is
+            // `LiquidationAuction.disposeWorkoutLot`, it is `onlyOwner`, and the same owner
+            // calls this setter - so the condition is under the guard-holder's own hand,
+            // and nothing reachable before this clause is unreachable after it.
+            //
+            // **The honest cost, stated because this is a judgement call rather than an
+            // obvious win.** `disposeWorkoutLot` requires `w.status == Closed`, so this arm
+            // refuses a manager migration during exactly the window
+            // `setLiquidationAuction`'s own clause calls "the normal steady state" - the
+            // close is forced at 14 days while the DexFi redemption behind the disposal is
+            // quoted at "48h+". That is the same trade the sibling already makes. The
+            // reason to make it here too is that this setter is the escape hatch from every
+            // other unrecoverable state in this contract, and an escape that silently
+            // strands the insurance fund's accrual is worse than one that names the lot and
+            // waits for a disposal the owner can already reach.
+            uint256 heldLot = bondCount[auction];
+            if (heldLot != 0) revert AuctionHasLiveWork(heldLot);
         }
         address boundVault = address(ICreditManager(creditManager_).vault());
         if (boundVault != address(this)) revert CreditManagerVaultMismatch(boundVault);
@@ -681,6 +823,7 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
         if (bondDepositsPaused) revert BondDepositsArePaused();
         ICustodyAdapter adapter = _adapter();
         if (amount == 0) revert ZeroAmount();
+        _requireSolventCustody();
 
         // Settle against the balance that earned, and set a new position's index to
         // now. Without this a fresh depositor would inherit an index of zero and
@@ -739,20 +882,37 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///
     ///      This makes `farmYieldDelivered` the eighth `ICustodyAdapter` selector this contract
     ///      calls - see `setCustodyAdapter`'s census, which had to be re-derived for it.
+    // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `reentrancy-benign` finding on
+    // `depositETH`: state written after the adapter call. The function is `nonReentrant` and the
+    // adapter is the owner-set custody backend, so the writes cannot be observed mid-flight by a
+    // re-entrant caller; the deltas they record are measured across the call by design.
+    // 🟥 SCOPE: above a function DECLARATION, so it suppresses `reentrancy-benign` for the whole
+    // function. Note it does NOT cover `reentrancy-eth`, which is a separate detector and is
+    // dispositioned in the triage rather than suppressed.
     // slither-disable-next-line reentrancy-benign
     function depositETH(bytes32 attemptId, bytes calldata mintData)
         external
         payable
         whenNotPaused
+        // FALSE (audit round 44). `whenNotPaused` is OpenZeppelin's `_requireNotPaused`, one storage
+        // read and a revert with no external call, so no control leaves the contract before the lock
+        // is taken. Reordering was refused rather than overlooked: it is a bytecode change on a
+        // contract with a measured size budget, bought for no change in behaviour.
+        // forge-lint: disable-next-line(non-reentrant-not-first)
         nonReentrant
     {
         ICustodyAdapter adapter = _adapter();
         if (msg.value == 0) revert ZeroAmount();
+        _requireSolventCustody();
 
         // Read either side of the mint and nothing else, so the delta is this call's sweep and
         // cannot pick up a settlement some other path performed.
         uint256 deliveredBefore = adapter.farmYieldDelivered();
         // Mint via DexFi's keeper-signed payload; bonds auto-stake for the adapter.
+        // FALSE (audit round 44). The destination is not user-controlled: it is the owner-set custody
+        // adapter read one line above, and the value is the caller's own `msg.value` funding the
+        // caller's own mint. A caller cannot name the recipient.
+        // forge-lint: disable-next-line(arbitrary-send-eth)
         uint256 amount = adapter.mintBonds{value: msg.value}(msg.sender, attemptId, mintData);
         uint256 swept = adapter.farmYieldDelivered() - deliveredBefore;
         if (amount == 0) revert NothingMinted();
@@ -967,6 +1127,14 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      deployment. That is deliberate: this contract is immutable and has no
     ///      egress, so USDC arriving here would be lost - the first audit's worst
     ///      finding, and the reason the recipient is settable rather than fixed.
+    // ACCEPTED (Slither 0.11.5, 79cfb98, 2026-09-09). The `reentrancy-events` finding on
+    // `harvestYield`, which had NO written reason before this line. The event is emitted after the
+    // external `claimYield`, which is what the detector reports; the call is `onlyOwner`, the
+    // callee is the owner-set adapter, and the event carries the value that call RETURNED, so
+    // emitting it first would report a number that had not happened yet. No state is written here
+    // at all, which is why this is `reentrancy-events` and not one of the stronger arms.
+    // 🟥 SCOPE: above a function DECLARATION, so it suppresses `reentrancy-events` for the whole
+    // function.
     // slither-disable-next-line reentrancy-events
     function harvestYield() external onlyOwner returns (uint256 usdcAmount) {
         usdcAmount = _adapter().claimYield();
@@ -978,7 +1146,38 @@ contract CollateralVault is ICollateralVault, Ownable, Pausable, ReentrancyGuard
     ///      the wrong amount in both directions.
     function _settlePosition(address owner_) private {
         address cm = creditManager;
+        // ACCEPTED (audit round 44). `_settlePosition` is private and every external path into it is
+        // `nonReentrant`; the callee is the owner-set `creditManager`, not caller-supplied code.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         if (cm != address(0)) ICreditManager(cm).settleForVault(owner_, bondCount[owner_]);
+    }
+
+    /// @dev Round 56 (A1). Both deposit paths refuse while custody does not back the ledger.
+    ///
+    ///      After a break-glass `DirectCallAdapter.emergencyUnstake` the farm position is empty and
+    ///      every `bondCount` survives, so `custodyIsSolvent()` is false and `withdrawBonds` reverts
+    ///      inside the farm - but only until somebody deposits. A deposit restocks the adapter's
+    ///      farm position, and the next `withdrawBonds` by ANY old ledger entry unstakes it: the
+    ///      old entry is paid twice (once from the rescued bonds governance holds, once from the
+    ///      newcomer's) and the newcomer is left holding a ledger entry nothing backs. MEASURED on
+    ///      the base tree: 100 bonds deposited by bob after the hatch were withdrawn by alice's
+    ///      pre-hatch entry, leaving bob's ledger at 100 over a custody stake of 0; the ETH path the
+    ///      same at 40. `borrow` already refused this state; the deposit paths did not, and the
+    ///      guardian cannot shut `depositBonds` by design, so only an owner operation the adapter
+    ///      knows nothing about closed the window.
+    ///
+    ///      Checked BEFORE the deposit, by calling `custodyIsSolvent()` rather than restating it. A
+    ///      deposit moves both sides by the same amount, so checking after would give the same
+    ///      answer at the cost of the transfer. Restating the inequality against the adapter the
+    ///      caller already holds was BUILT and MEASURED first, at CollateralVault runtime +148
+    ///      against this form's +53 on a clean `out/`; re-derive both from the size gate.
+    ///
+    ///      The trade, stated: this also refuses a borrower's `depositBonds` cure while custody is
+    ///      insolvent, and a recovery that re-deposits rescued bonds through the vault. In that state
+    ///      a cure's bonds are exposed to the same first-come withdrawal, so refusing it is the
+    ///      honest answer; the recovery path is a pre-staked adapter through `setCustodyAdapter`.
+    function _requireSolventCustody() private view {
+        if (!custodyIsSolvent()) revert CustodyInsolvent();
     }
 
     function _adapter() internal view returns (ICustodyAdapter adapter) {

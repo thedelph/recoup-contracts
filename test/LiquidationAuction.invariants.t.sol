@@ -34,9 +34,65 @@ import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 ///         their preconditions leave no gap between them. A state in which all three
 ///         exits revert is permanently stranded collateral, and only a fuzzer looking
 ///         for it will find it.
+///
+///         **Audit round 47, and the two identities below have teeth as a number rather than as a
+///         claim.** Round 46 finding 08 found this file checking `totalBountyEscrowed`,
+///         `totalBountyParked` and `totalBountyOwed` against their maps and checking neither
+///         `totalClaimable` nor `totalOwedToSources` against theirs, though both are terms of
+///         `invariant_creditManagerBalanceCoversEveryClaimOnIt` and that assertion is one-sided.
+///         Four neuters, each this file unchanged against one changed line in `CreditManager.sol`,
+///         all run with `FOUNDRY_PROFILE=neuter forge test --force`, all UNSEEDED at the
+///         `foundry.toml` defaults of 256 runs x 500 depth = **128,000 calls per invariant**:
+///
+///         | | the one changed line | result |
+///         |---|---|---|
+///         | baseline | nothing | **0 of 16 fail** |
+///         | N1 | `creditLiquidationProceeds`: `totalClaimable += toBorrower` deleted | **1 of 16 fail**: `invariant_theClaimableCounterEqualsItsMap`, `524567819 != 693536199` |
+///         | N2 | `_refundBounty`: `totalClaimable += held` deleted | **1 of 16 fail**: the same identity, `197383072 != 222383072` |
+///         | N3 | the repoint park: `totalOwedToSources += stranded` deleted | **1 of 16 fail**: `invariant_theOwedToSourcesCounterEqualsItsMap`, `0 != 400000000` |
+///         | N4 | `flushPrincipalTo`: `totalOwedToSources -= amount` deleted | **1 of 16 fail**: the same identity, `400000000 != 0` |
+///
+///         **Read the failures, not just the count.** N2's gap is exactly 25.000000, which is
+///         `LIQUIDATION_CALL_BOUNTY`, and N3 and N4 are the same 400.000000 in opposite directions:
+///         each neuter's arithmetic signature names the site it broke, which is the difference
+///         between an identity that is red and an identity that is red *for the right reason*. And
+///         in all four the rest of the suite stayed green - `invariant_creditManagerBalanceCovers
+///         EveryClaimOnIt` included, because a counter that drifts LOW leaves a one-sided bound
+///         satisfied. That is what these two identities are for.
+///
+///         **N3 and N4 are caught by the deterministic checkpoints, not by the campaign, and the
+///         campaign invariant is 0 == 0.** The reason is on
+///         `invariant_theOwedToSourcesCounterEqualsItsMap` itself: `setLiquiditySource` is
+///         admin-only and audit round 23 measured that a repointing handler action would make
+///         `invariant_theBooksAgreeOnWhatIsOwed` **false** rather than non-vacuous. It is stated
+///         here rather than left for a reader to find in a passing run.
+///
+///         **Audit round 54 added a repointing action, and it is not the one round 23 refused.**
+///         `AuctionHandler.migrate` moves the VAULT'S manager pointer to a second manager with its
+///         own pool; round 23 measured moving one manager's SOURCE to a treasury. The first leaves
+///         every (pool, manager) identity true and is asserted per pair below; the second still
+///         breaks it and is still not an action. The campaign now reaches the three sites round
+///         53's variant A changed (round-54 item 191), which no single-manager walk can.
+///
+///         **Gas, because a neuter that cannot move gas is a neuter that did not reach the run.**
+///         Under the neuter profile the pass figures are `test_R23_...` 2,458,929 and
+///         `test_handlerCanReachEveryStateTheInvariantsCheck` 7,926,897. N3 fails it at 1,775,751
+///         and N4 at 2,160,022; N1 moves the tripwire to 7,934,037. **N2 moves neither, and that
+///         is worth writing down rather than hiding**: `_refundBounty` is not on either
+///         deterministic path, so N2 is caught by the campaign alone - and the discriminator that
+///         it reached the run at all is that N1 and N2 print *different* figures for the same
+///         assertion.
 contract AuctionHandler is Test {
     CollateralVault public immutable vault;
-    CreditManager public immutable credit;
+    /// @notice The manager the vault currently points at.
+    /// @dev **Storage, not `immutable`, since audit round 54 - and still not a setter.** Round-54
+    ///      item 191 measured that this campaign reached NONE of the three sites round 53's variant
+    ///      A changed, because nothing here could move the vault's manager pointer. `migrate` below
+    ///      moves it, and this slot follows it, so every other action keeps reading "the live
+    ///      manager" the way it always did. The addresses it can ever hold are `managers`, injected
+    ///      by the constructor; no fuzzed address reaches this slot, which is the whole argument the
+    ///      `pool` docstring below makes and it is unchanged.
+    CreditManager public credit;
     LiquidationAuction public immutable auction;
     MockNavOracle public immutable oracle;
     MockUSDC public immutable usdc;
@@ -120,29 +176,63 @@ contract AuctionHandler is Test {
     uint256 public bountiesReleased;
     uint256 public bountiesReturned;
 
+    /// @notice Every manager this fixture can ever point the vault at, with the pool wired to
+    ///         each. Index 0 is the pair the campaign starts on; the rest are virgin spares.
+    /// @dev Injected, never created by an action and never named by a fuzz argument: `migrate`
+    ///      picks from this list by a seed, so the closed address universe
+    ///      `_everyAddressThisFixtureCanName` relies on stays closed - it enumerates these arrays.
+    CreditManager[] internal managers;
+    LenderPool[] internal pools;
+    mapping(address => LenderPool) internal poolOf;
+    /// @notice The owner of every wiring setter, so `migrate` can move the pointers.
+    address public immutable admin;
+    /// @notice The next spare `migrate` will move to, and the manager it last moved away from.
+    uint256 public nextSpare;
+    address public previousManager;
+
     constructor(
         CollateralVault vault_,
-        CreditManager credit_,
+        CreditManager[] memory managers_,
         LiquidationAuction auction_,
         MockNavOracle oracle_,
         MockUSDC usdc_,
         MockBond bond_,
-        LenderPool pool_,
+        LenderPool[] memory pools_,
         address keeper_,
         address harvester_,
+        address admin_,
         address[] memory actors_
     ) {
         vault = vault_;
-        credit = credit_;
-        riskParams = credit_.riskParams();
+        credit = managers_[0];
+        riskParams = managers_[0].riskParams();
         auction = auction_;
         oracle = oracle_;
         usdc = usdc_;
         bond = bond_;
-        pool = pool_;
+        pool = pools_[0];
         keeper = keeper_;
         harvester = harvester_;
+        admin = admin_;
         actors = actors_;
+        for (uint256 i = 0; i < managers_.length; i++) {
+            managers.push(managers_[i]);
+            pools.push(pools_[i]);
+            poolOf[address(managers_[i])] = pools_[i];
+        }
+        nextSpare = 1;
+    }
+
+    function managerCount() external view returns (uint256) {
+        return managers.length;
+    }
+
+    function managerAt(uint256 i) external view returns (CreditManager) {
+        return managers[i];
+    }
+
+    function poolAt(uint256 i) external view returns (LenderPool) {
+        return pools[i];
     }
 
     /// @dev The pool is read, never driven. Its state is the evidence that an impairment landed;
@@ -171,7 +261,12 @@ contract AuctionHandler is Test {
     ///      The setter arrived in audit round sixteen, the change that wired the real pool in so
     ///      the impairment lifecycle would stop being unreachable. **The fix for one vacuity built
     ///      the next one**, and it hid for three rounds because a vacuous suite reports green.
-    LenderPool internal immutable pool;
+    ///
+    ///      **Round 54: storage again, and the argument above still holds.** `migrate` writes this
+    ///      slot, from `poolOf[manager]` over the constructor-injected `pools` - never from a fuzz
+    ///      argument. What the round-16 setter got wrong was not being writable; it was being
+    ///      writable WITH AN ADDRESS THE FUZZER CHOSE. No action here takes an address.
+    LenderPool internal pool;
 
     function _actor(uint256 seed) internal view returns (address) {
         return actors[seed % actors.length];
@@ -349,6 +444,156 @@ contract AuctionHandler is Test {
         skip(bound(secondsSeed, 1 minutes, 3 days));
     }
 
+    /**
+     * ── THE EXHAUSTIVE DRAWS, AND WHY A BOUNDED CLOCK AND A BLIND MODULO ARE NOT ONE ───────────
+     *
+     * **Audit round 50, item 137**, and the same class of defect `CanonicalCashModel.t.sol`'s
+     * `redeemAll`/`serviceAll`/`destroyAllCash` block records one campaign over: an action whose
+     * draw cannot select the end of its own range leaves everything past that end unreachable by
+     * construction rather than by luck. Here the range is a CLOCK and the draw is a MODULO, but
+     * the shape is identical.
+     *
+     * Three things had to line up for a workout to be recognised and none of them could be drawn
+     * for. `passTime` is `skip(bound(seed, 1 minutes, 3 days))`, so reaching
+     * `Config.WORKOUT_MAX_DURATION` past `w.openedAt` needs FIVE consecutive maximal draws with no
+     * intervening action resetting the picture; `expire` needs `Config.AUCTION_DURATION` past
+     * `a.startedAt`; and `expire`, `closeWorkout`, `workoutSettle` and `workoutSettleAfterClose`
+     * all pick an id by `startedAuctions[seed % length]` - a blind modulo over EVERY auction that
+     * has ever started, most of which are settled - so the chance of naming the one live workout
+     * falls as the walk gets longer.
+     *
+     * MEASURED at 9d1e72d, 64 forced single runs, unseeded, depth 500, `cache/invariant` cleared
+     * between runs, `afterInvariant` logging every ghost (the census instrument is generated,
+     * thrown away and never committed). **The item's own "zero of 64" is right about the terminal
+     * half and WRONG about the entry, and both halves are recorded rather than the convenient
+     * one**: `workoutsOpened` reached 21 of 64 and `workoutsClosed` 2 of 64, while
+     * `forcedClosesThatWroteDown` and `lateRecoveriesPaid` were **0 of 64** and
+     * `cleanClosesThatBookedYield`, `workoutYieldClaimsThatPaid` and `workoutYieldSweepsThatMoved`
+     * were each **1 of 64**. So the campaign opens workouts and almost never RESOLVES one, which
+     * is worse than not reaching them at all: every property about a recognised loss was being
+     * quantified over a state space that had roughly one instance of it in 32,000 calls, and every
+     * one of those properties reported green.
+     *
+     * The three actions below draw for the state instead of hoping for it. Each picks from a LIVE
+     * set - `openWorkoutCount`/`openWorkoutAt` for workouts, a scan of `startedAuctions` for an
+     * unsettled auction - and each moves the clock to the exact instant the guard it is about
+     * names, rather than to a bounded increment of it. They are ADDITIONS: `passTime`, `expire`
+     * and `closeWorkout` all stay, so the fuzzed state space is a strict superset of the one every
+     * invariant here was previously proved over, which is the same discipline `moveNavNearThreshold`
+     * records for itself.
+     *
+     * The after-census, same instrument, same 64 forced runs, is the table on
+     * `test_handlerCanReachEveryStateTheInvariantsCheck` below.
+     *
+     * **And the census found a defect in these very actions before they shipped, which is the
+     * reason to run one rather than to argue from the shape of the code.** `expireEligible`
+     * indexed `startedAuctions[(idSeed + k) % n]`, and `idSeed` is a full `uint256` draw: two runs
+     * of 64 reported `expireEligible` with ONE revert against every other selector's zero - an
+     * arithmetic panic in the handler frame, outside every `try`, which is exactly what
+     * `invariant_theHandlerNeverDropsAFrame` exists to catch. See the comment on the loop.
+     */
+    function passTimeToRecognitionDeadline(uint256 idSeed) external {
+        uint256 n = auction.openWorkoutCount();
+        if (n == 0) return;
+        uint256 id = auction.openWorkoutAt(idSeed % n);
+        (, uint96 openedAt,,,,,,,,,) = auction.workouts(id);
+        uint256 deadline = uint256(openedAt) + Config.WORKOUT_MAX_DURATION;
+        // Counted on the POST-STATE rather than on the warp, so an action that arrives at a
+        // deadline already passed is the same evidence as one that moves the clock to it: the
+        // ghost's claim is "a live workout stood at or past its recognition deadline", which is
+        // the precondition `closeWorkout`'s forced branch actually evaluates.
+        if (block.timestamp < deadline) vm.warp(deadline);
+        warpsToRecognitionDeadline++;
+    }
+
+    /// @notice Expire a LIVE auction, moving the clock to its own deadline first.
+    /// @dev The two guards `expire` cannot draw for, taken together. It scans from the seed rather
+    ///      than indexing by it, because `startedAuctions` is dominated by settled ids the moment
+    ///      anything resolves - which is exactly what made the blind modulo a worse draw the
+    ///      longer the walk ran.
+    function expireEligible(uint256 idSeed) external {
+        uint256 n = startedAuctions.length;
+        if (n == 0) return;
+        // 🟥 **`(idSeed + k) % n` stood here and it OVERFLOWED.** `idSeed` is a full `uint256` fuzz
+        // draw, so a seed near the type maximum plus a scan offset panics - an arithmetic revert in
+        // the handler frame itself, outside every `try`, which is precisely what
+        // `invariant_theHandlerNeverDropsAFrame` exists to see. MEASURED by this row's own
+        // before/after census before the fix: `expireEligible` at 24 calls and **1 revert** in run
+        // 23 of 64, and again in run 50, while every other selector reverted zero times. Reducing
+        // the seed FIRST keeps both operands under `n`, so the sum is at most `2n - 2`.
+        for (uint256 k = 0; k < n; k++) {
+            uint256 id = startedAuctions[(idSeed % n + k) % n];
+            (, uint96 startedAt,, bool settled,,,,) = auction.auctions(id);
+            if (settled) continue;
+            uint256 finishesAt = uint256(startedAt) + Config.AUCTION_DURATION;
+            if (block.timestamp <= finishesAt) vm.warp(finishesAt + 1);
+            uint256 owedBefore = credit.bountyOwedTo(keeper);
+            // Still wrapped, and still counted from the outcome rather than the call: a healed
+            // position reverts here on `_requireLiquidatable`, which is the dispatch
+            // `expireToWorkout` documents, and that is a legitimate no-op rather than a fixture
+            // fault.
+            try auction.expireToWorkout(id) {
+                workoutsOpened++;
+                expiriesFromEligible++;
+                if (credit.bountyOwedTo(keeper) > owedBefore) bountiesReleased++;
+            } catch {}
+            return;
+        }
+    }
+
+    /// @notice `closeWorkout`, drawn from the workouts that are actually OPEN.
+    /// @dev The same call as `closeWorkout` above, with the id chosen from
+    ///      `_openWorkouts` instead of from every auction that has ever started. Deliberately does
+    ///      NOT move the clock: the clean-close branch needs no deadline at all, and folding the
+    ///      warp in here would make every close a forced one and delete the state
+    ///      `cleanClosesThatBookedYield` exists to record. `passTimeToRecognitionDeadline` is the
+    ///      clock, and the pair is what reaches the forced branch.
+    function closeLiveWorkout(uint256 idSeed) external {
+        uint256 n = auction.openWorkoutCount();
+        if (n == 0) return;
+        uint256 id = auction.openWorkoutAt(idSeed % n);
+        uint256 bookedBefore = auction.totalWorkoutYieldOwed();
+        bool splitPot = bookedBefore != auction.workoutYieldOwedOn(address(credit));
+        try auction.closeWorkout(id) {
+            workoutsClosed++;
+            closesFromLiveDraw++;
+            if (auction.totalWorkoutYieldOwed() > bookedBefore) {
+                cleanClosesThatBookedYield++;
+                if (splitPot) cleanClosesBookedOnASplitPot++;
+                if (bookedBefore != 0) bookingsMadeBesideAnother++;
+            }
+            (,,,,,,, uint256 writtenDown,,,) = auction.workouts(id);
+            if (writtenDown != 0) forcedClosesThatWroteDown++;
+        } catch {}
+        _drainOnceTheQueueIsEmpty();
+    }
+
+    /// @notice The three exhaustive draws' own ghosts, so each is asserted reachable on its own
+    ///         rather than inferred from the counter it was added to raise.
+    /// @dev One per action, for the reason the bounty branches have one each: a tripwire proves
+    ///      only the transition it names, and `workoutsClosed` moving says nothing about WHICH of
+    ///      the two closes moved it.
+    uint256 public warpsToRecognitionDeadline;
+    uint256 public expiriesFromEligible;
+    uint256 public closesFromLiveDraw;
+
+    /// @notice Clean closes that booked while another booking already stood: the STATE variant A's
+    ///         reserve term `totalWorkoutYieldOwed - owed` needs before it can be non-zero.
+    /// @dev **Round 54, and the one variant-A site this campaign still cannot reach, stated as a
+    ///      number rather than left in a passing run.** A booking stands only until a claim lands,
+    ///      and `claimWorkoutYield` plus `claimBookedWorkout` are two of about thirty selectors,
+    ///      while a second clean close needs a liquidation, an expiry, an epoch, a settle and a
+    ///      close inside that window. MEASURED with a census ghost on this counter's condition:
+    ///      ZERO at 256 runs x 500 calls, three unseeded campaigns; ZERO at 64 runs x 2,000 calls;
+    ///      and ZERO with a further draw that settled and closed every open workout in one frame
+    ///      (reached once in 256 runs, and the second lot had earned nothing to book) - that draw
+    ///      is preserved with round 54's bundle and deliberately NOT shipped, because a selector
+    ///      that dilutes every other by a thirtieth has to buy reach, and it measured none. The
+    ///      reserve term is therefore asserted DETERMINISTICALLY, in
+    ///      `test_handlerCanReachEveryStateTheInvariantsCheck`, on this very counter and on the
+    ///      partial payment it binds; the campaign's green is not evidence about it.
+    uint256 public bookingsMadeBesideAnother;
+
     function bid(uint256 idSeed, uint256 actorSeed) external {
         if (startedAuctions.length == 0) return;
         uint256 id = startedAuctions[idSeed % startedAuctions.length];
@@ -423,11 +668,18 @@ contract AuctionHandler is Test {
         uint256 pay = bound(amount, 1, 2_000e6);
         usdc.mint(address(this), pay);
         usdc.approve(address(auction), pay);
+        (,,,,,,,, address bearer,,) = auction.workouts(id);
         try auction.workoutSettleAfterClose(id, pay) {
             lateRecoveriesPaid++;
+            // Round 54: the tranche is delivered to `w.bearer`, which after `migrate` can be a
+            // manager the vault has left - round 46 finding 1's `wasLiquidationAuction` path.
+            if (bearer != address(credit)) lateRecoveriesToADetachedBearer++;
         } catch {}
         usdc.approve(address(auction), 0);
     }
+
+    /// @notice Late tranches that reached a manager the vault no longer points at.
+    uint256 public lateRecoveriesToADetachedBearer;
 
     /// @dev **The `forcedClosesThatWroteDown` ghost is audit round 23, finding 11.** That finding
     ///      measured `workoutSettleAfterClose` at 6,467 calls / 0 reverts per campaign with its
@@ -452,11 +704,35 @@ contract AuctionHandler is Test {
         if (startedAuctions.length == 0) return;
         uint256 id = startedAuctions[idSeed % startedAuctions.length];
         uint256 bookedBefore = auction.totalWorkoutYieldOwed();
+        bool splitPot = bookedBefore != auction.workoutYieldOwedOn(address(credit));
         try auction.closeWorkout(id) {
             workoutsClosed++;
-            if (auction.totalWorkoutYieldOwed() > bookedBefore) cleanClosesThatBookedYield++;
+            if (auction.totalWorkoutYieldOwed() > bookedBefore) {
+                cleanClosesThatBookedYield++;
+                if (splitPot) cleanClosesBookedOnASplitPot++;
+                if (bookedBefore != 0) bookingsMadeBesideAnother++;
+            }
             (,,,,,,, uint256 writtenDown,,,) = auction.workouts(id);
             if (writtenDown != 0) forcedClosesThatWroteDown++;
+        } catch {}
+        _drainOnceTheQueueIsEmpty();
+    }
+
+    /// @dev **Audit round 51, and the same bundling argument `recoverStrandedClaim` makes one
+    ///      screen down.** Both sweeps now reserve what still-OPEN workouts have earned, so USDC
+    ///      pushed onto the auction while a workout stood cannot be drained at the moment it
+    ///      arrives - and `invariant_auctionHoldsNothingButUnclaimedRewards` was always maintained
+    ///      by draining at push time rather than by arithmetic. The close is the transition that
+    ///      empties the queue, so the close is the transition that has to offer the drain.
+    ///
+    ///      Nothing is hidden by the bundling: the free-balance sweep reserves rewards, bookings
+    ///      and open accrual before it moves a cent, so the sum
+    ///      `invariant_everyBookedWorkoutYieldIsBackedByMoneyThatExists` measures cannot fall
+    ///      below what is booked, and that is the assertion that would notice.
+    function _drainOnceTheQueueIsEmpty() private {
+        if (auction.openWorkoutCount() != 0) return;
+        try auction.sweepFreeBalanceToInsurance() {
+            freeBalanceSweepsThatMoved++;
         } catch {}
     }
 
@@ -492,12 +768,73 @@ contract AuctionHandler is Test {
     ///      bundling by construction rather than by luck.
     function claimWorkoutYield(uint256 idSeed) external {
         if (startedAuctions.length == 0) return;
+        _claimAndCount(startedAuctions[idSeed % startedAuctions.length]);
+    }
+
+    /// @notice `claimWorkoutYield`, drawn from the workouts that are actually CLOSED WITH A BOOKING.
+    /// @dev The same call as `claimWorkoutYield` above with the id chosen by a scan for a booked
+    ///      workout instead of a blind modulo over every auction that ever started, and an ADDITION
+    ///      beside it, for the reason `closeLiveWorkout` gives beside `closeWorkout`. MEASURED by
+    ///      round 54's first census, 256 runs and 128,000 calls with `migrate` present and this
+    ///      action absent: the bearer branch, the split-differs close and the detached pull were all
+    ///      reached, and a paid claim WHILE ANOTHER BOOKING STOOD - the reserve term variant A
+    ///      added - was reached ZERO times, because the blind draw lands on a booked workout about
+    ///      as rarely as two bookings coexist. Scans from the reduced seed, for the reason
+    ///      `expireEligible` gives.
+    function claimBookedWorkout(uint256 idSeed) external {
+        uint256 n = startedAuctions.length;
+        if (n == 0) return;
+        for (uint256 k = 0; k < n; k++) {
+            uint256 id = startedAuctions[(idSeed % n + k) % n];
+            (,, LiquidationAuction.WorkoutStatus status,,,,,,,, uint256 owed) = auction.workouts(id);
+            if (status != LiquidationAuction.WorkoutStatus.Closed || owed == 0) continue;
+            targetedClaims++;
+            _claimAndCount(id);
+            return;
+        }
+    }
+
+    /// @dev The counted claim both claim actions share, so the ghosts below mean one thing.
+    ///      **Round 54: the three sites variant A changed, each counted on a claim that PAID.**
+    ///      `bearer` is read before the call so a claim on a workout closed under a manager the
+    ///      vault has since left is seen as such; `owedBefore` is this workout's own entry, so
+    ///      `bookedBefore - owedBefore` is exactly the reserve term `claimWorkoutYield` computes.
+    function _claimAndCount(uint256 id) private {
         uint256 bookedBefore = auction.totalWorkoutYieldOwed();
-        try auction.claimWorkoutYield(startedAuctions[idSeed % startedAuctions.length]) {
-            if (auction.totalWorkoutYieldOwed() < bookedBefore) workoutYieldClaimsThatPaid++;
+        (,,,,,,,, address bearer,, uint256 owedBefore) = auction.workouts(id);
+        uint256 bearerPotBefore = bearer == address(0) ? 0 : CreditManager(bearer).claimableOf(address(auction));
+        try auction.claimWorkoutYield(id) {
+            if (auction.totalWorkoutYieldOwed() < bookedBefore) {
+                workoutYieldClaimsThatPaid++;
+                if (bookedBefore - owedBefore != 0) {
+                    claimsPaidWithForeignBookingsReserved++;
+                    (,,,,,,,,,, uint256 owedAfter) = auction.workouts(id);
+                    if (owedAfter != 0) partialClaimsBoundByForeignBookings++;
+                }
+                if (bearer != address(credit)) {
+                    claimsPaidFromADetachedBearer++;
+                    if (bearerPotBefore != 0 && CreditManager(bearer).claimableOf(address(auction)) == 0) {
+                        bearerPullsThatRealised++;
+                    }
+                }
+            }
         } catch {}
         try auction.sweepFreeBalanceToInsurance() {} catch {}
     }
+
+    /// @notice Times the booked-workout draw found one to claim.
+    uint256 public targetedClaims;
+
+    /// @notice Variant A's reach, counted on money that moved. Round-54 item 191.
+    /// @dev One ghost per site, for the reason the bounty branches have one each. A campaign that
+    ///      pays claims and reaches none of these is exactly what round 53 measured, and the shipped
+    ///      tripwire below now asserts each of them reachable rather than inferring it from
+    ///      `workoutYieldClaimsThatPaid`.
+    uint256 public claimsPaidWithForeignBookingsReserved;
+    uint256 public partialClaimsBoundByForeignBookings;
+    uint256 public claimsPaidFromADetachedBearer;
+    uint256 public bearerPullsThatRealised;
+    uint256 public cleanClosesBookedOnASplitPot;
 
     function sweepWorkoutYield() external {
         uint256 insuranceBefore = credit.insuranceFund();
@@ -564,6 +901,193 @@ contract AuctionHandler is Test {
         try credit.claimBountyFor(keeper) {} catch {}
     }
 
+    /**
+     * ── THE REPOINT, AND WHY THIS FILE COULD NOT SPEAK TO VARIANT A WITHOUT IT ─────────────────
+     *
+     * **Round-54 item 191.** Round 53 shipped variant A - `workoutYieldOwedOn[manager]`, the
+     * per-bearer clamp in `closeWorkout`, the aggregate reserve and the bearer pull in
+     * `claimWorkoutYield` - and this campaign ran green at 256 runs and 128,000 calls under it.
+     * Four census ghosts then measured that the walk reached NONE of the three sites the variant
+     * changes, because no action here could move the vault's manager pointer, so `w.bearer` equalled
+     * `creditManager` on every close and `if (bearer != cm)` was dead. A green over a state space
+     * that cannot contain the change is a no-regression statement, not evidence about the fix.
+     *
+     * **This action moves the pointer the way the owner does, drawing for the preconditions the
+     * way `expireEligible` draws for its own.** `CollateralVault.setCreditManager` refuses while the
+     * outgoing manager records debt, while any auction is live or any workout is open, and unless
+     * the incoming manager is VIRGIN (`accYieldPerBond == 0` - the vault's one-way-detachment
+     * rule). So: no live work, or return; then a rescuer clears the live book through the
+     * permissionless `repayFor` (the same third-party cure `expireToWorkout`'s docstring names);
+     * then the owner moves the vault and the auction, in that order, because the auction's setter
+     * insists the incoming manager already be the vault's. A migration BACK to the previous manager
+     * is attempted on an odd seed and is REFUSED by the vault whenever that manager ever
+     * distributed yield; the refusal is counted rather than pre-filtered, so the census says how
+     * often the one-way rule bites instead of the handler deciding it in advance.
+     *
+     * **What the walk gains, stated so the cost column is visible.** Every clean close after a
+     * migration books against a pot the split now labels; every `claimWorkoutYield` on a booking
+     * whose bearer the vault has left takes the pull branch; `workoutSettleAfterClose` can deliver
+     * a tranche to a detached bearer; and `pullDetachedBearer` is the stranger's
+     * `claimSurplusFor(auction)` on a manager nobody points at - the one permissionless unwind of
+     * round-54 item 194's over-reserve. Three new selectors dilute every other by about a ninth,
+     * and a migration resets every actor to zero debt on a manager that has never seen them.
+     *
+     * **The identity this file said a repointing action would make FALSE is a different lever.**
+     * Audit round 23 measured `setLiquiditySource` - moving one manager's SOURCE to a treasury -
+     * and that does break `invariant_theBooksAgreeOnWhatIsOwed`, which is why
+     * `test_R23_theParkedTermOfThisIdentityIsReachableAndTheHandlerCannotReachIt` still asserts
+     * it. Moving the VAULT to a second manager with its own pool does not: the identity holds per
+     * (pool, manager) pair and is restated that way below, not weakened.
+     *
+     * **Why the pair, and not one door.** If the vault's setter takes and the auction's refuses,
+     * the two pointers are split and `liquidate` refuses `AuctionPointerMismatch` for the rest of
+     * the run. That cannot happen under the preconditions above (the auction checks a subset of
+     * what the vault checked, plus that the incoming IS the vault's, which it now is), so the
+     * second door is called BARE inside the success block: a revert there is a dropped handler
+     * frame, which is exactly what `invariant_theHandlerNeverDropsAFrame` exists to report.
+     */
+    function migrate(uint256 seed) external {
+        if (auction.liveAuctionCount() != 0 || auction.openWorkoutCount() != 0) return;
+        // Round 55: the vault's manager door counts the parked LOT as well as the two queue
+        // counters, so this precondition is the vault's own the same way the two above are.
+        // Without it every draw taken over a closed-but-undisposed lot lands in
+        // `migrationsRefusedOtherwise`, whose whole job is to be zero, and the campaign loses the
+        // repoint state space rather than reporting news. `disposeClosedLot` is the action that
+        // clears it, so the fuzzer still reaches a migration by drawing the two in order.
+        if (vault.bondCount(address(auction)) != 0) return;
+
+        bool goBack = (seed & 1) == 1 && previousManager != address(0);
+        CreditManager target;
+        if (goBack) {
+            target = CreditManager(previousManager);
+        } else {
+            if (nextSpare >= managers.length) return;
+            target = managers[nextSpare];
+        }
+
+        _clearTheLiveBook();
+        if (credit.totalDebt() != 0) return;
+
+        address outgoing = address(credit);
+        vm.startPrank(admin);
+        try vault.setCreditManager(address(target)) {
+            auction.setCreditManager(address(target));
+            vm.stopPrank();
+            previousManager = outgoing;
+            credit = target;
+            pool = poolOf[address(target)];
+            migrations++;
+            if (goBack) migrationsBack++;
+            else nextSpare++;
+        } catch (bytes memory reason) {
+            vm.stopPrank();
+            if (goBack && _selectorOf(reason) == CollateralVault.CreditManagerNotVirgin.selector) {
+                backMigrationsRefusedNotVirgin++;
+            } else {
+                migrationsRefusedOtherwise++;
+            }
+        }
+    }
+
+    /// @dev A rescuer clears every actor's debt on the live manager, so `totalDebt` can reach the
+    ///      zero the vault's setter insists on. `repayFor` is permissionless and settles first;
+    ///      a position whose pending yield already covers its stored debt is settled instead.
+    function _clearTheLiveBook() private {
+        for (uint256 i = 0; i < actors.length; i++) {
+            address a = actors[i];
+            uint256 live = credit.currentDebtOf(a);
+            if (live != 0) {
+                usdc.mint(address(this), live);
+                usdc.approve(address(credit), live);
+                try credit.repayFor(a, live) {
+                    rescuesPaid++;
+                } catch {}
+                usdc.approve(address(credit), 0);
+            } else if (credit.debtOf(a) != 0) {
+                try credit.settle(a) {} catch {}
+            }
+        }
+    }
+
+    function _selectorOf(bytes memory reason) private pure returns (bytes4 sel) {
+        if (reason.length < 4) return bytes4(0);
+        assembly {
+            sel := mload(add(reason, 32))
+        }
+    }
+
+    /// @notice Migrations that landed, how many of them went BACK to the previous manager, how
+    ///         many back-attempts the vault's virgin rule refused, and every other refusal.
+    /// @dev `migrationsRefusedOtherwise` should stay at zero: the preconditions above are the
+    ///      vault's own, so a non-zero reading means the vault refuses something this file does not
+    ///      know about, which is news rather than noise. Round 55 added the vault's third arm - the
+    ///      parked lot - to that list, and it was found exactly this way.
+    uint256 public migrations;
+    uint256 public migrationsBack;
+    uint256 public backMigrationsRefusedNotVirgin;
+    uint256 public migrationsRefusedOtherwise;
+    uint256 public rescuesPaid;
+
+    /// @notice The stranger's `claimSurplusFor(auction)` on a manager the vault has LEFT.
+    /// @dev `recoverStrandedClaim` above pulls the live manager; this pulls a detached one, which
+    ///      is the only permissionless call that unwinds round-54 item 194's over-reserve (a
+    ///      booking on a detached bearer that nobody pulled is reserved against every other
+    ///      claimant until it arrives). Bundled with the free-balance sweep for the reason
+    ///      `recoverStrandedClaim` gives: post-close padding on a detached manager arrives with the
+    ///      pull unbooked, and that is excess `invariant_auctionHoldsNothingButUnclaimedRewards`
+    ///      forbids at rest.
+    function pullDetachedBearer(uint256 seed) external {
+        CreditManager m = managers[seed % managers.length];
+        if (address(m) == address(credit)) return;
+        uint256 held = usdc.balanceOf(address(auction));
+        try m.claimSurplusFor(address(auction)) {
+            uint256 pushed = usdc.balanceOf(address(auction));
+            if (pushed > held) {
+                detachedPulls++;
+                usdcPushedToTheAuction += pushed - held;
+            }
+        } catch {}
+        uint256 betweenTheLegs = usdc.balanceOf(address(auction));
+        try auction.sweepFreeBalanceToInsurance() {
+            if (usdc.balanceOf(address(auction)) < betweenTheLegs) freeBalanceSweepsThatMoved++;
+        } catch {}
+    }
+
+    /// @notice Detached pulls that actually moved USDC onto the auction.
+    uint256 public detachedPulls;
+
+    /// @notice The owner disposes a CLOSED workout's lot back to its borrower.
+    /// @dev Without this the collateral of every workout the walk resolves stays parked under the
+    ///      auction for the rest of the run, so after three workouts no actor holds a bond and no
+    ///      auction can ever open again - which is why `test_handlerCanReachEveryStateTheInvariantsCheck`
+    ///      could not open a fourth era without it. `disposeTo` settles the recipient on the LIVE
+    ///      manager before the count moves, so after a migration this is also the first time the
+    ///      new manager stamps that borrower's index. Scans from the seed rather than indexing by it,
+    ///      for the reason `expireEligible` gives; the seed is reduced first, for the reason it
+    ///      gives in red.
+    function disposeClosedLot(uint256 idSeed) external {
+        uint256 n = startedAuctions.length;
+        if (n == 0) return;
+        for (uint256 k = 0; k < n; k++) {
+            uint256 id = startedAuctions[(idSeed % n + k) % n];
+            (address borrower,, LiquidationAuction.WorkoutStatus status, uint256 bonds,,,,,,,) = auction.workouts(id);
+            if (status != LiquidationAuction.WorkoutStatus.Closed || bonds == 0) continue;
+            vm.prank(admin);
+            try auction.disposeWorkoutLot(id, borrower) {
+                lotsDisposed++;
+                // `disposeTo` UNSTAKES the lot and hands the raw tokens to the recipient, so the
+                // bonds are out of the vault entirely until somebody deposits them again. The
+                // borrower does, so the collateral re-enters the walk rather than leaving it.
+                vm.prank(borrower);
+                try vault.depositBonds(bonds) {} catch {}
+            } catch {}
+            return;
+        }
+    }
+
+    /// @notice Closed lots handed back, so positions can re-enter the walk.
+    uint256 public lotsDisposed;
+
     // ── views the invariants need ────────────────────────────────────────────
 
     /// @dev Restates each exit's precondition from the *spec*, not from the code, and
@@ -572,18 +1096,64 @@ contract AuctionHandler is Test {
     ///      construction and prove nothing.
     ///
     ///      The union has one hole in it, and finding out whether that hole is
-    ///      reachable is the job. `liquidatable && bondCount == 0 && the auction is
-    ///      still running` satisfies none of the three: `bid` refuses an empty lot,
-    ///      `cancel` refuses a position that is still underwater, and expiry has not
-    ///      opened yet. It *should* be unreachable, because a borrower cannot withdraw
-    ///      collateral while breaching LTV and nothing else empties a position - but
-    ///      "should be" is an argument, and this is a test.
+    ///      reachable is the job. `liquidatable && bondCount == 0` satisfies none of the
+    ///      three: `bid` refuses an empty lot, `cancel` refuses a position that is still
+    ///      underwater, and `expireToWorkout` refuses an empty lot too. It *should* be
+    ///      unreachable, because a borrower cannot withdraw collateral while breaching
+    ///      LTV and nothing else empties a position - but "should be" is an argument,
+    ///      and this is a test.
+    ///
+    ///      **A clock branch used to stand at the head of this function and it was
+    ///      UNSOUND. Audit round 46 finding 08, executed; deleted in round 47.** It read:
+    ///
+    ///      ```
+    ///      // expireToWorkout: needs only that the clock has run out.
+    ///      if (block.timestamp >= uint256(startedAt) + Config.AUCTION_DURATION) return true;
+    ///      ```
+    ///
+    ///      **The comment is the defect, and the reason it looked right is worth
+    ///      keeping.** `expireToWorkout` does open with exactly that clock - it reverts
+    ///      `AuctionStillRunning` on its first line and nothing else about it is timed -
+    ///      so "needs only that the clock has run out" is a true reading of the *first*
+    ///      guard and a false reading of the function. The guard that falsifies it is the
+    ///      last one before the workout is written: `if (lot == 0) revert
+    ///      NothingToAuction(borrower)`, which is there because a position emptied out
+    ///      from under a live auction must not open a workout over nothing. So past
+    ///      `AUCTION_DURATION` on an empty lot **all three exits revert, two of them with
+    ///      the same error**, and this branch answered "reachable" over precisely the
+    ///      strand the invariant exists to find. A predicate restated from the spec is
+    ///      only as good as the spec it restates, and this one restated the docstring
+    ///      rather than the code.
+    ///
+    ///      **What the deletion is, and what it is not.** Removing a `return true` can
+    ///      only make this function answer true less often, so
+    ///      `invariant_everyLiveAuctionHasAReachableExit` is strictly stronger afterwards
+    ///      and nothing that used to be checked stops being checked. That sign is a
+    ///      property of the edit rather than of a measurement, and it is the half a
+    ///      measurement cannot establish. What the measurement adds is the other half:
+    ///      the campaign still passes, so the branch was not holding up any state the
+    ///      assertion needs.
+    ///
+    ///      **And the deletion is not a no-op, which is the third thing and the one a
+    ///      green run cannot tell you.** A branch nothing ever takes could be deleted
+    ///      with the same green result and would have changed nothing at all. MEASURED
+    ///      with a throwaway invariant asserting `block.timestamp < startedAt +
+    ///      AUCTION_DURATION` over every live auction: it fails, at **`1828574 >=
+    ///      1606297`** - a live auction 222,277 seconds, two and a half days, past its
+    ///      own expiry. So the campaign really does observe auctions on which the old
+    ///      branch short-circuited, and on every one of them the remaining two arms are
+    ///      now evaluated instead of skipped. Unseeded, 256 runs x 500 depth.
+    ///
+    ///      **The strand it admitted is unreachable through shipped code**, which is why
+    ///      this was a defect in the instrument and not in the protocol: `_bid` and
+    ///      `expireToWorkout` both set `a.settled` before they call `seize`/`reassign`,
+    ///      so an auction whose lot has gone is an auction that is no longer live and the
+    ///      first line here returns on it. That is an argument, and turning arguments
+    ///      into assertions is what this file is for - so it is stated here and
+    ///      deliberately not written into the predicate.
     function hasReachableExit(uint256 auctionId) external view returns (bool) {
-        (address borrower, uint96 startedAt,, bool settled,,,,) = auction.auctions(auctionId);
+        (address borrower,,, bool settled,,,,) = auction.auctions(auctionId);
         if (borrower == address(0) || settled) return true; // not live: nothing to strand
-
-        // expireToWorkout: needs only that the clock has run out.
-        if (block.timestamp >= uint256(startedAt) + Config.AUCTION_DURATION) return true;
 
         uint256 debt = credit.currentDebtOf(borrower);
         uint256 collateral = vault.collateralValue(borrower);
@@ -613,7 +1183,18 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///      the whole book cannot exceed about 1,886 USDC at the 25% ceiling.
     uint256 internal constant POOL_DEPOSIT = 20_000e6;
 
+    /// @dev Virgin managers the handler's `migrate` can move the vault to, each with its own pool
+    ///      wired on both sides and funded like the first. Three, because the vault's one-way rule
+    ///      means a manager that ever distributed yield is never re-attachable, so the number of
+    ///      forward migrations a run can make is bounded by this and every one of them is a spare
+    ///      the census can name. Round-54 item 191.
+    uint256 internal constant SPARES = 3;
+
     AuctionHandler internal handler;
+    /// @dev `managers[0]`/`pools[0]` are `credit`/`pool` below, the pair the walk starts on; the
+    ///      deterministic tests that predate the repoint read those two fields and are unchanged.
+    CreditManager[] internal managers;
+    LenderPool[] internal pools;
     CollateralVault internal vault;
     CreditManager internal credit;
     LiquidationAuction internal auction;
@@ -705,9 +1286,52 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
             vm.stopPrank();
         }
 
-        handler =
-            new AuctionHandler(vault, credit, auction, oracle, usdc, bond, pool, keeper, harvester, actors);
+        managers.push(credit);
+        pools.push(pool);
+        for (uint256 i = 0; i < SPARES; i++) {
+            _deploySpare();
+        }
+
+        handler = new AuctionHandler(
+            vault, managers, auction, oracle, usdc, bond, pools, keeper, harvester, admin, actors
+        );
         targetContract(address(handler));
+    }
+
+    /// @dev A spare manager, wired exactly as the first one is above, minus the vault's pointer:
+    ///      its pool on both sides, the harvester, the auction. `CreditWiring.checkAuctionSwap`
+    ///      with no outgoing auction checks only the incoming pair, so a manager the vault does not
+    ///      point at yet can be wired to the auction in advance; `migrate` then moves the vault and
+    ///      the auction and nothing else. Funded through `deposit` for the reason the first pool is.
+    function _deploySpare() internal {
+        CreditManager m = new CreditManager(
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
+        );
+        LenderPool p = new LenderPool(IERC20(address(usdc)), admin);
+        vm.startPrank(admin);
+        p.setCreditManager(address(m));
+        p.setEpochHarvester(harvester);
+        m.setLiquiditySource(address(p));
+        m.setLenderPool(address(p));
+        m.setEpochHarvester(harvester);
+        m.setLiquidationAuction(address(auction));
+        vm.stopPrank();
+        usdc.mint(address(this), POOL_DEPOSIT);
+        usdc.approve(address(p), POOL_DEPOSIT);
+        p.deposit(POOL_DEPOSIT, address(this));
+        managers.push(m);
+        pools.push(p);
+    }
+
+    /// @dev The manager the vault points at NOW, read off the handler, which is the one place the
+    ///      repoint is recorded. Every property about live work reads this; every property about
+    ///      a ledger reads all of `managers`.
+    function _live() internal view returns (CreditManager) {
+        return handler.credit();
+    }
+
+    function _yieldOwed(uint256 id) internal view returns (uint256 owed) {
+        (,,,,,,,,,, owed) = auction.workouts(id);
     }
 
     /// @notice No handler call may revert. Every action in `AuctionHandler` wraps its interesting
@@ -770,17 +1394,82 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///      phantom liability would admit any balance at all. The pair is strictly stronger than the
     ///      equality it replaces, which said nothing whatever about whether an obligation could be
     ///      honoured.
+    ///      **Audit round 51 gave this contract a THIRD named claimant, by the identical argument
+    ///      and with the identical consequence.** The reserve that closes round-51 item 154 holds
+    ///      what the lots of still-OPEN workouts have already earned, and that figure is booked
+    ///      nowhere - `totalWorkoutYieldOwed` counts closes only - so both sweeps now deliberately
+    ///      leave it behind and the two-term bound is false by design in exactly the way the
+    ///      one-term equality was. MEASURED against the two-term bound: `157425429 > 0`.
+    ///
+    ///      **It is DERIVED from the public queue rather than read out of a new accessor**, which
+    ///      is the same choice `invariant_everyBookedWorkoutYieldIsBackedByMoneyThatExists` below
+    ///      already made and it costs the contract no bytes. It is also the stronger form: a
+    ///      getter would be the implementation asserting about itself, while this restates the
+    ///      quantity from `openWorkoutCount`, `openWorkoutAt`, `workouts` and the manager's own
+    ///      `yieldAccruedOn` - so a maintenance error in the contract's running sums fails here.
+    ///
+    ///      The bound still degenerates to the two-term one whenever no workout is open, and to
+    ///      the original equality whenever nothing is booked either. The slack the third term adds
+    ///      is again bounded by a figure the contract cannot invent: it is priced off the
+    ///      manager's accumulator over bond counts the vault holds, neither of which the auction
+    ///      writes.
+    ///
+    ///      🟥 **THE UPPER BOUND IS ALSO NOW GATED ON AN EMPTY QUEUE, AND THAT IS A SECOND,
+    ///      LARGER WEAKENING WHICH SHOULD BE READ AS A COST OF THE FIX RATHER THAN AS BOOKKEEPING.**
+    ///      The two-term bound never held on its own arithmetic: it held because every handler
+    ///      action that can push USDC onto this contract BUNDLES a `sweepFreeBalanceToInsurance`
+    ///      behind it, which is stated in `recoverStrandedClaim`'s own note. A reserve that stops
+    ///      money leaving while a workout is open necessarily stops that bundled drain too, so
+    ///      between a FORCED close - which books nothing and leaves its lot's yield for insurance -
+    ///      and the moment the last workout closes, this contract legitimately holds USDC that is
+    ///      neither a reward, nor booked, nor an open lot's accrual. MEASURED against the ungated
+    ///      three-term bound: `856220144 > 0`.
+    ///
+    ///      What is NOT weakened, and is why this is a gate rather than a deletion: the lower
+    ///      bound is unconditional, the upper bound is asserted in every state where the money has
+    ///      somewhere to go, and
+    ///      `invariant_everyBookedWorkoutYieldIsBackedByMoneyThatExists` - the sibling that stops
+    ///      the booked figure being invented, which is what made the round-22 weakening safe - is
+    ///      unconditional and unchanged. Any fix that closes round-51 item 154 pays this price;
+    ///      it is not particular to the form chosen, because "the money may not leave while a
+    ///      workout is open" is the property itself.
     function invariant_auctionHoldsNothingButUnclaimedRewards() public view {
         assertGe(
             usdc.balanceOf(address(auction)),
             auction.totalUnclaimedRewards(),
             "rewards must always be backed"
         );
+        if (auction.openWorkoutCount() != 0) return;
         assertLe(
             usdc.balanceOf(address(auction)),
-            auction.totalUnclaimedRewards() + auction.totalWorkoutYieldOwed(),
+            auction.totalUnclaimedRewards() + auction.totalWorkoutYieldOwed() + _openWorkoutAccrual(),
             "and nothing else may accumulate"
         );
+    }
+
+    /// @dev What the lots of still-open workouts have earned, restated from the auction's public
+    ///      queue and the manager's public pricing view rather than read back out of the reserve
+    ///      under test. Audit round 51.
+    function _openWorkoutAccrual() internal view returns (uint256 total) {
+        uint256 n = auction.openWorkoutCount();
+        for (uint256 i = 0; i < n; ++i) {
+            (,, uint256 bonds, uint256 indexAtOpen) = _openWorkoutTerms(auction.openWorkoutAt(i));
+            // The LIVE manager: an open workout can only exist on it, because both repoint doors
+            // refuse while one stands (`AuctionHasLiveWork`), and `migrate` returns before them.
+            total += _live().yieldAccruedOn(bonds, indexAtOpen);
+        }
+    }
+
+    /// @dev Split out only because the `workouts` tuple is eleven fields wide and destructuring it
+    ///      twice inline is where a position slips.
+    function _openWorkoutTerms(uint256 id)
+        internal
+        view
+        returns (address borrower, uint256 openedAt, uint256 bonds, uint256 indexAtOpen)
+    {
+        uint96 openedAt_;
+        (borrower, openedAt_,, bonds,,,,,, indexAtOpen,) = auction.workouts(id);
+        openedAt = openedAt_;
     }
 
     /// @notice Every USDC the auction has **booked** as owed to a cleanly-closed workout's borrower
@@ -849,17 +1538,71 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///      and never the proof.** The proof is deterministic and opens two workouts -
     ///      `Impairment.integration.t.sol::test_R23_04_twoCleanClosesCannotBookTheSameClaimTwice`,
     ///      which reports `800000000 > 400000000` against the defective clamp every single time.
+    ///
+    ///      **Round 54, restated over every manager the vault has pointed at, and the two terms
+    ///      are NOT treated alike.** A booking closed under a manager the vault has since left is
+    ///      backed by that manager's `claimableOf(auction)`, which `claimSurplusFor` and variant A's
+    ///      bearer pull can still reach - so every manager's settled claim is summed. Its
+    ///      `pendingYieldOf(auction)` is NOT summed: `CreditManager._settle` returns on its first
+    ///      line once detached, so that figure is a projection over the vault's LIVE bond count
+    ///      against a frozen accumulator that no call can ever realise (READ, and it is the reason
+    ///      `closeWorkout` settles its own position before it books - audit round 46). Only the
+    ///      live manager's pending is money that exists. Counting a detached pending would make
+    ///      this property weaker than the shipped one; counting only the live one keeps it exactly
+    ///      the shipped statement whenever the vault has never moved.
     function invariant_everyBookedWorkoutYieldIsBackedByMoneyThatExists() public view {
         uint256 held = usdc.balanceOf(address(auction));
         uint256 rewards = auction.totalUnclaimedRewards();
         uint256 free = held > rewards ? held - rewards : 0;
-        uint256 backing =
-            free + credit.claimableOf(address(auction)) + credit.pendingYieldOf(address(auction));
+        uint256 backing = free + _live().pendingYieldOf(address(auction));
+        uint256 n = handler.managerCount();
+        for (uint256 i = 0; i < n; i++) {
+            backing += handler.managerAt(i).claimableOf(address(auction));
+        }
         assertGe(
             backing,
             auction.totalWorkoutYieldOwed(),
             "the auction booked workout yield it cannot pay"
         );
+    }
+
+    /// @notice `totalWorkoutYieldOwed` equals the sum of `workoutYieldOwedOn` over every address.
+    /// @dev Round-54 item 191. The counter-equals-map identity variant A created and nothing
+    ///      checked, stated the way the two round-46 identities below are: over the whole closed
+    ///      address universe, so a key outside `managers` reads as a failure rather than as a
+    ///      narrower sum that happens to balance.
+    function invariant_theSplitSumsToTheAggregate() public view {
+        address[] memory all = _everyAddressThisFixtureCanName();
+        uint256 sum;
+        for (uint256 i = 0; i < all.length; i++) {
+            sum += auction.workoutYieldOwedOn(all[i]);
+        }
+        assertEq(auction.totalWorkoutYieldOwed(), sum, "the split must sum to the aggregate");
+    }
+
+    /// @notice Every manager's split equals the bookings of the closed workouts that name it as
+    ///         bearer, and every closed workout names a manager this fixture deployed.
+    /// @dev The per-bearer half of the identity above. `workoutYieldOwedOn[bearer]` is decremented
+    ///      by `claimWorkoutYield` on the workout's recorded bearer and incremented by `closeWorkout`
+    ///      on the manager it read into `cm`; the mapping docstring argues the two cannot diverge,
+    ///      and this holds that argument to the ledger over every sequence the walk produces,
+    ///      migrations included. Quantified over every auction that ever started, which is the
+    ///      whole domain of `workouts`.
+    function invariant_everyBearersSplitIsItsOwnClosedBookings() public view {
+        uint256 m = handler.managerCount();
+        uint256 n = handler.startedCount();
+        for (uint256 i = 0; i < m; i++) {
+            address bearer = address(handler.managerAt(i));
+            uint256 sum;
+            for (uint256 j = 0; j < n; j++) {
+                uint256 id = handler.startedAuctions(j);
+                (,, LiquidationAuction.WorkoutStatus status,,,,,, address b,, uint256 owed) = auction.workouts(id);
+                if (status != LiquidationAuction.WorkoutStatus.Closed) continue;
+                assertTrue(b != address(0), "a closed workout must name its bearer");
+                if (b == bearer) sum += owed;
+            }
+            assertEq(auction.workoutYieldOwedOn(bearer), sum, "a bearer's split must equal its own closed bookings");
+        }
     }
 
     /// @notice Nothing is escrowed, ever. If a bond unit ever rests here, some path is
@@ -917,23 +1660,30 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///
     ///      Bids follow the same shape: 0 of 20 runs, then 10, then 13.
     function invariant_everyPrepaidBountyIsInExactlyOnePot() public view {
-        uint256 escrowed;
-        uint256 owed;
-        for (uint256 i = 0; i < handler.actorCount(); i++) {
-            escrowed += credit.bountyEscrowOf(handler.actors(i));
-            owed += credit.bountyOwedTo(handler.actors(i));
-        }
-        owed += credit.bountyOwedTo(handler.keeper());
+        // Round 54: per manager. Each manager keeps its own three pots; a migration resolves every
+        // park first (no live auction may stand) and leaves the escrow and owed maps behind, still
+        // claimable (`claimBounty` is open while detached), so the identity holds on each ledger.
+        uint256 m = handler.managerCount();
+        for (uint256 k = 0; k < m; k++) {
+            CreditManager cm = handler.managerAt(k);
+            uint256 escrowed;
+            uint256 owed;
+            for (uint256 i = 0; i < handler.actorCount(); i++) {
+                escrowed += cm.bountyEscrowOf(handler.actors(i));
+                owed += cm.bountyOwedTo(handler.actors(i));
+            }
+            owed += cm.bountyOwedTo(handler.keeper());
 
-        uint256 parked;
-        for (uint256 i = 0; i < handler.startedCount(); i++) {
-            (,, uint256 amount) = credit.parkedBountyOf(handler.startedAuctions(i));
-            parked += amount;
-        }
+            uint256 parked;
+            for (uint256 i = 0; i < handler.startedCount(); i++) {
+                (,, uint256 amount) = cm.parkedBountyOf(handler.startedAuctions(i));
+                parked += amount;
+            }
 
-        assertEq(credit.totalBountyEscrowed(), escrowed, "escrow counter must equal its map");
-        assertEq(credit.totalBountyParked(), parked, "park counter must equal the live parks");
-        assertEq(credit.totalBountyOwed(), owed, "owed counter must equal its map");
+            assertEq(cm.totalBountyEscrowed(), escrowed, "escrow counter must equal its map");
+            assertEq(cm.totalBountyParked(), parked, "park counter must equal the live parks");
+            assertEq(cm.totalBountyOwed(), owed, "owed counter must equal its map");
+        }
     }
 
     /// @notice With no auction live, no bounty is parked against one.
@@ -951,7 +1701,10 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///      clear the counter either.
     function invariant_noParkSurvivesTheLastLiveAuction() public view {
         if (auction.liveAuctionCount() != 0) return;
-        assertEq(credit.totalBountyParked(), 0, "a park outlived every auction that could spend it");
+        uint256 m = handler.managerCount();
+        for (uint256 k = 0; k < m; k++) {
+            assertEq(handler.managerAt(k).totalBountyParked(), 0, "a park outlived every auction that could spend it");
+        }
     }
 
     /// @notice What the pool believes it has lent equals what the manager believes is owed.
@@ -975,6 +1728,25 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///      those consumers at once rather than to one of them. If this assertion ever fails, the
     ///      failure is the news - it means one of them just became live.
     function invariant_theBooksAgreeOnWhatIsOwed() public view {
+        // **Round 54: one identity per (pool, manager) pair, and this is a RESTATEMENT rather
+        // than the weakening the paragraph below warns against.** The paragraph is about
+        // `setLiquiditySource` - moving one manager's FUNDER to a treasury - and it is still
+        // right: that lever makes this identity false. `AuctionHandler.migrate` moves the VAULT to
+        // a second manager funded by its own pool, which is a different lever, and under it each
+        // pair's identity holds on its own: the detached manager's pool still holds the principal
+        // it lent, the detached manager still holds the same figure parked in `pendingPrincipal`
+        // (the rescuer's `repayFor` put it there and only `settlePrincipal` or a source swap moves
+        // it home), and the live pair is the shipped statement over the loans it funds.
+        uint256 m = handler.managerCount();
+        for (uint256 k = 0; k < m; k++) {
+            CreditManager cm = handler.managerAt(k);
+            LenderPool lp = handler.poolAt(k);
+            assertEq(
+                lp.outstandingPrincipal(),
+                cm.pendingPrincipal() + cm.owedToSource(address(lp)) + cm.totalDebt(),
+                "the pool's lending and the manager's debt have to be the same money"
+            );
+        }
         assertEq(
             pool.outstandingPrincipal(),
             // `owedToSource` is the third term and it arrived with audit round 22 finding 5. A
@@ -1009,13 +1781,122 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///         auctions in it. `writeDownLoss` is the only function that moves money
     ///         between its terms, so it was previously untested by construction.
     function invariant_creditManagerBalanceCoversEveryClaimOnIt() public view {
-        assertGe(
-            usdc.balanceOf(address(credit)),
-            credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.totalOwedToSources() + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
-                + credit.totalBountyOwed(),
-            "balance must cover every claim on it"
-        );
+        // Round 54: every manager, the detached ones included - detachment freezes a manager's
+        // accumulator and its unsettled entitlements, and it must not un-back a claim it recorded.
+        uint256 m = handler.managerCount();
+        for (uint256 k = 0; k < m; k++) {
+            CreditManager cm = handler.managerAt(k);
+            assertGe(
+                usdc.balanceOf(address(cm)),
+                cm.totalClaimable() + cm.undistributedYield() + cm.pendingPrincipal() + cm.totalOwedToSources()
+                    + cm.insuranceFund() + cm.totalBountyEscrowed() + cm.totalBountyParked() + cm.totalBountyOwed(),
+                "balance must cover every claim on it"
+            );
+        }
+    }
+
+    /// @notice Every address this fixture can name, so the two identities below are equalities
+    ///         over a domain that is **provably** complete rather than a plausible one.
+    /// @dev A counter-equals-map identity is only as good as the set it sums over: a key outside
+    ///      the domain makes the counter read high and the assertion fail on a ledger that is
+    ///      correct, and - worse, because it is silent - a *narrow* domain paired with a `assertGe`
+    ///      would pass over a counter that had drifted. So this enumerates the whole address
+    ///      universe instead of the addresses the maps are expected to use.
+    ///
+    ///      **It is closed, and that is a property of the fixture rather than an assumption.**
+    ///      Every actor is drawn by `AuctionHandler._actor`, which is `actors[seed % length]` - no
+    ///      fuzzed address ever reaches a call as an account, which is the same reason the `pool`
+    ///      pointer had to stop being a setter. So the only addresses that exist here are the ones
+    ///      `setUp` created, and they are all below.
+    ///
+    ///      Zero terms are deliberate. `claimableOf` has three writers and every one of them names
+    ///      either an auction record's borrower or an account `_settleYield` was run for, so its
+    ///      support is the actors plus the auction; `owedToSource` has two writers and both name
+    ///      an *outgoing* liquidity source, which here can only ever be the pool. Including the
+    ///      other eleven costs a few thousand gas an observation and buys the difference between
+    ///      "the keys I thought of balance" and "the ledger balances".
+    function _everyAddressThisFixtureCanName() internal view returns (address[] memory all) {
+        uint256 n = handler.actorCount();
+        // Round 54: every manager and every pool, the spares included, in place of the one pair.
+        // `migrate` only ever installs an address from these two lists, so the universe is still
+        // closed; it is just wider than one manager and one pool.
+        uint256 m = handler.managerCount();
+        all = new address[](n + 9 + 2 * m);
+        for (uint256 i = 0; i < n; i++) {
+            all[i] = handler.actors(i);
+        }
+        all[n] = address(auction);
+        all[n + 1] = address(vault);
+        all[n + 2] = address(adapter);
+        all[n + 3] = address(farm);
+        all[n + 4] = address(handler);
+        all[n + 5] = admin;
+        all[n + 6] = keeper;
+        all[n + 7] = harvester;
+        all[n + 8] = address(this); // the runner holds every pool's deposit
+        for (uint256 k = 0; k < m; k++) {
+            all[n + 9 + 2 * k] = address(handler.managerAt(k));
+            all[n + 10 + 2 * k] = address(handler.poolAt(k));
+        }
+    }
+
+    /// @notice `totalClaimable` equals the sum of `claimableOf`.
+    /// @dev **Audit round 46 finding 08: the counter had no mirror.** `totalClaimable` is a term of
+    ///      `invariant_creditManagerBalanceCoversEveryClaimOnIt` above, which is a one-sided bound -
+    ///      so a counter that drifted **low** left that bound green while quietly narrowing what it
+    ///      claims, and a counter that drifted low is a claimant who cannot be paid. That is the
+    ///      identical argument `invariant_everyPrepaidBountyIsInExactlyOnePot` makes for using
+    ///      `assertEq` rather than `assertGe`, one pot over; the bounty pots got it in round 18 and
+    ///      these two never did.
+    ///
+    ///      Stated here rather than in `CreditManager.invariants.t.sol` for the reason round 18
+    ///      recorded about the bounty counter: three of the four writers are on paths this suite
+    ///      reaches and that one does not. `creditLiquidationProceeds` needs a filled bid,
+    ///      `_refundBounty` needs a bounty that was parked by a real `liquidate`, and
+    ///      `_settleYield`'s overflow branch needs a workout lot earning under the auction. A suite
+    ///      with a stub auction can reach none of them, which is how the bounty sibling spent a
+    ///      round comparing 0 to 0.
+    function invariant_theClaimableCounterEqualsItsMap() public view {
+        address[] memory all = _everyAddressThisFixtureCanName();
+        uint256 m = handler.managerCount();
+        for (uint256 k = 0; k < m; k++) {
+            CreditManager cm = handler.managerAt(k);
+            uint256 sum;
+            for (uint256 i = 0; i < all.length; i++) {
+                sum += cm.claimableOf(all[i]);
+            }
+            assertEq(cm.totalClaimable(), sum, "claimable counter must equal its map");
+        }
+    }
+
+    /// @notice `totalOwedToSources` equals the sum of `owedToSource`.
+    /// @dev **Audit round 46 finding 08, the sibling above's other half - and it is 0 == 0 in this
+    ///      campaign, which is stated plainly rather than discovered later.** The only writers of
+    ///      `owedToSource` are on the repoint path, `setLiquiditySource` is admin-only, and the
+    ///      handler holds no role - so the fuzzer cannot move either side. That is not an oversight
+    ///      to be fixed with a handler action: audit round 23 finding 11 asked for exactly one and
+    ///      it was refused **by measurement**, because a repoint makes
+    ///      `invariant_theBooksAgreeOnWhatIsOwed` false by arithmetic rather than non-vacuous. The
+    ///      refusal is asserted at the foot of
+    ///      `test_R23_theParkedTermOfThisIdentityIsReachableAndTheHandlerCannotReachIt`.
+    ///
+    ///      **So the content is in that deterministic test, which calls this at three checkpoints:
+    ///      before the park, with `owedToSource[pool]` holding the whole 400.000000, and after the
+    ///      flush.** What it is worth as an invariant is the state space it covers *afterwards* -
+    ///      it is the standing statement, so the first handler action that can ever move a source
+    ///      pointer inherits it rather than needing it written. The same standing
+    ///      `invariant_theBooksAgreeOnWhatIsOwed` records for itself two properties up.
+    function invariant_theOwedToSourcesCounterEqualsItsMap() public view {
+        address[] memory all = _everyAddressThisFixtureCanName();
+        uint256 m = handler.managerCount();
+        for (uint256 k = 0; k < m; k++) {
+            CreditManager cm = handler.managerAt(k);
+            uint256 sum;
+            for (uint256 i = 0; i < all.length; i++) {
+                sum += cm.owedToSource(all[i]);
+            }
+            assertEq(cm.totalOwedToSources(), sum, "owed-to-sources counter must equal its map");
+        }
     }
 
     /// @notice The `owedToSource` term of `invariant_theBooksAgreeOnWhatIsOwed` is reachable, the
@@ -1049,6 +1930,7 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         assertEq(credit.totalDebt(), 0, "premise: the book is flat");
         assertEq(pool.outstandingPrincipal(), loan, "premise: the pool still records the loan");
         invariant_theBooksAgreeOnWhatIsOwed();
+        invariant_theOwedToSourcesCounterEqualsItsMap();
 
         // The pool cannot take delivery. This is the round-22 state, on the funding leg that
         // matters, and it is the only way the third term is ever non-zero.
@@ -1061,6 +1943,7 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         assertEq(credit.owedToSource(address(pool)), loan, "the term this identity states must be reachable");
         assertEq(credit.pendingPrincipal(), 0, "and the money must have left the other counter");
         invariant_theBooksAgreeOnWhatIsOwed();
+        invariant_theOwedToSourcesCounterEqualsItsMap();
 
         // And the flush, which is where finding 1 lived. Before the fix the pool kept the whole
         // 400.000000 on its own book while every manager-side term went to zero.
@@ -1071,6 +1954,7 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         assertEq(usdc.balanceOf(address(pool)) - poolCashBefore, loan, "the money must go home");
         assertEq(pool.outstandingPrincipal(), 0, "and the pool must stop counting it");
         invariant_theBooksAgreeOnWhatIsOwed();
+        invariant_theOwedToSourcesCounterEqualsItsMap();
 
         // ── why finding 11's prescription is refused, MEASURED ────────────────
         //
@@ -1111,12 +1995,79 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
     ///      either: the runner reverts to the post-`setUp` snapshot between runs, so nothing in
     ///      EVM state survives to be totalled.
     ///
+    ///      **THE REACH TABLE, and it is a measurement of the CAMPAIGN rather than of this test.**
+    ///      Audit round 50, item 137. Both columns are `N of 64` at 64 FORCED SINGLE RUNS,
+    ///      unseeded, depth 500, `cache/invariant` cleared between runs, an `afterInvariant`
+    ///      override logging every handler ghost (the instrument is generated into a scratch copy,
+    ///      read, and never committed). BEFORE is `9d1e72d`; AFTER is the same tree with
+    ///      `passTimeToRecognitionDeadline`, `expireEligible` and `closeLiveWorkout` added and
+    ///      nothing else changed.
+    ///
+    ///      | ghost | before | after |
+    ///      |---|---|---|
+    ///      | `workoutsOpened` | 21 | **27** |
+    ///      | `workoutsClosed` | 2 | **12** |
+    ///      | `recoveriesPaid` | 2 | **8** |
+    ///      | `lateRecoveriesPaid` | **0** | **4** |
+    ///      | `forcedClosesThatWroteDown` | **0** | **4** |
+    ///      | `cleanClosesThatBookedYield` | 1 | 4 |
+    ///      | `workoutYieldClaimsThatPaid` | 1 | 3 |
+    ///      | `workoutYieldSweepsThatMoved` | 1 | **11** |
+    ///      | `usdcPushedToTheAuction` | 2 | **11** |
+    ///      | `freeBalanceSweepsThatMoved` | 2 | **11** |
+    ///      | `impairmentsOpenedByAnAuction` | 44 | 44 |
+    ///      | `impairmentsReleasedByAnAuction` | 34 | 19 |
+    ///      | `bidsFilled` | 20 | 10 |
+    ///      | `cancelsDone` | 20 | 11 |
+    ///      | `bountiesParked` | 21 | 17 |
+    ///      | `bountiesReleased` | 9 | 11 |
+    ///      | `bountiesReturned` | 9 | 1 |
+    ///      | `reStrikes` | 2 | **0** |
+    ///      | `navsDrawnNearThreshold` | 64 | 64 |
+    ///      | `yieldEpochsDistributed` | 64 | 64 |
+    ///      | `warpsToRecognitionDeadline` | - | 10 |
+    ///      | `expiriesFromEligible` | - | 25 |
+    ///      | `closesFromLiveDraw` | - | 5 |
+    ///
+    ///      **The item this closes said the workout lifecycle was reached in ZERO of 64 runs, and
+    ///      that is right about the terminal half and wrong about the entry.** Workouts were being
+    ///      OPENED in a third of runs and almost never resolved, which is worse than not reaching
+    ///      them: every property about a recognised loss was quantified over a state space holding
+    ///      about one instance of it in 32,000 calls, and every one of them reported green.
+    ///
+    ///      🟥 **AND THE TABLE HAS A COST COLUMN IN IT, which is why the whole census is printed
+    ///      rather than the rows that improved.** Three new actions dilute every other selector by
+    ///      about an eighth, and more auctions now end in a workout rather than in a fill or a
+    ///      cancel: `bidsFilled` and `cancelsDone` halve, `bountiesReturned` falls from 9 to 1, and
+    ///      **`reStrikes` falls from 2 of 64 to 0 of 64**. That last one is a real loss - the
+    ///      round-19 re-strike branch is now unreached by the campaign, and the only thing standing
+    ///      over it is the deterministic block in this test. It is recorded here rather than
+    ///      absorbed, because the next reader of this file needs to know which of these numbers are
+    ///      evidence and which are the price of the evidence.
+    ///
     ///      **So the vacuity guard is deliberately split in two, and neither half is a campaign
     ///      floor.** This test proves every transition is reachable at all;
     ///      `invariant_theHandlerNeverDropsAFrame` proves the fuzzer is not silently discarding
     ///      the ones it reaches. The second is the half this file did not have, and it is the half
     ///      that mattered - a suite can pass a reachability tripwire and still fuzz nothing, which
     ///      is precisely what happened here for three audit rounds.
+    ///
+    ///      **ROUND 54's CENSUS, under the repointing action, and what it says the campaign's
+    ///      green is and is not evidence about.** Round-54 item 191 measured that without
+    ///      `migrate` the walk reached NONE of the three sites variant A changed. With it, three
+    ///      unseeded censuses at 256 runs x 500 calls (the round-53 instrument reinstalled as a
+    ///      diff, `cache/invariant` cleared, every member its own campaign) reached a migration
+    ///      and a migration BACK in run 1 of every census, and reached the bearer pull
+    ///      (`bearer != live` on a paid claim) and the per-bearer clamp (`split != aggregate`
+    ///      before a close) in runs 20 and 29, then 154 and 154, then in NEITHER - a lottery
+    ///      across runs, the same shape round 51 recorded about this file. The third site, the
+    ///      reserve term `totalWorkoutYieldOwed - owed`, was reached in ZERO runs of all three
+    ///      censuses, ZERO at 64 runs x 2,000 calls, and ZERO with an unshipped draw that closed
+    ///      every open workout in one frame (`bookingsMadeBesideAnother`'s docstring has why). So
+    ///      the campaign's `(runs: 256, calls: 128000)` green corroborates the bearer pull and
+    ///      the clamp and says NOTHING about the reserve term; that term is asserted
+    ///      DETERMINISTICALLY below, in `_repointEraTwo`: `bookingsMadeBesideAnother == 1`, and
+    ///      bob paid exactly `499,999,999 - 298,459,777` with carol's booking still standing.
     function test_handlerCanReachEveryStateTheInvariantsCheck() public {
         handler.borrow(0, 500e6); // alice, at a healthy LTV
         handler.borrow(1, 500e6); // bob
@@ -1158,7 +2109,16 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         // the id must not move, and the park must still belong to whoever opened it.
         uint256 idBefore = auction.auctionOf(handler.actors(0));
         (address claimantBefore,, uint256 parkedBefore) = credit.parkedBountyOf(idBefore);
-        handler.passTime(Config.AUCTION_DURATION + 1);
+        // 🟥 **`handler.passTime(Config.AUCTION_DURATION + 1)` used to stand here and on the
+        // second workout below, and the argument did not mean what it read.** `passTime` takes a
+        // SEED and does `skip(bound(seed, 1 minutes, 3 days))`. It happened to be correct - 21,601
+        // lies inside that range, so `bound` returns it unchanged and the skip really was
+        // `AUCTION_DURATION + 1` - and it was correct by ARITHMETIC COINCIDENCE rather than by
+        // construction: raise `AUCTION_DURATION` past three days, or lower `passTime`'s ceiling,
+        // and the same line silently skips a different interval while still reading like a
+        // deadline. Audit round 50, item 137. A deterministic walk that wants a specific instant
+        // says so directly.
+        skip(Config.AUCTION_DURATION + 1);
         handler.liquidate(0);
         assertEq(handler.reStrikes(), 1, "a lapsed auction must be re-strikeable");
         assertEq(auction.auctionOf(handler.actors(0)), idBefore, "re-striking must not mint a new id");
@@ -1194,32 +2154,90 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         // Every assertion in this block was unreachable before `deliverYield` existed, and each is
         // asserted on **money that moved** rather than on a call that failed to revert.
         assertGt(vault.bondCount(address(auction)), 0, "the workout lot must be parked under the auction");
-        handler.deliverYield(500e6);
+        // 🟥 **Audit round 55, item 215: the two PRE-close epochs are deliberately small, and the
+        // post-close ones are not.** These two exist to give the refusals below something real to
+        // refuse, and any non-zero amount does that. Since the forced close now spends the lot's
+        // accrual on its own residual before writing anything down, a large pre-close epoch covers
+        // the residual entirely, `writeDownLoss` returns zero, and `workoutSettleAfterClose`
+        // returns without reaching its body - which would silently retire round-23 finding 11's
+        // census state further down. They were 500.000000 each until this round.
+        handler.deliverYield(50e6);
         assertEq(handler.yieldEpochsDistributed(), 1, "an epoch must reach the accumulator");
         handler.passTime(3 days);
 
         handler.recoverStrandedClaim();
         assertGt(handler.usdcPushedToTheAuction(), 0, "claimSurplusFor must actually push the auction's claim");
-        assertGt(handler.freeBalanceSweepsThatMoved(), 0, "and the free-balance sweep must actually move it");
+        // **Audit round 51 moved the two sweep assertions behind the close, and asserts the
+        // negative here rather than deleting the attempt.** Both sweeps now reserve what the lots
+        // of still-OPEN workouts have earned, and while workout 2 is the only lot the auction
+        // holds that reserve is the whole of what the push just delivered. So the money arrives
+        // and stays, which is the entire point of round-51 item 154's fix - and if a later change
+        // ever lets a sweep take it again, this line is what goes red.
+        assertEq(handler.freeBalanceSweepsThatMoved(), 0, "no sweep may take an open workout's backing");
 
-        // A second epoch, because the pair above drained the first one. The live manager's own
-        // claim route is a different call with a different failure mode, so it gets its own money.
-        handler.deliverYield(500e6);
+        // A second epoch. The live manager's own claim route is a different call with a different
+        // failure mode, so it gets its own money - and it is refused for the same reason. Small for
+        // the reason stated on the first one; it was 500.000000 until round 55.
+        handler.deliverYield(50e6);
         handler.passTime(3 days);
         handler.sweepWorkoutYield();
-        assertGt(handler.workoutYieldSweepsThatMoved(), 0, "the workout-yield sweep must actually fund insurance");
+        assertEq(handler.workoutYieldSweepsThatMoved(), 0, "nor may the sibling sweep, for the same reason");
 
         handler.workoutSettle(2, 100e6);
         assertEq(handler.recoveriesPaid(), 1, "recoveries must be payable");
 
-        // `passTime` is capped at three days a call, so the 14-day recognition window
-        // takes a few of them - which is the point of the cap: a fuzzer must be able to
-        // reach the forced close without one lucky jump doing all the work.
-        for (uint256 i = 0; i < 5; i++) {
-            handler.passTime(3 days);
-        }
+        // **`passTime` is capped at three days a call, which is what makes the 14-day recognition
+        // window unreachable for the CAMPAIGN rather than merely slow, and audit round 50 item 137
+        // measured the cost.** Five consecutive maximal draws with nothing in between is not a
+        // sequence a bounded uniform draw produces: over 64 forced runs of 500 calls,
+        // `forcedClosesThatWroteDown` was 0 of 64. The cap is still right - one lucky jump doing
+        // all the work is the failure it prevents - so the fix is a sibling action that draws for
+        // the deadline exactly, never a wider `passTime`.
+        //
+        // Driven through that action here rather than through five `passTime` calls, so the
+        // deterministic walk exercises the thing the campaign now relies on instead of a hand-rolled
+        // equivalent of it.
+        handler.passTimeToRecognitionDeadline(0);
+        assertEq(handler.warpsToRecognitionDeadline(), 1, "the recognition deadline must be reachable");
         handler.closeWorkout(2);
         assertEq(handler.workoutsClosed(), 1, "losses must be recognisable");
+
+        // ── both sweeps, now that the outcome is known ───────────────────────
+        //
+        // **Audit round 51, and this pair is the whole behavioural change the reserve makes.**
+        // Workout 2 ran out of time and wrote a residual down, so its lot's yield really is the
+        // insurance fund's by round 22 finding 18 - which is a fact the protocol could not know
+        // while the workout was open, and which the two refusals above are waiting for. With the
+        // open queue empty the reserve is zero and both routes move money again, so nothing that
+        // used to be reachable has stopped being reachable; it has moved behind the close.
+        //
+        // Ordered rather than arbitrary: `recoverStrandedClaim` bundles `claimSurplusFor` with the
+        // free-balance sweep and would otherwise leave the sibling nothing to claim - which would
+        // reach `sweepWorkoutYieldToInsurance`'s `swept == 0` refusal, and that clause is round-51
+        // item 155's dead one, so a census must not start depending on it.
+        //
+        // 🟥 **Audit round 55, item 215: the free-balance leg now needs its OWN epoch, exactly the
+        // way the sibling leg below already did.** The forced close claims and sweeps this
+        // contract's whole free balance into the fund before it writes anything down, so the
+        // accrual this leg used to find sitting here was spent one call earlier by
+        // `handler.closeWorkout(2)`. Without a fresh epoch this leg would move zero and the
+        // tripwire would go red on the state it exists to prove reachable - which is the honest
+        // outcome and is why the fix is an epoch rather than a weaker assertion. The lot stays
+        // parked and earning until it is disposed of, so a post-close epoch reaches the same claim
+        // by the same route.
+        uint256 epochsBeforeTheFreeBalanceLeg = handler.yieldEpochsDistributed();
+        handler.deliverYield(500e6);
+        assertGt(handler.yieldEpochsDistributed(), epochsBeforeTheFreeBalanceLeg, "the free-balance leg needs an epoch");
+        handler.passTime(3 days);
+        handler.recoverStrandedClaim();
+        assertGt(handler.freeBalanceSweepsThatMoved(), 0, "and the free-balance sweep must actually move it");
+
+        uint256 epochsBeforeTheSiblingSweep = handler.yieldEpochsDistributed();
+        handler.deliverYield(500e6);
+        assertGt(handler.yieldEpochsDistributed(), epochsBeforeTheSiblingSweep, "the sibling sweep needs its own epoch");
+        handler.passTime(3 days);
+        handler.sweepWorkoutYield();
+        assertGt(handler.workoutYieldSweepsThatMoved(), 0, "the workout-yield sweep must actually fund insurance");
 
         // And the redemption comes good after the close. Audit round 21, finding 14: this is the
         // state the campaign could not reach before, because there was no call that could reach
@@ -1256,8 +2274,12 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         handler.moveNav(1e8);
         handler.liquidate(1);
         assertEq(handler.startedCount(), 4, "a re-borrowed position must be liquidatable again");
-        handler.passTime(Config.AUCTION_DURATION + 1);
-        handler.expire(3);
+        // Through the eligible-draw action rather than through `passTime` plus a blind modulo, so
+        // both halves of what the campaign now depends on are exercised deterministically: the
+        // scan finds the one unsettled auction (ids 1, 2 and 3 are filled, cancelled and expired
+        // by this point) and moves the clock to its own deadline before expiring it.
+        handler.expireEligible(0);
+        assertEq(handler.expiriesFromEligible(), 1, "the eligible-auction draw must actually expire one");
         assertEq(handler.workoutsOpened(), 2, "the second workout must open");
 
         // Its own epoch, delivered while the workout is open, so the lot earns something for the
@@ -1272,7 +2294,13 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
 
         handler.workoutSettle(3, 2_000e6);
         assertEq(credit.currentDebtOf(handler.actors(1)), 0, "the settlement must clear the debt");
-        handler.closeWorkout(3);
+        // The live draw, on the clean branch, and with NO warp in front of it - which is the whole
+        // reason `closeLiveWorkout` does not fold the clock in. `residual` is zero here, so
+        // `closeWorkout` never evaluates the recognition deadline, and a version of this action
+        // that warped first would have made every close in the campaign a forced one and deleted
+        // this state.
+        handler.closeLiveWorkout(0);
+        assertEq(handler.closesFromLiveDraw(), 1, "the live-workout draw must actually close one");
         assertEq(handler.workoutsClosed(), 2, "the clean close must land");
         assertEq(handler.cleanClosesThatBookedYield(), 1, "and it must book the borrower's yield");
         assertGt(auction.totalWorkoutYieldOwed(), 0, "and the running total must be real money");
@@ -1283,5 +2311,209 @@ contract LiquidationAuctionInvariants is RiskParamsFixture {
         handler.claimWorkoutYield(3);
         assertEq(handler.workoutYieldClaimsThatPaid(), 1, "the borrower must be able to collect it");
         assertGt(usdc.balanceOf(handler.actors(1)), borrowerBefore, "and the USDC must actually arrive");
+
+        // ── the repoint, and the three sites variant A changes ──────────────
+        //
+        // **Round-54 item 191.** Everything above happened under one manager, which is the only
+        // state space this file could reach until `migrate` existed - and round 53 measured that
+        // in that space `workoutYieldOwedOn[live] == totalWorkoutYieldOwed` at every instant, the
+        // per-bearer clamp subtracts exactly what the aggregate did, the reserve term
+        // `totalWorkoutYieldOwed - owed` is zero on every paid claim, and the bearer pull is dead
+        // code. So each of the three is driven here, deterministically, and asserted on the
+        // handler's own ghosts, the same way every earlier round's blind spot was.
+        _repointEraTwo();
+        _repointEraThree();
+        assertEq(handler.migrationsRefusedOtherwise(), 0, "the vault refused a repoint this walk does not understand");
+    }
+
+    /// @dev Era two: a booking left UNCLAIMED on the original manager, the vault moved to a spare,
+    ///      a clean close on the spare booked in FULL (the round-53 finding under its fix), and
+    ///      the two claim orders that exercise the reserve term and the bearer pull.
+    function _repointEraTwo() internal {
+        // Both lots the walk above parked go back to their borrowers, or nobody holds a bond and
+        // no auction can open again; the disposal path itself is new to this suite.
+        handler.disposeClosedLot(0);
+        handler.disposeClosedLot(0);
+        assertEq(handler.lotsDisposed(), 2, "both closed lots must be disposable");
+        assertEq(vault.bondCount(address(auction)), 0, "nothing may stay parked under the auction");
+
+        uint256 carolId = _cleanCloseOnTheLiveManager(2, 1, 1);
+        uint256 carolBooked = _yieldOwed(carolId);
+        assertGt(carolBooked, 0, "carol's clean close must book yield on the original manager");
+        assertEq(auction.workoutYieldOwedOn(address(credit)), carolBooked, "and split it onto that manager");
+
+        // Round 55: the vault's manager door now refuses while carol's closed lot is still parked,
+        // so this disposal - which used to FOLLOW the repoint - has to precede it. The half of the
+        // old assertion that is lost here ("the disposal must settle the recipient on the NEW
+        // manager") is not lost from the walk: bob's era-two lot is closed on the spare and
+        // disposed at the top of era three, which is that same shape one era along.
+        handler.disposeClosedLot(0);
+        assertEq(handler.lotsDisposed(), 3, "carol's closed lot must be disposable before the repoint");
+        assertEq(vault.bondCount(address(auction)), 0, "nothing may stay parked under the auction at a repoint");
+
+        handler.migrate(0);
+        assertEq(handler.migrations(), 1, "the vault must be repointable once the book is clear");
+        assertTrue(address(handler.credit()) != address(credit), "the walk must have LEFT the original manager");
+        assertEq(vault.creditManager(), address(handler.credit()), "the handler must follow the vault");
+        assertEq(auction.creditManager(), address(handler.credit()), "and so must the auction");
+        assertEq(credit.claimableOf(address(auction)), carolBooked, "her backing stays settled on the detached manager");
+
+        // Bob closes clean on the spare with a bigger pot than carol's booking, so the reserve
+        // term below is a PARTIAL payment rather than a refusal.
+        uint256 bobId = _cleanCloseOnTheLiveManager(1, 2, 10);
+        assertEq(handler.cleanClosesBookedOnASplitPot(), 1, "the split must differ from the aggregate at a close after a repoint");
+        assertEq(handler.bookingsMadeBesideAnother(), 1, "bob's booking must be made while carol's still stands");
+        uint256 bobBooked = _yieldOwed(bobId);
+        {
+            (,,, uint256 bonds,,,,,, uint256 idx,) = auction.workouts(bobId);
+            assertEq(bobBooked, _live().yieldAccruedOn(bonds, idx), "bob was clamped by a booking the live pot does not hold");
+        }
+        assertGt(bobBooked, carolBooked, "fixture: bob must out-earn carol's booking");
+        assertEq(auction.workoutYieldOwedOn(address(_live())), bobBooked, "bob's booking is split onto the spare");
+        assertEq(auction.totalWorkoutYieldOwed(), carolBooked + bobBooked, "the split does not sum to the aggregate");
+
+        // Bob first: carol's booking is reserved against him and unpulled, so he is paid short by
+        // exactly it. The reserve term, non-zero and BINDING.
+        uint256 bobBefore = usdc.balanceOf(handler.actors(1));
+        // Through the booked-workout draw, so the action the campaign relies on to reach this
+        // term is the one exercised here; carol's claim below goes through the blind one.
+        handler.claimBookedWorkout(_indexOf(bobId));
+        assertEq(handler.targetedClaims(), 1, "the booked-workout draw must find bob's booking");
+        assertEq(handler.claimsPaidWithForeignBookingsReserved(), 1, "the reserve term must be reachable");
+        assertEq(handler.partialClaimsBoundByForeignBookings(), 1, "and it must be able to BIND a payment");
+        assertEq(usdc.balanceOf(handler.actors(1)) - bobBefore, bobBooked - carolBooked, "bob's short is not exactly the unpulled booking");
+
+        // Carol second: her bearer is the manager the vault left, so her claim takes the pull
+        // branch and realises her own backing off it.
+        uint256 carolBefore = usdc.balanceOf(handler.actors(2));
+        handler.claimWorkoutYield(_indexOf(carolId));
+        assertEq(handler.claimsPaidFromADetachedBearer(), 1, "the bearer branch must be reachable");
+        assertEq(handler.bearerPullsThatRealised(), 1, "and the pull must actually realise the detached pot");
+        assertEq(usdc.balanceOf(handler.actors(2)) - carolBefore, carolBooked, "carol must be paid in full from her own bearer");
+
+        // Bob's remainder, now that her pull left his money unreserved.
+        handler.claimWorkoutYield(_indexOf(bobId));
+        assertEq(usdc.balanceOf(handler.actors(1)) - bobBefore, bobBooked, "bob must be whole in total");
+        assertEq(auction.totalWorkoutYieldOwed(), 0, "a booking survived both claims");
+        assertEq(auction.workoutYieldOwedOn(address(credit)) + auction.workoutYieldOwedOn(address(_live())), 0, "a split survived both claims");
+    }
+
+    /// @dev Era three: a booking left on the spare, a BACK-migration refused by the vault's virgin
+    ///      rule, a second forward migration, the stranger's pull on the detached bearer, and a late
+    ///      tranche delivered to a bearer the vault has left.
+    function _repointEraThree() internal {
+        // Only bob's era-two lot is still parked; carol's went back before his era began.
+        handler.disposeClosedLot(0);
+        assertEq(handler.lotsDisposed(), 4, "bob's era-two lot must be disposable");
+        assertEq(vault.bondCount(address(auction)), 0, "nothing may stay parked under the auction");
+
+        uint256 carolId = _cleanCloseOnTheLiveManager(2, 1, 1);
+        uint256 carolBooked = _yieldOwed(carolId);
+        address spareOne = address(_live());
+
+        // Round 55: her close parks her lot again, and the vault's manager door refuses over it,
+        // so it goes back to her before EITHER move below. Both draws in this era are about the
+        // manager pointer and neither loses anything by the lot being gone - her booking is
+        // recorded against her bearer, not against the collateral.
+        handler.disposeClosedLot(0);
+        assertEq(handler.lotsDisposed(), 5, "carol's era-three lot must be disposable before the repoint");
+        assertEq(vault.bondCount(address(auction)), 0, "nothing may stay parked under the auction at a repoint");
+
+        // Odd seed: asks to go back to the original manager, which distributed yield in era one.
+        // The vault decides, not the handler.
+        handler.migrate(1);
+        assertEq(handler.backMigrationsRefusedNotVirgin(), 1, "the one-way rule must be the thing that refuses a return");
+        assertEq(handler.migrations(), 1, "and nothing must have moved");
+        assertEq(vault.creditManager(), spareOne, "the vault must still point at the spare");
+
+        // A live borrow on the spare, so the second forward move has a book to clear: the vault's
+        // door insists on `totalDebt == 0`, and the rescuer's permissionless `repayFor` inside
+        // `migrate` is the only thing that gets this walk through it with a debt standing.
+        handler.moveNav(30e8);
+        handler.borrow(1, 100e6);
+        assertGt(_live().currentDebtOf(handler.actors(1)), 0, "bob must be able to borrow on the spare before the repoint");
+        handler.migrate(0);
+        assertEq(handler.rescuesPaid(), 1, "the rescuer must have cleared bob's live debt before the vault admitted the move");
+        assertEq(handler.migrations(), 2, "a second forward migration must land");
+        assertTrue(address(_live()) != spareOne, "onto a fresh spare");
+
+        // The stranger pulls the detached bearer: money moves, and the bundled sweep must leave it
+        // alone because every wei of it is booked.
+        uint256 sweepsBefore = handler.freeBalanceSweepsThatMoved();
+        handler.pullDetachedBearer(1);
+        assertEq(handler.detachedPulls(), 1, "the stranger's pull on a detached bearer must move money");
+        assertEq(handler.freeBalanceSweepsThatMoved(), sweepsBefore, "and the sweep must not take a booked pot");
+
+        uint256 carolBefore = usdc.balanceOf(handler.actors(2));
+        handler.claimWorkoutYield(_indexOf(carolId));
+        assertEq(handler.claimsPaidFromADetachedBearer(), 2, "a claim on an already-pulled bearer still takes the branch");
+        assertEq(handler.bearerPullsThatRealised(), 1, "but has nothing left to realise");
+        assertEq(usdc.balanceOf(handler.actors(2)) - carolBefore, carolBooked, "carol must be paid the pulled pot in full");
+
+        // The late tranche on carol's FORCED workout from era one is delivered to its bearer, the
+        // original manager, which the vault left two migrations ago.
+        (,,,,,,, uint256 outstanding, address bearer,,) = auction.workouts(3);
+        assertGt(outstanding, 0, "fixture: the era-one write-down must still be recoverable");
+        assertEq(bearer, address(credit), "fixture: its bearer is the original manager");
+        handler.workoutSettleAfterClose(_indexOf(3), 50e6);
+        assertEq(handler.lateRecoveriesToADetachedBearer(), 1, "a late tranche must reach a detached bearer");
+
+        // The three remaining `migrate` counters, read here so none is an unread ghost. Two forward
+        // moves consumed spares one and two in order. This walk never ADMITS a return: every
+        // manager it leaves has distributed yield, so the vault's one-way rule refuses each (ghost
+        // 1 above), and the accepted return - to a spare that never streamed - is driven
+        // deterministically in `R54A01_RepointLeads` lead 1 and was reached by the campaign in run
+        // 1 of all three round-54 censuses. The rescuer's `repayFor` cleared live debt ahead of a
+        // repoint exactly this many times, MEASURED by this line when it was written.
+        assertEq(handler.nextSpare(), 3, "two forward migrations must have consumed two spares in order");
+        assertEq(handler.migrationsBack(), 0, "this walk admits no return; lead 1 and the census hold that branch");
+        assertEq(handler.rescuesPaid(), 1, "the rescuer cleared the book exactly once, ahead of the era-three move");
+    }
+
+    /// @dev Borrow at the cap on the live manager, crash, liquidate, expire, `epochs` epochs of
+    ///      yield, settle the debt through the workout, and close it CLEAN by the live draw.
+    function _cleanCloseOnTheLiveManager(uint256 actorIx, uint256 epochs, uint256 skips)
+        internal
+        returns (uint256 id)
+    {
+        address who = handler.actors(actorIx);
+        uint256 closesBefore = handler.cleanClosesThatBookedYield();
+        handler.moveNav(30e8);
+        handler.borrow(actorIx, 620e6);
+        assertGt(_live().currentDebtOf(who), 0, "the actor must be able to borrow on the live manager");
+        handler.moveNav(1e8);
+        handler.liquidate(actorIx);
+        id = auction.auctionOf(who);
+        assertGt(id, 0, "the position must be liquidatable on the live manager");
+        handler.expireEligible(0);
+        assertEq(auction.workoutsOpenFor(who), 1, "the workout must open");
+        // `skips` three-day draws per epoch. A spare deployed in `setUp` and installed weeks of
+        // simulated time later streams its first epoch over that whole shelf life
+        // (`distributeYield`'s `duration = max(elapsed since lastDistributeAt, ...)`, round-54
+        // item 70's drought re-rating, MEASURED here at 86,805,399 for two epochs over six days
+        // against about 360,000,000 on a five-day stream), so an era on a fresh spare needs time,
+        // not more epochs, to earn.
+        for (uint256 i = 0; i < epochs; i++) {
+            uint256 landed = handler.yieldEpochsDistributed();
+            handler.deliverYield(500e6);
+            assertEq(handler.yieldEpochsDistributed(), landed + 1, "the epoch must reach the live accumulator");
+            for (uint256 s = 0; s < skips; s++) {
+                handler.passTime(3 days);
+            }
+        }
+        handler.workoutSettle(_indexOf(id), 2_000e6);
+        assertEq(_live().currentDebtOf(who), 0, "the settlement must clear the debt");
+        handler.closeLiveWorkout(0);
+        assertEq(handler.cleanClosesThatBookedYield(), closesBefore + 1, "the close must be clean and book yield");
+    }
+
+    /// @dev The handler's id-taking actions index `startedAuctions[seed % length]`; this is the
+    ///      seed that names `id`.
+    function _indexOf(uint256 id) internal view returns (uint256) {
+        uint256 n = handler.startedCount();
+        for (uint256 j = 0; j < n; j++) {
+            if (handler.startedAuctions(j) == id) return j;
+        }
+        revert("fixture: unknown auction id");
     }
 }

@@ -50,6 +50,20 @@ contract AssertMockStackLocked is DeployBase {
     error GateDoesNotRefuse(string name, address target);
     error FaucetClosed(string name);
     error ConfigurationTampered(string what);
+    /// @dev Round-47 item 95. The record is the committed side and the only side this file
+    ///      asserts against; an environment value that disagrees with it is named, never obeyed.
+    error KeeperEnvDisagreesWithRecord(address env, address record);
+    /// @dev Round 56 (round-56 item 145, lead 3; audit agent A6). Every mock on chain was created
+    ///      AND locked by one key, and that key is not the record's `deployer`. `lockAuthority` is
+    ///      set in each mock's constructor from `msg.sender` and `admin` by the deploy's `lockTo`,
+    ///      so six reads agreeing on one address is the fingerprint of a whole broadcast sent from
+    ///      that address - a deploy run with a different `--sender` / `--private-key` than the record
+    ///      names, or a record whose `deployer` row is stale. Before this error the same state read
+    ///      back as `MockAdminWrong` on the first mock, which names one contract and whose remedy
+    ///      reads as a redeploy; neither cause is fixed by one. A PARTIAL disagreement (one mock
+    ///      re-locked, two not) is still `MockAdminWrong`, because that is a tamper or a half-finished
+    ///      re-lock rather than a sender. Carries both keys, chain first, record second.
+    error StackDeployedByAnotherKey(address chainKey, address recordDeployer);
 
     /// @dev An address with no role of any kind, used to probe that the gate actually refuses.
     address internal constant ROLELESS = address(0xBAD);
@@ -88,6 +102,7 @@ contract AssertMockStackLocked is DeployBase {
         _report("MockBond", s.bond);
         _report("MockFarm", s.farm);
 
+        _assertDeployedByRecordedKey(s);
         _assertOne("MockUSDC", s.usdc, s.deployer, s.keeper);
         _assertOne("MockBond", s.bond, s.deployer, s.keeper);
         _assertOne("MockFarm", s.farm, s.deployer, s.keeper);
@@ -95,6 +110,7 @@ contract AssertMockStackLocked is DeployBase {
         _assertStackAgrees(s);
         _assertGateRefuses(s);
         _assertFaucetOpen(s);
+        _assertRecordedContractsHaveCode(s);
         _assertConfigurationPristine(s);
 
         console.log("");
@@ -115,23 +131,63 @@ contract AssertMockStackLocked is DeployBase {
     ///      the live stack fails at the first assertion - its bytecode predates the lockdown gate -
     ///      four of this file's five assertion groups had never been executed by anything at all.
     ///      The harness is `test/R39AssertLocked.t.sol` now, and it is named here so the claim is
-    ///      checkable rather than merely asserted. Seven tests; the load-bearing one is
-    ///      `test_R39_slotsSetButTheGateDoesNotRefuseIsCaught`, which MEASURED: deleting
-    ///      `_assertGateRefuses` from `assertLockedOnChain()` turns exactly ONE test of 93 red.
+    ///      checkable rather than merely asserted. The load-bearing test is
+    ///      `test_R39_slotsSetButTheGateDoesNotRefuseIsCaught`, which MEASURED in round 39:
+    ///      deleting `_assertGateRefuses` from `assertLockedOnChain()` turned exactly ONE test of
+    ///      that tree's 93 red.
+    ///
+    /// @dev 🟥 **"Touches no filesystem" was only half of hermetic, and round 47's item 95 found
+    ///      the other half.** This seam kept the DISK out of `forge test`; the keeper read in
+    ///      `_readStack` reached the process ENVIRONMENT through `_envOrAddress`, and forge
+    ///      auto-loads `contracts/.env` into every test run, so the harness result was a property
+    ///      of the machine: MEASURED, a `.env` naming a stranger `RECOUP_KEEPER` turned 4 of the
+    ///      harness's 7 tests red. The harness now overrides `_envOrAddress` as well, defaulting to
+    ///      the fallback and never to `super`, and installs a value only when a test is about one.
+    ///      The residual is unchanged in kind: both base implementations read the real disk and
+    ///      the real environment and are exercised only on a real run.
     function _readRecord() internal view virtual returns (string memory) {
         return vm.readFile(RECORD);
     }
 
     function _readStack() internal view returns (Stack memory s) {
         string memory j = _readRecord();
+        // Round 54: every row named before it is parsed, the `WirePhase4._resolveOne` way. These
+        // nine rows had no `keyExistsJson` on any of them, so a record missing one died inside
+        // forge's JSON parser as an unnamed `CheatcodeError(string)` before a single line printed.
+        // The `name` is the environment variable where one exists (`RECOUP_KEEPER`) and the
+        // record's own field where none does, so the error says which row to add.
+        _requireRecordRow(j, "chainId", ".chainId");
+        _requireRecordRow(j, "deployer", ".deployer");
+        _requireRecordRow(j, "RECOUP_KEEPER", ".operators.keeper");
+        _requireRecordRow(j, "MockUSDC", ".mocks.MockUSDC");
+        _requireRecordRow(j, "MockBond", ".mocks.MockBond");
+        _requireRecordRow(j, "MockFarm", ".mocks.MockFarm");
+        _requireRecordRow(j, "CollateralVault", ".contracts.CollateralVault");
+        _requireRecordRow(j, "DirectCallAdapter", ".contracts.DirectCallAdapter");
+        _requireRecordRow(j, "seededPosition.bonds", ".seededPosition.bonds");
         s.chainId = vm.parseJsonUint(j, ".chainId");
-        s.deployer = vm.parseJsonAddress(j, ".deployer");
-        s.keeper = _envOrAddress("RECOUP_KEEPER", vm.parseJsonAddress(j, ".operators.keeper"));
-        s.usdc = vm.parseJsonAddress(j, ".mocks.MockUSDC");
-        s.bond = vm.parseJsonAddress(j, ".mocks.MockBond");
-        s.farm = vm.parseJsonAddress(j, ".mocks.MockFarm");
-        s.vault = vm.parseJsonAddress(j, ".contracts.CollateralVault");
-        s.adapter = vm.parseJsonAddress(j, ".contracts.DirectCallAdapter");
+        // Round 55: every address row through `DeployBase._recordAddress`, so a wrong-checksum row
+        // is `AddressChecksumInvalid` by name before any chain read (round-55 item 225(i)).
+        s.deployer = _recordAddress(j, "deployer", ".deployer");
+        // **The record is the only side asserted against, and an environment value is checked
+        // AGAINST it rather than read INSTEAD of it.** Round-47 item 95: this line used to be
+        // `_envOrAddress("RECOUP_KEEPER", record)`, so a `.env` that named the chain's keeper
+        // certified the stack against the environment and never looked at the committed value -
+        // MEASURED, the whole entrypoint green over a record naming a keeper nobody set. The
+        // environment is not forbidden outright, because the documented `deploy && assert`
+        // command runs both halves against one `.env` and the deploy half needs `RECOUP_KEEPER`
+        // in it; forge auto-loads that file into this run too. An agreeing value is tolerated
+        // and a disagreeing one is named with both values, so a stale `.env` reads as a stale
+        // `.env` rather than as `MockOperatorNotKeeper`, whose stated remedy is a redeploy.
+        address recordKeeper = _recordAddress(j, "RECOUP_KEEPER", ".operators.keeper");
+        address envKeeper = _envOrAddress("RECOUP_KEEPER", recordKeeper);
+        if (envKeeper != recordKeeper) revert KeeperEnvDisagreesWithRecord(envKeeper, recordKeeper);
+        s.keeper = recordKeeper;
+        s.usdc = _recordAddress(j, "MockUSDC", ".mocks.MockUSDC");
+        s.bond = _recordAddress(j, "MockBond", ".mocks.MockBond");
+        s.farm = _recordAddress(j, "MockFarm", ".mocks.MockFarm");
+        s.vault = _recordAddress(j, "CollateralVault", ".contracts.CollateralVault");
+        s.adapter = _recordAddress(j, "DirectCallAdapter", ".contracts.DirectCallAdapter");
         s.seededBonds = vm.parseJsonUint(j, ".seededPosition.bonds");
     }
 
@@ -144,7 +200,22 @@ contract AssertMockStackLocked is DeployBase {
         if (target.code.length == 0) revert NoCodeAt(name, target);
         (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSelector(sel));
         if (!ok || ret.length != 32) revert PreLockdownBytecode(name, target, selName);
-        return abi.decode(ret, (address));
+        return _asAddress(name, target, selName, ret);
+    }
+
+    /// @dev Round 53. Decoded as a word and range-checked rather than `abi.decode`d as an `address`,
+    ///      for the reason `DeployBase._answersWithItself` already gives: a 32-byte answer whose high
+    ///      96 bits are not zero makes `abi.decode(ret, (address))` revert the whole run with EMPTY
+    ///      data. That is the wrong contract at the recorded address answering a colliding selector,
+    ///      and it is named the same way a short answer is.
+    function _asAddress(string memory name, address target, string memory selName, bytes memory ret)
+        private
+        pure
+        returns (address)
+    {
+        uint256 word = abi.decode(ret, (uint256));
+        if (word > type(uint160).max) revert PreLockdownBytecode(name, target, selName);
+        return address(uint160(word));
     }
 
     // -- assertions ----------------------------------------------------------
@@ -164,6 +235,45 @@ contract AssertMockStackLocked is DeployBase {
         // recorded address fails here even if somebody set its admin to the right value.
         address auth = _readAddress(name, m, IMockLockdownView.lockAuthority.selector, "lockAuthority()");
         if (auth != expectedAdmin) revert MockLockAuthorityWrong(name, auth, expectedAdmin);
+    }
+
+    /// @notice The whole-stack question, asked before any per-mock verdict: was this stack made by
+    ///         the key the record names?
+    /// @dev Reads `admin()` FIRST on each mock, so a pre-lockdown or codeless row fails with exactly
+    ///      the error `_assertOne` would have raised (`PreLockdownBytecode(..., "admin()")`,
+    ///      `NoCodeAt`), and an open mock (`admin == 0`) or a correct one returns at once and is left
+    ///      to `_assertOne`. Only when all three admins and all three lock authorities are one
+    ///      non-zero key other than `s.deployer` does it refuse, and then by the sender rather than
+    ///      by the first mock. Zero runtime bytes: this is a script.
+    function _assertDeployedByRecordedKey(Stack memory s) internal view {
+        address key = _readAddress("MockUSDC", s.usdc, IMockLockdownView.admin.selector, "admin()");
+        if (key == address(0) || key == s.deployer) return;
+        if (!_madeAndLockedBy(s.usdc, key)) return;
+        if (!_madeAndLockedBy(s.bond, key)) return;
+        if (!_madeAndLockedBy(s.farm, key)) return;
+        console.log("");
+        console.log("Every mock was created AND locked by", key);
+        console.log("but the record's deployer is        ", s.deployer);
+        console.log("Either the deploy ran from a different --sender / --private-key than the record");
+        console.log("names, or the record's deployer row is stale. A redeploy fixes neither.");
+        revert StackDeployedByAnotherKey(key, s.deployer);
+    }
+
+    /// @dev `admin()` and `lockAuthority()` both answer `key`. SOFT reads on purpose: anything that
+    ///      does not answer cleanly is "not the fingerprint" and falls through to `_assertOne`, so
+    ///      this probe can only ever REPLACE a `MockAdminWrong`, never change which of the existing
+    ///      errors a malformed stack reports.
+    function _madeAndLockedBy(address m, address key) private view returns (bool) {
+        return _softAddress(m, IMockLockdownView.admin.selector) == key
+            && _softAddress(m, IMockLockdownView.lockAuthority.selector) == key;
+    }
+
+    function _softAddress(address m, bytes4 sel) private view returns (address) {
+        if (m.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = m.staticcall(abi.encodeWithSelector(sel));
+        if (!ok || ret.length != 32) return address(0);
+        uint256 word = abi.decode(ret, (uint256));
+        return word > type(uint160).max ? address(0) : address(uint160(word));
     }
 
     /// @dev Catches a PARTIAL re-lock, where one mock was replaced and two were not. Keeps the
@@ -219,6 +329,41 @@ contract AssertMockStackLocked is DeployBase {
         vm.prank(ROLELESS);
         (bool okU,) = s.usdc.call(abi.encodeWithSignature("mint(address,uint256)", ROLELESS, 1));
         if (!okU) revert FaucetClosed("MockUSDC");
+    }
+
+    /// @notice The two `contracts.*` rows this file parses, asked whether they name anything at all.
+    /// @dev **Round-51 item 150, lead 2. `_readStack` parses `.contracts.CollateralVault` and
+    ///      `.contracts.DirectCallAdapter` and uses them ONLY as arguments to
+    ///      `bond.whitelistContains(...)` and `usdc.blocked(...)`, so it never asked whether either
+    ///      address holds code.** A record row naming nothing at all passed the whole entrypoint
+    ///      green, and `usdc.blocked(address(0))` is `false`, so even the zero address passed the
+    ///      two clauses that read the vault.
+    ///
+    ///      **The shipped suite already demonstrated this and nobody read it as a finding.**
+    ///      `R39AssertLocked.t.sol` set `VAULT = address(0xFA017)` and `ADAPTER = address(0xADA97E)`,
+    ///      two literals with no code, and `test_R39_theEntrypointPassesOverACorrectlyLockedStack`
+    ///      was green. Those two literals are deployed contracts now, which is the other half of
+    ///      this change: a fixture that could not tell the two states apart cannot be the evidence
+    ///      that they are told apart.
+    ///
+    ///      **LOW, and the reason is worth stating rather than assuming.** A wrong `contracts.*` row
+    ///      does not make the mock stack less locked. What it costs is the OTHER direction: a
+    ///      mistyped adapter row fails `_assertConfigurationPristine` as "the adapter is not
+    ///      whitelisted - an unfinished broadcast (try --resume) or a tamper", which is the exact
+    ///      misdiagnosis that function's own docstring says it was rewritten to avoid one cause
+    ///      over. Two `EXTCODESIZE` reads separate "this row names nothing" from "this row names
+    ///      something that is not whitelisted", and they run BEFORE that function so the cheaper
+    ///      diagnosis wins.
+    ///
+    ///      **Deliberately the two rows this file already parses, and not the other eight.**
+    ///      `AssertLocked` is about the MOCK STACK; widening it to the protocol graph is
+    ///      `WirePhase4.assertOnly()`'s job, and that function does hold all eight to the record.
+    ///      The gap closed here is narrower and real: the rows this file reads and then uses only as
+    ///      somebody else's arguments. `NoCodeAt` already exists and is the error `_readAddress`
+    ///      raises for the same question one contract over.
+    function _assertRecordedContractsHaveCode(Stack memory s) internal view {
+        if (s.vault.code.length == 0) revert NoCodeAt("contracts.CollateralVault", s.vault);
+        if (s.adapter.code.length == 0) revert NoCodeAt("contracts.DirectCallAdapter", s.adapter);
     }
 
     /// @notice The half the lock-ordering fix does NOT close.
@@ -291,8 +436,10 @@ contract AssertMockStackLocked is DeployBase {
         (bool ok, bytes memory ret) = m.staticcall(abi.encodeWithSelector(sel));
         if (!ok || ret.length != 32) {
             console.log(string.concat(label, " REVERTS - this bytecode predates MockLockdown"));
+        } else if (abi.decode(ret, (uint256)) > type(uint160).max) {
+            console.log(string.concat(label, " ANSWERS A WORD THAT IS NOT AN ADDRESS - wrong contract at this row"));
         } else {
-            console.log(label, abi.decode(ret, (address)));
+            console.log(label, address(uint160(abi.decode(ret, (uint256)))));
         }
     }
 
@@ -301,13 +448,17 @@ contract AssertMockStackLocked is DeployBase {
     function _addr(address t, bytes memory data) private view returns (address) {
         (bool ok, bytes memory ret) = t.staticcall(data);
         if (!ok || ret.length != 32) revert PreLockdownBytecode("config read", t, "address getter");
-        return abi.decode(ret, (address));
+        return _asAddress("config read", t, "address getter", ret);
     }
 
     function _bool(address t, bytes memory data) private view returns (bool) {
         (bool ok, bytes memory ret) = t.staticcall(data);
         if (!ok || ret.length != 32) revert PreLockdownBytecode("config read", t, "bool getter");
-        return abi.decode(ret, (bool));
+        // Round 53: the same range check as `_asAddress`, because `abi.decode(ret, (bool))` reverts
+        // EMPTY on any word above 1.
+        uint256 word = abi.decode(ret, (uint256));
+        if (word > 1) revert PreLockdownBytecode("config read", t, "bool getter");
+        return word == 1;
     }
 
     function _uint(address t, bytes memory data) private view returns (uint256) {

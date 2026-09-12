@@ -85,10 +85,36 @@ contract RiskParamsHandler is Test {
         try riskParams.setRiskParams(p) {
             accepted++;
             // The ratchet, observed per accepted write against the value in storage a moment
-            // earlier. Recorded rather than asserted: a forge-std assertion inside a handler
-            // reverts, and under `fail_on_revert = false` a reverting handler call is discarded -
-            // so an in-handler assertion can fail invisibly and truncate the state space at the
-            // same time. Counting it and asserting the count from the suite has neither problem.
+            // earlier. Recorded rather than asserted, and the reason is ASYMMETRIC rather than
+            // blanket - MEASURED on forge 1.8.1, 2026-09-09.
+            //
+            // A THREE-argument forge-std assertion inside a handler reverts with the assertion's
+            // own message, is indistinguishable from an ordinary business revert, and under
+            // `fail_on_revert = false` is DISCARDED SILENTLY. A TWO-argument one reverts with a
+            // string beginning "assertion failed", which forge 1.8.1 picks out of the discarded
+            // frame and reports as `failure_type: "handler_assertion"`, naming the handler and
+            // the selector. So a MESSAGE IS SUFFICIENT to make an in-handler assertion invisible,
+            // and ITS ABSENCE IS NOT SUFFICIENT to guarantee reporting: a message-less `assertEq`
+            // inside `RegistryHandler.register`'s catch block went unreported at
+            // `(runs: 256, calls: 128000, reverts: 62346)`, and THAT READING IS UNEXPLAINED.
+            // Position, and possibly the campaign, is a third variable nobody has isolated.
+            // Do not restate this in either blanket form - "always discarded" is false in one
+            // direction and "only messaged ones are discarded" is unsupported in the other.
+            // `CreditHandler.firstBrokenProperty` in `CreditManager.invariants.t.sol` carries the
+            // fullest statement of the same rule.
+            //
+            // THIS CAMPAIGN IS THE ONE THE ORIGINAL WRONG EXPERIMENT WAS RUN IN, which is why the
+            // correction is spelled out here rather than only pointed at. One argument changed at
+            // the top of `propose` and nothing else, both runs `--force`, both observed through
+            // `invariant_theStoredSetIsAlwaysLegal`: `assertEq(uint256(1), uint256(2))` goes RED
+            // as `failure_type: "handler_assertion"` naming `propose` and `proposeNearby`, while
+            // `assertEq(uint256(1), uint256(2), "planted with a message")` reproduces
+            // `[PASS] (runs: 256, calls: 128000, reverts: 128000)` verbatim. The revert on all
+            // 128,000 calls is the plant site's own signature rather than a property of the
+            // hazard: `proposeNearby` calls `this.propose(...)`, so a plant at the top of
+            // `propose` reverts on every action of this handler.
+            //
+            // Counting it and asserting the count from the suite has neither problem.
             if (threshold < before.liquidationThresholdBps) thresholdRegressions++;
             if (threshold > highestThresholdAccepted) highestThresholdAccepted = threshold;
             if (threshold > before.liquidationThresholdBps) thresholdRaises++;

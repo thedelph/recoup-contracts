@@ -5,7 +5,20 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @notice Test-only executable specification for LenderPool's canonical-cash replacement.
 /// @dev This is deliberately independent of LenderPool. It carries only the balance-sheet terms
-///      needed to decide F3 and is an oracle for production tests, not an implementation helper.
+///      needed to decide F3. It is NOT an oracle for production tests - round 46, item 73 - and
+///      what compares it to the pool is `test/LenderPoolModelDifferential.t.sol`, which drives
+///      both through one action sequence and holds the canonical book equal after every step. It
+///      OVER-APPROXIMATES the pool in four named ways, so a state this model reaches is not
+///      evidence the pool reaches it, and a property that holds here has not been checked there:
+///        1. `activateFrozen` starts a stream with no supply check, so this model reaches
+///           `{totalSupply < MIN_SUPPLY, yieldRate != 0}`, a state the pool refuses on every
+///           rating path and freezes on every burn;
+///        2. `deliverEpochYield` has no `YieldExceedsCapital` refusal, so it accepts an epoch the
+///           pool refuses;
+///        3. there is no queue reserve, no 15% float, no impairment and no pause, so `available`,
+///           `maxRedeem` and every exit price here are strictly looser than the pool's;
+///        4. `_startStream` takes `max(duration, remaining)` and ignores `_rateStream`'s rules 1
+///           and 1b, the accrual-window floor and the pay-for-your-extension rule.
 contract CanonicalCashModel {
     uint256 internal constant ACC_PRECISION = 1e18;
     uint256 internal constant VIRTUAL_SHARES = 1_000;

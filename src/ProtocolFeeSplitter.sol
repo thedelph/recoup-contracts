@@ -414,8 +414,12 @@ contract ProtocolFeeSplitter is ReentrancyGuard {
         uint256 balanceBefore = usdc.balanceOf(address(this));
         // A wallet that reverts must not be able to trap the other party's leg - the whole
         // of round-23 finding 8.
+        // ACCEPTED (audit round 44). The callee is the immutable USDC token, which does not call back.
+        // A failed pay parks the amount rather than reverting, which is the point of `_payOrPark`.
+        // forge-lint: disable-start(reentrancy-no-eth)
         // slither-disable-next-line unchecked-lowlevel
         (bool ok,) = address(usdc).call(abi.encodeCall(IERC20.transfer, (wallet, amount)));
+        // forge-lint: disable-end(reentrancy-no-eth)
         uint256 balanceAfter = usdc.balanceOf(address(this));
 
         uint256 delivered = ok && balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;

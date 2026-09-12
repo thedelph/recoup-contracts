@@ -126,6 +126,8 @@ contract CreditManagerTest is RiskParamsFixture {
     ///      is meaningless without that, and `test_stream_perSecondAccrualDeliversWhatOneCallWould`
     ///      is what keeps it honest.
     uint256 internal constant DUST = 2;
+    /// @dev The auction id a pranked write-down is recorded against; nothing here recovers on it.
+    uint256 internal constant WRITE_DOWN_ID = 1;
     uint256 internal constant FLOAT = 100_000e6;
 
     /// @dev The NAV the liquidation-boundary tests crash to. The debt that sits exactly on
@@ -196,11 +198,7 @@ contract CreditManagerTest is RiskParamsFixture {
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
         credit = new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         liquidity = new TreasuryLiquiditySource(usdc, admin);
 
@@ -322,9 +320,7 @@ contract CreditManagerTest is RiskParamsFixture {
     function test_borrow_revertsWithNoCollateral() public {
         uint256 ceilingBps = maxLtvBps();
         vm.prank(bob);
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.ExceedsMaxLtv.selector, type(uint256).max, ceilingBps)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.ExceedsMaxLtv.selector, type(uint256).max, ceilingBps));
         credit.borrow(1e6);
     }
 
@@ -377,9 +373,7 @@ contract CreditManagerTest is RiskParamsFixture {
         address extra = makeAddr("extra");
         _giveCollateral(extra, 5_000);
         vm.prank(extra);
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.GlobalCapExceeded.selector, globalCap + 1e6, globalCap)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.GlobalCapExceeded.selector, globalCap + 1e6, globalCap));
         credit.borrow(1e6);
     }
 
@@ -392,9 +386,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.setLiquiditySource(address(short));
 
         vm.prank(alice);
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.LiquidityNotDelivered.selector, 100e6, 100e6 - 1)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.LiquidityNotDelivered.selector, 100e6, 100e6 - 1));
         credit.borrow(100e6);
     }
 
@@ -662,9 +654,8 @@ contract CreditManagerTest is RiskParamsFixture {
 
         assertGe(
             usdc.balanceOf(address(credit)),
-            credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
-                + credit.totalBountyOwed(),
+            credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal() + credit.insuranceFund()
+                + credit.totalBountyEscrowed() + credit.totalBountyParked() + credit.totalBountyOwed(),
             "distribution promised more than the contract holds"
         );
     }
@@ -965,9 +956,7 @@ contract CreditManagerTest is RiskParamsFixture {
         pool.setRefusingPrincipal(true);
         uint256 poolCashBefore = usdc.balanceOf(address(pool));
 
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.PrincipalRefused.selector, address(pool), uint256(500e6))
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.PrincipalRefused.selector, address(pool), uint256(500e6)));
         vm.prank(makeAddr("stranger"));
         credit.flushPrincipalTo(address(pool));
 
@@ -1109,9 +1098,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.borrow(500e6);
 
         vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(CollateralVault.CreditManagerHasDebt.selector, 500e6)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.CreditManagerHasDebt.selector, 500e6));
         vault.setCreditManager(makeAddr("freshManager"));
     }
 
@@ -1134,9 +1121,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         vm.prank(admin);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CollateralVault.CreditManagerVaultMismatch.selector, address(otherVault)
-            )
+            abi.encodeWithSelector(CollateralVault.CreditManagerVaultMismatch.selector, address(otherVault))
         );
         vault.setCreditManager(address(foreign));
     }
@@ -1210,11 +1195,7 @@ contract CreditManagerTest is RiskParamsFixture {
         assertEq(credit.totalDebt(), 0);
 
         CreditManager fresh = new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         vm.prank(admin);
         vault.setCreditManager(address(fresh));
@@ -1257,11 +1238,7 @@ contract CreditManagerTest is RiskParamsFixture {
         assertEq(credit.bountyEscrowOf(alice), 0, "bounty refunded when yield cleared the debt");
 
         CreditManager fresh = new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         vm.prank(admin);
         vault.setCreditManager(address(fresh));
@@ -1270,11 +1247,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.claimSurplus();
         // Alice is square on the loan itself: she received the disbursement, the debt was
         // cleared by yield, and everything recorded as hers, refunded bounty included, paid out.
-        assertEq(
-            usdc.balanceOf(alice),
-            500e6 - Config.LIQUIDATION_CALL_BOUNTY + owed,
-            "recorded surplus still payable"
-        );
+        assertEq(usdc.balanceOf(alice), 500e6 - Config.LIQUIDATION_CALL_BOUNTY + owed, "recorded surplus still payable");
     }
 
     /// @dev A third party clearing the debt refunds the escrow rather than consuming it. The
@@ -1347,10 +1320,7 @@ contract CreditManagerTest is RiskParamsFixture {
         vm.stopPrank();
 
         assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "charged exactly once");
-        assertEq(
-            usdc.balanceOf(alice),
-            Config.MIN_BOUNTIED_DEBT + 120e6 - Config.LIQUIDATION_CALL_BOUNTY
-        );
+        assertEq(usdc.balanceOf(alice), Config.MIN_BOUNTIED_DEBT + 120e6 - Config.LIQUIDATION_CALL_BOUNTY);
     }
 
     /// @dev The one transaction-wide cliff: existing debt just under the threshold, and a
@@ -1363,9 +1333,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         uint256 tooSmall = Config.LIQUIDATION_CALL_BOUNTY - 1;
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.BorrowBelowBounty.selector, tooSmall, Config.LIQUIDATION_CALL_BOUNTY
-            )
+            abi.encodeWithSelector(CreditManager.BorrowBelowBounty.selector, tooSmall, Config.LIQUIDATION_CALL_BOUNTY)
         );
         credit.borrow(tooSmall);
         vm.stopPrank();
@@ -1481,9 +1449,7 @@ contract CreditManagerTest is RiskParamsFixture {
         // The arithmetic, stated where a parameter move would break it: any position whose
         // headroom is under the charge has an empty feasible band.
         assertLt(
-            Config.LIQUIDATION_CALL_BOUNTY,
-            perAccountBorrowCap(),
-            "premise: the charge fits inside the cap at all"
+            Config.LIQUIDATION_CALL_BOUNTY, perAccountBorrowCap(), "premise: the charge fits inside the cap at all"
         );
 
         // A reachable unarmed position: under the dust threshold, so never charged.
@@ -1661,11 +1627,7 @@ contract CreditManagerTest is RiskParamsFixture {
         assertEq(credit.debtOf(alice), 0);
         assertEq(credit.bountyEscrowOf(alice), 0, "refunded by the settle that cleared the debt");
         assertEq(credit.totalBountyEscrowed(), 0);
-        assertGe(
-            credit.claimableOf(alice),
-            Config.LIQUIDATION_CALL_BOUNTY,
-            "and it is claimable rather than stranded"
-        );
+        assertGe(credit.claimableOf(alice), Config.LIQUIDATION_CALL_BOUNTY, "and it is claimable rather than stranded");
     }
 
     /// @dev A debt that reached zero passively but has not been refunded yet is still armed,
@@ -1684,10 +1646,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         // Refunded, so this is a fresh position and it pays again - which is correct.
         assertEq(credit.bountyEscrowOf(alice), Config.LIQUIDATION_CALL_BOUNTY);
-        assertEq(
-            usdc.balanceOf(alice),
-            balanceBefore + Config.MIN_BOUNTIED_DEBT - Config.LIQUIDATION_CALL_BOUNTY
-        );
+        assertEq(usdc.balanceOf(alice), balanceBefore + Config.MIN_BOUNTIED_DEBT - Config.LIQUIDATION_CALL_BOUNTY);
     }
 
     /// @dev **The counter-overwrite regression.** `settlePrincipal` snapshots
@@ -1704,11 +1663,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         // Fresh manager so the liquidity source can be swapped in at zero debt.
         CreditManager credit2 = new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         vm.startPrank(admin);
         vault.setCreditManager(address(credit2));
@@ -1741,9 +1696,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         // Bob's principal was added mid-call and must still be owed, not erased.
         uint256 bobShare = 400e6 / 2;
-        assertApproxEqAbs(
-            credit2.pendingPrincipal(), bobShare, DUST, "the re-entrant increment survived"
-        );
+        assertApproxEqAbs(credit2.pendingPrincipal(), bobShare, DUST, "the re-entrant increment survived");
         // And the contract still covers every claim on it.
         assertGe(
             usdc.balanceOf(address(credit2)),
@@ -2157,9 +2110,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.AuctionPointerMismatch.selector, otherManager, address(credit)
-            )
+            abi.encodeWithSelector(CreditManager.AuctionPointerMismatch.selector, otherManager, address(credit))
         );
         credit.borrow(100e6);
 
@@ -2189,11 +2140,7 @@ contract CreditManagerTest is RiskParamsFixture {
         _wireAuction();
 
         CreditManager next = new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         vm.startPrank(admin);
         next.setLiquiditySource(address(liquidity));
@@ -2208,9 +2155,7 @@ contract CreditManagerTest is RiskParamsFixture {
         assertEq(next.liquidationAuction(), address(0));
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.AuctionPointerMismatch.selector, address(0), address(auctionMock)
-            )
+            abi.encodeWithSelector(CreditManager.AuctionPointerMismatch.selector, address(0), address(auctionMock))
         );
         next.borrow(100e6);
 
@@ -2378,7 +2323,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         uint256 principalBefore = credit.pendingPrincipal();
         vm.prank(a);
-        credit.writeDownLoss(alice, 200e6);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, 200e6);
 
         assertEq(credit.debtOf(alice), loan - 200e6);
         assertEq(credit.totalDebt(), loan - 200e6);
@@ -2394,7 +2339,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.borrow(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan * 10);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan * 10);
         assertEq(credit.debtOf(alice), 0);
         assertEq(credit.totalDebt(), 0);
     }
@@ -2411,7 +2356,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.fundInsurance(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         // Insurance covered it, so the source is owed the principal back and both
         // migration guards stay armed until it is actually returned.
         assertEq(credit.pendingPrincipal(), loan);
@@ -2494,7 +2439,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.borrow(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
 
         assertEq(credit.unsocialisedLoss(), 0, "a treasury-funded default must leave nothing to place");
 
@@ -2523,7 +2468,7 @@ contract CreditManagerTest is RiskParamsFixture {
         pool.setAccepting(false); // the default, stated so the test does not rest on it
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         assertGt(credit.unsocialisedLoss(), 0, "the fixture must leave a genuine pool-funded backlog");
 
         // `expectRevert` before `prank`, because the expected-error arguments contain a read.
@@ -2541,9 +2486,7 @@ contract CreditManagerTest is RiskParamsFixture {
         // prank, exactly as this file always said - and the staticcall is a *second*, newer way to
         // lose it that arrived with the risk parameters moving into storage. The ordering below
         // survives both, which is why it is the ordering to copy.
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.LossOutstanding.selector, credit.unsocialisedLoss())
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.LossOutstanding.selector, credit.unsocialisedLoss()));
         vm.prank(admin);
         credit.setLiquiditySource(address(liquidity));
     }
@@ -2580,7 +2523,7 @@ contract CreditManagerTest is RiskParamsFixture {
         pool.setAccepting(false); // the default, stated so the test does not rest on it
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         assertGt(credit.unsocialisedLoss(), 0, "the fixture must leave a genuine pool-funded backlog");
 
         MockLenderPool incoming = new MockLenderPool(usdc);
@@ -2601,9 +2544,7 @@ contract CreditManagerTest is RiskParamsFixture {
         // survives both, which is why it is the ordering to copy.
         uint256 backlog = credit.unsocialisedLoss();
         vm.expectRevert(
-            abi.encodeWithSelector(
-                CreditManager.LossSinkMustBeTheFunder.selector, address(pool), address(incoming)
-            )
+            abi.encodeWithSelector(CreditManager.LossSinkMustBeTheFunder.selector, address(pool), address(incoming))
         );
         vm.prank(admin);
         credit.setLenderPool(address(incoming));
@@ -2643,9 +2584,7 @@ contract CreditManagerTest is RiskParamsFixture {
         assertTrue(credit.liquiditySource() != address(pool), "and the round-21 clause must not either");
 
         MockLenderPool incoming = new MockLenderPool(usdc);
-        vm.expectRevert(
-            abi.encodeWithSelector(CreditManager.PoolPrincipalOutstanding.selector, address(pool), loan)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CreditManager.PoolPrincipalOutstanding.selector, address(pool), loan));
         vm.prank(admin);
         credit.setLenderPool(address(incoming));
     }
@@ -2674,7 +2613,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         // A default the pool will not take yet: both clauses of the guard are now armed.
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         assertEq(credit.unsocialisedLoss(), loan, "remembered, not swallowed");
         assertEq(outgoing.outstandingPrincipal(), loan, "and still recorded as lent");
 
@@ -2703,7 +2642,7 @@ contract CreditManagerTest is RiskParamsFixture {
         assertEq(incoming.outstandingPrincipal(), loan, "the incoming pool funds the book");
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         assertEq(incoming.socialisedTotal(), loan, "and takes the loss on what it funded");
         assertEq(outgoing.socialisedTotal(), loan, "while the outgoing one keeps only its own");
     }
@@ -2727,7 +2666,7 @@ contract CreditManagerTest is RiskParamsFixture {
 
         // Insurance is empty, so the whole loss has to reach lenders - and cannot.
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         assertEq(credit.unsocialisedLoss(), loan, "remembered, not swallowed");
         assertEq(credit.debtOf(alice), 0, "and the liquidation still completed");
 
@@ -2778,7 +2717,7 @@ contract CreditManagerTest is RiskParamsFixture {
         credit.borrow(loan);
 
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
 
         assertEq(pool.socialisedTotal(), loan / 4, "the pool took what it could");
         assertEq(credit.unsocialisedLoss(), loan - loan / 4, "the rest must be remembered, not erased");
@@ -2800,7 +2739,7 @@ contract CreditManagerTest is RiskParamsFixture {
         vm.prank(alice);
         credit.borrow(loan);
         vm.prank(a);
-        credit.writeDownLoss(alice, loan);
+        credit.writeDownLoss(alice, WRITE_DOWN_ID, loan);
         assertEq(credit.unsocialisedLoss(), loan);
 
         pool.setAccepting(true);
@@ -3137,7 +3076,8 @@ contract CreditManagerTest is RiskParamsFixture {
         // is a deliberate no-op - it exists so the manager's push has somewhere to land, not so a
         // test can read it back. What is being pinned is that the push happens at all.
         vm.expectCall(
-            address(pool), abi.encodeCall(ILenderPool.setLossReserves, (credit.unsocialisedLoss(), credit.insuranceFund()))
+            address(pool),
+            abi.encodeCall(ILenderPool.setLossReserves, (credit.unsocialisedLoss(), credit.insuranceFund()))
         );
 
         vm.prank(makeAddr("sweeper"));

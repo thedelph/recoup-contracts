@@ -49,6 +49,7 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     using SafeERC20 for IERC20;
 
     error NotCreditManager();
+    error NotSelf();
     error ZeroAddress();
     error RenounceDisabled();
     error AuctionAlreadyLive(uint256 auctionId);
@@ -66,6 +67,14 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     error LotChanged(uint256 expected, uint256 actual);
     error PriceAboveCap(uint256 price, uint256 cap);
     error NothingToClaim();
+    /// @notice Everything this contract holds is already spoken for.
+    /// @dev **Audit round 51, item 155.** Both refusals in `sweepWorkoutYieldToInsurance` raised
+    ///      `NothingToClaim` and so carried the identical selector `0x969bf728`, which is exactly
+    ///      the distinction that function's own docstring says it exists to preserve: "a caller
+    ///      told a claim succeeded when none was made is how an ordering constraint hides". An
+    ///      operator reading a revert could not tell "the live manager owes nothing" - retry after
+    ///      an epoch - from "the money is here and belongs to somebody else" - retry after a close.
+    error NothingUnreserved();
     error ZeroAmount();
     error AuctionStillRunning(uint256 finishesAt);
     error WorkoutStillRunning(uint256 forceableAt);
@@ -84,6 +93,12 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     error RiskParamsVaultMismatch(address vaultRiskParams);
     /// @notice The incoming manager reads a different NAV feed to the vault's.
     error CreditManagerNavOracleMismatch(address managerNavOracle);
+    /// @notice Round 55: the incoming manager did not answer one of the members `setCreditManager`
+    ///         probes, or answered with something that is not one word. Two views the door reads
+    ///         (`totalBountyParked`, `yieldAccruedOn`) and two members every exit calls bare on the
+    ///         pointer (`resolveBounty`, `currentDebtOf`). Carries the selector so the operator is
+    ///         told WHICH; the twin of `CollateralVault.AdapterDoesNotAnswer`.
+    error CreditManagerDoesNotAnswer(bytes4 selector);
     /// @notice This auction was built on a different NAV feed to the vault it is bound to.
     error NavOracleVaultMismatch(address vaultNavOracle);
 
@@ -167,10 +182,16 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         uint256 debtAtExpiry;
         uint256 recovered;
         /// @notice Penalty still collectable, fixed at expiry.
-        /// @dev Deriving it from live debt at settlement time meant it was charged
-        ///      *never* rather than once: surplus only exists after the debt is zero, and
-        ///      the borrower can reach that state themselves with a permissionless,
-        ///      never-pausable `repay`. Fixing the base at expiry is the whole fix.
+        /// @dev Charged only out of the surplus of tranches paid through `workoutSettle`, once those
+        ///      tranches have cleared the debt, and carried across tranches so a split recovery is
+        ///      charged once in total and never twice. It is charged on NO other exit: a clean close
+        ///      reached by the borrower's own `repay`, a stranger's `repayFor` or the yield stream
+        ///      clearing the debt books the lot's yield to the borrower and charges nothing; a forced
+        ///      close writes the residual down and charges nothing; `cancel` charges nothing. Fixing the
+        ///      base at expiry closed the case where a tranche-funded surplus was priced off a live debt
+        ///      that had already reached zero; it did not put the penalty on the self-repay path, and
+        ///      nothing does. MEASURED: 31,437,500 fixed at expiry, 31,437,500 after a clean close by
+        ///      `repayFor` (round-52 item 162).
         uint256 penaltyRemaining;
         /// @notice What a forced close wrote off and **nobody was made whole for**, and therefore
         ///         what a late tranche may still repay. Falls as `workoutSettleAfterClose` pays it
@@ -351,6 +372,39 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      insurance by the very call finding 18 is about, and still be owed here.
     uint256 public totalWorkoutYieldOwed;
 
+    /// @notice `totalWorkoutYieldOwed` split by the manager whose `claimableOf(auction)` backs it:
+    ///         the manager that was live when the workout closed cleanly, which is `Workout.bearer`.
+    /// @dev Round-53 item 178. A booking backed on a manager the vault has since moved off is in
+    ///      `totalWorkoutYieldOwed` and NOT in the live manager's `claimableOf + pendingYieldOf`, so
+    ///      the aggregate clamp in `closeWorkout` under-booked the next clean close on the live
+    ///      manager by exactly the detached booking, and `claimWorkoutYield` then paid the earlier
+    ///      borrower out of the later borrower's accrual (MEASURED: bob booked 500,000,000 of
+    ///      999,999,999 earned, alice's own 499,999,999 arriving later with no booking to hold it
+    ///      and swept to insurance). Splitting the sum per backing manager lets the clamp subtract
+    ///      only what is spoken for on the pot it is reading, and lets a claim reserve every OTHER
+    ///      booking while pulling its own bearer's pot as well as the live one.
+    ///
+    ///      The key and `Workout.bearer` cannot diverge: `closeWorkout` reads `creditManager` into
+    ///      one local `cm`, adds to `workoutYieldOwedOn[cm]` on the clean branch and writes
+    ///      `w.bearer = cm` unconditionally after it, in the same call, and `claimWorkoutYield`
+    ///      decrements the entry of `w.bearer`. A Closed workout always has a non-zero bearer.
+    ///
+    ///      **The split's one COST, MEASURED by round 53 and recorded here rather than chased.**
+    ///      The aggregate clamp used to net a foreign bearer's booking off THIS contract's balance
+    ///      as well as off the pot; the split does not. So backing that a stranger has already
+    ///      PUSHED here from a detached manager (`claimSurplusFor(auction)`) before the next lot's
+    ///      era is read by the next clean close as though it were a donation. That only matters
+    ///      when `earned` exceeds the lot's own pot, which only the permissionless settle grind can
+    ///      cause, at one wei per settle per stream: with 499,999,999 pushed and a ground lot
+    ///      earning 729,927,006 against a pot of 729,926,919, the close books 87 wei over, both
+    ///      borrowers are paid 87 wei short, and the two dust bookings stand under `NothingToClaim`
+    ///      both ways, holding `sweepFreeBalanceToInsurance` at `NothingUnreserved` until any later
+    ///      unbooked wei arrives here. Bound: one wei per settle. The `min(...)` alternative that
+    ///      would net the pushed backing back off was refused by reasoning, because with a realised
+    ///      live pull sitting here reserved and a foreign booking unpulled it under-books the close
+    ///      by up to that booking, which is this finding's own shape again and worse than dust.
+    mapping(address => uint256) public workoutYieldOwedOn;
+
     /// @inheritdoc ILiquidationAuction
     /// @dev Incremented on `start` and decremented on every path that settles an
     ///      auction, so the vault can refuse a repoint that would strand work in flight.
@@ -369,6 +423,31 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     mapping(uint256 => Workout) public workouts;
     uint256[] private _openWorkouts;
     mapping(uint256 => uint256) private _workoutIndex; // id → index + 1
+
+    /// @notice The two running sums that price what still-OPEN workouts have already earned, in
+    ///         one view call rather than one per workout.
+    /// @dev **Audit round 51, and the reason it is two scalars and not a loop.** The manager prices
+    ///      an entry as `bonds x (acc - sinceIndex) / ACC_PRECISION` over a SINGLE global
+    ///      accumulator (`CreditManager.yieldAccruedOn`, whose only nonlinearity is one floor and a
+    ///      saturation at `acc <= sinceIndex`), and `accYieldPerBond` is assigned in exactly one
+    ///      place, always as itself plus a non-negative term - so it never falls below an index
+    ///      recorded from it and the saturation arm is unreachable for an open workout. The sum
+    ///      over open workouts is therefore `(acc x SUM(bonds) - SUM(bonds x index)) / PRECISION`,
+    ///      which these two sums carry, and asking `yieldAccruedOn` for
+    ///      `(SUM(bonds), SUM(bonds x index) / SUM(bonds))` evaluates it in one call.
+    ///
+    ///      Both roundings go the same way. A weighted-average index floored down, and one floor
+    ///      over the aggregate instead of one per term, each give at least the sum of the
+    ///      per-workout floors - so this never reserves LESS than a loop would, at most a few wei
+    ///      more, which leaves a few wei unsweepable and nothing unbacked. Under-reserving is the
+    ///      dangerous direction and neither rounding takes it.
+    ///
+    ///      Maintained at the two statements that already own the queue: `expireToWorkout`, which
+    ///      reads the accumulator into `yieldIndexAtOpen` anyway, and `closeWorkout`, beside
+    ///      `_removeOpenWorkout`. `disposeWorkoutLot` cannot run before the close, so `bondCount`
+    ///      is constant across the interval and the subtraction is exact.
+    uint256 private _openWorkoutBonds;
+    uint256 private _openWorkoutIndexWeight;
 
     constructor(
         IERC20 usdc_,
@@ -470,7 +549,14 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // **This adds one check; it does not fix the shape.** Round eighteen's finding is that
         // the rule needs to be "every selector this contract calls bare on this pointer", and
         // the others are still unprobed. That stays open.
-        ICreditManager(creditManager_).totalBountyParked();
+        // **Round-55 item 246(i): NAMED rather than bare, on both probes.** The paragraph above
+        // argued that `onlyOwner` plus the live-work refusal made a loud EMPTY failure free; #482
+        // refuted the same argument for the vault's mirror pair, because empty returndata cannot
+        // tell an operator WHICH selector their manager is missing, and shipped
+        // `AdapterDoesNotAnswer(bytes4)` there. Same shape here, through `_probeManager`. Unlike
+        // the vault's `vault()` probe there is nothing to range-check: both members return a
+        // `uint256`, every 32-byte word is a valid answer, and the value is discarded either way.
+        _probeManager(creditManager_, abi.encodeCall(ICreditManager.totalBountyParked, ()));
 
         // **Audit round 22, finding 18 arrived with a new bare selector, so it arrives with its
         // probe.** `closeWorkout` calls `yieldAccruedOn` bare on this pointer to size what a cleanly
@@ -480,10 +566,85 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // `try`, for the reason the block above gives: this setter is `onlyOwner` and already
         // refuses while any work is live, so failing loudly costs nothing. The arguments are zeroes
         // because the answer is not the point; the selector answering at all is.
-        ICreditManager(creditManager_).yieldAccruedOn(0, 0);
+        // Named for the reason the probe above gives (round-55 item 246(i)).
+        _probeManager(creditManager_, abi.encodeCall(ICreditManager.yieldAccruedOn, (0, 0)));
+
+        // **Round 55: the two selectors EVERY exit shares, probed by shape.** `totalBountyParked`
+        // above is evidence of the storage and not of `resolveBounty`, which is exactly what a
+        // wrong-but-coded address satisfies: a manager answering the five probes above and the two
+        // views the vault reads, but not `resolveBounty`, installs through both doors and can then
+        // open an auction through `start` that `cancel`, `bid` and `expireToWorkout` all revert on -
+        // the state the header calls permanently stranded collateral - after which
+        // `liveAuctionCount` welds every wiring door shut. MEASURED in
+        // `test/R55A01_WorkoutLifecycle.t.sol`.
+        //
+        // Read the SHAPE of the answer, the way `EpochHarvester.setLenderPool` reads its probe: the
+        // genuine manager refuses `resolveBounty(0, false)` by name with four bytes
+        // (`NotLiquidationAuction`) when this setter runs before `CreditManager.setLiquidationAuction`,
+        // and returns silently on an unissued id when it runs after (`parkedBountyOf[0]` is never
+        // written), so the probe is free in either wiring order and moves no state. An address
+        // without the member returns EMPTY, and empty is what is refused. `currentDebtOf` is a
+        // view, so it goes through `_probeManager` like the two above (MEASURED 38 bytes cheaper on
+        // both arms than a bare high-level call); its answer for the zero address is not the point.
+        try ICreditManager(creditManager_).resolveBounty(0, false) {}
+        catch (bytes memory reason) {
+            if (reason.length == 0) revert CreditManagerDoesNotAnswer(ICreditManager.resolveBounty.selector);
+        }
+        _probeManager(creditManager_, abi.encodeCall(ICreditManager.currentDebtOf, (address(0))));
+
+        // **Round-56 item 236: the four members whose absence STRANDS work, probed by name.** A
+        // real manager missing exactly one of them installed through this door, and then (MEASURED
+        // in `test/R56A02_ManagerDoorLegs.t.sol` at `8ab4d88`): without `writeDownLoss` a workout's
+        // forced close reverts empty for good; without `claimableOf` or `pendingYieldOf` any accrual
+        // plus one permissionless `repayFor` makes the clean close revert forever with the forced
+        // branch unreachable; without `accYieldPerBond` an auction can never expire and `liquidate`
+        // refuses after the re-strike window. Each leaves `liveAuctionCount` or `openWorkoutCount`
+        // welding every wiring door, so the refusal has to happen here, before any work exists.
+        //
+        // **Deliberately NOT probed, by decision (2026-09-10):** `repayFor`,
+        // `creditLiquidationProceeds`, `fundInsurance` and `debtOf`, whose absence loses a path but
+        // strands nothing because another exit still ends the work; and the three pointer legs
+        // above, which this door already refuses, only with empty returndata. The three views go
+        // through `_probeManager`; `writeDownLoss` is not a view, so it gets the shape probe below.
+        _probeManagerCall(creditManager_, abi.encodeCall(ICreditManager.writeDownLoss, (address(0), 0, 0)));
+        _probeManager(creditManager_, abi.encodeCall(ICreditManager.claimableOf, (address(0))));
+        _probeManager(creditManager_, abi.encodeCall(ICreditManager.pendingYieldOf, (address(0))));
+        _probeManager(creditManager_, abi.encodeCall(ICreditManager.accYieldPerBond, ()));
 
         creditManager = creditManager_;
         emit CreditManagerSet(creditManager_);
+    }
+
+    /// @dev One completeness probe on the INCOMING manager: the call must succeed and answer exactly
+    ///      one word, or the selector that did not answer is named. Takes the encoded call rather
+    ///      than a bare selector because two of the three members it carries take arguments; the
+    ///      error's selector is the first four bytes of that calldata. `resolveBounty` is not a view
+    ///      and cannot come through a `staticcall`, so it keeps its own `try` above. Low-level for the reason
+    ///      `CollateralVault._probe` gives: a `staticcall` to a codeless account succeeds with empty
+    ///      returndata, and the length check is what turns that into a named refusal. Never used on
+    ///      the outgoing pointer.
+    function _probeManager(address cm, bytes memory data) private view {
+        (bool ok, bytes memory ret) = cm.staticcall(data);
+        // casting to 'bytes4' is safe because truncation to the leading four bytes IS the intent:
+        // every caller passes `abi.encodeCall(...)`, whose first four bytes are the selector this
+        // error has to name, and which is therefore never shorter than four bytes.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (!ok || ret.length != 32) revert CreditManagerDoesNotAnswer(bytes4(data));
+    }
+
+    /// @dev Round-56 item 236: a shape probe for a NON-view member, which cannot come through
+    ///      `_probeManager`'s `staticcall`. The genuine manager refuses every zero-amount call it is
+    ///      given here BY NAME - `NotLiquidationAuction` before `CreditManager.setLiquidationAuction`
+    ///      has run, `ZeroAmount` after - so the probe is free in either wiring order and, reverting,
+    ///      moves no state. Empty returndata is a manager that does not carry the member; a silent
+    ///      success is one that swallows every selector. Both are refused, naming the selector.
+    function _probeManagerCall(address cm, bytes memory data) private {
+        (bool ok, bytes memory ret) = cm.call(data);
+        // casting to 'bytes4' is safe because truncation to the leading four bytes IS the intent:
+        // the one caller passes `abi.encodeCall(...)`, whose first four bytes are the selector this
+        // error has to name, and which is therefore never shorter than four bytes.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (ok || ret.length == 0) revert CreditManagerDoesNotAnswer(bytes4(data));
     }
 
     // ── ILiquidationAuction ──────────────────────────────────────────────────
@@ -564,6 +725,9 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             uint256 restruckNav = navOracle.navPerBond();
             if (restruckNav == 0) revert NavUnset();
 
+            // Casting to `uint96` is safe because `block.timestamp` cannot reach 2**96 seconds, and the
+            // field is packed at `uint96` deliberately to keep the auction struct inside its slots.
+            // forge-lint: disable-next-line(unsafe-typecast)
             stale.startedAt = uint96(block.timestamp);
             stale.bondCount = restruckBonds;
             stale.startNav = restruckNav;
@@ -611,9 +775,26 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // room is tens of basis points, and that is the figure this decision is made
         // against.
         //
-        // The cost is real and accepted: a genuinely collapsing NAV means the auction
-        // is priced too high and does not fill, which routes to the workout path. That
-        // is the designed fallback, not a failure.
+        // The cost is real and accepted, and it has TWO directions - audit round 47 item 82,
+        // because this paragraph named only the first until then.
+        //
+        // Downward: a genuinely collapsing NAV means the auction is priced too high and does
+        // not fill, which routes to the workout path. That is the designed fallback, not a
+        // failure.
+        //
+        // Upward, and it is the borrower who pays: a NAV rise CONFIRMED mid-auction does not
+        // move a live auction's price, so the lot fills against the older, lower `startNav` and
+        // the difference goes to the bidder. MEASURED by a round-46 agent at `8631498` - exactly
+        // 157,187,500 on both sides of the trade, the bidder's saving being the borrower's lost
+        // surplus to the unit. That is a transfer, not a leak: nothing is destroyed and the debt
+        // is covered either way. UNconfirmed moves cannot do it at all, because the freeze bounds
+        // them at one `NAV_MAX_DEVIATION_BPS` step - 250 bps per auction - which is the same
+        // bound `AUCTION_FLOOR_BPS` above is sized against.
+        //
+        // Both directions are working as designed: the freeze is what makes a Dutch price
+        // monotone, and a price that cannot fall under a signed bid also cannot rise under a
+        // borrower. It is stated here so a reader does not conclude the freeze is symmetric in
+        // WHO it costs - it is symmetric in mechanism and asymmetric in incidence.
         uint256 nav = navOracle.navPerBond();
         if (nav == 0) revert NavUnset();
 
@@ -622,6 +803,8 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         auctionId = ++nextAuctionId;
         auctions[auctionId] = Auction({
             borrower: borrower,
+            // Casting to `uint96` is safe because `block.timestamp` cannot reach 2**96 seconds.
+            // forge-lint: disable-next-line(unsafe-typecast)
             startedAt: uint96(block.timestamp),
             caller: caller,
             settled: false,
@@ -651,9 +834,26 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     }
 
     /// @notice Fill at up to `maxPriceUsdc`, whatever the lot has become.
-    /// @dev It cannot be griefed by a borrower topping up mid-auction, and it bounds what an
+    /// @dev It accepts whatever the lot has become rather than pinning it, and it bounds what an
     ///      in-flight transaction can cost. **It does not bound the lot**, which is the other half a
     ///      keeper wants - see the three-argument form below.
+    ///
+    ///      **This said "it cannot be griefed by a borrower topping up mid-auction" until audit
+    ///      round 47 item 83, and measurement refutes that.** Accepting the new lot is not the
+    ///      same as being immune to it. A borrower who deposits **one bond unit** mid-auction
+    ///      raises the whole lot's price by one bond's worth, and `maxPriceUsdc` is the cap a
+    ///      keeper computed against the OLD lot - so this door reverts `PriceAboveCap`. The
+    ///      three-argument form reverts `LotChanged` from its own wrapper on the same deposit,
+    ///      and the one-argument form reverts `LotChanged` out of `_bid`'s pinned branch.
+    ///      **Every bid door refuses.** Executed by a round-46 agent at `8631498`; which error
+    ///      belongs to which door is read straight off the three signatures below and above.
+    ///
+    ///      It is self-financed - the borrower is depositing real collateral they do not get back
+    ///      cheaply - and it does not stop the liquidation, it pushes the position onto the
+    ///      workout path, which is the designed fallback. A keeper's remedy is to requote against
+    ///      the new lot, and every unpinned requote is a fresh cap. But the honest statement is
+    ///      that a determined borrower can refuse bids at a cost to themselves, not that the door
+    ///      cannot be griefed. A price-per-bond door would close it and is UNBUILT.
     function bid(uint256 auctionId, uint256 maxPriceUsdc) external nonReentrant {
         _bid(auctionId, maxPriceUsdc, false);
     }
@@ -862,6 +1062,22 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         usdc.safeTransferFrom(msg.sender, address(this), price);
         uint256 credited = usdc.balanceOf(address(this)) - heldBefore;
         if (credited > price) credited = price;
+        // **Audit round 46: what the settlement distributes is what the bidder actually
+        // delivered, not the nominal price.** Captured here, after the clamp to `price` and before
+        // the hard-ceiling clamp below, because that ceiling exists for `recognisedRecoveryOf`'s
+        // consumer and would be the wrong bound for a sum of payouts.
+        //
+        // `_settleFill` used to be handed `price`, while the delta four lines above was kept only
+        // for the mark. Both sibling inbound legs in this file - `workoutSettle` and
+        // `workoutSettleAfterClose` - measure `received` and distribute `received`, each citing
+        // fee-on-transfer by name, so this leg was the odd one out rather than following a rule.
+        // The premise is the repo's own (`test/R34AccountingIdentity.t.sol`): USDC sits behind a
+        // mutable proxy that could start taking a fee. MEASURED with a token delivering 1% short:
+        // the auction ended holding 6.287500 against a `totalUnclaimedRewards` of 15.718750, a
+        // 9.431250 deficit taken out of the liquidation callers' reserve, and `claimReward`
+        // reverted; at 5% the fill reverted outright, bricking the liquidation path. With
+        // `delivered` the held balance equals `totalUnclaimedRewards` exactly in both cases.
+        uint256 delivered = credited;
         // Clamped at the hard ceiling rather than at the live cap, deliberately. This sits between
         // a `safeTransferFrom` and a `seize`, so an external read here would add a revert path to
         // a frame that is holding somebody's collateral mid-move.
@@ -886,6 +1102,10 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         recognisedRecoveryOf[borrower] = credited;
         _refreshImpairment(auctionId, borrower);
 
+        // ACCEPTED (audit round 44). `seize` moves the borrower's whole bond balance and returns the
+        // count it moved; this fill is priced from `proceeds`, so there is nothing here to compare the
+        // count against and nothing a caller could do with it.
+        // forge-lint: disable-next-line(unused-return)
         _vault.seize(borrower, msg.sender);
 
         // **Cleared here: after the winner's callback, and before the first statement that applies
@@ -912,7 +1132,7 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // residual - rather than an over-mark somebody could be paid at.
         delete recognisedRecoveryOf[borrower];
 
-        _settleFill(auctionId, borrower, cm, price, penaltyDue);
+        _settleFill(auctionId, borrower, cm, delivered, penaltyDue);
 
         // **`liveAuctionCount` is decremented last, and audit round 11 is why.** It used to sit
         // beside `a.settled` above, which is correct effects-before-interactions for a counter
@@ -968,11 +1188,18 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      everything here runs after the winner's callback has already had its turn.
     /// @dev `penaltyDue` is passed in rather than computed here: this runs after the
     ///      winner's callback, so any figure read at this point is attacker-influenced.
-    function _settleFill(uint256 auctionId, address borrower, address cm, uint256 price, uint256 penaltyDue)
+    /// @dev `delivered` is the MEASURED credit from the bidder's transfer, not the nominal
+    ///      `_lotPrice`, and the parameter is named for it so a reader cannot mistake the two.
+    ///      Under an ordinary token they are equal and every existing figure is unchanged. Under a
+    ///      token that delivers short they are not, and distributing the nominal figure spends the
+    ///      liquidation callers' reserve to cover the gap - audit round 46. The
+    ///      `AuctionFilled` payload follows the same rule for the same reason: an indexer must see
+    ///      what the auction was actually paid.
+    function _settleFill(uint256 auctionId, address borrower, address cm, uint256 delivered, uint256 penaltyDue)
         private
     {
-        (uint256 repaid,) = _distribute(auctionId, borrower, cm, price, penaltyDue, true);
-        emit AuctionFilled(auctionId, msg.sender, price, repaid, price - repaid);
+        (uint256 repaid,) = _distribute(auctionId, borrower, cm, delivered, penaltyDue, true);
+        emit AuctionFilled(auctionId, msg.sender, delivered, repaid, delivered - repaid);
     }
 
     /// @dev The one place proceeds are shared out, used by both recovery paths so they
@@ -1004,7 +1231,14 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             // Only reachable when NAV fell further than the floor's coverage margin.
             // This must never revert the fill: a position nobody can buy is strictly
             // worse for lenders than one bought at a loss.
-            ICreditManager(cm).writeDownLoss(borrower, debtNow - repaid);
+            // ACCEPTED (audit round 44). `writeDownLoss` returns how much it socialised; this path
+            // deliberately does not act on it, because - as the comment above says - a write-down must
+            // never revert or alter the fill.
+            // Recorded against this auction's id like a workout's write-down, and nothing reads it
+            // back: a filled auction has no workout, so no `workoutSettleAfterClose` can ever
+            // deliver a recovery under this id. The record is inert, not a door.
+            // forge-lint: disable-next-line(unused-return)
+            ICreditManager(cm).writeDownLoss(borrower, auctionId, debtNow - repaid);
         }
 
         uint256 surplus = proceeds - repaid;
@@ -1323,9 +1557,14 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // to close it. Executed PoC.
         if (lot == 0) revert NothingToAuction(borrower);
         uint256 debt = ICreditManager(cm).currentDebtOf(borrower);
+        // Read once and used twice: the workout's own stamp, and the two running sums that price
+        // every open workout's accrual in one call. Audit round 51.
+        uint256 indexAtOpen = ICreditManager(cm).accYieldPerBond();
 
         workouts[auctionId] = Workout({
             borrower: borrower,
+            // Casting to `uint96` is safe because `block.timestamp` cannot reach 2**96 seconds.
+            // forge-lint: disable-next-line(unsafe-typecast)
             openedAt: uint96(block.timestamp),
             status: WorkoutStatus.Open,
             bondCount: lot,
@@ -1341,9 +1580,11 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             // contract's ledger entry and settled both positions on the way. Before it, the
             // accumulator would be stamped a moment early and this workout would be credited with
             // yield the borrower's own position had already been paid.
-            yieldIndexAtOpen: ICreditManager(cm).accYieldPerBond(),
+            yieldIndexAtOpen: indexAtOpen,
             yieldOwed: 0
         });
+        _openWorkoutBonds += lot;
+        _openWorkoutIndexWeight += lot * indexAtOpen;
         _openWorkouts.push(auctionId);
         workoutsOpenFor[borrower]++;
         _workoutIndex[auctionId] = _openWorkouts.length;
@@ -1429,6 +1670,16 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      function changes, deliberately**: it is permissionless, so a stranger picks the moment
     ///      it runs, and anything new it *did* would be new work a stranger could time. A stored
     ///      figure is not work.
+    ///
+    ///      🟥 **Audit round 55, item 215 is the one exception to that sentence, and it is argued
+    ///      rather than waived.** The forced branch now claims and sweeps this contract's free
+    ///      balance into the insurance fund before `writeDownLoss` reads it, because the reserve
+    ///      round 51 put on both sweeps means the closing lot's own accrual can reach the fund at
+    ///      no other instant, and without it every forced close socialises money the defaulter's
+    ///      own collateral had already earned. The paragraph beside that call makes the case
+    ///      against this docstring in full: both new calls are themselves permissionless, neither
+    ///      takes a destination, and the only figure a stranger's timing moves is one that grows
+    ///      with waiting. The clean branch is unchanged and still does no new work.
     function closeWorkout(uint256 auctionId) external nonReentrant {
         Workout storage w = _openWorkout(auctionId);
         address cm = creditManager;
@@ -1444,15 +1695,80 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         uint256 exposure = w.debtAtExpiry > w.recovered ? w.debtAtExpiry - w.recovered : 0;
         uint256 live = ICreditManager(cm).currentDebtOf(w.borrower);
         uint256 residual = live < exposure ? live : exposure;
+
+        // Off the open-accrual sums, by the same terms that were added: `bondCount` cannot have
+        // moved, because `disposeWorkoutLot` refuses an open workout. Audit round 51 wrote this
+        // pair; **audit round 55, item 215 moved it up here, ahead of the branch**, and the
+        // position is load-bearing rather than tidy. `_openWorkoutAccrual(cm)` sums what still-OPEN
+        // workouts have earned, and the forced branch below now spends this contract's free balance
+        // before the write-down reads the fund. Left in the tail, this lot would still be counted
+        // open at that moment and would reserve its own accrual against itself, so the sweep would
+        // find nothing free and the whole residual would be socialised exactly as before. **So the
+        // reserve must be computed AFTER this pair, not before it**, which is the ordering
+        // `test_R55_215_negative_aSiblingOpenWorkoutsBackingIsNotSpentByTheForcedClose` holds:
+        // decrement too little and the fix is inert, decrement someone else's lot and the forced
+        // close spends a sibling workout's backing. `expireToWorkout` is the only incrementer and
+        // this function the only decrementer, so moving them within this function moves nothing
+        // outside it, and the clean branch reads neither sum.
+        _openWorkoutBonds -= w.bondCount;
+        _openWorkoutIndexWeight -= w.bondCount * w.yieldIndexAtOpen;
+
         if (residual != 0) {
             uint256 forceableAt = w.openedAt + Config.WORKOUT_MAX_DURATION;
             if (block.timestamp < forceableAt) revert WorkoutStillRunning(forceableAt);
+
+            // **Audit round 55, item 215: realise this lot's own accrual into the fund BEFORE the
+            // write-down spends the fund.** MEASURED on the shipped tree, one 100-bond lot in
+            // workout out of 200 staked with a 1,000.000000 epoch streamed during the window and an
+            // empty fund: the lot accrued 499.999999, the residual was 628.750000, `writtenDown`
+            // was the whole 628.750000 and `fromInsurance` was zero - and
+            // `sweepWorkoutYieldToInsurance` one block later handed the fund 499.999999 out of that
+            // same lot, where it stood as insurance against somebody else's default. The funder is
+            // short by exactly what the protocol is long, on every forced close, with no attacker
+            // required.
+            //
+            // It is structural rather than an ordering race, and audit round 51 is why: the reserve
+            // that stops both sweeps taking a live borrower's backing holds an OPEN lot's accrual
+            // back from both doors, so both revert `NothingUnreserved` at any instant before the
+            // close. There is no order of permissionless calls that puts this lot's yield in front
+            // of `writeDownLoss`, because the close is the only moment the lot stops being open.
+            // The pair above is what makes that instant reachable at all.
+            //
+            // **The near miss, recorded so nobody re-derives it as inert.**
+            // `LiquidationAuction.t.sol::test_H_signCheck_sweepingWhatHasArrivedAtTheCloseMovesNothing`
+            // already sign-checked "sweep the free balance before writing off" and MEASURED it
+            // moving nothing, because that fixture streams no yield into the workout. This is the
+            // same shape against the case that fixture did not have: a workout lot stays staked and
+            // keeps earning for up to `WORKOUT_MAX_DURATION`, so its own accrual is always there.
+            //
+            // **Against this function's own standing constraint**, one docstring up: it is
+            // permissionless, so a stranger picks the moment it runs, and anything new it did would
+            // be new work a stranger could time. The counter-argument is the one this function
+            // already makes for the `try ... settle` in the clean branch, and it holds here for the
+            // same three reasons. Both calls are themselves permissionless, so a stranger reaches
+            // nothing through this function they could not reach directly one block later; neither
+            // takes a destination, so there is nothing for a stranger to aim; and both only ever
+            // move money towards the side of the ledger this default damaged. The single figure a
+            // stranger's timing moves is how much the lot has accrued by the close, and that was
+            // already theirs through the close itself - waiting longer accrues MORE, so the timing
+            // a stranger controls cannot be turned against the funder.
+            //
+            // Both optional legs are isolated from loss recognition. The funding subcall includes
+            // its reserve and balance reads, approval, transfer and allowance cleanup: USDC can
+            // refuse APPROVAL while paused, before fundInsurance is reached. Catching only that
+            // middle call leaves the forced close blocked. A failed cleanup must also roll back
+            // the transfer and its approval together, rather than leave an allowance behind.
+            try ICreditManager(cm).claimSurplus() {} catch {}
+            try this.fundInsuranceWithFree(cm) returns (uint256 funded) {
+                if (funded != 0) emit WorkoutYieldSwept(funded);
+            } catch {}
+
             // Only the part no balance sheet was made whole for. The manager returns it rather
             // than this contract re-deriving it from `insuranceFund`: one model, in the contract
             // that owns the split. The insurance-funded part is already sitting in
             // `pendingPrincipal` on its way home, so a later recovery must not repay it a second
             // time - `fundInsurance` is the permissionless destination for anything above this.
-            w.writtenDown = ICreditManager(cm).writeDownLoss(w.borrower, residual);
+            w.writtenDown = ICreditManager(cm).writeDownLoss(w.borrower, auctionId, residual);
         } else {
             // **Audit round 22, finding 18: a clean close is not a default, so its yield is not
             // insurance's.** The design premise for sweeping workout yield to the insurance fund is
@@ -1488,11 +1804,71 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
             // Three view calls and a comparison: still a stored figure, still no new work a stranger
             // could time. The unbacked direction is the only dangerous one - booking too little
             // leaves the residue with insurance, which is where it already went.
+            //
+            // **Audit round 46: settle this contract's own position before the bound is
+            // computed, because one of its three terms is a claim the protocol is allowed to
+            // destroy.** `reachable` below sums `claimableOf` and `pendingYieldOf`. The first is
+            // named by the solvency invariant's `totalClaimable` term and by
+            // `CreditManager.migrateReserves`'s `spokenFor` line, so a migration must leave it
+            // behind. The second is named by nothing - it is exactly the "accrued but not settled"
+            // balance `migrateReserves`'s own docstring says such a holder loses.
+            //
+            // This contract is such a holder by construction: `reassign` parks the lot under this
+            // ledger entry, `disposeWorkoutLot` cannot run until after the close, and nothing in
+            // the protocol settles this position in between. So a clean close normally books the
+            // whole entry against the destructible term, which is the default case rather than an
+            // edge case. MEASURED: a 1,000.000000 epoch booked 999.999999, a sanctioned zero-debt
+            // migration relabelled the same money as the incoming manager's insurance, and both
+            // `claimSurplusFor(auction)` and `claimWorkoutYield` then reverted `NothingToClaim`
+            // forever - round 21's permissionless recovery pair cannot reach it, because
+            // `_claimSurplus` settles first and `_settle` early-returns on a detached manager. The
+            // phantom then sat on the `spokenFor` line below and refused
+            // `sweepFreeBalanceToInsurance` over USDC that was genuinely free.
+            //
+            // Settling moves value between the two terms without changing their sum, so the size of
+            // the booking is unchanged and round 22 finding 18 cannot be reopened in the
+            // under-booking direction. MEASURED at 999999999 either way. Dropping `pendingYieldOf`
+            // from `reachable` instead was REFUSED on measured inputs: at the close in the ordinary
+            // case `claimableOf(this)` and `usdc.balanceOf(this)` are both zero, so `earned` would
+            // clamp to zero and finding 18 would be reopened in full.
+            //
+            // **The `try`, on the ground that is actually true.** The finding argued it is required
+            // because `settle` is `whileAttached` and this function must never be blockable. That
+            // first half does not hold: MEASURED, both doors to a detached manager -
+            // `CollateralVault.setCreditManager` and this contract's `setCreditManager` - revert
+            // `AuctionHasLiveWork` while an open workout stands, so the detached state is not
+            // reachable at the instant this line runs (`test_R46_negative_neitherPointerCanBeDetachedWhileAWorkoutIsOpen`).
+            // 🟥 **THAT GROUND WAS FALSE AND AUDIT ROUND 51 EXECUTED THE REFUTATION.** This comment
+            // read: "the `try` stays on the narrower ground: `settle` reaches `_pushUsdc`, so a USDC
+            // that refuses a transfer to this contract - a blocklist, the mutable proxy this repo
+            // already models - would otherwise brick the exit of last resort", and it dismissed the
+            // original ground, `settle`'s own `whileAttached`, as unreachable. READ: `settle` ->
+            // `_settleLive` -> `_settle`, whose only external calls are `vault.creditManager()`,
+            // `vault.bondCount`, `vault.totalBondCount()`, `_refreshImpairmentOf` and
+            // `_pushLossReserves`, the last two `try`/`catch`ed inside the manager. No `_pushUsdc`
+            // site is reachable from `_settle`; every one of them is in `borrow`, `_claimSurplus`,
+            // `_claimBounty` or `flushPrincipalTo`. EXECUTED with this contract `blocked` on the
+            // token, transfers to and from it reverting: `settle(address(this))` SUCCEEDS,
+            // `claimableOf` becomes non-zero, and this close books the identical figure.
+            //
+            // **The `try` stays and its reason is now the true one:** `settle` carries
+            // `whileAttached`, so a manager detached from the vault reverts it - and that is the
+            // one revert it actually has. The exit of last resort must not depend on the pointer
+            // this function exists to unwind around.
+            //
+            // Against the docstring above - a permissionless function must do no new work a stranger
+            // could time - `settle` is already permissionless, has no destination to choose, only
+            // ever helps the position it settles, and provably does not move any figure computed
+            // here. It is the same call the control measurement made from outside.
+            try ICreditManager(cm).settle(address(this)) {} catch {}
+
             uint256 earned = ICreditManager(cm).yieldAccruedOn(w.bondCount, w.yieldIndexAtOpen);
             if (earned != 0) {
                 // Everything already spoken for comes off first: `totalUnclaimedRewards` belongs to
-                // liquidation callers and `totalWorkoutYieldOwed` to the borrowers of workouts that
-                // closed before this one, so neither is available to back this entry.
+                // liquidation callers and `workoutYieldOwedOn[cm]` to the borrowers of workouts that
+                // closed before this one ON THIS MANAGER, so neither is available to back this entry.
+                // Round-53 item 178: it was `totalWorkoutYieldOwed`, which also counted bookings a
+                // DETACHED manager backs, and those are not in this pot to subtract from.
                 //
                 // Both halves of what the manager still owes this contract. `claimableOf` is
                 // settled and waiting, `pendingYieldOf` is unsettled and accruing, and neither
@@ -1502,6 +1878,13 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
                 // then reserves what is booked before funding insurance, while
                 // `sweepFreeBalanceToInsurance` never touches the manager and so can only ever
                 // take USDC that is already here and already unreserved.
+                //
+                // 🟥 **That last clause reads as a safety property and is not one, which is
+                // round-51 item 154.** `claimWorkoutYield` puts the WHOLE shared pot here one
+                // block earlier with a single `claimSurplus`, so "already here" includes a
+                // still-open workout's backing and "already unreserved" was true only because
+                // nothing reserved it. Both sweeps now reserve `_openWorkoutAccrual` as a third
+                // term, which is what makes the sentence above true rather than merely narrow.
                 uint256 reachable = usdc.balanceOf(address(this))
                     + ICreditManager(cm).claimableOf(address(this))
                     + ICreditManager(cm).pendingYieldOf(address(this));
@@ -1519,28 +1902,42 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
                 // `invariant_everyBookedWorkoutYieldIsBackedByMoneyThatExists` has always asserted;
                 // this line is now the same statement, made one workout at a time.
                 //
-                // **The residual, stated rather than left to be rediscovered.** What is left after
-                // a mid-workout sweep now goes to whichever workout closes first, and a later close
-                // books nothing - MEASURED 400.000000 and 0 in
-                // `test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst`, against
-                // both fully backed when nothing was swept. That is the round-22 residual arriving
-                // somewhere visible rather than a new hazard: the missing money left through the
-                // permissionless `sweepWorkoutYieldToInsurance`, which takes the whole realisable
-                // claim and never advances `yieldIndexAtOpen`. All this clamp decides is who
-                // absorbs a shortfall that has already happened, and ordering is the only answer
-                // available to a function whose own docstring forbids it doing new work. The
-                // alternative is what shipped: paying the later borrower out of insurance's money
-                // or another borrower's.
-                uint256 spokenFor = totalUnclaimedRewards + totalWorkoutYieldOwed;
+                // 🟥 **THE RESIDUAL THIS PARAGRAPH DISCLOSED IS CLOSED, IN ROUND 51, AND IT WAS
+                // A DECISION RATHER THAN A DISCOVERY.** It read: "what is left after a mid-workout
+                // sweep now goes to whichever workout closes first, and a later close books
+                // nothing - MEASURED 400.000000 and 0", and it argued that closing it "means the
+                // sweeps must stop taking yield attributable to lots whose workout is still open",
+                // which contradicted `sweepWorkoutYieldToInsurance`'s own stated premise. That is
+                // exactly what both sweeps now do. Round 51 found a SECOND door onto the same
+                // money, one the paragraph above says cannot exist -
+                // `sweepFreeBalanceToInsurance`, opened by an entitled borrower's ordinary
+                // `claimWorkoutYield` - and a bound that closes one door and not the other is not
+                // a bound.
+                //
+                // **What the decision costs, stated so nobody has to rediscover it either.**
+                // `sweepFreeBalanceToInsurance` is now refused for ANY money, a donation included,
+                // while any workout is open. That is bounded by `WORKOUT_MAX_DURATION` and it is
+                // the price of the reserve: a function that cannot tell a donation from a live
+                // borrower's backing must refuse both.
+                //
+                // **The clamp itself is untouched and is still what backs the booking.** What
+                // changed is that nothing legitimate can now create the shortfall it allocates.
+                // Its arithmetic is still exercised by
+                // `test_R23_04_twoCleanClosesCannotBookTheSameClaimTwice`.
+                uint256 spokenFor = totalUnclaimedRewards + workoutYieldOwedOn[cm];
                 reachable = reachable > spokenFor ? reachable - spokenFor : 0;
                 if (earned > reachable) earned = reachable;
             }
             if (earned != 0) {
                 w.yieldOwed = earned;
                 totalWorkoutYieldOwed += earned;
+                workoutYieldOwedOn[cm] += earned;
                 emit WorkoutYieldOwedToBorrower(auctionId, w.borrower, earned);
             }
         }
+
+        // The open-accrual sums came off ahead of the branch, and the comment there says why the
+        // position is load-bearing. Audit round 51 wrote them; audit round 55 moved them.
 
         // **Audit round 22, finding 8.** Written on every close, not only the forced one, because
         // the field means "the manager this workout is settled against" and a clean close has one
@@ -1631,7 +2028,10 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
 
         // Leaves no standing allowance, matching every other outbound leg here.
         usdc.forceApprove(cm, received);
-        ICreditManager(cm).recoverWrittenDownLoss(w.borrower, received);
+        // The manager resolves the bearer from `(this auction, auctionId)`, the record written
+        // when THIS workout's loss was recognised, so a later default by the same borrower under
+        // another id cannot redirect this one's recovery.
+        ICreditManager(cm).recoverWrittenDownLoss(w.borrower, auctionId, received);
         usdc.forceApprove(cm, 0);
 
         // No `_refreshImpairment`. The close already released the mark and the borrower has no
@@ -1657,26 +2057,33 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         address cm = creditManager;
         if (cm == address(0)) revert CreditManagerUnset();
 
-        uint256 balanceBefore = usdc.balanceOf(address(this));
+        // **Audit round 51, item 155: the refusal this call used to make for itself is made by
+        // `claimSurplus` and could never be reached from here.** The bare call reverts
+        // `CreditManager.NothingToClaim()` at a zero claim, and `_pushUsdc` goes through
+        // `SafeERC20`, so a call that returns has always moved a non-zero amount into this
+        // contract. That is why `if (swept == 0) revert NothingToClaim();` and the two balance
+        // reads it needed are gone. The ordering constraint the old comment protected is
+        // protected by the manager's own revert, unchanged, one frame down - and this function is
+        // still separate from its sibling for that reason.
         ICreditManager(cm).claimSurplus();
-        uint256 swept = usdc.balanceOf(address(this)) - balanceBefore;
-        // Unchanged, and deliberately measured on the *claim* rather than on what is swept below: a
-        // caller told a claim succeeded when the live manager owed nothing is how an ordering
-        // constraint hides, which is the reason this function is separate from its sibling at all.
-        if (swept == 0) revert NothingToClaim();
 
         // The two carried balances come off the top. `totalUnclaimedRewards` is what liquidation
         // callers are owed; `totalWorkoutYieldOwed` is what borrowers of cleanly-closed workouts
         // are. Both may already be sitting here from an earlier pull, so the bound is on the
         // balance rather than on this call's delta.
-        uint256 owed = totalUnclaimedRewards + totalWorkoutYieldOwed;
-        uint256 balance = usdc.balanceOf(address(this));
-        if (balance <= owed) revert NothingToClaim();
-        uint256 free = balance - owed;
-
-        usdc.forceApprove(cm, free);
-        ICreditManager(cm).fundInsurance(free);
-        usdc.forceApprove(cm, 0);
+        //
+        // Audit round 51: the third term is what still-OPEN workouts have earned. Without it this
+        // line reserves only what is BOOKED, and a lot whose workout has not closed yet is booked
+        // nowhere - so this function funded insurance out of a live borrower's backing.
+        //
+        // Audit round 55, item 215: those three terms and the delivery moved into
+        // `_fundInsuranceWithFree`, shared verbatim with the sibling sweep below and with
+        // `closeWorkout`'s forced branch, so the three cannot drift on the reserve. **This door
+        // keeps its own refusal and its own event**, which is the whole reason it is a separate
+        // function from its sibling: a caller told a sweep succeeded when nothing moved is how an
+        // ordering constraint hides, and `NothingUnreserved` is asserted here by name.
+        uint256 free = _fundInsuranceWithFree(cm);
+        if (free == 0) revert NothingUnreserved();
         emit WorkoutYieldSwept(free);
     }
 
@@ -1708,16 +2115,33 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         if (cm != address(0)) {
             try ICreditManager(cm).claimSurplus() {} catch {}
         }
+        address bearer = w.bearer;
+        if (bearer != cm) {
+            try ICreditManager(bearer).claimSurplus() {} catch {}
+        }
 
-        // Never out of the liquidation callers' rewards, which are owed to somebody else.
+        // Never out of the liquidation callers' rewards, which are owed to somebody else, and -
+        // audit round 51 - never out of what a still-OPEN workout's lot has already earned. The
+        // `claimSurplus` above realises the whole shared pot, this borrower's share and every open
+        // workout's alike, so without the second term this payment can be met out of a live
+        // borrower's backing.
+        //
+        // Round-53 item 178: never out of what OTHER closed workouts are booked either. Under one
+        // manager every booking was clamped at its close over the same pot, so this term was
+        // harmless; across a migration a booking backed on a detached manager is in the sum and not
+        // in the live pot, and without it this payment was met out of a later borrower's accrual.
+        // The pull from `w.bearer` above is what makes that reserve satisfiable: this claim realises
+        // its own backing rather than waiting for a stranger's `claimSurplusFor(auction)`.
         uint256 balance = usdc.balanceOf(address(this));
-        uint256 reserved = totalUnclaimedRewards;
+        uint256 reserved = totalUnclaimedRewards + (totalWorkoutYieldOwed - owed);
+        if (cm != address(0)) reserved += _openWorkoutAccrual(cm);
         uint256 available = balance > reserved ? balance - reserved : 0;
         if (available == 0) revert NothingToClaim();
         uint256 pay = owed > available ? available : owed;
 
         w.yieldOwed = owed - pay;
         totalWorkoutYieldOwed -= pay;
+        workoutYieldOwedOn[bearer] -= pay;
         emit WorkoutYieldClaimed(auctionId, w.borrower, pay);
         usdc.safeTransfer(w.borrower, pay);
     }
@@ -1741,8 +2165,12 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      figure that made the property checkable in one read.
     ///
     ///      Kept separate from the sweep above rather than folded into it, because that one
-    ///      must keep reverting `NothingToClaim` when the live manager owes nothing - a caller
-    ///      told a claim succeeded when none was made is how an ordering constraint hides.
+    ///      must keep REVERTING when the live manager owes nothing - a caller told a claim
+    ///      succeeded when none was made is how an ordering constraint hides. Since round 51 that
+    ///      revert is the MANAGER's `CreditManager.NothingToClaim`, bubbled out of the bare
+    ///      `claimSurplus()` at the top of the sibling; this contract's own `NothingToClaim` is no
+    ///      longer raised there. The two errors share the selector `0x969bf728`, so a test that
+    ///      names the wrong contract still passes, which is why the contract is named here.
     function sweepFreeBalanceToInsurance() external nonReentrant {
         address cm = creditManager;
         if (cm == address(0)) revert CreditManagerUnset();
@@ -1750,15 +2178,67 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
         // `totalWorkoutYieldOwed` joined this line in audit round 22, finding 18, for the reason
         // `totalUnclaimedRewards` was always on it: it is USDC this contract holds on a named
         // party's behalf, so it is not free.
-        uint256 owed = totalUnclaimedRewards + totalWorkoutYieldOwed;
+        //
+        // Audit round 51 added the third term for the same reason and against a stronger claim.
+        // `closeWorkout`'s own note says this function "never touches the manager and so can only
+        // ever take USDC that is already here and already unreserved" - true, and not the safety
+        // property it reads as, because `claimWorkoutYield` puts the whole shared pot HERE one
+        // block earlier. An open workout's accrual is held on a named party's behalf too.
+        //
+        // Audit round 55, item 215: the arithmetic and the delivery are now one shared copy in
+        // `_fundInsuranceWithFree`. This door keeps its own `NothingUnreserved` and its own
+        // distinct `FreeBalanceSwept`, so the two sweeps stay tellable apart in a log.
+        uint256 free = _fundInsuranceWithFree(cm);
+        if (free == 0) revert NothingUnreserved();
+        emit FreeBalanceSwept(free);
+    }
+
+    /// @notice Internal-only subcall that makes optional workout funding atomic.
+    /// @dev Only `closeWorkout` calls this through `this`, so every failure inside the strict
+    ///      helper can be caught without rolling back the close. The caller already holds the
+    ///      reentrancy guard; adding `nonReentrant` here would refuse every legitimate subcall.
+    ///      No other caller, including the owner or a token callback, can use this door.
+    function fundInsuranceWithFree(address cm) external returns (uint256) {
+        if (msg.sender != address(this)) revert NotSelf();
+        return _fundInsuranceWithFree(cm);
+    }
+
+    /// @dev **Audit round 55, item 215.** Everything this contract holds beyond what is spoken for
+    ///      - liquidation callers' rewards, booked clean-close yield, and every still-OPEN
+    ///      workout's accrual - handed to the live manager's insurance fund. One copy of the
+    ///      three-term reserve and of the approve/deliver/revoke leg, shared by the two
+    ///      caller-facing sweeps above and by `closeWorkout`'s forced branch, so no two of the
+    ///      three can drift on what "free" means. The two sweeps held nine identical lines each
+    ///      before this extraction, which is why the contract got smaller rather than larger.
+    ///
+    ///      **The middle term is the AGGREGATE `totalWorkoutYieldOwed`, deliberately, and NOT
+    ///      `workoutYieldOwedOn[cm]`.** Round-53 item 178 split the per-manager ledger so that a
+    ///      clean close clamps its booking against the pot its own bearer actually backs; that is a
+    ///      question about how much may be BOOKED, and it is untouched here - the forced branch
+    ///      books nothing into `workoutYieldOwedOn`. This is the other question: how much of the
+    ///      cash sitting here is already owed to a named party. A booking made against a bearer
+    ///      that has since been detached is real money owed to a real borrower even though the live
+    ///      pot does not back it, so it must stay reserved on this line or this contract funds
+    ///      insurance out of it. Narrowing this term to the live manager's slice would hand a
+    ///      detached bearer's borrower's money to the fund.
+    ///
+    ///      `_openWorkoutAccrual(cm)` reads `_openWorkoutBonds`, so a caller inside `closeWorkout`
+    ///      must take the closing lot off that sum BEFORE calling here, or the lot reserves its own
+    ///      accrual against itself and this returns zero. The comment above that decrement pair
+    ///      states the same constraint from the other side.
+    /// @param cm The live credit manager, never `address(0)`: all three callers check first.
+    /// @return free What was handed over, or zero when nothing was unreserved. Every failure
+    ///         reverts; only the forced close catches it through the external only-self subcall.
+    function _fundInsuranceWithFree(address cm) private returns (uint256 free) {
+        uint256 owed = totalUnclaimedRewards + totalWorkoutYieldOwed + _openWorkoutAccrual(cm);
         uint256 balance = usdc.balanceOf(address(this));
-        if (balance <= owed) revert NothingToClaim();
-        uint256 free = balance - owed;
+        if (balance <= owed) return 0;
+        free = balance - owed;
 
         usdc.forceApprove(cm, free);
         ICreditManager(cm).fundInsurance(free);
+        // The whole subcall rolls back if cleanup fails, including the funding and approval.
         usdc.forceApprove(cm, 0);
-        emit FreeBalanceSwept(free);
     }
 
     /// @notice Hand a closed workout's lot out of the vault, for redemption or sale.
@@ -1779,6 +2259,8 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     ///      redemption counterparty on a written-off workout, the borrower on one that
     ///      closed clean. Under a timelock this is a 48h operation, which is the right
     ///      cadence for a redemption quoted at "48h+" anyway.
+    // FALSE (audit round 44). `onlyOwner` is a storage read and a revert with no external call.
+    // forge-lint: disable-next-line(non-reentrant-not-first)
     function disposeWorkoutLot(uint256 auctionId, address to) external onlyOwner nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         Workout storage w = workouts[auctionId];
@@ -1817,6 +2299,23 @@ contract LiquidationAuction is ILiquidationAuction, ERC1155Holder, Ownable, Reen
     function _openWorkout(uint256 auctionId) private view returns (Workout storage w) {
         w = workouts[auctionId];
         if (w.status != WorkoutStatus.Open) revert WorkoutNotOpen(auctionId);
+    }
+
+    /// @dev What the lots of still-OPEN workouts have already earned, and therefore what neither
+    ///      sweep nor an earlier borrower's claim may take. Audit round 51: `claimWorkoutYield`
+    ///      realises the WHOLE `claimableOf(auction)` pot with one `claimSurplus`, and that pot is
+    ///      shared by every lot this contract holds - so an entitled borrower's ordinary claim
+    ///      moves a still-open workout's backing out of the manager, where the two sweeps provably
+    ///      could not reach it, and into raw balance, where both of them can. Reserving it is the
+    ///      only bound that closes BOTH doors, since `sweepWorkoutYieldToInsurance` reaches the
+    ///      same money directly with no claim in front of it at all.
+    ///
+    ///      One external call whatever the queue holds. See `_openWorkoutBonds` for why the two
+    ///      running sums are exactly equivalent to a loop, and which way the two roundings go.
+    function _openWorkoutAccrual(address cm) private view returns (uint256) {
+        uint256 bonds = _openWorkoutBonds;
+        if (bonds == 0) return 0;
+        return ICreditManager(cm).yieldAccruedOn(bonds, _openWorkoutIndexWeight / bonds);
     }
 
     /// @dev Swap and pop, so the queue stays a bounded read for a keeper scanning it.

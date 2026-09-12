@@ -645,54 +645,148 @@ contract CanonicalCashModelHandler is Test {
     CanonicalCashModel public immutable model;
     uint256 public protocolEntryDeficitMismatches;
 
+    /**
+     * ── REACHABILITY GHOSTS ───────────────────────────────────────────────────────────────────
+     *
+     * One counter per state an invariant on the campaign contract discriminates on, so a green
+     * campaign can be told apart from a campaign that never left the corner `setUp` seeds it in.
+     * An earlier audit round found `CreditManager.invariants` running 128,000 calls apiece against
+     * a protocol that could not reach a single borrow, for six days: none of those invariants was
+     * wrong, every one still passed once debt was reachable, and what was wrong was the claim that
+     * they had been TESTED.
+     *
+     * Every counter here is read by `test_handlerCanReachEveryStateTheInvariantsCheck` on the
+     * campaign contract below. An unread ghost reads as coverage that is not there, and the
+     * repository's documented-claims check fails the build on one.
+     */
+    uint256 public actionsObserved;
+    uint256 public principalOutstandingStates;
+    uint256 public claimableStates;
+    uint256 public unreleasedYieldStates;
+    uint256 public frozenYieldStates;
+    uint256 public cashDeficitStates;
+    uint256 public claimLiquidityDeficitStates;
+    uint256 public entryPriceDeficitStates;
+    uint256 public claimSolvencyDeficitStates;
+    uint256 public belowMinimumSupplyStates;
+    uint256 public emptyPoolStates;
+    uint256 public openEntryStates;
+    uint256 public donationsDone;
+    uint256 public destructionsDone;
+    uint256 public exhaustiveExitsDone;
+    uint256 public claimCoversDone;
+    uint256 public entryCoversDone;
+    /// @dev Round 46, item 73. Entry attempts made while a deficit stood, and the ones the model
+    ///      ACCEPTED. `invariant_unresolvedDeficitsCloseEntry` used to assert only that
+    ///      `maxDeposit()` read zero under a deficit, which is that view's own first line and held
+    ///      over arbitrary storage; the door is what an entrant meets, so the door is what is
+    ///      knocked on. The first is the denominator, the second must stay zero.
+    uint256 public entryProbesUnderDeficit;
+    uint256 public entryAcceptedUnderDeficit;
+
+    /**
+     * The most load-bearing counter in this file.
+     *
+     * `invariant_protocolControlledCashFlowsCannotManufactureAnEntryPriceDeficit` asserts that
+     * `protocolEntryDeficitMismatches` is zero, and until this counter existed nothing in the tree
+     * could tell "no protocol flow ever manufactured a deficit" apart from "no protocol flow was
+     * ever measured for one". A mismatch counter reading zero because its recorder never ran is
+     * the exact shape of a vacuously green invariant, and it is the shape that hides best: the
+     * assertion looks like a statement about the protocol when it is also one about the handler.
+     *
+     * **Round-50 item 143 asked whether this counter carries the two-population defect its
+     * `LenderPool.invariants.t.sol` namesake had, and MEASURED that it does not.** There the same
+     * counter was fed both by an arm running after every watched action and by an arm inside
+     * `stressLossRefill`, so its tripwire was satisfied by the first deposit and said nothing about
+     * the boundary; there it is now split in two. Here every increment comes through
+     * `_recordProtocolEntryDeficit`, whose eight callers - `lend`, `repay`, `socialiseLoss`,
+     * `redeem`, `service`, `claim`, `redeemAll` and `serviceAll` - are ONE population by
+     * construction: protocol-controlled cash flows that began with no entry-price deficit, which is
+     * exactly the domain the mismatch counter is about. So it stays one counter. What changed is
+     * that its two assertions now say what it counts rather than "the recorder never ran", which is
+     * the wording that let the sibling's defect hide.
+     */
+    uint256 public protocolEntryDeficitChecks;
+
+    /// @dev Runs `_observe()` after the body, including after a guard's early `return`. That is
+    ///      verified by execution rather than assumed - a Solidity `return` inside a modified
+    ///      function continues into the modifier's post-code - so the census covers refused draws
+    ///      as well as accepted ones, which is what makes "the guard was hit" measurable.
+    modifier watched() {
+        _;
+        _observe();
+    }
+
     constructor(CanonicalCashModel model_) {
         model = model_;
     }
 
-    function deposit(uint96 seed) external {
+    /**
+     * 🟥 **`maxDeposit() != 0` does NOT make every amount below it depositable, and this handler
+     * assumed it did for the life of the campaign.** Shares are floored, so an amount under the
+     * share-rounding floor mints zero and `deposit` reverts `DepositClosed` - the same selector
+     * the entry-closed guards use, which is why it reads as a closed door rather than as dust.
+     *
+     * It was unreachable until round 44 made the low-supply half reachable, and then
+     * `invariant_theHandlerNeverDropsAFrame` caught it on the first campaign that could get there:
+     * ONE revert in 14,143 calls, `0xe00c8ecd`, on a `deposit` drawn after four `serviceAll`s had
+     * moved nearly the whole book into the fixed claim. Every other invariant in this file ran the
+     * same sequence and reported green, because under the global `fail_on_revert = false` a
+     * reverting handler call is DISCARDED - which is the entire argument for the frame guard.
+     */
+    function deposit(uint96 seed) external watched {
         uint256 maximum = model.maxDeposit();
         if (maximum == 0) return;
         uint256 top = maximum < MAX_FLOW ? maximum : MAX_FLOW;
-        model.deposit(bound(uint256(seed), 1, top));
+        uint256 assets = bound(uint256(seed), 1, top);
+        if (model.previewDeposit(assets) == 0) return;
+        model.deposit(assets);
     }
 
-    function mint(uint96 seed) external {
+    /// @dev The same asymmetry from the other side: `previewMint` rounds the cost UP, so a share
+    ///      count inside `maxMint()` can still cost more assets than `maxDeposit()` allows.
+    function mint(uint96 seed) external watched {
         uint256 maximum = model.maxMint();
         if (maximum == 0) return;
         uint256 top = maximum < MAX_FLOW * 1_000 ? maximum : MAX_FLOW * 1_000;
-        model.mint(bound(uint256(seed), 1, top));
+        uint256 shares = bound(uint256(seed), 1, top);
+        uint256 cost = model.previewMint(shares);
+        if (cost == 0 || cost > model.maxDeposit()) return;
+        model.mint(shares);
     }
 
-    function donate(uint96 seed) external {
+    function donate(uint96 seed) external watched {
         model.donate(bound(uint256(seed), 1, MAX_FLOW));
+        ++donationsDone;
     }
 
-    function destroyCash(uint96 seed) external {
+    function destroyCash(uint96 seed) external watched {
         uint256 raw = model.rawCash();
         if (raw == 0) return;
         model.destroyCash(bound(uint256(seed), 1, raw));
+        ++destructionsDone;
     }
 
-    function reconcileCashDeficit() external {
+    function reconcileCashDeficit() external watched {
         model.reconcileCashDeficit();
     }
 
-    function addActiveGain(uint96 amountSeed, uint32 durationSeed) external {
+    function addActiveGain(uint96 amountSeed, uint32 durationSeed) external watched {
         uint256 amount = bound(uint256(amountSeed), 1, MAX_FLOW);
         uint256 duration = bound(uint256(durationSeed), 1 hours, 30 days);
         model.addActiveGain(amount, duration);
     }
 
-    function addFrozenGain(uint96 seed) external {
+    function addFrozenGain(uint96 seed) external watched {
         model.addFrozenGain(bound(uint256(seed), 1, MAX_FLOW));
     }
 
-    function activateFrozen(uint32 durationSeed) external {
+    function activateFrozen(uint32 durationSeed) external watched {
         if (model.pendingYield() == 0 || model.yieldRate() != 0) return;
         model.activateFrozen(bound(uint256(durationSeed), 1 hours, 30 days));
     }
 
-    function lend(uint96 seed) external {
+    function lend(uint96 seed) external watched {
         model.reconcileCashDeficit();
         uint256 available = model.available();
         if (available == 0 || model.totalSupply() < model.minimumSupply() || model.claimLiquidityDeficit() != 0) {
@@ -703,13 +797,13 @@ contract CanonicalCashModelHandler is Test {
         _recordProtocolEntryDeficit(deficitBefore);
     }
 
-    function repay(uint96 seed) external {
+    function repay(uint96 seed) external watched {
         uint256 principal = model.outstandingPrincipal();
         uint256 top = principal == 0 ? MAX_FLOW : principal > type(uint96).max / 2 ? type(uint96).max : principal * 2;
         model.repay(bound(uint256(seed), 1, top), STREAM);
     }
 
-    function socialiseLoss(uint96 seed) external {
+    function socialiseLoss(uint96 seed) external watched {
         model.reconcileCashDeficit();
         uint256 principal = model.outstandingPrincipal();
         if (principal == 0) return;
@@ -718,7 +812,7 @@ contract CanonicalCashModelHandler is Test {
         _recordProtocolEntryDeficit(deficitBefore);
     }
 
-    function redeem(uint96 seed) external {
+    function redeem(uint96 seed) external watched {
         model.reconcileCashDeficit();
         uint256 maximum = model.maxRedeem();
         if (maximum == 0) return;
@@ -727,7 +821,7 @@ contract CanonicalCashModelHandler is Test {
         _recordProtocolEntryDeficit(deficitBefore);
     }
 
-    function service(uint96 seed) external {
+    function service(uint96 seed) external watched {
         model.reconcileCashDeficit();
         uint256 maximum = model.maxRedeem();
         if (maximum == 0) return;
@@ -736,7 +830,7 @@ contract CanonicalCashModelHandler is Test {
         _recordProtocolEntryDeficit(deficitBefore);
     }
 
-    function claim(uint96 seed) external {
+    function claim(uint96 seed) external watched {
         model.reconcileCashDeficit();
         uint256 claimable = model.totalClaimable();
         if (claimable == 0 || model.claimLiquidityDeficit() != 0) return;
@@ -745,22 +839,24 @@ contract CanonicalCashModelHandler is Test {
         _recordProtocolEntryDeficit(deficitBefore);
     }
 
-    function coverClaimDeficit(uint96 seed) external {
+    function coverClaimDeficit(uint96 seed) external watched {
         model.reconcileCashDeficit();
         uint256 deficit = model.claimSolvencyDeficit();
         if (deficit == 0) return;
         model.coverClaimDeficit(bound(uint256(seed), 1, deficit));
+        ++claimCoversDone;
     }
 
-    function coverEntryPriceDeficit(uint96 seed) external {
+    function coverEntryPriceDeficit(uint96 seed) external watched {
         model.reconcileCashDeficit();
         if (model.claimLiquidityDeficit() != 0) return;
         uint256 deficit = model.entryPriceDeficit();
         if (deficit == 0) return;
         model.coverEntryPriceDeficit(bound(uint256(seed), 1, deficit));
+        ++entryCoversDone;
     }
 
-    function deliverEpochYield(uint96 offeredSeed, uint32 durationSeed) external {
+    function deliverEpochYield(uint96 offeredSeed, uint32 durationSeed) external watched {
         model.reconcileCashDeficit();
         if (model.totalSupply() < model.minimumSupply() && model.claimSolvencyDeficit() == 0) return;
         uint256 offered = bound(uint256(offeredSeed), 1, MAX_FLOW);
@@ -768,12 +864,141 @@ contract CanonicalCashModelHandler is Test {
         model.deliverEpochYield(offered, duration);
     }
 
-    function advance(uint32 seed) external {
+    function advance(uint32 seed) external watched {
         skip(bound(uint256(seed), 1, 7 days));
     }
 
+    /**
+     * ── THE EXHAUSTIVE DRAWS, AND WHY A `uint96` SEED IS NOT ONE ──────────────────────────────
+     *
+     * `redeem`, `service` and `destroyCash` each draw `bound(uint256(seed), 1, maximum)` from a
+     * `uint96`. Where `maximum` is small that is a uniform draw over the whole range. Where it is
+     * not, it is a uniform draw over a range whose TOP the seed cannot reach, and the top is the
+     * only end that matters here.
+     *
+     * MEASURED on the post-`setUp` fixture, which is what makes this a defect rather than a
+     * stylistic note: `totalSupply` is 8.69e38 and `maxRedeem()` is 8.69e38, against a `uint96`
+     * ceiling of 7.92e28. One `redeem` can therefore burn at most 9.1e-11 of the supply, 500 of
+     * them cannot move it by a millionth, and every guard below `MIN_SUPPLY` is unreachable by
+     * construction rather than by luck. `destroyCash` has the same shape from the other side:
+     * `rawCash` is 2.5e10, so "destroy all of it" is one draw in 2.5e10.
+     *
+     * These three pass the maximum directly. A 64-run unseeded census before they existed reached
+     * none of `claimLiquidityDeficit`, `claimSolvencyDeficit` or an empty pool in 32,000 calls;
+     * the campaign was not vacuous, but a third of what its invariants discriminate on was
+     * outside the handler's reach. The counters they move are asserted in the tripwire.
+     */
+    function redeemAll() external watched {
+        model.reconcileCashDeficit();
+        uint256 maximum = model.maxRedeem();
+        if (maximum == 0) return;
+        uint256 deficitBefore = model.entryPriceDeficit();
+        model.redeem(maximum);
+        ++exhaustiveExitsDone;
+        _recordProtocolEntryDeficit(deficitBefore);
+    }
+
+    function serviceAll() external watched {
+        model.reconcileCashDeficit();
+        uint256 maximum = model.maxRedeem();
+        if (maximum == 0) return;
+        uint256 deficitBefore = model.entryPriceDeficit();
+        model.service(maximum);
+        ++exhaustiveExitsDone;
+        _recordProtocolEntryDeficit(deficitBefore);
+    }
+
+    /// @dev External destruction is not protocol-controlled, so it deliberately does NOT record
+    ///      an entry-deficit mismatch: manufacturing a price deficit is exactly what an external
+    ///      loss is allowed to do, and `invariant_unresolvedDeficitsCloseEntry` is what states
+    ///      the consequence.
+    function destroyAllCash() external watched {
+        uint256 raw = model.rawCash();
+        if (raw == 0) return;
+        model.destroyCash(raw);
+        ++destructionsDone;
+    }
+
+    /// @dev The door under a deficit. Every other entry action returns early on `maxDeposit() == 0`
+    ///      and so never asks the model to refuse; this one asks, for one asset-wei and one share,
+    ///      whenever any of the three deficits stands. An acceptance is the finding; a refusal
+    ///      with either selector is the designed answer and is not distinguished here.
+    function probeEntryUnderDeficit() external watched {
+        if (model.cashDeficit() == 0 && model.claimLiquidityDeficit() == 0 && model.entryPriceDeficit() == 0) return;
+        ++entryProbesUnderDeficit;
+        try model.deposit(1) {
+            ++entryAcceptedUnderDeficit;
+        } catch {}
+        try model.mint(1) {
+            ++entryAcceptedUnderDeficit;
+        } catch {}
+    }
+
     function _recordProtocolEntryDeficit(uint256 deficitBefore) private {
-        if (deficitBefore == 0 && model.entryPriceDeficit() != 0) ++protocolEntryDeficitMismatches;
+        if (deficitBefore != 0) return;
+        ++protocolEntryDeficitChecks;
+        if (model.entryPriceDeficit() != 0) ++protocolEntryDeficitMismatches;
+    }
+
+    /**
+     * The whole state census, evaluated once at the tail of every action.
+     *
+     * 🟥 **No `assert*` may ever appear in here, and nothing in here may revert.** The rule behind
+     * that is ASYMMETRIC and must not be restated in either blanket form - MEASURED on forge
+     * 1.8.1, 2026-09-09. A THREE-argument forge-std assertion inside a handler reverts with the
+     * assertion's own message, is indistinguishable from an ordinary business revert, and under
+     * the global `fail_on_revert = false` is DISCARDED SILENTLY. A TWO-argument one reverts with a
+     * string beginning "assertion failed", which forge 1.8.1 picks out of the discarded frame and
+     * reports as `failure_type: "handler_assertion"`, naming the handler and the selector.
+     * 🟥 **A MESSAGE IS SUFFICIENT to make an in-handler assertion invisible; ITS ABSENCE IS NOT
+     * SUFFICIENT to guarantee reporting** - a message-less `assertEq` inside
+     * `RegistryHandler.register`'s catch block went unreported at
+     * `(runs: 256, calls: 128000, reverts: 62346)`, and THAT READING IS UNEXPLAINED. Position, and
+     * possibly the campaign, is a third variable nobody has isolated, so the ban here is stated
+     * over `assert*` as a whole rather than over the messaged form only. Every assertion this
+     * campaign would want here carries a message anyway, which is the suppressing half.
+     * `CreditHandler.firstBrokenProperty` in `CreditManager.invariants.t.sol` carries the fullest
+     * statement of the same rule.
+     *
+     * Reads and `++` only; every assertion over these counters lives on the campaign contract.
+     *
+     * Two cost decisions, stated rather than left to be re-derived:
+     *
+     *  - `maxDeposit()` is NOT called. It runs `previewMint` and `previewDeposit`, and this
+     *    function runs on all 128,000 calls of every one of the campaign's invariants. What
+     *    `openEntryStates` counts instead is the cheap conjunction of `maxDeposit`'s four early
+     *    returns that are already read here anyway - the three deficits and cap headroom. **That
+     *    is a necessary, not a sufficient, condition**: it cannot see the share-room and
+     *    `previewDeposit(headroom) == 0` arms, so the ghost can over-count relative to the branch
+     *    `invariant_entryMaximaStayInsideTheAbsoluteShareCeiling` actually takes. The tripwire
+     *    closes that gap by asserting the exact `model.maxDeposit() != 0` deterministically.
+     *  - `effectiveUnreleasedYield()` IS called, because nothing cheaper distinguishes the state
+     *    `invariant_claimsAndYieldNeverBecomeLendable` and `invariant_availableWithholds...` turn
+     *    on: `pendingYield != 0` is not the same predicate once a cash deficit has eaten it.
+     */
+    function _observe() private {
+        ++actionsObserved;
+
+        uint256 supply = model.totalSupply();
+        uint256 principal = model.outstandingPrincipal();
+        if (principal != 0) ++principalOutstandingStates;
+        if (model.totalClaimable() != 0) ++claimableStates;
+        if (model.effectiveUnreleasedYield() != 0) ++unreleasedYieldStates;
+        if (model.pendingYield() != 0 && model.yieldRate() == 0) ++frozenYieldStates;
+        if (supply < model.minimumSupply()) ++belowMinimumSupplyStates;
+        if (supply == 0 && principal == 0) ++emptyPoolStates;
+
+        uint256 cash = model.cashDeficit();
+        uint256 liquidity = model.claimLiquidityDeficit();
+        uint256 entry = model.entryPriceDeficit();
+        if (cash != 0) ++cashDeficitStates;
+        if (liquidity != 0) ++claimLiquidityDeficitStates;
+        if (entry != 0) ++entryPriceDeficitStates;
+        if (model.claimSolvencyDeficit() != 0) ++claimSolvencyDeficitStates;
+
+        if (cash == 0 && liquidity == 0 && entry == 0 && model.depositCapUsage() < model.depositCap()) {
+            ++openEntryStates;
+        }
     }
 }
 
@@ -808,43 +1033,26 @@ contract CanonicalCashModelInvariants is Test {
         revert("stateful numeric-boundary fixture was not reached");
     }
 
-    function invariant_effectiveCashNeverInventsBacking() public view {
-        assertLe(model.effectiveCash(), model.accountedCash(), "effective cash exceeded the recognised balance");
-        assertLe(model.effectiveCash(), model.rawCash(), "effective cash exceeded physical backing");
-    }
-
-    function invariant_theReleasedAndUnreleasedBooksPartitionGrossValue() public view {
-        uint256 gross = model.effectiveCash() + model.outstandingPrincipal();
-        gross = gross > model.totalClaimable() ? gross - model.totalClaimable() : 0;
-        assertEq(
-            model.totalAssets() + model.effectiveUnreleasedYield(), gross, "released and unreleased books diverged"
-        );
-    }
-
-    function invariant_claimsAndYieldNeverBecomeLendable() public view {
-        uint256 cash = model.effectiveCash();
-        uint256 senior = model.totalClaimable() + model.effectiveUnreleasedYield();
-        uint256 expected = cash > senior ? cash - senior : 0;
-        assertEq(model.shareholderCash(), expected, "senior cash entered shareholder liquidity");
-    }
-
-    function invariant_availableWithholdsOnlyTheYieldAdjustedNumericReserve() public view {
-        uint256 cash = model.shareholderCash();
-        uint256 required = model.requiredEntryAssets();
-        uint256 unreleased = model.effectiveUnreleasedYield();
-        uint256 reserve = required > unreleased ? required - unreleased : 0;
-        uint256 expected = model.totalSupply() < model.minimumSupply() || model.claimLiquidityDeficit() != 0
-            ? 0
-            : cash > reserve ? cash - reserve : 0;
-        assertEq(model.available(), expected, "available used the wrong numeric reserve");
-    }
-
-    function invariant_capUsageUsesTheWholeStoredGrossBook() public view {
-        uint256 gross = model.accountedCash() + model.outstandingPrincipal();
-        gross = gross > model.totalClaimable() ? gross - model.totalClaimable() : 0;
-        assertEq(model.depositCapUsage(), gross, "cap usage left the canonical book");
-    }
-
+    /**
+     * ── ROUND-46: EIGHT OF THE FIFTEEN WERE IDENTITIES, AND THE ROUND-44 REPAIR ADDED TWO ──────
+     *
+     * 🟥 **Round 44 struck three assertions of the shape `min(a, b) <= a` and replaced one of them
+     * with `min(a, r) + max(a - r, 0) == a`, which is the same shape with the clamp written
+     * out.** Audit round 45 wrote arbitrary `uint120` values into every slot these invariants
+     * read - `rawCash`, `accountedCash`, `outstandingPrincipal`, `totalClaimable`, `totalSupply`,
+     * the pot, the rate and both clocks, states no handler reaches and states that are not
+     * self-consistent - and re-ran each assertion verbatim. Eight of the fifteen held over all of
+     * it: the effective-cash pair, all three legs of the gross-value partition (its own comment
+     * called the first "an identity" and the other two "the content"; all three are), the
+     * `shareholderCash`, `available`, `depositCapUsage` and `claimSolvencyDeficit` formulas, the
+     * `entryPriceDeficit` formula with its quotient bound, and `maxDeposit`'s own first line under
+     * a deficit.
+     *
+     * An assertion that holds over uint120^n of inconsistent storage is a statement about the
+     * function's source text, not about the model's behaviour. Those are regression pins on text,
+     * and they are kept as exactly that in `LenderPoolFormulaPins.t.sol`, over `vm.store`d
+     * storage, labelled. What stands here is what some reachable state could falsify.
+     */
     function invariant_rawCashConservesAllModelledFlows() public view {
         uint256 sources = model.recognisedIn() + model.donatedIn();
         uint256 sinks = model.paidOut() + model.externallyDestroyed();
@@ -858,28 +1066,27 @@ contract CanonicalCashModelInvariants is Test {
         }
     }
 
+    /// @notice An unresolved deficit closes the entry DOOR, not only the entry view.
+    /// @dev Round 46: the door half is `entryAcceptedUnderDeficit`, moved by
+    ///      `probeEntryUnderDeficit` whenever any deficit stands (`entryProbesUnderDeficit` is its
+    ///      denominator, asserted in the tripwire). The view half restates `maxDeposit`'s first
+    ///      line and is kept only because ERC-4626 makes that view a MUST; alone it was the whole
+    ///      invariant and held over arbitrary storage.
     function invariant_unresolvedDeficitsCloseEntry() public view {
+        assertEq(handler.entryAcceptedUnderDeficit(), 0, "the model accepted an entry across a deficit");
         if (model.cashDeficit() != 0 || model.claimLiquidityDeficit() != 0 || model.entryPriceDeficit() != 0) {
             assertEq(model.maxDeposit(), 0, "entry stayed open across a deficit");
             assertEq(model.maxMint(), 0, "mint stayed open across a deficit");
         }
     }
 
-    function invariant_entryPriceDeficitAndTheQuotientBoundAreExact() public view {
-        uint256 target = model.totalClaimable() + model.requiredEntryAssets();
-        uint256 cash = model.effectiveCash();
-        uint256 expectedDeficit = target > cash ? target - cash : 0;
-        assertEq(model.entryPriceDeficit(), expectedDeficit, "entry price deficit used the wrong cash target");
+    /// @notice Real share supply never crosses the absolute ceiling.
+    /// @dev A GUARD, not coverage, kept from `invariant_entryPriceDeficitAndTheQuotientBoundAreExact`
+    ///      as its one clause a `vm.store` could break; the formula and the quotient bound beside
+    ///      it are pins now. The seeded fixture sits at 8.69e38 shares against a ceiling of
+    ///      2^128 x 250,001e6 - 1000, so nothing the walk does approaches it.
+    function invariant_realSupplyNeverCrossesTheAbsoluteCeiling() public view {
         assertLe(model.totalSupply(), model.maximumShareSupply(), "absolute share ceiling escaped");
-
-        if (expectedDeficit == 0) {
-            assertLe(model.requiredEntryAssets(), model.entryAssets(), "open entry book crossed the quotient bound");
-            assertLe(
-                Math.ceilDiv(model.totalSupply() + 1_000, model.entryAssets() + 1),
-                model.MAX_SHARES_PER_ASSET(),
-                "open entry quotient exceeded its bound"
-            );
-        }
     }
 
     function invariant_entryMaximaStayInsideTheAbsoluteShareCeiling() public view {
@@ -908,18 +1115,26 @@ contract CanonicalCashModelInvariants is Test {
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
 
-    function invariant_claimSolvencyUsesCashAndOutstandingPrincipal() public view {
-        uint256 backing = model.effectiveCash() + model.outstandingPrincipal();
-        uint256 expected = model.totalClaimable() > backing ? model.totalClaimable() - backing : 0;
-        assertEq(model.claimSolvencyDeficit(), expected, "claim solvency used the wrong backing");
-    }
-
+    /**
+     * 🟥 **This invariant's NAME was false about its own body until round 44.** It said a raw
+     * donation cannot exceed the recognised book and then asserted `x <= x + y` and
+     * `subOrZero(x, c) <= x`, neither of which any state can falsify, and it never read
+     * `donatedIn` at all. A donation was the one thing it was not about.
+     *
+     * The line below is the real statement, and it is about donation by exclusion:
+     * `recognisedIn` counts every inflow the model AGREED to recognise and `paidOut` every
+     * outflow, while `donate` credits `rawCash` and `donatedIn` only. So a recognised book larger
+     * than net recognised flows means donated cash got in. Crediting `accountedCash` inside
+     * `donate` turns this red immediately, which is the neuter that proves it.
+     *
+     * Round 44 kept the old tautology as a second line "marked, so nobody counts it twice".
+     * Round 46 struck it: a marked tautology is still a line somebody counts.
+     */
     function invariant_aRawDonationCannotExceedTheRecognisedBook() public view {
-        assertLe(model.totalAssets(), model.entryAssets(), "released NAV exceeded entry NAV");
         assertLe(
-            model.entryAssets(),
-            model.effectiveCash() + model.outstandingPrincipal(),
-            "entry NAV counted unmanaged cash"
+            model.accountedCash() + model.paidOut(),
+            model.recognisedIn(),
+            "the recognised book outgrew the flows that were recognised into it"
         );
     }
 
@@ -929,5 +1144,179 @@ contract CanonicalCashModelInvariants is Test {
             assertEq(model.pendingYield(), 0, "empty pool retained pending yield");
             assertEq(model.yieldRate(), 0, "empty pool retained an active stream");
         }
+    }
+
+    /**
+     * ── THE TRIPWIRE ──────────────────────────────────────────────────────────────────────────
+     *
+     * @notice Proves the nine invariants above (fifteen until round 46 struck six identities) are
+     *         checking states this handler can actually reach, rather than passing over a fixture
+     *         that never leaves the corner `setUp` seeds it in.
+     *
+     * @dev Every handler action returns early on a guard it cannot satisfy, which it has to: most
+     *      random call sequences are meaningless and must not fail a run. The cost is that a
+     *      handler which could never reach a deficit, a fixed claim or an empty pool at all would
+     *      still report nine green invariants having exercised none of them. An earlier audit
+     *      round found exactly that here: seven invariants, 128,000 calls apiece, six days, and a
+     *      protocol that could not reach a single borrow.
+     *
+     *      **It is a normal `test_` rather than an `afterInvariant` on purpose, and that is a
+     *      measurement rather than a preference.** `afterInvariant` fires once per run against
+     *      counters the runner resets between runs, so as a floor it demands that every behaviour
+     *      occur in EVERY random 500-call sequence and fails on the first unlucky one - measured
+     *      on the sibling `LiquidationAuction` campaign at `0 <= 0`, one run in 256. There is no
+     *      cross-run accumulator either: the runner reverts to the post-`setUp` snapshot between
+     *      runs, so nothing in EVM state survives to be totalled. Round 44 built that floor anyway
+     *      as a MEASURING INSTRUMENT, ran it 64 times with `runs = 1`, and threw it away. **Do not
+     *      ship it.** The vacuity guard is deliberately two halves, neither of them a campaign
+     *      floor: this test proves the transitions are reachable at all, and
+     *      `invariant_theHandlerNeverDropsAFrame` proves the fuzzer is not discarding the ones it
+     *      reaches.
+     *
+     *      🟥 **This test proves reachability. It does NOT prove the CAMPAIGN reaches anything,
+     *      and the two were measured separately.** Both censuses are unseeded - `foundry.toml`
+     *      sets no seed and CI runs a bare `forge test` - forge 1.8.1, `depth = 500`, sampled as
+     *      64 independent forced single runs at `8b730d8`, 32,000 calls in total each.
+     *
+     *      BEFORE the three exhaustive draws, over eighteen actions: nine of the fifteen counters
+     *      moved in every run, `claimableStates` in 44 of 64, `entryPriceDeficitStates` in **one**
+     *      of 64, and `claimLiquidityDeficitStates`, `claimSolvencyDeficitStates`,
+     *      `belowMinimumSupplyStates` and `emptyPoolStates` in **none of 32,000 calls**. The
+     *      campaign was not vacuous. A third of what its invariants discriminate on was outside
+     *      its handler's reach, and the cause was the `uint96` seeds rather than the fixture.
+     *
+     *      AFTER, over twenty-one: every one of them moves. Twelve counters in 64 of 64,
+     *      `unreleasedYieldStates` 62, `frozenYieldStates` 60, `principalOutstandingStates` 52,
+     *      `belowMinimumSupplyStates` 34, `emptyPoolStates` 31, and `entryCoversDone` **8 of 64**.
+     *      🟥 **The last two are not a clear majority and are reported rather than rounded up.**
+     *      An empty pool needs several exhaustive exits with no lend, loss or claim interleaved,
+     *      and the entry-price cover needs recognised cash below `requiredEntryAssets` with no
+     *      claim gap, which is a narrow corner of the model's own arithmetic rather than a defect.
+     *      Re-measure rather than quote: these are frequencies of an unseeded walk, not properties
+     *      of the tree.
+     *
+     *      MEASURED at `dfd987d`, 2026-09-04 (audit round 48, item 51), the same instrument
+     *      rebuilt and thrown away again: 64 forced single runs, `depth = 500`, unseeded, forge
+     *      1.8.1, over the twenty-two actions the handler now has (`probeEntryUnderDeficit` is
+     *      round 46's). The fixture HAD moved since `8b730d8` - #392, #405 and #406 all touch this
+     *      file or the model - so this is a re-measurement, not a re-sample. Fourteen counters in
+     *      64 of 64, `frozenYieldStates` 59, `principalOutstandingStates` 53,
+     *      `belowMinimumSupplyStates` 35, `emptyPoolStates` 33, and `entryCoversDone` **6 of 64**
+     *      (at most two covers in any run). The two violation counters,
+     *      `entryAcceptedUnderDeficit` and `protocolEntryDeficitMismatches`, read 0 in 64 of 64,
+     *      which is what they must read and is not reach. Same shape as round 44, within
+     *      sampling: no state fell to zero, and the two narrow corners are still below a
+     *      majority. Re-measure rather than quote.
+     */
+    function test_handlerCanReachEveryStateTheInvariantsCheck() public {
+        // ── the numeric-boundary corner the fixture is seeded in ──────────────────────
+        // `setUp` leaves `totalSupply` at 8.69e38, the deposit cap FULL and every deficit at
+        // zero, so entry is closed and the only thing that reopens it is a loss freeing cap
+        // headroom. Asserted rather than assumed, because if `_seedNumericBoundary` ever stops
+        // landing here the rest of this test would quietly measure a different fixture.
+        assertEq(model.maxDeposit(), 0, "premise: the seeded fixture starts with entry closed");
+        assertGt(model.requiredEntryAssets(), 0, "premise: the seeded fixture is at the numeric boundary");
+
+        handler.lend(uint96(1_000e6));
+        assertGt(handler.principalOutstandingStates(), 0, "principal was never reached");
+        assertGt(
+            handler.protocolEntryDeficitChecks(),
+            0,
+            "the entry-deficit recorder never ran on a protocol-controlled cash flow"
+        );
+
+        handler.socialiseLoss(uint96(1_000e6));
+        assertGt(handler.openEntryStates(), 0, "entry never reopened");
+        // The ghost counts a cheap four-clause necessary condition, not `maxDeposit()` itself.
+        // This is the assertion that closes the gap between the two.
+        assertGt(model.maxDeposit(), 0, "the cheap open-entry conjunction over-counted");
+        handler.deposit(uint96(1_000e6));
+        handler.mint(uint96(1_000e6));
+
+        // Both yield shapes, which are different states rather than one: a frozen pot is fully
+        // unreleased with no rate, and `invariant_availableWithholds...` reads the difference.
+        handler.addActiveGain(uint96(1_000e6), uint32(5 days));
+        assertGt(handler.unreleasedYieldStates(), 0, "streamed yield was never reached");
+        handler.addFrozenGain(uint96(1_000e6));
+        assertGt(handler.frozenYieldStates(), 0, "frozen yield was never reached");
+        handler.activateFrozen(uint32(5 days));
+        handler.deliverEpochYield(uint96(1_000e6), uint32(5 days));
+        handler.advance(uint32(7 days));
+
+        // External destruction and the raw donation, which are the two terms
+        // `invariant_rawCashConservesAllModelledFlows` quantifies over.
+        handler.destroyCash(uint96(1_000e6));
+        assertGt(handler.destructionsDone(), 0, "external destruction was never reached");
+        assertGt(handler.cashDeficitStates(), 0, "a cash deficit was never reached");
+        // Round 46: the door under that deficit, knocked on rather than read.
+        handler.probeEntryUnderDeficit();
+        assertGt(handler.entryProbesUnderDeficit(), 0, "entry was never attempted under a deficit");
+        assertEq(handler.entryAcceptedUnderDeficit(), 0, "the model accepted an entry under a deficit");
+        handler.donate(uint96(1_000e6));
+        assertGt(handler.donationsDone(), 0, "a raw donation was never reached");
+        handler.reconcileCashDeficit();
+
+        // ── the entry-price corner, and why it needs the whole book drained ───────────
+        // `entryPriceDeficit != 0` with `claimLiquidityDeficit == 0` is the only state in which
+        // `coverEntryPriceDeficit` can run at all, and on this fixture it needs recognised cash
+        // BELOW `requiredEntryAssets`, which is 2. Lending stops at exactly the reserve, so the
+        // last two units have to be destroyed. The census reached this in 1 run of 64.
+        uint256 lendable = model.available();
+        assertLe(lendable, type(uint96).max, "fixture lendable cash exceeded the handler seed");
+        handler.lend(uint96(lendable));
+        handler.socialiseLoss(uint96(model.outstandingPrincipal()));
+        assertEq(model.available(), 0, "the drain left lendable cash behind");
+        handler.destroyCash(uint96(model.rawCash()));
+        assertGt(handler.entryPriceDeficitStates(), 0, "an entry price deficit was never reached");
+        assertEq(model.claimLiquidityDeficit(), 0, "the entry-price corner was contaminated by a claim gap");
+        handler.coverEntryPriceDeficit(uint96(model.entryPriceDeficit()));
+        assertGt(handler.entryCoversDone(), 0, "the entry-price repair door was never opened");
+        assertEq(model.entryPriceDeficit(), 0, "an exact cover left a deficit");
+
+        // ── the senior claim, and all three senior deficits at once ───────────────────
+        handler.serviceAll();
+        assertGt(handler.exhaustiveExitsDone(), 0, "the exhaustive exit was never reached");
+        assertGt(handler.claimableStates(), 0, "a fixed claim was never reached");
+        handler.redeem(uint96(1_000e6));
+        handler.service(uint96(1_000e6));
+
+        handler.destroyAllCash();
+        assertGt(handler.claimLiquidityDeficitStates(), 0, "a claim liquidity deficit was never reached");
+        assertGt(handler.claimSolvencyDeficitStates(), 0, "a claim solvency deficit was never reached");
+
+        uint256 solvency = model.claimSolvencyDeficit();
+        assertLe(solvency, type(uint96).max, "fixture claim exceeded the handler seed");
+        handler.coverClaimDeficit(uint96(solvency));
+        assertGt(handler.claimCoversDone(), 0, "the claim repair door was never opened");
+        assertEq(model.claimSolvencyDeficit(), 0, "an exact claim cover left a deficit");
+        handler.claim(uint96(model.totalClaimable()));
+        assertEq(model.totalClaimable(), 0, "the fixed claim was never collected");
+
+        // ── the descent to an empty pool ──────────────────────────────────────────────
+        // 🟥 **This is the half a bounded seed cannot do.** One `redeem` can burn at most
+        // `type(uint96).max` shares out of ~9e38, so 500 of them cannot move the supply by a
+        // millionth, and both `invariant_emptyPoolCannotRetainRecyclableShareholderValue` and the
+        // below-minimum branch of `invariant_availableWithholds...` sit behind a floor the walk
+        // cannot descend to. Passing `maxRedeem()` directly divides the supply by roughly the
+        // cash on hand each time, so the descent is five cycles rather than ninety halvings.
+        for (uint256 cycle = 0; cycle < 16 && model.totalSupply() != 0; ++cycle) {
+            handler.repay(uint96(1_000e6));
+            handler.advance(uint32(7 days));
+            handler.redeemAll();
+        }
+        assertEq(model.totalSupply(), 0, "the exhaustive exit could not empty the pool");
+        assertGt(handler.belowMinimumSupplyStates(), 0, "the below-minimum supply regime was never reached");
+        assertGt(handler.emptyPoolStates(), 0, "an empty pool was never reached");
+
+        // Nothing above may have manufactured a price deficit through a protocol-controlled flow,
+        // and the recorder that decides it must have run - which is the whole point of counting
+        // the checks as well as the mismatches.
+        assertGt(
+            handler.protocolEntryDeficitChecks(),
+            0,
+            "the entry-deficit recorder never ran on a protocol-controlled cash flow"
+        );
+        assertEq(handler.protocolEntryDeficitMismatches(), 0, "a protocol flow manufactured a price deficit");
+        assertGt(handler.actionsObserved(), 0, "the state census never ran");
     }
 }

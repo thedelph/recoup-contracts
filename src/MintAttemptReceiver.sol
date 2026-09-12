@@ -90,12 +90,19 @@ contract MintAttemptReceiver is IERC1155Receiver {
             withdrawPaid = usdc.balanceOf(address(this)) - beforeBalance;
         }
 
+        // FALSE (audit round 44). `withdrawPaid` stays zero when nothing was staked, which is exactly
+        // the amount the farm paid in that case.
+        // forge-lint: disable-next-line(uninitialized-local)
         uint256 newlyAccrued = farmPaidOnAutoDeposit + withdrawPaid;
         if (newlyAccrued != 0) parkedFarmYield += newlyAccrued;
 
         // ERC-1155 authorisation is caller-based: the clone must move its own
         // units. The adapter cannot pull them without an approval. DexFi's transfer
         // whitelist still passes because the whitelisted adapter is `to`.
+        // ACCEPTED (audit round 44). `onlyAdapter onlyClone`, and every path that reaches the adapter
+        // starts at a `nonReentrant` vault entry point. DexFi's bond contract is third-party and
+        // MUTABLE, which is why re-entry is refused by the caller gate rather than by trusting it.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         bond.safeTransferFrom(address(this), adapter, Config.DEXFI_BOND_TOKEN_ID, bondAmount, "");
 
         farmYieldForwarded = _tryForwardFarmYield();
@@ -133,19 +140,33 @@ contract MintAttemptReceiver is IERC1155Receiver {
         )
     {
         if (recoveryRecipient == address(0)) revert ZeroAddress();
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 staked,) = farm.userInfo(address(this));
         if (staked != 0 || farm.pendingShare(address(this)) != 0) {
             uint256 beforeBalance = usdc.balanceOf(address(this));
             farm.withdraw(staked);
-            uint256 farmPaid = usdc.balanceOf(address(this)) - beforeBalance;
+            // Saturated, like `emergencyRecoverAll` and `_tryForwardRawUsdc` in this file, and the
+            // adapter's `_farmDelta`. Round-49 finding: the farm holds this window too, and from
+            // inside `withdraw` it can reach the adapter's permissionless `flushMintAttemptYield`,
+            // which has this clone forward its park mid-window - so the balance can come back
+            // BELOW `beforeBalance` and a bare subtraction panics the owner's recovery. A drained
+            // window reports 0 for what the farm paid, the same under-count `_farmDelta` accepts.
+            uint256 afterBalance = usdc.balanceOf(address(this));
+            uint256 farmPaid = afterBalance > beforeBalance ? afterBalance - beforeBalance : 0;
             if (farmPaid != 0) parkedFarmYield += farmPaid;
         }
 
         recoveredBonds = bond.balanceOf(address(this), Config.DEXFI_BOND_TOKEN_ID);
         if (recoveredBonds != 0) {
+            // ACCEPTED (audit round 44). Same gate as `releaseMint`: `onlyAdapter onlyClone`, reached only
+            // through a `nonReentrant` vault or an `onlyOwner` adapter entry point. Block form because a
+            // next-line directive does not reach a multi-line span at forge 1.8.1.
+            // forge-lint: disable-start(reentrancy-no-eth)
             bond.safeTransferFrom(
                 address(this), adapter, Config.DEXFI_BOND_TOKEN_ID, recoveredBonds, ""
             );
+            // forge-lint: disable-end(reentrancy-no-eth)
         }
 
         farmYieldForwarded = _tryForwardFarmYield();
@@ -170,6 +191,8 @@ contract MintAttemptReceiver is IERC1155Receiver {
             uint256 nativeRemaining
         )
     {
+        // FALSE (audit round 44). Tuple destructure; the slot this site needs is bound.
+        // forge-lint: disable-next-line(unused-return)
         (uint256 staked,) = farm.userInfo(address(this));
         if (staked != 0 || farm.pendingShare(address(this)) != 0) {
             farm.emergencyWithdraw();
@@ -245,6 +268,13 @@ contract MintAttemptReceiver is IERC1155Receiver {
             // Best-effort by design: a rejecting recovery recipient must not roll
             // back the bond handoff. Measure the clone's balance rather than trust
             // the call result, including for a recipient that sends some value back.
+            // ACCEPTED (audit round 44). Both remedies the lint names are already in force. The caller is
+            // restricted twice - `onlyAdapter onlyClone` here, `onlyOwner` on
+            // `DirectCallAdapter.recoverMintAttempt` - and the destination is validated there against zero,
+            // the adapter and the receiver. The control this hands `recoveryRecipient` is audit round 34's
+            // finding and is recorded in `_recoverTo`'s own comment; forwarding is best effort on purpose,
+            // because a rejecting recipient must not roll back the bond handoff.
+            // forge-lint: disable-next-line(arbitrary-send-eth)
             (bool ok,) = recipient.call{value: beforeBalance}("");
             if (ok && beforeBalance > address(this).balance) {
                 forwarded = beforeBalance - address(this).balance;
@@ -259,8 +289,11 @@ contract MintAttemptReceiver is IERC1155Receiver {
     ///      than the requested amount or the token's return value.
     function _tryTransferUsdc(address recipient, uint256 amount) private returns (uint256 forwarded) {
         uint256 beforeBalance = usdc.balanceOf(recipient);
-        // slither-disable-next-line unchecked-lowlevel
+        // ACCEPTED (audit round 44). The callee is the immutable USDC token, which does not call back.
+        // The result is deliberately not trusted; the recipient's balance delta is measured instead.
+        // forge-lint: disable-start(reentrancy-no-eth)
         (bool ok,) = address(usdc).call(abi.encodeCall(IERC20.transfer, (recipient, amount)));
+        // forge-lint: disable-end(reentrancy-no-eth)
         if (!ok) return 0;
 
         uint256 afterBalance = usdc.balanceOf(recipient);

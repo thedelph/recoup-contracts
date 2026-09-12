@@ -115,6 +115,95 @@ contract CreditHandler is Test {
     uint256 public accumulatorRegressions;
     uint256 public debtRoseWithNoBorrow;
 
+    // -- coverage ghosts: the LEGAL half of each transition the two violation counters above
+    //    count the illegal half of. Audit round 48, item 116: `assertEq(violations, 0)` is
+    //    satisfied most easily by never reaching the transition, so each ghost is incremented in
+    //    the same observation as its partner and asserted `> 0` by
+    //    `test_handlerCanReachEveryStateTheInvariantsCheck`, never in `afterInvariant`.
+    /// @notice Actions across which `totalDebt` rose AND a borrow landed. Partner of
+    ///         `debtRoseWithNoBorrow`: `borrowCount` proves a borrow happened, and only this
+    ///         proves `watched` saw debt rise across one.
+    uint256 public debtRoseOnABorrow;
+    /// @notice Actions across which the stored accumulator ADVANCED. Partner of
+    ///         `accumulatorRegressions`: `accYieldPerBond` moves in `_accrue`, on a settle or a
+    ///         later distribution, and not at the instant of the distribution that funds it.
+    uint256 public accumulatorAdvances;
+
+    /// @dev The in-handler property record. Two fields, so a failure carries its own message
+    ///      rather than only a count.
+    ///
+    ///      **Why these are recorded and not asserted, MEASURED 2026-09-09 on forge 1.8.1 against
+    ///      this file's own pre-conversion commit.** A forge-std assertion inside a handler
+    ///      reverts, and under the global `fail_on_revert = false` a reverting handler call is
+    ///      DISCARDED - so the seven assertions that used to stand in the four actions below could
+    ///      fail invisibly for as long as this suite existed, while rolling back the frame that
+    ///      tripped them. Measured at a REAL site rather than argued: flipping
+    ///      `assertLe(credit.totalDebt(), riskParams.globalBorrowCap(), ...)` to `assertGt` makes
+    ///      the property false on every successful borrow, and
+    ///      `invariant_totalDebtEqualsSumOfDebts` still reported
+    ///      `[PASS] (runs: 256, calls: 128000, reverts: 2723)`. With the recorder in place the same
+    ///      flip is red on the first frame, carrying "a borrow crossed the global cap".
+    ///
+    ///      🟥 **THE BLANKET FORM OF THAT CLAIM IS FALSE, and the correction is worth more than the
+    ///      claim.** forge 1.8.1 DOES report SOME in-handler assertion failures: a bare
+    ///      `assertEq(uint256(1), uint256(2))` at the top of `settle` turns this suite RED with
+    ///      `[FAIL: assertion failed: 1 != 2] CreditHandler::settle`. **The discriminator is the
+    ///      MESSAGE**, isolated by changing that one argument and nothing else at the same site:
+    ///      `assertEq(uint256(1), uint256(2), "planted with a message")` is green again at
+    ///      `(runs: 256, calls: 128000, reverts: 11473)`. A two-argument forge-std assertion
+    ///      reverts with a string beginning "assertion failed", which forge picks out of the
+    ///      discarded frame; a three-argument one reverts with the assertion's own message instead and
+    ///      is indistinguishable from an ordinary business revert. **Every assertion this
+    ///      conversion touched carried a message**, which is why the hazard was total here - and
+    ///      why a session that probes it with a message-less one-liner will measure the opposite
+    ///      and conclude there is nothing to fix. The message is a SUFFICIENT suppressor and not
+    ///      the only one: a message-LESS `assertEq(uint256(1), uint256(2))` planted inside
+    ///      `RegistryHandler.register`'s catch block was not reported either,
+    ///      `(runs: 256, calls: 128000, reverts: 62346)`. That reading is unexplained and is
+    ///      recorded rather than smoothed over.
+    ///
+    ///      **This file is the worst place in the tree for that hazard, and the reason is three
+    ///      lines up from `borrow`'s `try`.** The two cap assertions there are the ONLY place the
+    ///      global and per-account borrow caps are checked at the instant the guard binds -
+    ///      `borrow`'s own docstring sets out why they cannot live in a standing invariant, since
+    ///      a downward cap move makes `totalDebt > globalBorrowCap()` a correct resting state. So
+    ///      the two checks that carry the whole cap property were also the two least able to
+    ///      report. Worse, they sit inside the success branch of a `try`: a revert there is not
+    ///      caught by the `catch` beside it, it kills the frame, and the frame it kills is the
+    ///      borrow that had just landed. A broken cap would have rolled back its own
+    ///      counterexample.
+    ///
+    ///      Three repairs exist and this is the third. `assert(cond)` raises Panic(0x01), which
+    ///      forge 1.8.1 DOES report as a `handler_assertion` failure naming the contract and the
+    ///      offending selector - measured for `CollateralVault.invariants.t.sol` on 2026-09-09 and
+    ///      recorded on `VaultHandler.firstBrokenProperty`, not re-measured here - but it discards
+    ///      the frame and carries no message, and a cap failure with no message is a failure that
+    ///      does not say WHICH cap. `assertions_revert
+    ///      = false` makes the whole `vm.assert*` family report, but it is a whole-suite semantic
+    ///      change across every test in the tree and is not a test file's to take. Recording keeps
+    ///      the message, keeps the frame, and is the idiom `RiskParams.invariants.t.sol::propose`
+    ///      already documents in prose: "Counting it and asserting the count from the suite has
+    ///      neither problem."
+    ///
+    ///      **The one hole, and why it is already covered.** A record written here is lost if the
+    ///      SAME frame reverts later for an unrelated reason. That case is exactly a dropped
+    ///      frame, and `invariant_theHandlerNeverDropsAFrame` is red on the first one - so the two
+    ///      guards compose and neither has to be trusted alone.
+    string public firstBrokenProperty;
+    uint256 public brokenProperties;
+
+    /// @dev Records rather than reverts. See `firstBrokenProperty`. The FIRST message is kept
+    ///      because it is the one with a live counterexample behind it; later ones only add noise.
+    ///
+    ///      `private`, and non-view, on purpose. `targetContract(address(handler))` takes every
+    ///      external non-view function as a fuzz action whether it was written to be one or not,
+    ///      so a public recorder would let the fuzzer write the very field the suite reads.
+    function _mustHold(bool ok, string memory what) private {
+        if (ok) return;
+        if (brokenProperties == 0) firstBrokenProperty = what;
+        ++brokenProperties;
+    }
+
     constructor(
         MockUSDC usdc_,
         MockNavOracle oracle_,
@@ -157,8 +246,13 @@ contract CreditHandler is Test {
         uint256 debtBefore = credit.totalDebt();
         uint256 borrowsBefore = borrowCount;
         _;
-        if (credit.accYieldPerBond() < accBefore) ++accumulatorRegressions;
-        if (borrowCount == borrowsBefore && credit.totalDebt() > debtBefore) ++debtRoseWithNoBorrow;
+        uint256 accAfter = credit.accYieldPerBond();
+        if (accAfter < accBefore) ++accumulatorRegressions;
+        if (accAfter > accBefore) ++accumulatorAdvances;
+        bool borrowed = borrowCount != borrowsBefore;
+        bool debtRose = credit.totalDebt() > debtBefore;
+        if (!borrowed && debtRose) ++debtRoseWithNoBorrow;
+        if (borrowed && debtRose) ++debtRoseOnABorrow;
     }
 
     /// @dev The upper bound is the live per-account cap, not the 5,000e6 literal it used to be.
@@ -210,12 +304,17 @@ contract CreditHandler is Test {
         try credit.borrow(amount) {
             borrowCount++;
             if (credit.bountyEscrowOf(a) > escrowBefore) ++bountiesCharged;
-            assertLe(credit.totalDebt(), riskParams.globalBorrowCap(), "a borrow crossed the global cap");
-            assertLe(credit.debtOf(a), riskParams.perAccountBorrowCap(), "a borrow crossed the per-account cap");
-            assertFalse(shut, "a borrow landed against a paused manager");
+            _mustHold(credit.totalDebt() <= riskParams.globalBorrowCap(), "a borrow crossed the global cap");
+            _mustHold(
+                credit.debtOf(a) <= riskParams.perAccountBorrowCap(), "a borrow crossed the per-account cap"
+            );
+            _mustHold(!(shut), "a borrow landed against a paused manager");
         } catch (bytes memory err) {
             if (shut) {
-                assertEq(bytes4(err), Pausable.EnforcedPause.selector, "a paused borrow was refused by something else");
+                _mustHold(
+                    bytes4(err) == Pausable.EnforcedPause.selector,
+                    "a paused borrow was refused by something else"
+                );
                 ++borrowsRefusedByThePause;
             }
         }
@@ -301,7 +400,7 @@ contract CreditHandler is Test {
         try credit.repay(amount) {
             ++repaysDone;
         } catch (bytes memory err) {
-            assertEq(bytes4(err), CreditManager.NoDebt.selector, "unexpected repay revert");
+            _mustHold(bytes4(err) == CreditManager.NoDebt.selector, "unexpected repay revert");
         }
         vm.stopPrank();
     }
@@ -350,7 +449,7 @@ contract CreditHandler is Test {
         try credit.claimSurplus() {
             ++surplusClaimsDone;
         } catch (bytes memory err) {
-            assertEq(bytes4(err), CreditManager.NothingToClaim.selector, "unexpected claimSurplus revert");
+            _mustHold(bytes4(err) == CreditManager.NothingToClaim.selector, "unexpected claimSurplus revert");
         }
     }
 
@@ -385,9 +484,8 @@ contract CreditHandler is Test {
         } catch (bytes memory err) {
             // The withdrawal rule is the only guard that should ever refuse here: the
             // amount is bounded to the balance and this fixture's NAV is never stale.
-            assertEq(
-                bytes4(err),
-                CollateralVault.WithdrawalExceedsMaxLtv.selector,
+            _mustHold(
+                bytes4(err) == CollateralVault.WithdrawalExceedsMaxLtv.selector,
                 "unexpected withdrawBonds revert"
             );
             ++withdrawsRefusedByLtv;
@@ -541,6 +639,29 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
     ///      invariant here and is what lets the `try`/`catch` idiom work at all.
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
+
+    /// @notice Every property the four handler actions check held on every frame that ran.
+    /// @dev **This invariant is the whole reason those seven checks are worth anything.** They used
+    ///      to be forge-std assertions inside the handler, which revert - and under
+    ///      `fail_on_revert = false` a reverting handler call is DISCARDED, so each of them could
+    ///      have been failing since the day it was written and this suite would have reported every
+    ///      other invariant green over the top of it. `CreditHandler.firstBrokenProperty` carries
+    ///      the measurement and the two rejected repairs.
+    ///
+    ///      **Two of the seven are the cap guards at the borrow**, which `CreditHandler.borrow`'s
+    ///      docstring explains cannot be restated as standing invariants at all: a downward cap
+    ///      move is the protocol's intended tightening lever, so `totalDebt > globalBorrowCap()` is
+    ///      a correct resting state and only the borrow itself is a place the ceiling binds. Those
+    ///      two therefore had no second reader anywhere in the tree, which is why this line matters
+    ///      more here than in the suite it was copied from.
+    ///
+    ///      Asserted from the suite rather than in the handler, which is the only place the check
+    ///      both survives the frame and can carry its message. The message IS the original
+    ///      assertion's message, moved rather than rewritten, so a failure here reads exactly as
+    ///      the in-handler assertion would have.
+    function invariant_everyInHandlerPropertyHeld() public view {
+        assertEq(handler.brokenProperties(), 0, handler.firstBrokenProperty());
+    }
 
     function invariant_totalDebtEqualsSumOfDebts() public view {
         uint256 sum;
@@ -704,6 +825,7 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         handler.borrow(0, cap);
         assertEq(handler.borrowCount(), 1, "borrowing must be possible");
         assertEq(credit.totalDebt(), cap, "the borrow must have landed");
+        assertGt(handler.debtRoseOnABorrow(), 0, "the observer never saw debt rise across a borrow");
 
         // The prepaid liquidation bounty has to be reachable here or both bounty invariants
         // are checking a quantity that is always zero, and would report green over a dust
@@ -719,10 +841,12 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         handler.distributeYield(2_000e6);
         assertEq(handler.yieldDistributions(), 1, "yield distribution must be reachable");
         assertEq(handler.debtWriteDowns(), 0, "an epoch paid out at the instant it was distributed");
+        assertEq(handler.accumulatorAdvances(), 0, "the accumulator moved at the instant of distribution");
 
         handler.passTime(Config.YIELD_STREAM_DURATION);
         handler.settle(0);
         assertEq(handler.debtWriteDowns(), 1, "the debt write-down path was never exercised");
+        assertGt(handler.accumulatorAdvances(), 0, "the observer never saw the accumulator advance");
         assertLt(credit.debtOf(actors[0]), cap, "settling must reduce what is owed");
 
         // Releasing 4,900 of 5,000 bonds would leave $2,515 of collateral against a
@@ -817,5 +941,10 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         // sequence that is meant to be clean is 0 == 0 and evidence of nothing. Their invariants
         // read them; what makes those invariants non-vacuous is that `watched` wraps every action
         // in this handler, which is a property of the code rather than of a run.
+        //
+        // Round 48, item 116: that property is now also MEASURED rather than argued from the code.
+        // `debtRoseOnABorrow` and `accumulatorAdvances`, the legal halves of the same two
+        // transitions, are asserted `> 0` above, so an observer that stopped seeing the
+        // transition fails this test instead of leaving both invariants green over nothing.
     }
 }

@@ -1103,6 +1103,168 @@ contract LenderPoolTest is Test {
         assertEq(pool.unreleasedYield(), backlog, "the epoch streams once the pool can carry it");
     }
 
+    // ── External review (33audits, 2026-09-11), M-05: a backlog above the hard ceiling ────────
+    //
+    // The refusal above recovers by depositing more, which works at 5,000 USDC and is impossible
+    // at 300,000: the cap cannot exceed `Config.GLOBAL_BORROW_CAP_MAX`, a constant, and a pool
+    // full at it has `maxDeposit` at zero for everybody. The reviewers' three tests are kept in
+    // this suite's naming, then the drain and the below-ceiling control that bound the clamp.
+
+    uint256 internal constant CEILING = Config.GLOBAL_BORROW_CAP_MAX;
+    uint256 internal constant BACKLOG = 300_000e6;
+
+    function _fillPoolToTheCeiling() internal {
+        vm.prank(admin);
+        pool.setDepositCap(Config.GLOBAL_BORROW_CAP_MAX);
+        usdc.mint(alice, CEILING);
+        vm.prank(alice);
+        pool.deposit(CEILING, alice);
+    }
+
+    function _offer(uint256 amount) internal {
+        usdc.mint(harvester, amount);
+        vm.prank(harvester);
+        usdc.approve(address(pool), amount);
+    }
+
+    /// @notice The ceiling is hard: the cap cannot exceed `GLOBAL_BORROW_CAP_MAX`, and once the
+    ///         pool is full there is no room left for more capital to arrive.
+    function test_distributeYield_theHardCeilingAdmitsNoMoreCapital() public {
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LenderPool.DepositCapTooLarge.selector, Config.GLOBAL_BORROW_CAP_MAX + 1, Config.GLOBAL_BORROW_CAP_MAX
+            )
+        );
+        pool.setDepositCap(Config.GLOBAL_BORROW_CAP_MAX + 1);
+
+        _fillPoolToTheCeiling();
+        emit log_named_uint("MEASURED max capital  ", pool.totalAssets());
+        emit log_named_uint("MEASURED maxDeposit   ", pool.maxDeposit(bob));
+        assertEq(pool.totalAssets(), CEILING, "the pool is not at the ceiling");
+        assertEq(pool.maxDeposit(bob), 0, "more capital can still enter");
+    }
+
+    /// @notice REGRESSION. A backlog above the ceiling used to revert `YieldExceedsCapital` with
+    ///         no action able to raise capital to meet it. The pool now takes exactly what fits
+    ///         and leaves the rest with the measuring harvester.
+    function test_distributeYield_aBacklogAboveTheHardCeilingIsClampedNotRefused() public {
+        _fillPoolToTheCeiling();
+        uint256 capital = pool.totalAssets();
+        _offer(BACKLOG);
+
+        uint256 harvesterBefore = usdc.balanceOf(harvester);
+        vm.prank(harvester);
+        pool.distributeYield(BACKLOG);
+
+        emit log_named_uint("MEASURED backlog offered", BACKLOG);
+        emit log_named_uint("MEASURED capital        ", capital);
+        emit log_named_uint("MEASURED pulled         ", harvesterBefore - usdc.balanceOf(harvester));
+        assertEq(harvesterBefore - usdc.balanceOf(harvester), capital, "the pool pulled other than what fits");
+        assertEq(pool.unreleasedYield(), capital, "the clamped epoch did not stream");
+        assertEq(usdc.allowance(harvester, address(pool)), BACKLOG - capital, "the remainder was not left behind");
+    }
+
+    /// @notice The money is fine; only the offer size is wrong. The same pool, in the same state,
+    ///         accepts an offer of exactly `capital` and streams it in full.
+    function test_distributeYield_anOfferOfExactlyCapitalIsAcceptedInFull() public {
+        _fillPoolToTheCeiling();
+        uint256 capital = pool.totalAssets();
+        _offer(BACKLOG);
+
+        vm.prank(harvester);
+        pool.distributeYield(capital);
+
+        emit log_named_uint("MEASURED offer accepted", capital);
+        assertEq(pool.unreleasedYield(), capital, "the epoch did not stream");
+    }
+
+    /// @notice The backlog drains over successive flushes. Driven as the harvester drives it: the
+    ///         whole remainder is offered each time, delivery is measured off the harvester's own
+    ///         balance and the remainder decremented by exactly that, until nothing is pending.
+    /// @dev Each delivery raises what the pool holds, so every later offer meets a larger
+    ///      `capital`; the drain is geometric and terminates. `test_R40_D7_theBacklogAboveTheHardCeilingDrainsThroughTheRealHarvester`
+    ///      runs the same drain through a real `EpochHarvester.flushLenderYield`.
+    function test_distributeYield_aBacklogAboveTheHardCeilingDrainsOverSuccessiveFlushes() public {
+        _fillPoolToTheCeiling();
+        uint256 pending = BACKLOG * 3; // three and a half ceilings above capital, plus change
+        usdc.mint(harvester, pending);
+
+        uint256 flushes;
+        while (pending != 0) {
+            uint256 capital = pool.totalAssets();
+            uint256 before = usdc.balanceOf(harvester);
+            vm.startPrank(harvester);
+            usdc.approve(address(pool), pending);
+            pool.distributeYield(pending);
+            usdc.approve(address(pool), 0);
+            vm.stopPrank();
+            uint256 delivered = before - usdc.balanceOf(harvester);
+            uint256 expected = pending > capital ? capital : pending;
+            assertEq(delivered, expected, "a flush delivered other than min(pending, capital)");
+            assertGt(delivered, 0, "a flush delivered nothing");
+            pending -= delivered;
+            ++flushes;
+            emit log_named_uint("MEASURED flush delivered", delivered);
+            emit log_named_uint("MEASURED remainder      ", pending);
+            vm.warp(pool.yieldStreamEndsAt() + 1); // release the delivery before the next offer
+            if (flushes > 16) break;
+        }
+        assertEq(pending, 0, "the backlog did not drain");
+        assertGt(flushes, 1, "premise: the backlog fit in one flush, so the drain was not exercised");
+        assertEq(usdc.balanceOf(harvester), 0, "the harvester still holds lender yield");
+        assertEq(pool.totalAssets(), CEILING + BACKLOG * 3, "the pool did not receive the whole backlog");
+        emit log_named_uint("MEASURED flushes to drain", flushes);
+    }
+
+    /// @notice BOUND. Below the hard ceiling the refusal is unchanged: a pool at the same
+    ///         `capital` whose cap is not pinned at the constant, and a pool whose cap is the
+    ///         constant but which is not full, both still revert `YieldExceedsCapital`.
+    /// @dev The clamp must not reopen the one-cent capture in slow motion, and it must not fire
+    ///      while the owner can still raise the cap or a depositor can still enter.
+    function test_distributeYield_belowTheHardCeilingTheRefusalIsUnchanged() public {
+        // Full at a cap the owner can still raise.
+        uint256 smallCap = 20_000e6;
+        vm.prank(admin);
+        pool.setDepositCap(smallCap);
+        _deposit(alice, DEPOSIT);
+        _deposit(bob, DEPOSIT);
+        assertEq(pool.maxDeposit(carol), 0, "fixture: full at the small cap");
+        uint256 capital = pool.totalAssets();
+        uint256 backlog = capital + 1;
+        _offer(backlog);
+        vm.prank(harvester);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.YieldExceedsCapital.selector, backlog, capital));
+        pool.distributeYield(backlog);
+
+        // The cap pinned at the constant, with room still to fill.
+        vm.prank(admin);
+        pool.setDepositCap(Config.GLOBAL_BORROW_CAP_MAX);
+        assertGt(pool.maxDeposit(carol), 0, "fixture: not full at the hard ceiling");
+        vm.prank(harvester);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.YieldExceedsCapital.selector, backlog, capital));
+        pool.distributeYield(backlog);
+
+        // And the one-cent pool: the original refusal, byte for byte.
+        LenderPool tiny = new LenderPool(IERC20(address(usdc)), admin);
+        vm.startPrank(admin);
+        tiny.setCreditManager(creditManager);
+        tiny.setEpochHarvester(harvester);
+        tiny.setDepositCap(Config.GLOBAL_BORROW_CAP_MAX);
+        vm.stopPrank();
+        usdc.mint(carol, 10_000);
+        vm.startPrank(carol);
+        usdc.approve(address(tiny), 10_000);
+        tiny.deposit(10_000, carol);
+        vm.stopPrank();
+        usdc.mint(harvester, BACKLOG);
+        vm.startPrank(harvester);
+        usdc.approve(address(tiny), BACKLOG);
+        vm.expectRevert(abi.encodeWithSelector(LenderPool.YieldExceedsCapital.selector, BACKLOG, 10_000));
+        tiny.distributeYield(BACKLOG);
+        vm.stopPrank();
+    }
+
     /// @notice A repoint cannot leave the pool priced against a manager it no longer talks to.
     /// @dev Audit round 12. `impairmentOf`, `totalImpairment`, `unplacedLoss` and `insuranceCover`
     ///      all survived `setCreditManager`, and the outgoing manager could no longer clear them -
@@ -3402,6 +3564,124 @@ contract LenderPoolTest is Test {
 
         vm.prank(bob);
         assertEq(pool.deposit(1, bob), quoteBefore, "execution departed from the donation-inert quote");
+    }
+
+    // ── round-45 item 55: `maxDeposit` is a maximum, and the entry floor is `previewMint(1)` ──
+    //
+    // Neither ERC-4626 MUST is breached, and nothing below claims one is. "`maxDeposit` MUST
+    // return the maximum amount of assets deposit would allow" is a statement about ONE number,
+    // and `_maxDeposit` returns one; `previewDeposit` may under-quote; `deposit` has a MUST revert
+    // and no MUST NOT. What the pair below pins is the integrator hazard: a caller that reads
+    // `maxDeposit(r) > 0` and infers every `x <= maxDeposit(r)` is accepted is wrong for every
+    // `x < previewMint(1)`. Stock OpenZeppelin 5.6.1 would TAKE those assets and mint nothing for
+    // them; the round-22 guard in `_deposit` refuses them with `ZeroAmount()` and takes nothing.
+    // The balance pair asserted after each refusal is what separates the two behaviours, and it
+    // is the line a neuter of that guard turns red. The guard had no falsifier before this round:
+    // MEASURED 2026-09-02 on forge 1.8.1 with the guard deleted, 337 of 341 tests across the
+    // twelve deposit-calling suites stayed green and the four reds were all round 45's.
+    //
+    // The floor quantity is `previewMint(1)`, not `minimumEntryAssets()`: that view is the
+    // shares-per-asset ceiling's backing minimum, the OPPOSITE boundary, and reads 0 below 2^128.
+    // There is no dedicated floor view and no distinct floor error; the three-argument doors
+    // report `ZeroAmount()` rather than `SharesBelowMinimum`, and that identity is recorded here.
+
+    /// @dev The sub-floor fixture. Derived below and MEASURED 2026-09-02 on forge 1.8.1 by the two
+    ///      tests that use it; the figures in their assertions are the measured ones.
+    ///
+    ///      `_deposit(alice, 10_000)` at genesis mints `10_000 * 10 ** 3 = 1e7` shares, which is
+    ///      exactly `MIN_SUPPLY_FOR_YIELD`, so `recoverLoss` takes its streaming branch rather
+    ///      than freezing the pot. `recoverLoss(1_000e6)` from the credit manager then prices the
+    ///      whole pot into entry in the same block through `_effectiveUnreleasedYield`: entry
+    ///      assets `10_000 + 1_000e6 = 1_000_010_000`, supply plus the virtual thousand
+    ///      `10_001_000`, so one share costs `ceil(1_000_010_001 / 10_001_000) = 100` asset-wei
+    ///      and one asset-wei buys `floor(10_001_000 / 1_000_010_001) = 0` shares. A sub-floor
+    ///      state needs the entry price above one asset-wei per share, which with a decimals
+    ///      offset of 3 is a thousandfold appreciation; the model's `_seedNumericBoundary` pushes
+    ///      the price DOWN and cannot reach it. The lever is production: `recoverLoss` is gated by
+    ///      `NotCreditManager` and `ZeroAmount` and nothing else.
+    function _seedSubFloorEntryPrice() internal returns (uint256 floor) {
+        uint256 aliceShares = _deposit(alice, 10_000);
+        assertEq(aliceShares, 10_000 * 10 ** 3, "fixture: the genesis deposit did not mint at the offset");
+
+        usdc.mint(creditManager, 1_000e6);
+        vm.startPrank(creditManager);
+        usdc.approve(address(pool), 1_000e6);
+        pool.recoverLoss(1_000e6);
+        vm.stopPrank();
+
+        floor = pool.previewMint(1);
+    }
+
+    /// @dev A refusal takes nothing. This is the pair that distinguishes the round-22 guard from
+    ///      stock OpenZeppelin, which reverts on neither and books the assets against zero shares.
+    function _assertSubFloorDepositIsRefusedAndTakesNothing(uint256 assets) internal {
+        uint256 cashBefore = usdc.balanceOf(bob);
+        uint256 sharesBefore = pool.balanceOf(bob);
+        uint256 supplyBefore = pool.totalSupply();
+        uint256 usageBefore = _depositCapUsage(pool);
+
+        vm.expectRevert(LenderPool.ZeroAmount.selector);
+        vm.prank(bob);
+        pool.deposit(assets, bob);
+
+        assertEq(usdc.balanceOf(bob), cashBefore, "the refusal took USDC");
+        assertEq(pool.balanceOf(bob), sharesBefore, "the refusal minted shares");
+        assertEq(pool.totalSupply(), supplyBefore, "the refusal moved supply");
+        assertEq(_depositCapUsage(pool), usageBefore, "the refusal recognised cash");
+    }
+
+    /// @dev The assertions both round-45 tests share, so the second can show the floor survives
+    ///      the stream ending without restating the first.
+    function _assertMaxDepositIsAMaximumNotAMinimum(uint256 floor) internal {
+        // Premise: the pool is open, unimpaired and quoting a live maximum to a fresh receiver,
+        // and one asset-wei buys nothing.
+        assertEq(pool.entryPriceDeficit(), 0, "fixture: the entry price deficit is not zero");
+        assertEq(pool.maxDeposit(bob), 23_999_990_000, "fixture: maxDeposit is not the cap headroom");
+        assertEq(pool.previewDeposit(1), 0, "fixture: one asset-wei must buy nothing");
+
+        // The floor/ceil pair. `previewMint(1)` is the smallest deposit that buys a share.
+        assertEq(floor, 100, "the floor moved from its derived value");
+        assertEq(pool.previewDeposit(floor - 1), 0, "one asset-wei below the floor bought a share");
+        assertGe(pool.previewDeposit(floor), 1, "the floor did not buy a share");
+        assertLe(floor, pool.maxDeposit(bob), "the floor is above the maximum, so nothing could enter");
+
+        _assertSubFloorDepositIsRefusedAndTakesNothing(1);
+        _assertSubFloorDepositIsRefusedAndTakesNothing(floor - 1);
+
+        vm.prank(bob);
+        uint256 shares = pool.deposit(floor, bob);
+        assertGe(shares, 1, "the floor deposit minted nothing");
+        assertEq(pool.balanceOf(bob), shares, "the floor deposit's shares went elsewhere");
+
+        // Error identity on the EIP-5143 door: the guard fires inside `_deposit`, before the
+        // bound is read, so the caller sees `ZeroAmount()` and never `SharesBelowMinimum`.
+        vm.expectRevert(LenderPool.ZeroAmount.selector);
+        vm.prank(bob);
+        pool.deposit(1, bob, 1);
+
+        // And the exact-share door funnels through the same hook.
+        vm.expectRevert(LenderPool.ZeroAmount.selector);
+        vm.prank(bob);
+        pool.mint(0, bob);
+    }
+
+    /// @notice `maxDeposit` is a maximum and not a minimum: a deposit below `previewMint(1)` is
+    ///         refused with `ZeroAmount()` and takes nothing, while `maxDeposit` quotes the cap.
+    function test_R45I55_maxDepositIsAMaximumNotAMinimum() public {
+        uint256 floor = _seedSubFloorEntryPrice();
+        _assertMaxDepositIsAMaximumNotAMinimum(floor);
+    }
+
+    /// @notice The floor is `previewMint(1)` and it is the same number once the stream has run,
+    ///         because entry already prices the whole active tail.
+    function test_R45I55_theEntryFloorIsPreviewMintOfOneShareAndSurvivesTheStreamEnding() public {
+        uint256 floorDuringTheStream = _seedSubFloorEntryPrice();
+        skip(Config.YIELD_STREAM_DURATION + 1);
+
+        assertEq(pool.unreleasedYield(), 0, "fixture: the stream has not finished");
+        uint256 floor = pool.previewMint(1);
+        assertEq(floor, floorDuringTheStream, "the floor moved when the stream finished");
+        _assertMaxDepositIsAMaximumNotAMinimum(floor);
     }
 
     // ── round-28 item 10 (round-25 A6 F4): the pool refuses entry while paused ──

@@ -94,15 +94,20 @@ interface ICreditManager {
 
     /// @notice Recognise unrecoverable debt: insurance first, then socialised to
     ///         lenders. LiquidationAuction only.
+    /// @param auctionId The caller's own id for the auction or workout the loss belongs to. The
+    ///        balance sheet that bears the loss is recorded against `(caller, auctionId)`, so a
+    ///        later recovery on the same id reaches the sheet that bore it even after the same
+    ///        borrower defaults again under a different one.
     /// @return socialised The part the insurance fund did **not** make the liquidity source whole
     ///         for, and therefore the exact amount a later recovery may still repay without paying
     ///         the same tranche twice. `LiquidationAuction.closeWorkout` keeps it.
-    function writeDownLoss(address borrower, uint256 amount) external returns (uint256 socialised);
+    function writeDownLoss(address borrower, uint256 auctionId, uint256 amount) external returns (uint256 socialised);
 
     /// @notice Book USDC recovered after its loss was written down, back to whichever balance
     ///         sheet bore it - the pool that absorbed it, or the source that was never repaid.
     ///         LiquidationAuction only.
-    function recoverWrittenDownLoss(address borrower, uint256 amount) external;
+    /// @param auctionId The id the loss was written down under by the same caller.
+    function recoverWrittenDownLoss(address borrower, uint256 auctionId, uint256 amount) external;
 
     /// @return Sum of the bounties currently parked against live auctions.
     /// @dev Also the marker `LiquidationAuction.setCreditManager` checks a candidate manager

@@ -100,6 +100,9 @@ contract TreasuryLiquiditySource is ILiquiditySource, Ownable {
         // surplus simply becomes idle float rather than underflowing the counter.
         outstandingPrincipal = amount > outstandingPrincipal ? 0 : outstandingPrincipal - amount;
         emit PrincipalRepaid(amount);
+        // FALSE (audit round 44). `onlyCreditManager` makes `from` equal `msg.sender` by construction;
+        // the allowance is set by that same caller immediately before, as the doc comment says.
+        // forge-lint: disable-next-line(arbitrary-send-erc20)
         usdc.safeTransferFrom(creditManager, address(this), amount);
     }
 

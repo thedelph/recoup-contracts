@@ -66,6 +66,10 @@ contract ZeroMintAdapter is ICustodyAdapter {
         return 0;
     }
 
+    function farmYieldDeliveredToHarvester() external pure returns (uint256) {
+        return 0;
+    }
+
     function mintBonds(address, bytes32, bytes calldata) external payable returns (uint256) {
         return 0;
     }
@@ -361,6 +365,40 @@ contract A7VaultSeamTest is Test {
 
     // -- Task 3: the local-path gas figure ------------------------------------
 
+    /// @dev An UPPER BOUND ON THE PAIR, and both halves of that are the design.
+    ///
+    ///      UPPER BOUND, never an equality pin. A pinned figure reddens on every unrelated
+    ///      optimiser or toolchain move and gets deleted the third time it does, and this tree
+    ///      deliberately floats its Foundry version. Nothing in this repository pinned this number
+    ///      by equality before this line existed either - both `depositETH` gas measurements, here
+    ///      and on the fork, were bare `log_named_uint` emissions with no assertion at all, so this
+    ///      is the first thing that can fail on a gas regression.
+    ///
+    ///      THE PAIR, not either call, and that is what makes the bound tight enough to be worth
+    ///      having. MEASURED by this test, forge 1.8.1, both execution modes, one run each:
+    ///
+    ///        | mode                    | first   | second  | TOTAL   |
+    ///        |-------------------------|---------|---------|---------|
+    ///        | isolate (1.8.0 default) | 451,996 | 352,198 | 804,194 |
+    ///        | `--no-isolate`          | 508,828 | 295,930 | 804,758 |
+    ///
+    ///      Either call alone moves by 56,832 gas - 12.6% - between modes, in opposite directions,
+    ///      because isolate redistributes warm and cold account access between the two
+    ///      transactions. The TOTAL moves by 564, which is 0.070%. So a per-call bound would need
+    ///      more than 12% of slack purely for a switch that changes no code, while a bound on the
+    ///      sum needs none of it and can therefore be tight enough to catch something. Pin the
+    ///      invariant, not the measurement.
+    ///
+    ///      THE NUMBER. 900,000 is 11.84% above the larger of the two measured totals, which
+    ///      satisfies the >= 11% of slack the execution-mode spread was costed at, with the spread
+    ///      itself already excluded by measuring the sum. A change that adds a fifth of the cost of
+    ///      a deposit fails here; a toolchain move does not.
+    ///
+    ///      IT DOES NOT BOUND BELOW, deliberately. A path that stopped doing its work would pass
+    ///      this and fail the twenty-odd behavioural assertions in this file and in
+    ///      `MintAttemptReceiver.t.sol`, which is where that belongs.
+    uint256 internal constant DEPOSIT_ETH_GAS_PAIR_CEILING = 900_000;
+
     function test_a7_measureLocalDepositEthGas() public {
         bytes32 attempt = bytes32(uint256(71));
         address receiver = adapter.predictMintReceiver(alice, attempt);
@@ -369,7 +407,8 @@ contract A7VaultSeamTest is Test {
         vm.prank(alice);
         uint256 g0 = gasleft();
         vault.depositETH{value: PAYMENT}(attempt, data);
-        emit log_named_uint("A7 MEASURED depositETH gas, mock path, first", g0 - gasleft());
+        uint256 first = g0 - gasleft();
+        emit log_named_uint("A7 MEASURED depositETH gas, mock path, first", first);
 
         bytes32 attempt2 = bytes32(uint256(72));
         address receiver2 = adapter.predictMintReceiver(alice, attempt2);
@@ -378,7 +417,15 @@ contract A7VaultSeamTest is Test {
         vm.prank(alice);
         uint256 g1 = gasleft();
         vault.depositETH{value: PAYMENT}(attempt2, data2);
-        emit log_named_uint("A7 MEASURED depositETH gas, mock path, second", g1 - gasleft());
+        uint256 second = g1 - gasleft();
+        emit log_named_uint("A7 MEASURED depositETH gas, mock path, second", second);
+        emit log_named_uint("A7 MEASURED depositETH gas, mock path, PAIR TOTAL", first + second);
+
+        assertLe(
+            first + second,
+            DEPOSIT_ETH_GAS_PAIR_CEILING,
+            "depositETH got materially dearer - see the table above before raising this"
+        );
     }
 
     // -- helpers --------------------------------------------------------------
