@@ -73,10 +73,13 @@ redeploy and no disturbance to live state.
 This is stated plainly because Recoup also asks DexFi about *their* admin-key plans, and asking a
 question you have not answered yourself is the one thing that would make that ask land badly.
 
-What the owner can do: set the yield recipient (`:95`), set the harvester (`:125`), and call
-`emergencyUnstake` (`:260`).
+What the owner can do: `setYieldRecipient`, `setHarvester` and `emergencyUnstake`. Those three are
+named rather than cited by line: this paragraph carried the line numbers `:95`, `:125` and `:260`
+until 2026-09-12, and by then all three pointed at unrelated code, because a line number is wrong
+the first time anything above it moves and nothing checks it. A symbol survives every insertion, so
+grep for it.
 
-What the owner cannot do: `renounceOwnership` reverts (`:132`), so ownership can never be dropped
+What the owner cannot do: `renounceOwnership` reverts, so ownership can never be dropped
 and the contract can never be orphaned. There is no path for the owner to move bonds to an
 arbitrary address other than the break-glass above, and no upgrade path at all. These contracts
 are immutable by choice.
@@ -201,8 +204,13 @@ opening none from 20 of 20 to 0 of 20.
 includes deterministic regressions, stateful invariants and live-contract fork tests;
 [KNOWN_RISKS.md](KNOWN_RISKS.md) records the open posture and activation gates.
 
-No external audit has been commissioned. Internal review and passing tests do not replace that
-gate before third-party capital.
+An external audit is in progress and is not complete. It began on 2026-09-07 over `LenderPool`,
+`CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit
+b66023d, and ten preliminary issues were filed on 2026-09-11; the disposition of each in this
+source is in [KNOWN_RISKS.md](KNOWN_RISKS.md). This sentence said no external audit had been
+commissioned until 2026-09-12, which was true when it was written and false from 2026-09-07 on.
+Internal review and passing tests do not replace that gate before third-party capital, and neither
+does an audit that has not finished.
 
 ## Questions
 
