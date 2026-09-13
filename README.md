@@ -20,7 +20,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Core loan path | Implemented and tested: custody, NAV, borrowing, yield application, liquidation and workout |
 | Base Sepolia | Historic mock-stack deployment; explorer-verified at deployment, but not current-source parity. Addresses are in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
 | Base mainnet | No Recoup contracts deployed |
-| Lender pool | Source and testnet instance exist, but the pool is empty, unwired and blocked from activation |
+| Lender pool | Source and testnet instance exist. The testnet pool is empty and blocked from activation, and it is not wired as the protocol's liquidity source; its own pointers to the manager and the harvester are set, so "unwired" is true in one direction only. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
 | Referral registry | Source fixed through partner self-registration; the carried-over Sepolia instance remains defective and unused, and live replacement is disabled and unauthorised |
 | External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11 and their disposition in this source is recorded in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). Not completed |
 
@@ -62,7 +62,7 @@ CreditManager <--- NAVOracle             v
 | `CreditWiring` | Deploy-time-linked library that `CreditManager` reaches by delegatecall for its wiring and migration probes; split out so the manager fits under the EIP-170 runtime limit |
 | `EpochHarvester` | Claims realised farm yield, splits it and applies the borrower share to debt |
 | `LiquidationAuction` | Public Dutch auction with a workout fallback for unfilled positions |
-| `LenderPool` | ERC-4626 USDC pool, impairment pricing and FIFO withdrawal queue; not approved for activation |
+| `LenderPool` | ERC-4626 USDC pool, impairment pricing, and escrowed withdrawal requests serviced per controller rather than a global queue; not approved for activation |
 | `ReferralRegistry`, `ProtocolFeeSplitter` | Standalone referral and fee-routing utilities; neither is part of the core deployment path |
 
 Fixed protocol parameters and external addresses live in [`src/Config.sol`](src/Config.sol). Max LTV,
@@ -81,7 +81,7 @@ lender pool this source replaces, and their status against what is actually here
 | Finding | Status in this source |
 |---|---|
 | Round 22 F3, principal-cap accounting | **Closed.** There are no principal units, so the residuals that were properties of them cannot be reproduced. Cap usage is `max(accountedCash + outstandingPrincipal - totalClaimable, 0)`, and the quotient bound is held explicitly by `minimumEntryAssets`, `entryPriceCashReserve` and `maximumShareSupply` |
-| Round 21 F7, queue over-reservation | **Closed.** `_queueCashReserve` is a per-controller pro-rata slice of executable cash. The old code priced the exit against the whole book and subtracted it from cash alone, which is why the over-reservation equalled leverage; that multiplier is gone by construction |
+| Round 21 F7, queue over-reservation | **Closed.** `_queueCashReserve` is a pro-rata slice of executable cash taken over every outstanding request at once, and `maxRequestRedeem` is the per-controller one. The old code priced the exit against the whole book and subtracted it from cash alone, which is why the over-reservation equalled leverage; that multiplier is gone by construction |
 | Round 22 F12, uncollectable claims | **Half closed.** `serviceWithdrawalRequest` reverts unless the caller is the controller or an operator it approved, so service is no longer permissionless. A claim recorded for a receiver the asset refuses to pay is still uncollectable, and that half is accepted rather than fixed |
 
 Round 22 F11 and F6a were listed here in earlier revisions and are fixed: F11 rated non-epoch
