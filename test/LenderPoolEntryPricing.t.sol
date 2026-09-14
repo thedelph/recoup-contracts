@@ -54,7 +54,11 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///      different fix. `test_theEntryBoundCannotSeeTheStretchFinding14IsAbout` executes both
 ///      halves on one fixture: 4,545,454,545,495 shares minted either way against the same bound,
 ///      and a five-day exit that forfeits 1 wei under the floor and 303.819445 USDC under the
-///      drought, out of a 5,000.000000 entry.
+///      drought, out of a 5,000.000000 entry. (Those figures were taken with the drought rated
+///      over its whole 180 days; since the external review's M-04 the epoch leg is capped at
+///      `Config.MAX_YIELD_STREAM_DURATION`, so the drought arm is rated over the cap and the
+///      forfeit is smaller. The blindness of the quote to the window is what the test asserts,
+///      and it holds at either window; read the logged figures rather than these.)
 ///
 ///      **4. What round 23 counted, inverted rather than deleted.** Its probe
 ///      `test_A23_03_theEntryDoorsCarryNoBound` asserted the two selectors were ABSENT, from the
@@ -322,6 +326,13 @@ contract LenderPoolEntryPricingTest is Test {
         pool.mint(tooMany, bob, type(uint256).max);
     }
 
+    /// @dev The window a `DROUGHT`-long gap is rated over. It was `DROUGHT` itself until the
+    ///      external review's M-04 put a ceiling on the epoch leg; the quote's blindness to the
+    ///      window, which is what this file measures, is unchanged by where the ceiling sits.
+    function _droughtWindow() internal pure returns (uint256) {
+        return DROUGHT > Config.MAX_YIELD_STREAM_DURATION ? Config.MAX_YIELD_STREAM_DURATION : DROUGHT;
+    }
+
     // -- 2. the size of what remains after PR #259 ----------------------------
 
     /// @notice SIZING. The epoch leg after a drought: it steps the quote AND stretches the window.
@@ -335,7 +346,7 @@ contract LenderPoolEntryPricingTest is Test {
 
         uint256 after_ = pool.previewDeposit(ENTRY);
         assertLt(after_, before, "the epoch leg no longer steps the entry quote");
-        assertEq(_window(), DROUGHT, "the epoch leg must still be rated over its own accrual window");
+        assertEq(_window(), _droughtWindow(), "the epoch leg must still be rated over its own accrual window, capped");
         emit log_named_uint("epoch leg: shortfall bps ", ((before - after_) * 10_000) / before);
         emit log_named_uint("epoch leg: window seconds", _window());
 
@@ -454,7 +465,7 @@ contract LenderPoolEntryPricingTest is Test {
 
         // Premises, so a later reader can see which half moved if this ever changes.
         assertEq(shortWindow, Config.YIELD_STREAM_DURATION, "premise: the control must be the floor");
-        assertEq(longWindow, DROUGHT, "premise: the epoch leg must still stretch to the drought");
+        assertEq(longWindow, _droughtWindow(), "premise: the epoch leg must still stretch to the drought, capped");
 
         // THE ANSWER. The quote is blind to the window, so no `minShares` tells the two apart.
         assertEq(longQuote, shortQuote, "the entry quote saw the window after all");

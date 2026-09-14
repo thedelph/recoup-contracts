@@ -328,7 +328,9 @@ contract R53A01_VariantSplit is Test {
         try auction.sweepFreeBalanceToInsurance() {
             fail("the free-balance sweep moved money while a booking stood unpaid");
         } catch (bytes memory err) {
-            assertEq(bytes4(err), LiquidationAuction.NothingUnreserved.selector, "the sweep refused for the wrong reason");
+            assertEq(
+                bytes4(err), LiquidationAuction.NothingUnreserved.selector, "the sweep refused for the wrong reason"
+            );
         }
         assertEq(three.insuranceFund(), 0, "insurance received something");
 
@@ -365,6 +367,14 @@ contract R53A01_VariantSplit is Test {
     ///
     ///         Dust by construction (only the grind can make `earned` exceed the lot's own pot),
     ///         measured so the split's one cost has a number beside it. Both branches assert.
+    ///
+    ///         FLIPPED by the L-02 fix (33audits #54, session 2026-09-14): the 120 hourly settles
+    ///         no longer destroy anything, so `earned - pot` reads 0, bob is booked `earned`, both
+    ///         are paid in full and nothing stands. The pushed foreign backing still reads as a
+    ///         donation under the split (`spokenFor` still nets nothing of it), which is the shape
+    ///         this test was written to measure; what changed is that the grind no longer produces
+    ///         anything for that donation to absorb. The count-change door that still can is
+    ///         reached in `R60S2_L02Probes.t.sol`.
     function test_R53A01_split_pushedForeignBackingBacksTheNextCloseLikeADonation() public {
         (uint256 aliceId, uint256 a) = _era(credit, alice, EPOCH);
         CreditManager two = _migrate();
@@ -398,7 +408,7 @@ contract R53A01_VariantSplit is Test {
         emit log_named_uint("MEASURED manager two's pot for bob       ", pot);
         emit log_named_uint("MEASURED earned - pot (the grind)        ", grind);
         emit log_named_uint("MEASURED bob booked                      ", booked);
-        assertGt(grind, 0, "fixture: the grind produced no gap, nothing to measure");
+        assertEq(grind, 0, "the grind produced a gap: a non-moving settle destroyed a remainder");
 
         uint256 aliceBefore = usdc.balanceOf(alice);
         uint256 bobBefore = usdc.balanceOf(bob);
@@ -421,17 +431,11 @@ contract R53A01_VariantSplit is Test {
             assertEq(auction.totalWorkoutYieldOwed(), 0, "shipped tree: a booking stood");
         } else {
             assertEq(booked, earned, "split: bob was clamped after all");
-            assertEq(a - alicePaid, grind, "split: alice's shortfall is not the grind");
-            assertEq(booked - bobPaid, grind, "split: bob's shortfall is not the grind");
-            assertEq(auction.totalWorkoutYieldOwed(), 2 * grind, "split: the standing dust is not two grinds");
-            // The two dust bookings deadlock each other until any later unbooked money arrives.
-            vm.prank(stranger);
-            vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
-            auction.claimWorkoutYield(aliceId);
-            // And the sweep is refused over them (the safe direction).
-            vm.prank(stranger);
-            vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
-            auction.sweepFreeBalanceToInsurance();
+            // With no grind to absorb, the split pays both in full and nothing stands: the two
+            // dust bookings that used to deadlock each other here are gone with the grind.
+            assertEq(alicePaid, a, "split: alice was short with nothing ground");
+            assertEq(bobPaid, booked, "split: bob was short with nothing ground");
+            assertEq(auction.totalWorkoutYieldOwed(), 0, "split: a booking stood with nothing ground");
         }
     }
 }

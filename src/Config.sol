@@ -422,6 +422,26 @@ library Config {
     ///      yield. Same mechanism as Synthetix StakingRewards.
     uint256 internal constant YIELD_STREAM_DURATION = MIN_EPOCH_GAP;
 
+    /// @notice The longest window the lender pool's epoch leg may rate a delivered epoch over.
+    /// @dev `LenderPool._rateStream` rates an epoch over at least the time it took to accrue
+    ///      (rule 1, so a stale pot is not captured in one short window) and, since the external
+    ///      review's M-04, over at most this. Without a ceiling the window was whatever the gap
+    ///      since the last delivery happened to be, a keeper outage or the pre-wiring gap could
+    ///      make it months, and a permissionless flush picks the block: a newcomer entering after
+    ///      the flush pays gross for a pot that then vests over that whole gap, and leaving early
+    ///      forfeits the unreleased remainder to the cohort that was already there.
+    ///
+    ///      **The trade, stated rather than hidden.** A ceiling does not remove that transfer; it
+    ///      moves it. Rule 1's second attack is "a sixty-day pot rated over five hands
+    ///      eleven-twelfths to whoever is staked for those five days"; with a ceiling the same
+    ///      shape reopens at ratio `elapsed / MAX`: a 180-day pot rated over 30 days pays the
+    ///      whole pot to whoever is staked for those 30 days, where the unbounded window paid
+    ///      them a sixth. The newcomer-underwater case closes; the just-in-time-for-a-month case
+    ///      opens by the same amount. 30 days sits above any honest outage this protocol has
+    ///      measured, so ordinary epochs (five days apart) never meet it, and a 30-day floor still
+    ///      defeats same-block capture outright. Measured either way in `YieldStreamClock.t.sol`.
+    uint256 internal constant MAX_YIELD_STREAM_DURATION = 30 days;
+
     // ── NAV oracle guards (PRD §4.6) ─────────────────────────────────────────
     uint256 internal constant NAV_MAX_DEVIATION_BPS = 1_000;
     uint256 internal constant NAV_PENDING_DELAY = 12 hours; // large moves wait for 2nd key

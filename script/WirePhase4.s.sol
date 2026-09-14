@@ -272,8 +272,7 @@ contract WirePhase4 is DeployBase {
         if (_executionIsOpen(timelock)) {
             return "executeBatch calldata - ONE transaction, after the delay, sent by anyone (EXECUTOR_ROLE is open):";
         }
-        return
-            "executeBatch calldata - ONE transaction, after the delay, sent by an EXECUTOR_ROLE holder (execution is NOT open):";
+        return "executeBatch calldata - ONE transaction, after the delay, sent by an EXECUTOR_ROLE holder (execution is NOT open):";
     }
 
     /// @dev The half the operator needs before they commit to a maturity: whether the key in front
@@ -525,9 +524,7 @@ contract WirePhase4 is DeployBase {
         console.logBytes32(timelock.hashOperationBatch(targets, values, payloads, PREDECESSOR, salt));
         console.log("scheduleBatch calldata - ONE transaction, sent by the proposer:");
         console.logBytes(
-            abi.encodeCall(
-                TimelockController.scheduleBatch, (targets, values, payloads, PREDECESSOR, salt, delay)
-            )
+            abi.encodeCall(TimelockController.scheduleBatch, (targets, values, payloads, PREDECESSOR, salt, delay))
         );
         console.log(_executeAudienceLine(timelock));
         console.logBytes(
@@ -717,9 +714,7 @@ contract WirePhase4 is DeployBase {
         console.logBytes32(timelock.hashOperationBatch(targets, values, payloads, PREDECESSOR, SALT));
         console.log("scheduleBatch calldata - ONE transaction, sent by the proposer:");
         console.logBytes(
-            abi.encodeCall(
-                TimelockController.scheduleBatch, (targets, values, payloads, PREDECESSOR, SALT, delay)
-            )
+            abi.encodeCall(TimelockController.scheduleBatch, (targets, values, payloads, PREDECESSOR, SALT, delay))
         );
         console.log(_executeAudienceLine(timelock));
         console.logBytes(
@@ -759,9 +754,7 @@ contract WirePhase4 is DeployBase {
     function executeQueued() external {
         _requireConfirmation();
         Deployed memory d = _resolveDeployed();
-        _executeQueued(
-            d, TimelockController(payable(_requiredTimelock())), _resolveParamsAgainstRecord(msg.sender)
-        );
+        _executeQueued(d, TimelockController(payable(_requiredTimelock())), _resolveParamsAgainstRecord(msg.sender));
     }
 
     /// @dev Split from `executeQueued()` for the reason `_queue` above gives.
@@ -831,6 +824,56 @@ contract WirePhase4 is DeployBase {
         console.log("Phase-4 wiring holds.");
     }
 
+    /// @notice The same report for the state the protocol is actually in TODAY: the shipped,
+    ///         pre-Phase-4 wiring, read off a chain.
+    /// @dev Usage: forge script script/WirePhase4.s.sol:WirePhase4 --sig "assertDeployedOnly()" --rpc-url base
+    ///
+    ///      **Round-59 finding 1, and it is a gap rather than a refinement.** `DeployBase._assertWiring`
+    ///      is the shipped-state census - forty-odd comparisons including `pool.paused()`, the two
+    ///      legs that must still be zero, and the nine owners - and until this function existed
+    ///      every one of its callers was inside `Deploy.s.sol`, which is to say inside the
+    ///      SIMULATION. Nothing read a chain. The one chain-reading report the documents defer to
+    ///      is `assertOnly()` one function up, and it calls `_assertPhase4Wiring`, which requires
+    ///      `credit.liquiditySource == pool`: a correctly shipped pre-Phase-4 deployment therefore
+    ///      FAILS it by construction. MEASURED on a local anvil at `c9b5f95`, against a completed
+    ///      deployment whose whole `_assertCoreGraph` census read green: `assertOnly()` exited 1 on
+    ///      `WiringIncomplete("credit.liquiditySource")`.
+    ///
+    ///      What that left uncovered is a broadcast that the node truncates. A real `--broadcast` of
+    ///      `Deploy.s.sol:DeployLocal` printed `ONCHAIN EXECUTION COMPLETE & SUCCESSFUL` and exited
+    ///      **0** after the node discarded 22 of its 39 transactions: all thirteen CREATEs landed,
+    ///      all twenty wiring CALLs were lost, and the nine contracts stood there with every pointer
+    ///      at zero and `LenderPool` unpaused at the full deposit cap - the round-36 D7 capture
+    ///      state, reported as a success. On the testnet path `AssertLocked` catches that by luck of
+    ///      ordering (the whitelist pair is last, so a truncation is a suffix that trips
+    ///      `ConfigurationTampered`); on the mainnet path nothing catches it at all.
+    ///
+    ///      **What this is NOT, MEASURED read-only against the LIVE Base Sepolia deployment on
+    ///      2026-09-12 through `https://base-sepolia-rpc.publicnode.com`.** Pointed at the
+    ///      2026-08-19 testnet deployment it reverts, and it reverts UNNAMED: `_assertWiring` reads
+    ///      `d.adapter.mintReceiverImplementation()`, a selector that deployment's adapter bytecode
+    ///      does not carry (`cast call` on it answers `execution reverted`), so the census dies on a
+    ///      bare `EvmError: Revert` before it can name a row. That is the source drift the
+    ///      deployed-bytecode gate already reports and deliberately does not fail on, not a wiring
+    ///      fault. So this is a post-condition for a deployment made BY THIS TREE, to
+    ///      be run immediately after the broadcast that made it. It is not a health check for a
+    ///      deployment older than the census, and an operator who points it at one should read an
+    ///      unnamed revert as "this chain predates these scripts" rather than as a finding.
+    ///
+    ///      Zero runtime bytes: this file is a script and is never deployed. The pin is
+    ///      `test/R59A03_PostBroadcastGap.t.sol`, whose open-pool case is the one a neuter of the
+    ///      `pool.paused` clause turns red.
+    function assertDeployedOnly() external view {
+        // Read against the record, and name a missing owner rather than blaming the chain for it,
+        // for the reasons the long comment in `assertOnly()` gives. This is the same health report
+        // pointed at the census that matches the deployment as it stands.
+        GovParams memory p = _readParamsAgainstRecord(msg.sender);
+        if (p.owner == address(0)) revert OwnerNotNamedForReport();
+
+        _assertWiring(_resolveDeployed(), p);
+        console.log("Shipped (pre-Phase-4) wiring holds ON CHAIN.");
+    }
+
     /// @dev A stray `forge script` should not be able to move the funder and the loss sink by
     ///      accident, which is the same reason the mainnet deploy target carries one. No chain
     ///      guard, though: unlike a deployment this is legitimate on a testnet, on a fork and on
@@ -865,8 +908,7 @@ contract WirePhase4 is DeployBase {
         d.liquidity =
             TreasuryLiquiditySource(_resolveOne("RECOUP_LIQUIDITY_SOURCE", ".contracts.TreasuryLiquiditySource", j));
         d.harvester = EpochHarvester(_resolveOne("RECOUP_EPOCH_HARVESTER", ".contracts.EpochHarvester", j));
-        d.auction =
-            LiquidationAuction(_resolveOne("RECOUP_LIQUIDATION_AUCTION", ".contracts.LiquidationAuction", j));
+        d.auction = LiquidationAuction(_resolveOne("RECOUP_LIQUIDATION_AUCTION", ".contracts.LiquidationAuction", j));
         // Derived rather than read from a ninth environment variable, deliberately. The pointer is
         // `immutable` on all three readers, so the deployment already knows the answer and asking
         // an operator to retype it would be inviting a typo that `_assertCoreGraph` would then
@@ -1050,8 +1092,9 @@ contract WirePhase4 is DeployBase {
             _operatorAgainstRecord("RECOUP_YIELD_RECIPIENT", ".operators.yieldRecipient", p.yieldRecipient, j);
         p.keeper = _operatorAgainstRecord("RECOUP_KEEPER", ".operators.keeper", p.keeper, j);
         p.navConfirmer = _operatorAgainstRecord("RECOUP_NAV_CONFIRMER", ".operators.navConfirmer", p.navConfirmer, j);
-        p.protocolFeeWallet =
-            _operatorAgainstRecord("RECOUP_PROTOCOL_FEE_WALLET", ".operators.protocolFeeWallet", p.protocolFeeWallet, j);
+        p.protocolFeeWallet = _operatorAgainstRecord(
+            "RECOUP_PROTOCOL_FEE_WALLET", ".operators.protocolFeeWallet", p.protocolFeeWallet, j
+        );
         p.guardian = _operatorAgainstRecord("RECOUP_GUARDIAN", ".operators.guardian", p.guardian, j);
         return p;
     }

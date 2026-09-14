@@ -3429,16 +3429,20 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
 
     // ─────────────────────────────────────────────────────────────────────────
     // External review (33audits, 2026-09-11), H-03: the reviewers' loop, kept as the pin that
-    // states the relationship. `maxRequestRedeem` recomputes a request's slice against a base
-    // the previous service already shrank, so stepped service captures more than one slice of
-    // the opening cash. That arithmetic is right. What it is measured against here is the
-    // synchronous door: `maxRedeem` is bounded by all unreserved executable cash, so an un-queued
-    // holder takes at least the loop's total in ONE `redeem`. The request door's per-call slice
-    // is a reservation against lending and other exits, not a cap; the docstrings say so now.
+    // states the relationship. `maxRequestRedeem` used to recompute a request's slice against a
+    // base the previous service already shrank, so stepped service of ONE request captured
+    // more than one slice of the opening cash. Since the request-draw memory (the reviewers'
+    // own shape, `_requestDraws`) the same controller's stepped service reaches EXACTLY the
+    // single slice, and this pin now asserts the equality. What it is measured against is
+    // still the synchronous door, and the second inequality still holds. Neither door is a
+    // bound on what a position reaches: `R60S1_H03Routes.t.sol` measures the stepped sync
+    // door and the sequential address split at the request loop's own total from the same
+    // state, with another lender queued. The memory closes one route of three.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Stepped request service captures more than a single pro-rata slice, and no more
-    ///         than one synchronous `redeem` of the same shares delivers from the same state.
+    /// @notice Stepped request service of ONE request captures exactly a single pro-rata slice
+    ///         (the request-draw memory), and no more than one synchronous `redeem` of the same
+    ///         shares delivers from the same state.
     /// @dev Snapshot BEFORE `requestWithdrawal`: once the shares are escrowed `balanceOf` is zero
     ///      and `maxRedeem` reads zero by construction. Three figures are logged - the fair
     ///      single-shot slice, the loop's total, one `redeem` - and the assertion that pins the
@@ -3490,8 +3494,11 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
         emit log_named_uint("MEASURED one sync redeem, paid           ", syncPaid);
         emit log_named_uint("MEASURED shares left after the sync door ", sharesLeftAfterSync);
 
-        // The reviewers' arithmetic, reproduced: stepped service beats the single slice.
-        assertGt(captured, fairOnce, "stepped service captured no more than the fair slice");
+        // The reviewers' arithmetic, closed: stepped service of one request reaches exactly the
+        // single slice (4,874.250000 here), because every later call reads the base it drained
+        // added back and its own draw deducted. It read 4,999.999999 over 7 calls before the
+        // memory, against the same 4,874.250000 slice.
+        assertEq(captured, fairOnce, "stepped service of one request reached other than its single slice");
         // And the relationship the design rests on: it beats nothing the sync door does not
         // already deliver in one call, from the same state, for the same shares.
         assertEq(syncPaid, syncQuoted, "the sync door paid other than it quoted");
@@ -3553,24 +3560,28 @@ contract ImpairmentIntegrationTest is RiskParamsFixture {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // External review (33audits, 2026-09-11), L-02: `_settle` stamps the index before its
-    // `owed == 0` return, so a settle whose slice floors to zero discards the sub-unit remainder;
-    // held by decision (about $0.432 per victim per stream against ~1,500x that in gas). The
-    // reviewers' one-line fix - stamp only when `bonds == 0 || owed != 0` - was refuted by
-    // execution before they proposed it, and this test is the pin: under the one-liner a settle
-    // that floors to zero leaves the index stale, `settleForVault` runs against the OLD count in
-    // front of a top-up, and the next settle prices the whole stale delta at the larger count.
-    // The credit that mints is backed by nothing. Green on the shipped code; red under the
-    // one-liner with the unbacked figure in the assertion message.
+    // External review (33audits, 2026-09-11), L-02: `_settle` USED TO stamp the index before its
+    // `owed == 0` return, so a settle whose slice floored to zero discarded the sub-unit remainder;
+    // held by decision through round 59 (about $0.432 per victim per stream against ~1,500x that
+    // in gas), then CLOSED on 2026-09-14 by the reviewers' second shape: a non-moving settle now
+    // advances the index only over what it paid, and only `settleForVault` still stamps. The
+    // reviewers' FIRST shape, the one-liner - stamp only when `bonds == 0 || owed != 0` - was
+    // refuted by execution before they proposed it, and this test stays as its pin: under the
+    // one-liner a settle that floors to zero leaves the index stale, `settleForVault` runs against
+    // the OLD count in front of a top-up, and the next settle prices the whole stale delta at the
+    // larger count. The credit that mints is backed by nothing. Green on the shipped code, before
+    // and after the fix; red under the one-liner with the unbacked figure in the assertion message.
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice A zero-floored settle in front of a top-up never credits more than was streamed:
     ///         after both holders are settled at the end of the stream, everything credited plus
     ///         everything still undistributed is at most the pot.
-    /// @dev The shipped code destroys the floored remainders (the sum lands BELOW the pot, which
-    ///      is the accepted Low); the refuted one-liner mints credit ABOVE it. The rate is chosen
-    ///      so a one-bond position's per-second slice floors to zero: a 1.000000 pot over the
-    ///      stream window across 101 bonds is under one wei per bond per second.
+    /// @dev Before the fix the shipped code destroyed every floored remainder (2 wei on this pot);
+    ///      since the fix the grind destroys nothing and only the top-up's own stamp does, under
+    ///      one base unit (the sum lands at most one below the pot, and the atto-wei accounting is
+    ///      closed in `R60S2_L02Probes.t.sol`); the refuted one-liner mints credit ABOVE it. The
+    ///      rate is chosen so a one-bond position's per-second slice floors to zero: a 1.000000
+    ///      pot over the stream window across 101 bonds is under one wei per bond per second.
     function test_L02_aZeroFlooredSettleBeforeATopUpCreditsNoMoreThanWasStreamed() public {
         address victim = makeAddr("victim");
         bond.mint(victim, 2_000);

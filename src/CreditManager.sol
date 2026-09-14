@@ -759,9 +759,11 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
     /// @dev Settle a position against its live bond count. Four callers did this inline and all
     ///      four must read the vault rather than a cached figure, which is the reason the vault
-    ///      call is inside the helper rather than at the call sites.
+    ///      call is inside the helper rather than at the call sites. `borrow` and `_claimSurplus`
+    ///      joined them (external review, L-02), so `_settle` now has exactly two callers: this,
+    ///      and `settleForVault` with the count the vault is about to change.
     function _settleLive(address borrower) private {
-        _settle(borrower, vault.bondCount(borrower));
+        _settle(borrower, vault.bondCount(borrower), false);
     }
 
     /// @dev Recompute and store one borrower's impairment. `_setImpairment` returns whether the
@@ -1246,7 +1248,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
         // Credit any yield the position has already earned before sizing the loan, so
         // a borrower is never refused against a debt that yield has covered.
-        _settle(msg.sender, vault.bondCount(msg.sender));
+        _settleLive(msg.sender);
 
         // All three gates below come from one read. `params()` rather than three single getters
         // so this cannot combine a cap seen in one block with a ceiling seen in another - and it
@@ -1459,27 +1461,34 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     /// @dev Permissionless on purpose, and making it require the borrower would mean an
     ///      inattentive borrower keeps paying against a debt that yield has already covered.
     ///
-    ///      **It does NOT "only ever help", and this line said it did until audit round 47
-    ///      item 77.** `_settle` stamps `yieldIndexOf[borrower]` unconditionally and sizes the
-    ///      slice with a flooring division, so a settle whose slice floors to zero advances the
-    ///      index over an entitlement it did not pay. Because this door is permissionless, a
-    ///      stranger can repeat that at will and grind a small holder's whole stream entitlement
-    ///      away one remainder at a time. MEASURED independently by two round-46 agents at
-    ///      `8631498`: **1,999 wei to 0 over 2,161 settles**, and 3,326 wei to 0 over 3,600
-    ///      settles in two simulated hours at 100 bonds. The griefable band widens with the
-    ///      accrual window - 400 bonds is zeroable after a 60-day drought.
+    ///      **It no longer grinds.** Until the external review's L-02 (33audits #54, the
+    ///      reviewers' comment of 2026-09-13) `_settle` stamped `yieldIndexOf[borrower]`
+    ///      unconditionally and sized the slice with a flooring division, so a settle whose slice
+    ///      floored to zero advanced the index over an entitlement it did not pay - and because
+    ///      this door is permissionless, a stranger could repeat that at will and grind a small
+    ///      holder's whole stream entitlement away one remainder at a time. MEASURED
+    ///      independently by two round-46 agents at `8631498`: **1,999 wei to 0 over 2,161
+    ///      settles**, and 3,326 wei to 0 over 3,600 settles in two simulated hours at 100
+    ///      bonds; bounded at about **$0.432 per victim per stream** against roughly 98,587 gas
+    ///      a step, which is why it was held as documented through round 59.
     ///
-    ///      **The destroyed wei reach nobody**: a bystander position measures identical to the
-    ///      control, so this is burn, not theft, and there is no attacker-side profit to fund it.
-    ///      The bound is about **$0.432 per victim per stream** against roughly 98,587 gas a
-    ///      step - about **1,500x the damage in gas** - which is why it is documented rather than
-    ///      fixed. The careful one-line code fix was REFUTED by execution: skipping the index
-    ///      stamp when the slice floors to zero revalues a stale index against a larger bond
-    ///      count after a top-up, and minted 925,925 wei of unbacked credit. A per-position
-    ///      remainder carry works, at +198 bytes, and makes `pendingYieldOf` under-report.
+    ///      The shape that closes it is the reviewers' own, trimmed: on a path that does not move
+    ///      the bond count, `_settle` advances the index only over the part it actually paid,
+    ///      so the floored remainder stays in the index gap and is paid once it reaches a base
+    ///      unit. Nothing is carried, so `pendingYieldOf` reads it. `settleForVault` still
+    ///      stamps, because the count is about to change and a remainder priced at the new
+    ///      count would be minted rather than earned: the careful one-liner that skipped the
+    ///      stamp when the slice floored to zero was REFUTED by execution on exactly that
+    ///      (925,925 wei of unbacked credit, then 336 on a 1.000000 pot), and
+    ///      `Impairment.integration.t.sol::test_L02_aZeroFlooredSettleBeforeATopUpCreditsNoMoreThanWasStreamed`
+    ///      pins it.
     ///
-    ///      So: it usually helps, it can grind a dust holder's entitlement to zero, and the
-    ///      bound above is what that is worth. Round 21 finding 12 is the same shape one level up.
+    ///      What remains is the count-changing stamp itself: every `depositBonds`,
+    ///      `withdrawBonds`, `reassign`, `seize` and `disposeTo` still destroys under one base
+    ///      unit of the position's remainder, so an entitlement can still fall short by at most
+    ///      one wei per count change - and that is now the only door onto the auction's dust
+    ///      deadlock, which `R60S2_L02Probes.t.sol` reaches through count changes alone and
+    ///      bounds at one wei per change. Round 21 finding 12 is the same shape one level up.
     function settle(address borrower) public whileAttached {
         _settleLive(borrower);
     }
@@ -1491,7 +1500,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///      before they arrived.
     function settleForVault(address borrower, uint256 currentBonds) external {
         if (msg.sender != address(vault)) revert NotVault();
-        _settle(borrower, currentBonds);
+        _settle(borrower, currentBonds, true);
     }
 
     /// @inheritdoc ICreditManager
@@ -1615,7 +1624,7 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     }
 
     function _claimSurplus(address account) private {
-        _settle(account, vault.bondCount(account));
+        _settleLive(account);
         // **Reachable, and round 21 measured the route.** This comment used to say "unreachable
         // today - every route a debt has to zero already refunds". It is wrong in one direction:
         // the refund hooks all key on a debt *reduction*, and `resolveBounty(id, false)` writes
@@ -3085,10 +3094,30 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
     ///
     ///      A position is owed `bonds x (accYieldPerBond - itsIndex)`. Settling pays
     ///      that against debt first and the remainder to claimable, then moves the
-    ///      index up to the current accumulator so the same yield cannot be counted
-    ///      twice. Setting the index for a position that has never been seen is what
-    ///      makes a first deposit start from now rather than from genesis.
-    function _settle(address borrower, uint256 bonds) private {
+    ///      index so the same yield cannot be counted twice. HOW FAR it moves depends on
+    ///      `bondCountMoving`, and the two callers are the two cases:
+    ///
+    ///      - `settleForVault` (true): the vault is about to change `bondCount`, so the index
+    ///        is STAMPED at the accumulator. Whatever the floor left unpaid is destroyed here
+    ///        rather than carried, because a remainder earned at the old count and priced at
+    ///        the new one is credit backed by nothing - that revaluation is the shape the
+    ///        refuted one-liner minted 925,925 wei through. Stamping also covers the position
+    ///        that has never been seen: a first deposit arrives with `bonds == 0` and starts
+    ///        from now rather than from genesis.
+    ///      - `_settleLive` (false): the count is not moving, so the index advances by exactly
+    ///        `owed x ACC_PRECISION / bonds`, the part that was paid, and the floored
+    ///        remainder stays in the gap to be paid once it reaches a base unit. `owed` is
+    ///        itself the floor of `bonds x delta / ACC_PRECISION`, so the advance never
+    ///        exceeds `delta` and the index never overtakes the accumulator - which
+    ///        `_pending`'s checked subtraction needs, and which
+    ///        `CreditManager.invariants.t.sol` watches on every frame (a ceiling here goes red
+    ///        on the first frame). At `owed == 0` nothing is written at all, which is the
+    ///        whole of the L-02 fix.
+    ///
+    ///      MEASURED on a clean `out/`: -57 runtime bytes against the unconditional stamp,
+    ///      because hoisting `borrow`'s and `_claimSurplus`'s inline settle through
+    ///      `_settleLive` (-149) paid for the branch (+92).
+    function _settle(address borrower, uint256 bonds, bool bondCountMoving) private {
         // Detached, `bonds` is a number this contract no longer governs, so pricing a
         // position against it would mint entitlement out of a stale accumulator. A
         // silent no-op rather than a revert, so that `repay` and `claimSurplus` keep
@@ -3097,19 +3126,26 @@ contract CreditManager is ICreditManager, Ownable, Pausable, ReentrancyGuard {
 
         _accrue();
 
-        // The index is stamped even at zero bonds, and that is load-bearing rather
-        // than incidental: the vault calls this with the balance BEFORE the change, so
-        // a first-time depositor's call arrives with `bonds == 0`, and stamping it
-        // there is exactly what stops them claiming the whole historical accumulator.
+        // On the moving path the index is stamped even at zero bonds, and that is load-bearing
+        // rather than incidental: the vault calls this with the balance BEFORE the change, so
+        // a first-time depositor's call arrives with `bonds == 0`, and stamping it there is
+        // exactly what stops them claiming the whole historical accumulator. On the non-moving
+        // path a zero-bond position owes nothing and nothing is written: the vault stamps it at
+        // count 0 before its first deposit lands, so it starts from then either way.
         //
         // Stamping at zero cannot burn an entitlement either, because the vault
         // settles before every one of the four paths that lowers a bond count, so a
         // position's earnings are always paid out while it still holds the bonds that
-        // earned them. That ordering is the invariant this relies on - if a bond count
-        // ever moves without a settle in front of it, this becomes a real loss.
-        uint256 acc = accYieldPerBond;
+        // earned them. That ordering is the invariant this relies on, twice over since the
+        // L-02 fix: if a bond count ever moves without a settle in front of it, the stamp
+        // becomes a real loss and, worse, a remainder the non-moving path left in the gap
+        // is re-priced at the new count.
         uint256 owed = _pending(borrower, bonds);
-        yieldIndexOf[borrower] = acc;
+        if (bondCountMoving) {
+            yieldIndexOf[borrower] = accYieldPerBond;
+        } else if (owed != 0) {
+            yieldIndexOf[borrower] += (owed * ACC_PRECISION) / bonds;
+        }
         if (owed == 0) return;
 
         uint256 debt = debtOf[borrower];

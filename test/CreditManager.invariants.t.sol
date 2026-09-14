@@ -129,6 +129,26 @@ contract CreditHandler is Test {
     ///         later distribution, and not at the instant of the distribution that funds it.
     uint256 public accumulatorAdvances;
 
+    /// @notice Frames after which some actor's `yieldIndexOf` stood ABOVE `accYieldPerBond`, and
+    ///         the number of actor-frames the comparison was taken over.
+    /// @dev L-02's fix (33audits #54, session 2026-09-14) stopped `_settle` stamping the index at the
+    ///      accumulator on a non-moving path: it now advances by `owed * ACC_PRECISION / bonds`,
+    ///      which is at most the delta because `owed` is the floor of `bonds * delta / ACC_PRECISION`.
+    ///      That "at most" is load-bearing. `_pending` subtracts the index from the projected
+    ///      accumulator CHECKED, so an index one unit above it would revert every `settle`, `borrow`,
+    ///      `_repay` and `settleForVault` for that actor and trap their collateral - and a ceiling
+    ///      division there is the one-character edit that does it. Read by
+    ///      `invariant_noIndexEverOvertakesTheAccumulator`; the observation count is asserted by
+    ///      `test_handlerCanReachEveryStateTheInvariantsCheck` so the counter cannot be zero for
+    ///      want of being taken. MEASURED with the ceiling planted: red on the first frame that
+    ///      settled a remainder, both here and on `invariant_theHandlerNeverDropsAFrame`.
+    uint256 public indexAboveAccumulator;
+    uint256 public indexObservations;
+    /// @notice Settles after which the settled actor's index stood BELOW the stored accumulator:
+    ///         a remainder retained in the gap, which is the L-02 fix doing its work. Before the
+    ///         fix this could only ever read zero, because every settle stamped.
+    uint256 public remaindersRetained;
+
     /// @dev The in-handler property record. Two fields, so a failure carries its own message
     ///      rather than only a count.
     ///
@@ -253,6 +273,10 @@ contract CreditHandler is Test {
         bool debtRose = credit.totalDebt() > debtBefore;
         if (!borrowed && debtRose) ++debtRoseWithNoBorrow;
         if (borrowed && debtRose) ++debtRoseOnABorrow;
+        for (uint256 i; i < actors.length; ++i) {
+            ++indexObservations;
+            if (credit.yieldIndexOf(actors[i]) > accAfter) ++indexAboveAccumulator;
+        }
     }
 
     /// @dev The upper bound is the live per-account cap, not the 5,000e6 literal it used to be.
@@ -305,15 +329,12 @@ contract CreditHandler is Test {
             borrowCount++;
             if (credit.bountyEscrowOf(a) > escrowBefore) ++bountiesCharged;
             _mustHold(credit.totalDebt() <= riskParams.globalBorrowCap(), "a borrow crossed the global cap");
-            _mustHold(
-                credit.debtOf(a) <= riskParams.perAccountBorrowCap(), "a borrow crossed the per-account cap"
-            );
+            _mustHold(credit.debtOf(a) <= riskParams.perAccountBorrowCap(), "a borrow crossed the per-account cap");
             _mustHold(!(shut), "a borrow landed against a paused manager");
         } catch (bytes memory err) {
             if (shut) {
                 _mustHold(
-                    bytes4(err) == Pausable.EnforcedPause.selector,
-                    "a paused borrow was refused by something else"
+                    bytes4(err) == Pausable.EnforcedPause.selector, "a paused borrow was refused by something else"
                 );
                 ++borrowsRefusedByThePause;
             }
@@ -441,6 +462,9 @@ contract CreditHandler is Test {
         uint256 before = credit.debtOf(a);
         credit.settle(a);
         if (credit.debtOf(a) < before) ++debtWriteDowns;
+        // Straight after a settle the stored accumulator IS the projected one, so an index below it
+        // is a remainder the L-02 fix kept rather than destroyed.
+        if (credit.yieldIndexOf(a) < credit.accYieldPerBond()) ++remaindersRetained;
     }
 
     function claimSurplus(uint256 actorSeed) external watched {
@@ -485,8 +509,7 @@ contract CreditHandler is Test {
             // The withdrawal rule is the only guard that should ever refuse here: the
             // amount is bounded to the balance and this fixture's NAV is never stale.
             _mustHold(
-                bytes4(err) == CollateralVault.WithdrawalExceedsMaxLtv.selector,
-                "unexpected withdrawBonds revert"
+                bytes4(err) == CollateralVault.WithdrawalExceedsMaxLtv.selector, "unexpected withdrawBonds revert"
             );
             ++withdrawsRefusedByLtv;
         }
@@ -495,7 +518,6 @@ contract CreditHandler is Test {
     function moveNav(uint256 nav) external watched {
         oracle.setNav(bound(nav, 1e8, 100e8));
     }
-
 }
 
 /// @notice The Phase 2 invariants named in PRD §8, fuzzed.
@@ -545,11 +567,7 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
             IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
         credit = new CreditManager(
-            usdc,
-            ICollateralVault(address(vault)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            usdc, ICollateralVault(address(vault)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         liquidity = new TreasuryLiquiditySource(usdc, admin);
         pool = new LenderPool(IERC20(address(usdc)), admin);
@@ -728,8 +746,8 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         assertGe(
             usdc.balanceOf(address(credit)),
             credit.totalClaimable() + credit.undistributedYield() + credit.pendingPrincipal()
-                + credit.totalOwedToSources() + credit.insuranceFund() + credit.totalBountyEscrowed() + credit.totalBountyParked()
-                + credit.totalBountyOwed()
+                + credit.totalOwedToSources() + credit.insuranceFund() + credit.totalBountyEscrowed()
+                + credit.totalBountyParked() + credit.totalBountyOwed()
         );
     }
 
@@ -766,6 +784,17 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
     ///      calls.
     function invariant_accumulatorNeverDecreases() public view {
         assertEq(handler.accumulatorRegressions(), 0, "the yield accumulator moved backwards");
+    }
+
+    /// @dev No position's index may stand above the accumulator, on any frame. Since the L-02 fix
+    ///      a non-moving settle advances the index by a computed step rather than stamping it, and
+    ///      if that step ever overshot, `_pending`'s checked subtraction would revert every path
+    ///      that settles the position - `settle`, `borrow`, `_repay` and the vault's
+    ///      `settleForVault` - and the collateral behind it would be trapped. Observed per action and
+    ///      per actor by `CreditHandler.watched`; the observation count is asserted non-zero by the
+    ///      reachability test so this cannot pass for want of ever looking.
+    function invariant_noIndexEverOvertakesTheAccumulator() public view {
+        assertEq(handler.indexAboveAccumulator(), 0, "a yield index stands above the accumulator");
     }
 
     /// @dev A stream can only ever pay out USDC that was actually delivered. If the
@@ -935,6 +964,27 @@ contract CreditManagerInvariantsTest is StdInvariant, RiskParamsFixture {
         handler.borrow(2, Config.MIN_BOUNTIED_DEBT);
         assertEq(handler.borrowCount(), borrowsHeld + 1, "reopening must let borrowing through again");
         assertEq(handler.pauseToggles(), 2, "both directions of the switch must be reachable");
+
+        // ── the L-02 index step ──────────────────────────────────────────────
+        //
+        // The observer behind `invariant_noIndexEverOvertakesTheAccumulator` has looked on every
+        // frame above, and the fix it guards has been exercised: a settle 101 seconds into a fresh
+        // stream leaves a sub-unit remainder in actor 1's gap (5,000 of 14,000 bonds at this point,
+        // so its slice is not a whole number of wei), and the index stands BELOW the accumulator
+        // where the pre-fix stamp would have put it level. Both counters are coverage ghosts and
+        // are asserted here rather than in an invariant, for the usual reason.
+        assertGt(handler.indexObservations(), 0, "the index observer never looked");
+        handler.distributeYield(2_000e6);
+        handler.passTime(101);
+        uint256 retainedBefore = handler.remaindersRetained();
+        handler.settle(1);
+        assertLt(
+            credit.yieldIndexOf(actors[1]),
+            credit.accYieldPerBond(),
+            "the settle stamped: the L-02 remainder was destroyed"
+        );
+        assertEq(handler.remaindersRetained(), retainedBefore + 1, "the retained-remainder ghost did not see it");
+        assertEq(handler.indexAboveAccumulator(), 0, "an index overtook the accumulator on a clean sequence");
 
         // `accumulatorRegressions` and `debtRoseWithNoBorrow` are deliberately NOT asserted here.
         // They are violation counters rather than coverage ghosts, so asserting them zero in a

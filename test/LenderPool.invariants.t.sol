@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {Config} from "../src/Config.sol";
 import {LenderPool} from "../src/LenderPool.sol";
@@ -233,6 +234,39 @@ contract CanonicalLenderHandler is Test {
     uint256 public mintMismatches;
     uint256 public withdrawMismatches;
     uint256 public redeemMismatches;
+
+    /**
+     * -- ROUND-60 REQUEST-DRAW GHOSTS (33audits H-03, issue #47) --------------------------------
+     */
+    /// @dev `LenderPool._requestDraws` has no getter; it is slot 32 (`forge inspect LenderPool
+    ///      storage-layout` at the commit that added it, declared LAST so nothing below
+    ///      `wasCreditManager` moved). `R60S1_H03Probes` probe 10 pins the slot by writing through
+    ///      the door and reading it back here.
+    uint256 private constant REQUEST_DRAWS_SLOT = 32;
+    /// @dev VIOLATION, asserted zero. After a service, the controller's cumulative draw exceeded
+    ///      the entitlement reconstructed over that draw, `(E + dA)(r + dS) / (S + dS)`, which is
+    ///      the one property the memory buys: a request serviced in steps never takes more than
+    ///      one slice of the cash as it stands. Exact, no tolerance: the burn can only lower the
+    ///      senior entry reserve, so the reconstruction after a service is at least the
+    ///      entitlement before it, and `previewRedeem(convertToShares(x)) <= x`.
+    ///
+    ///      **The draw is the HANDLER'S OWN MIRROR, not the pool's memory.** The first form read
+    ///      `_requestDraws` back through `vm.load` and compared it with itself: a pool neutered
+    ///      to forget the cash half of its memory read zero drawn, paid a second slice, and the
+    ///      campaign stayed GREEN (measured, round 60). The mirror below is written from what
+    ///      the door actually paid and cleared on the rule the pool documents, so a pool that
+    ///      forgets is caught by a figure it cannot write.
+    uint256 public cumulativeDrawExceededEntitlement;
+    mapping(address controller => uint256 shares) private _mirrorDrawShares;
+    mapping(address controller => uint256 assets) private _mirrorDrawAssets;
+    /// @dev Partner of the above: services on which the comparison was made.
+    uint256 public drawEntitlementChecks;
+    /// @dev CENSUS, a figure and never a floor: frames after a watched action where an actor held
+    ///      no shares, had no open request, and still carried a non-zero memory. The memory is
+    ///      cleared only by a service that empties BOTH the request and the balance, so a sync
+    ///      exit or a transfer out after a partial service leaves it behind (`R60S1_H03Probes`,
+    ///      probe 4). Reported from `afterInvariant` like `subFloorStatesSeen`.
+    uint256 public staleDrawFrames;
 
     mapping(address controller => bytes32 fingerprint) private _requestBefore;
     /// @dev `_requestFingerprint` of a controller with no request.
@@ -763,7 +797,38 @@ contract CanonicalLenderHandler is Test {
                 || pool.totalClaimable() != totalBefore + assets || pool.totalSupply() != supplyBefore - shares
                 || pool.queuedShares() != queuedBefore - shares || remainingShares != requestShares - shares
         ) ++serviceAccountingMismatches;
+        _checkDrawEntitlement(controller, shares, assets, remainingShares);
         _settleOtherRequests(controller);
+    }
+
+    function _drawOf(address controller) private view returns (uint256 drawnShares, uint256 drawnAssets) {
+        bytes32 base = keccak256(abi.encode(controller, REQUEST_DRAWS_SLOT));
+        drawnShares = uint256(vm.load(address(pool), base));
+        drawnAssets = uint256(vm.load(address(pool), bytes32(uint256(base) + 1)));
+    }
+
+    /// @dev Round 60: the cumulative draw against the entitlement reconstructed over it, read
+    ///      AFTER the service. The draw is the handler's mirror of what the door paid, added
+    ///      here and cleared on the pool's own rule (request empty AND balance zero). `E` is the
+    ///      executable cash now (`unreservedIdle + queueCashReserve`, the two halves of
+    ///      `_executablePoolCash`).
+    function _checkDrawEntitlement(address controller, uint256 shares, uint256 assets, uint256 remainingShares)
+        private
+    {
+        uint256 drawnShares = _mirrorDrawShares[controller] + shares;
+        uint256 drawnAssets = _mirrorDrawAssets[controller] + assets;
+        if (remainingShares == 0 && pool.balanceOf(controller) == 0) {
+            delete _mirrorDrawShares[controller];
+            delete _mirrorDrawAssets[controller];
+        } else {
+            _mirrorDrawShares[controller] = drawnShares;
+            _mirrorDrawAssets[controller] = drawnAssets;
+        }
+        ++drawEntitlementChecks;
+        uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
+        uint256 entitlement =
+            Math.mulDiv(executable + drawnAssets, remainingShares + drawnShares, pool.totalSupply() + drawnShares);
+        if (drawnAssets > entitlement) ++cumulativeDrawExceededEntitlement;
     }
 
     function claim(uint256 actorSeed) external watched {
@@ -967,6 +1032,15 @@ contract CanonicalLenderHandler is Test {
         if (reserve != 0 && reserve < principal) ++partialMarkStates;
         if (pool.insuranceCover() != 0 && pool.totalImpairment() != 0) ++nettedMarkStates;
         if (pool.unplacedLoss() != 0 && principal != 0) ++backlogStates;
+        // Round 60: a memory that outlived the position it priced. A census, not a property.
+        for (uint256 i = 0; i < actors.length; i++) {
+            address actor = actors[i];
+            if (pool.balanceOf(actor) != 0) continue;
+            (uint256 requestId,,,,) = pool.withdrawalRequest(actor);
+            if (requestId != 0) continue;
+            (uint256 drawnShares, uint256 drawnAssets) = _drawOf(actor);
+            if (drawnShares != 0 || drawnAssets != 0) ++staleDrawFrames;
+        }
     }
 }
 
@@ -1016,6 +1090,9 @@ contract LenderPoolInvariants is Test {
     function afterInvariant() public {
         uint256 seen = handler.subFloorStatesSeen();
         if (seen != 0) emit log_named_uint("sub-floor states seen in the replayed run", seen);
+        uint256 stale = handler.staleDrawFrames();
+        if (stale != 0) emit log_named_uint("stale request-draw frames seen in the replayed run", stale);
+        emit log_named_uint("draw-entitlement checks in the replayed run", handler.drawEntitlementChecks());
     }
 
     /// @notice The stored yield tail never exceeds the stored gross book that backs it.
@@ -1196,6 +1273,16 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.serviceAccountingMismatches(), 0, "request service stopped conserving its fixed claim");
     }
 
+    /// @notice A request serviced in steps never draws more than one slice of the cash as it
+    ///         stands: the controller's cumulative draw never exceeds the entitlement
+    ///         reconstructed over it (round 60, 33audits H-03, the request-draw memory).
+    /// @dev Its partner `drawEntitlementChecks` is asserted non-zero in the tripwire. What this
+    ///      does NOT say: nothing about the stepped sync door or a position walked through fresh
+    ///      controllers, which reach the loop's old total (`R60S1_H03Routes.t.sol`).
+    function invariant_oneRequestNeverDrawsMoreThanOneSliceOfTheLiveCash() public view {
+        assertEq(handler.cumulativeDrawExceededEntitlement(), 0, "a request's cumulative draw exceeded its slice");
+    }
+
     /// @notice Every ERC-4626 door pays or charges exactly what its preview quoted.
     /// @dev Lifted from round 45's bare-maxima campaign. Behavioural rather than a view identity:
     ///      a reconciliation, freeze or re-rate inside the door that moved the price between the
@@ -1346,12 +1433,29 @@ contract LenderPoolInvariants is Test {
         handler.claim(2);
         handler.cancelWithdrawalRequest(2);
 
+        // Round 60: a memory that outlives its position, reached on purpose. Actor 2 requests a
+        // slice of its (sub-floor, share-heavy) position, is serviced part of the way so the
+        // memory is written, cancels the rest, then transfers every share out: no balance, no
+        // request, a non-zero memory. The shape from `R60S1_H03Probes` probe 4.
+        handler.deposit(2, 100e6);
+        handler.requestWithdrawal(2, 2, 1e18);
+        handler.serviceWithdrawalRequestMaximum(2);
+        handler.cancelWithdrawalRequest(2);
+        handler.transferShares(2, 1, type(uint256).max);
+        assertGt(handler.staleDrawFrames(), 0, "a memory outliving its position was never reached");
+        // Shares back, so the exhaustive exit below still has a position to leave; the memory
+        // stays behind either way, which is the census's point.
+        handler.transferShares(1, 2, 1e18);
+
         handler.repay(3_000e6);
         handler.redeemViaAllowance(1, 0);
         assertGt(handler.allowanceExitsDone(), 0, "an allowance exit was never reached");
         handler.withdrawAll(0);
         handler.redeemAll(2);
         assertGt(handler.exhaustiveExitsDone(), 0, "an exit at the exact maximum was never reached");
+        // Round 60: the draw-entitlement comparison ran on the services above, and held.
+        assertGt(handler.drawEntitlementChecks(), 0, "no service was ever checked against its draw");
+        assertEq(handler.cumulativeDrawExceededEntitlement(), 0, "a request's cumulative draw exceeded its slice");
 
         handler.destroyAllRawCash();
         assertGt(handler.fullDestructionsDone(), 0, "whole-balance destruction was never reached");
