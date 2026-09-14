@@ -705,12 +705,14 @@ contract LenderPoolModelDifferentialTest is Test {
     }
 
     /// @dev Rule 1 of `LenderPool._rateStream` for a delivered epoch: at least as long as the pot
-    ///      took to accrue, floored at `YIELD_STREAM_DURATION`. Read from the MODEL's own delivery
-    ///      clock so the model stays independent of the pool. Rule 2 (never shorten a running
-    ///      stream) the model applies itself in `_startStream`.
+    ///      took to accrue, floored at `YIELD_STREAM_DURATION` and, since the external review's
+    ///      M-04, capped at `MAX_YIELD_STREAM_DURATION`. Read from the MODEL's own delivery clock
+    ///      so the model stays independent of the pool. Rule 2 (never shorten a running stream)
+    ///      the model applies itself in `_startStream`.
     function _epochWindow() internal view returns (uint256) {
         uint256 elapsed = block.timestamp - model.lastEpochDeliveryAt();
-        return elapsed > STREAM ? elapsed : STREAM;
+        uint256 window = elapsed > STREAM ? elapsed : STREAM;
+        return window > Config.MAX_YIELD_STREAM_DURATION ? Config.MAX_YIELD_STREAM_DURATION : window;
     }
 
     /// @dev Rules 1a and 1b for money that does not own the accrual clock: the floor window,

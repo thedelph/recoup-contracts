@@ -182,24 +182,38 @@ contract YieldStreamClockTest is Test {
     /// @notice GUARD, not teeth. The epoch leg keeps rule 1, deliberately: `EpochHarvester.harvest`
     ///         holds it `Config.MIN_EPOCH_GAP` apart and the clock really is the accrual window of
     ///         the money being rated. This is round-11's anti-just-in-time pin, and the fix must
-    ///         not have taken it out with the rest.
+    ///         not have taken it out with the rest. Since the external review's M-04 the window is
+    ///         also bounded above by `Config.MAX_YIELD_STREAM_DURATION`: an accrual window inside
+    ///         the ceiling is rated in full, one beyond it is rated over the ceiling.
     function test_clock_signCheck_theEpochLegStillRatesOverItsOwnAccrualWindow() public {
         _deposit(alice, DEPOSIT);
-        skip(60 days);
+        uint256 inside = Config.MAX_YIELD_STREAM_DURATION - 1 days;
+        skip(inside);
 
         _epoch(EPOCH);
 
-        assertEq(_window(), 60 days, "the epoch leg still rates over the window it accrued across");
+        assertEq(_window(), inside, "the epoch leg still rates over the window it accrued across");
         assertEq(pool.lastYieldDistributeAt(), block.timestamp, "and it still owns the clock");
+
+        // Past the ceiling, the ceiling.
+        skip(60 days);
+        _epoch(EPOCH);
+        assertEq(_window(), Config.MAX_YIELD_STREAM_DURATION, "a longer accrual window is rated over the ceiling");
+        assertLt(Config.MAX_YIELD_STREAM_DURATION, 60 days, "premise: the ceiling binds here");
+        assertGt(
+            Config.MAX_YIELD_STREAM_DURATION, Config.YIELD_STREAM_DURATION, "premise: the ceiling is above the floor"
+        );
     }
 
     /// @notice GUARD. Rule 2 is unchanged and still absolute: a later arrival on either leg can
-    ///         never bring a running stream's end date forward.
+    ///         never bring a running stream's end date forward. The first epoch here is rated over
+    ///         the ceiling, so what the later arrivals must not shorten is a ceiling-length tail.
     function test_clock_signCheck_ruleTwoStillRefusesToShortenARunningStream() public {
         _deposit(alice, DEPOSIT);
         skip(60 days);
         _epoch(EPOCH);
         uint256 endsAt = pool.yieldStreamEndsAt();
+        assertEq(endsAt, block.timestamp + Config.MAX_YIELD_STREAM_DURATION, "premise: rated over the ceiling");
 
         skip(Config.YIELD_STREAM_DURATION);
         _epoch(EPOCH);
@@ -210,6 +224,91 @@ contract YieldStreamClockTest is Test {
 
         _repaySurplus(1);
         assertEq(pool.yieldStreamEndsAt(), endsAt, "and so does a principal surplus");
+    }
+
+    /// @notice The epoch leg's window, both bounds on one call:
+    ///         `duration == min(max(elapsed, YIELD_STREAM_DURATION), MAX_YIELD_STREAM_DURATION)`
+    ///         for a fresh stream. Fuzzed over the elapsed gap from one second to two years.
+    /// @dev The non-epoch leg has its own two-sided fuzz
+    ///      (`testFuzz_clock_theWindowIsBoundedBothWays`); this is the epoch leg's, which had none.
+    ///      A fresh stream, so rule 2 has no running tail to hold the window open with.
+    function testFuzz_clock_theEpochWindowIsFloorAndCeilingBounded(uint32 elapsedSeed) public {
+        uint256 elapsed = bound(uint256(elapsedSeed), 1, 730 days);
+        _deposit(alice, DEPOSIT);
+        skip(elapsed);
+
+        _epoch(EPOCH);
+
+        uint256 expected = elapsed > Config.YIELD_STREAM_DURATION ? elapsed : Config.YIELD_STREAM_DURATION;
+        if (expected > Config.MAX_YIELD_STREAM_DURATION) expected = Config.MAX_YIELD_STREAM_DURATION;
+        assertEq(_window(), expected, "duration != min(max(elapsed, D), MAX)");
+    }
+
+    /// @notice MEASUREMENT, not a property: what the ceiling trades. A 180-day pot, an incumbent
+    ///         staked for exactly `MAX_YIELD_STREAM_DURATION` days after the flush, and the share
+    ///         of the pot they take with the ceiling at its shipped value against what the same
+    ///         hold took with no ceiling (derived: the pot released over `MAX` of 180 days).
+    /// @dev The figures are printed for the reply to the reviewers and asserted only loosely, so
+    ///      the test survives a retune of the constant; the relationship is
+    ///      `withCeiling / withoutCeiling == 180 days / MAX`.
+    function test_clock_measure_whatTheCeilingHandsAnIncumbentStakedForExactlyMax() public {
+        uint256 gap = 180 days;
+        uint256 pot = 1_000e6;
+
+        _deposit(alice, DEPOSIT);
+        skip(gap);
+
+        // The just-in-time incumbent: in for the flush block, out exactly MAX later.
+        uint256 shares = _deposit(bob, DEPOSIT);
+        _epoch(pot);
+        assertEq(_window(), Config.MAX_YIELD_STREAM_DURATION, "premise: the ceiling binds on a 180-day gap");
+
+        skip(Config.MAX_YIELD_STREAM_DURATION);
+        vm.prank(bob);
+        uint256 out = pool.redeem(shares, bob, bob);
+        uint256 withCeiling = out - DEPOSIT;
+
+        // Two equal holders. With no ceiling the same hold releases MAX / gap of the pot.
+        uint256 withoutCeiling = ((pot * Config.MAX_YIELD_STREAM_DURATION) / gap) / 2;
+
+        emit log_named_uint("MEASURED pot                                     ", pot);
+        emit log_named_uint("MEASURED ceiling (seconds)                       ", Config.MAX_YIELD_STREAM_DURATION);
+        emit log_named_uint("MEASURED incumbent's take, MAX days, WITH ceiling", withCeiling);
+        emit log_named_uint("DERIVED  incumbent's take, MAX days, NO ceiling  ", withoutCeiling);
+        emit log_named_uint("MEASURED take in bps of the pot, with ceiling    ", (withCeiling * 10_000) / pot);
+        emit log_named_uint("DERIVED  take in bps of the pot, no ceiling      ", (withoutCeiling * 10_000) / pot);
+
+        assertApproxEqAbs(withCeiling, pot / 2, 1e3, "with the ceiling the whole pot released inside the hold");
+        assertGt(withCeiling, withoutCeiling, "the ceiling hands the incumbent more, which is the trade");
+    }
+
+    /// @notice MEASUREMENT, the reviewers' M-04 shape under the ceiling: after a 180-day gap a
+    ///         flush rates the pot over the ceiling rather than the gap, and a lender entering
+    ///         straight after still pays gross for it (round 22 F10, deliberate) but is made whole
+    ///         by holding `MAX_YIELD_STREAM_DURATION`, not 180 days.
+    /// @dev The under-water figure on arrival is a property of gross entry pricing and does not
+    ///      move with the ceiling; what the ceiling changes is the holding period that recovers it.
+    function test_clock_measure_theNewcomersHoldingPeriodIsTheCeilingNotTheGap() public {
+        _deposit(alice, DEPOSIT);
+        skip(180 days);
+
+        uint256 pot = 1_000e6;
+        _epoch(pot);
+        assertEq(_window(), Config.MAX_YIELD_STREAM_DURATION, "premise: the ceiling binds");
+
+        uint256 stake = 3_000e6;
+        uint256 shares = _deposit(bob, stake);
+        uint256 atOnce = pool.previewRedeem(shares);
+
+        skip(Config.MAX_YIELD_STREAM_DURATION);
+        uint256 afterMax = pool.previewRedeem(shares);
+
+        emit log_named_uint("MEASURED stream window (seconds)   ", Config.MAX_YIELD_STREAM_DURATION);
+        emit log_named_uint("MEASURED deposited                 ", stake);
+        emit log_named_uint("MEASURED redeemable at once        ", atOnce);
+        emit log_named_uint("MEASURED redeemable after MAX days ", afterMax);
+        assertLt(atOnce, stake, "gross entry pricing: the newcomer pays for the unreleased pot on arrival");
+        assertGe(afterMax + 2, stake, "and is whole once the ceiling-length window has run");
     }
 
     // -- half 1b: the extension has to be paid for ----------------------------

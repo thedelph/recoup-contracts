@@ -420,7 +420,10 @@ contract LenderPoolTest is Test {
     ///      to be holding for those five days. Windows stretch for ordinary reasons - a keeper
     ///      outage, or simply the gap before this pool is wired at all.
     ///      A depositor who really does hold for one whole `YIELD_STREAM_DURATION` earns that
-    ///      window's worth and no more - a sixth of a sixty-day pot, not the lot.
+    ///      window's worth and no more - a sixth of a thirty-day pot, not the lot. Since the
+    ///      external review's M-04 the window is capped at `Config.MAX_YIELD_STREAM_DURATION`, so
+    ///      a sixty-day accrual is rated over the cap rather than over sixty days; the ratio the
+    ///      just-in-time holder takes is `YIELD_STREAM_DURATION / MAX` rather than `/ 60 days`.
     function test_stream_longAccrualWindowIsNotJustInTimeCapturable() public {
         _deposit(alice, DEPOSIT);
         skip(60 days);
@@ -433,15 +436,17 @@ contract LenderPoolTest is Test {
         vm.stopPrank();
 
         _distributeYield(500e6);
-        assertEq(pool.yieldStreamEndsAt(), block.timestamp + 60 days, "rated over the window it accrued across");
+        uint256 window = 60 days > Config.MAX_YIELD_STREAM_DURATION ? Config.MAX_YIELD_STREAM_DURATION : 60 days;
+        assertEq(pool.yieldStreamEndsAt(), block.timestamp + window, "rated over the accrual window, capped");
 
         skip(Config.YIELD_STREAM_DURATION);
         vm.prank(mallory);
         uint256 out = pool.redeem(shares, mallory, mallory);
 
         // Two equal holders, so half of whatever the window released. Derived, not hardcoded: the
-        // figure moves with `YIELD_STREAM_DURATION`, and a literal here would pin the parameter.
-        uint256 fair = ((500e6 * Config.YIELD_STREAM_DURATION) / 60 days) / 2;
+        // figure moves with `YIELD_STREAM_DURATION` and with the cap, and a literal here would pin
+        // a parameter.
+        uint256 fair = ((500e6 * Config.YIELD_STREAM_DURATION) / window) / 2;
         assertApproxEqAbs(out - DEPOSIT, fair, 1e3, "earned the window held, not the window accrued");
         assertLt(out - DEPOSIT, 250e6, "and nothing like half the whole pot");
     }

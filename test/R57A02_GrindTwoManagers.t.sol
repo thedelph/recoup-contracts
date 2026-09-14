@@ -370,10 +370,16 @@ contract R57A02_GrindTwoManagers is Test {
     }
 
     /// @dev The bound this file holds every sequence to, and why it is not zero: the pre-grind is
-    ///      sixty stranger settles, and every auction-position settle floors at most one wei, so a
-    ///      deficit or stuck booking of up to one wei per settle event is round-57 item 177's
+    ///      sixty stranger settles, and every auction-position settle USED TO floor at most one wei,
+    ///      so a deficit or stuck booking of up to one wei per settle event was round-57 item 177's
     ///      documented dust. Sixty pre-grind settles plus at most four walk settles plus the drain's
     ///      settles (one clean close and four pulls or claims per round, two rounds) is under 80.
+    ///
+    ///      Since the L-02 fix (33audits #54, session 2026-09-14) a non-moving settle destroys
+    ///      nothing, and this alphabet has no count-changing action on the auction's position, so
+    ///      the expected reading of every envelope is now 0 and the two `measure_` tests below are
+    ///      flipped to say so. The bound is kept as the pre-fix figure the walks are measured
+    ///      against; the residual door - count changes - is bounded in `R60S2_L02Probes.t.sol`.
     uint256 internal constant DUST_BOUND = 80;
 
     // ── CONTROL ──────────────────────────────────────────────────────────────
@@ -392,10 +398,12 @@ contract R57A02_GrindTwoManagers is Test {
         assertEq(e.maxShortB, 0, "control: bob unpaid");
     }
 
-    /// @notice The row's own state, reproduced on this fixture: push alice's backing FIRST, then the
-    ///         drain closes bob against it. The pre-grind has opened `earned - pot`, so both are paid
-    ///         short by that grind and the two dust bookings stand.
-    function test_R57A02_177_measure_pushFirstReproducesTheDustDeadlock() public {
+    /// @notice FLIPPED by the L-02 fix. The row's own state, reproduced on this fixture: push alice's
+    ///         backing FIRST, then the drain closes bob against it. The sixty-settle pre-grind USED
+    ///         TO open `earned - pot`, so both were paid short by that grind and two dust bookings
+    ///         stood; it now opens nothing, and the drain leaves nothing stuck even with the foreign
+    ///         backing pushed in front of it.
+    function test_R57A02_177_measure_pushFirstLeavesNothingStuckOnceTheGrindOpensNoGap() public {
         Env memory e;
         uint256[] memory seq = new uint256[](1);
         seq[0] = 2;
@@ -404,19 +412,19 @@ contract R57A02_GrindTwoManagers is Test {
         _log("MEASURE: push alice's backing, then drain", e);
         emit log_named_uint("MEASURED bob earned - pot at the push (wei)", grindAtPush);
         emit log_named_uint("MEASURED stuck bookings (wei)", stuck);
-        assertGt(grindAtPush, 0, "fixture: the pre-grind opened no gap");
-        assertEq(stuck, 2 * grindAtPush, "the stuck dust is not two grinds");
-        assertLe(stuck, 2 * DUST_BOUND, "stuck beyond the dust bound");
+        assertEq(grindAtPush, 0, "the sixty-settle pre-grind opened a gap: a non-moving settle destroyed a remainder");
+        assertEq(stuck, 0, "a booking stood: the dust deadlock is back");
+        assertEq(e.maxShortA, 0, "alice unpaid");
+        assertEq(e.maxShortB, 0, "bob unpaid");
     }
 
-    /// @notice REFUTES the letter of round-57 item 177's "only the settle grind can make `earned`
-    ///         exceed a lot's pot": any permissionless call that SETTLES the auction's own position is a
-    ///         grind step, and `settle` is only one of them. Here the grind is done with 40 hourly
-    ///         `claimSurplusFor(auction)` on the LIVE manager (a stranger pulling the auction's own
-    ///         surplus to it, which settles first) and never a bare `settle`. bob's `earned` then
-    ///         exceeds what the auction can reach for him (the manager's pot plus everything the
-    ///         pulls moved onto the auction) by more than the pre-grind, one wei at most per pull.
-    function test_R57A02_177_measure_aPullIsAGrindStepToo() public {
+    /// @notice FLIPPED by the L-02 fix. This used to REFUTE the letter of round-57 item 177's "only
+    ///         the settle grind can make `earned` exceed a lot's pot": any permissionless call that
+    ///         SETTLES the auction's own position was a grind step, and 40 hourly
+    ///         `claimSurplusFor(auction)` on the LIVE manager opened one wei at most per pull with
+    ///         no bare `settle` ever called. A pull still settles first, and it now destroys
+    ///         nothing: bob's `earned` never exceeds what the auction can reach for him.
+    function test_R57A02_177_measure_aPullIsNoLongerAGrindStep() public {
         uint256 g0 = _grind();
         uint256 held0 = usdc.balanceOf(address(auction));
         uint256 pulls;
@@ -435,8 +443,8 @@ contract R57A02_GrindTwoManagers is Test {
         emit log_named_uint("MEASURED pulls that moved money", pulls);
         emit log_named_uint("MEASURED gap after 40 hourly pulls, no settle", gap);
         assertGt(pulls, 0, "fixture: no pull moved");
-        assertGt(gap, g0, "the pulls did not grind: only settle grinds after all");
-        assertLe(gap - g0, pulls, "more than one wei per pull");
+        assertEq(g0, 0, "the sixty-settle pre-grind opened a gap");
+        assertEq(gap, 0, "the pulls ground the floor: a non-moving settle destroyed a remainder");
     }
 
     // ── the exhaustive depth-4 walk ──────────────────────────────────────────

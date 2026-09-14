@@ -34,8 +34,16 @@ import {RiskParamsFixture} from "./helpers/RiskParamsFixture.sol";
 ///      `claimSurplusFor(auction)` (permissionless, unbounded while pending accrues), and the
 ///      bounded protocol settles - `reassign` at expiry, the clean close's own `settle`, a
 ///      `disposeTo`, a sweep's pull. `yieldAccruedOn` and `_pending` cannot open a gap by
-///      themselves: both are one floor of the same accumulator delta. MEASURED: 87 hourly settles
-///      opened 23 wei, `claimSurplusFor` opened the same 23, no grind opened 0.
+///      themselves: both are one floor of the same accumulator delta. MEASURED at the time: 87
+///      hourly settles opened 23 wei, `claimSurplusFor` opened the same 23, no grind opened 0.
+///
+///      Since the L-02 fix (33audits #54, session 2026-09-14) a non-moving settle no longer floors
+///      away its remainder, so the two permissionless doors are CLOSED and the two 246(b) tests
+///      that reached the deadlock through them are flipped to assert the opposite on the same
+///      fixture. The bounded protocol settles that CHANGE the count (`reassign`, `disposeTo`)
+///      still stamp and still destroy under one base unit each, so the deadlock remains reachable
+///      through count changes alone: `R60S2_L02Probes.t.sol` reaches it that way and bounds it at
+///      one wei per change.
 ///
 ///      246(d): gas of the bearer pull with N detached bearers is flat in N, because every pull
 ///      names one manager and `_fundInsuranceWithFree` reads the aggregate booking. MEASURED:
@@ -135,9 +143,8 @@ contract R55A02_AuctionHeldOut is RiskParamsFixture {
             _deploySpare();
         }
 
-        handler = new AuctionHandler(
-            vault, managers, auction, oracle, usdc, bond, pools, keeper, harvester, admin, actors
-        );
+        handler =
+            new AuctionHandler(vault, managers, auction, oracle, usdc, bond, pools, keeper, harvester, admin, actors);
     }
 
     function _deploySpare() internal {
@@ -168,10 +175,7 @@ contract R55A02_AuctionHeldOut is RiskParamsFixture {
         (,,,,,,,,,, owed) = auction.workouts(id);
     }
 
-    function _cleanCloseOnTheLiveManager(uint256 actorIx, uint256 epochs, uint256 skips)
-        internal
-        returns (uint256 id)
-    {
+    function _cleanCloseOnTheLiveManager(uint256 actorIx, uint256 epochs, uint256 skips) internal returns (uint256 id) {
         address who = handler.actors(actorIx);
         uint256 closesBefore = handler.cleanClosesThatBookedYield();
         handler.moveNav(30e8);
@@ -270,44 +274,53 @@ contract R55A02_AuctionHeldOut is RiskParamsFixture {
         dust = auction.totalWorkoutYieldOwed();
     }
 
-    function test_R55A02_246b_theDustDeadlockIsReachedDeterministicallyBySettleGrind() public {
+    /// @notice FLIPPED by the L-02 fix (33audits #54, session 2026-09-14). This used to REACH the
+    ///         dust deadlock: 87 hourly `settle(auction)` calls during bob's stream opened a 23-wei
+    ///         gap (`earned` 166,666,666 against a pot of 166,666,643), bob was booked at `earned`,
+    ///         both claims came up short and 46 wei of bookings stood with `NothingToClaim` both
+    ///         ways and `NothingUnreserved` on the sweep. A non-moving settle no longer destroys
+    ///         its floored remainder, so the same 87 grinds open NO gap, bob is booked at `earned`
+    ///         with the pot covering it, both are paid in full and nothing stands. The fixture is
+    ///         unchanged; only the assertions moved. The deadlock's last door - count changes of
+    ///         the pooled position - is reached in `R60S2_L02Probes.t.sol` and bounded at one wei
+    ///         per change.
+    function test_R55A02_246b_theSettleGrindOpensNoGapAndBothClaimsPayInFull() public {
         (uint256 aliceId, uint256 bobId, uint256 earned, uint256 pot, uint256 pushed) = _reach(87, false);
         uint256 aliceBooked = _yieldOwed(aliceId);
         uint256 bobBooked = _yieldOwed(bobId);
         emit log_named_uint("pushed (alice's backing on the auction)", pushed);
         emit log_named_uint("alice booked", aliceBooked);
         emit log_named_uint("bob earned (one floor)", earned);
-        emit log_named_uint("bob's own pot (sum of per-settle floors)", pot);
+        emit log_named_uint("bob's own pot (no per-settle floors any more)", pot);
         emit log_named_uint("bob booked", bobBooked);
-        assertGt(earned, pot, "the grind must open a gap");
-        uint256 gap = earned - pot;
-        emit log_named_uint("gap in wei", gap);
-        assertEq(bobBooked, earned, "under the split bob is booked at earned, not clamped to the pot");
+        assertLe(earned, pot, "the grind opened a gap: a non-moving settle destroyed a remainder");
+        emit log_named_uint("pot - earned (the floors' slack, wei)", pot - earned);
+        assertLe(pot - earned, 2, "the pot outran earned by more than the two floors");
+        assertEq(bobBooked, earned, "bob is booked at earned");
 
         uint256 dust = _claimBoth(aliceId, bobId);
         emit log_named_uint("dust bookings left standing", dust);
-        assertGt(dust, 0, "the dust deadlock");
-        assertLe(dust, 2 * gap, "each claim is short by at most the gap");
-        vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
-        auction.claimWorkoutYield(aliceId);
-        vm.expectRevert(LiquidationAuction.NothingToClaim.selector);
-        auction.claimWorkoutYield(bobId);
-        vm.expectRevert(LiquidationAuction.NothingUnreserved.selector);
-        auction.sweepFreeBalanceToInsurance();
+        assertEq(dust, 0, "the dust deadlock: a booking stood after both claims");
+        assertEq(_yieldOwed(aliceId), 0, "alice's booking survived her claim");
+        assertEq(_yieldOwed(bobId), 0, "bob's booking survived his claim");
     }
 
-    /// @notice The SECOND permissionless door: `claimSurplusFor(auction)` settles the position
-    ///         too, one floor per call, so the same gap opens with the settle selector never used.
-    function test_R55A02_246b_enumerate_claimSurplusForIsASecondGrindDoor() public {
+    /// @notice The SECOND permissionless door, FLIPPED with the one above: `claimSurplusFor(auction)`
+    ///         settles the position too, and it used to floor once per call and open the same 23
+    ///         wei with the settle selector never used. It now opens nothing.
+    function test_R55A02_246b_enumerate_claimSurplusForIsNoLongerAGrindDoor() public {
         (,, uint256 earned, uint256 pot,) = _reach(87, true);
         emit log_named_uint("bob earned", earned);
         emit log_named_uint("bob's own pot", pot);
         emit log_named_uint("gap via claimSurplusFor grind", earned > pot ? earned - pot : 0);
-        assertGt(earned, pot, "claimSurplusFor grinds the same floor");
+        assertLe(earned, pot, "claimSurplusFor still grinds the floor");
     }
 
     /// @notice With NO grind the protocol's own settles (reassign at expiry, the close's own
     ///         settle) bound the gap; MEASURED so the bound is a number rather than a claim.
+    ///         Under the L-02 fix only the count-changing settle (the `reassign`) can still
+    ///         destroy anything, and bob's lot enters an EMPTY position, so the expected reading
+    ///         is now 0; the bound of 2 is kept as the pre-fix figure this is measured against.
     function test_R55A02_246b_enumerate_theUngroundGapIsBounded() public {
         (uint256 aliceId, uint256 bobId, uint256 earned, uint256 pot,) = _reach(0, false);
         uint256 gap = earned > pot ? earned - pot : 0;

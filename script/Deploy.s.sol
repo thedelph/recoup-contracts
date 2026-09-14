@@ -63,11 +63,8 @@ contract DeployLocal is DeployBase {
         // admits it. Sign-checked against `MockLockdown.gated` for every gated call on this path.
         bond.setRewardPool(address(farm));
 
-        Externals memory e = Externals({
-            bond: IDexFiBond(address(bond)),
-            farm: IDexFiFarm(address(farm)),
-            usdc: IERC20(address(usdc))
-        });
+        Externals memory e =
+            Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
 
         d = _deployProtocol(e, p, deployer);
 
@@ -84,14 +81,21 @@ contract DeployLocal is DeployBase {
     ///      88 of 88 green in two streams. A post-condition nothing exercises is a post-condition
     ///      somebody deletes in a tidy-up.
     function _afterBroadcast(Deployed memory d, GovParams memory p, address deployer) internal view {
-        _assertMockStackLocked(
-            address(deployedUsdc), address(deployedBond), address(deployedFarm), deployer, p.keeper
-        );
+        _assertMockStackLocked(address(deployedUsdc), address(deployedBond), address(deployedFarm), deployer, p.keeper);
         _assertWiring(d, p);
         console.log("MockUSDC          ", address(deployedUsdc));
         console.log("MockBond          ", address(deployedBond));
         console.log("MockFarm          ", address(deployedFarm));
         _log(d, p);
+        // **That census ran in the SIMULATION, which is the whole of round-59 finding 1.** A node
+        // that drops transactions leaves a deployment this function has already called healthy: a
+        // real `--broadcast` of this target against anvil exited 0 with 22 of its 39 transactions
+        // discarded, every CREATE landed, every wiring CALL lost. `assertDeployedOnly()` is the
+        // same census read off the chain, and it is the only caller of `_assertWiring` that does.
+        console.log("THEN, against the chain rather than this simulation:");
+        console.log(
+            "  forge script script/WirePhase4.s.sol:WirePhase4 --sig \"assertDeployedOnly()\" --rpc-url <anvil>"
+        );
     }
 }
 
@@ -141,9 +145,9 @@ contract DeployTestnet is DeployBase {
     function run() external {
         if (block.chainid != BASE_SEPOLIA_CHAIN_ID) revert WrongChain(block.chainid);
 
-        if (
-            keccak256(bytes(_envOrString("RECOUP_TESTNET_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))
-        ) revert TestnetConfirmationMissing();
+        if (keccak256(bytes(_envOrString("RECOUP_TESTNET_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))) {
+            revert TestnetConfirmationMissing();
+        }
 
         vm.startBroadcast();
         (Deployed memory d, GovParams memory p) = _deployTestnetStack(msg.sender);
@@ -164,9 +168,7 @@ contract DeployTestnet is DeployBase {
     ///      state and is blind to a partial broadcast. `script/AssertLocked.s.sol`, run without
     ///      `--broadcast` against the live RPC afterwards, is the thing that reads the chain.
     function _afterBroadcast(Deployed memory d, GovParams memory p, address deployer) internal view {
-        _assertMockStackLocked(
-            address(deployedUsdc), address(deployedBond), address(deployedFarm), deployer, p.keeper
-        );
+        _assertMockStackLocked(address(deployedUsdc), address(deployedBond), address(deployedFarm), deployer, p.keeper);
         _assertWiring(d, p);
         console.log("MockUSDC          ", address(deployedUsdc));
         console.log("MockBond          ", address(deployedBond));
@@ -175,6 +177,16 @@ contract DeployTestnet is DeployBase {
         console.log("Next: fund the liquidity source, then bootstrapNav as the owner.");
         console.log("THEN, and it is not optional:");
         console.log("  forge script script/AssertLocked.s.sol:AssertMockStackLocked --rpc-url base_sepolia");
+        // The mock stack is not the protocol graph. `AssertMockStackLocked` reads the three mocks
+        // and the configuration-pristine set; the forty-odd comparisons `_assertWiring` just made
+        // - the nine owners, the two legs that must stay zero, `pool.paused()` - are read off the
+        // chain by nothing until this second command is run. On this path the whitelist pair is
+        // last, so a truncated broadcast usually trips `ConfigurationTampered` first; that is luck
+        // of ordering, not a post-condition.
+        console.log("AND, for the protocol graph itself:");
+        console.log(
+            "  forge script script/WirePhase4.s.sol:WirePhase4 --sig \"assertDeployedOnly()\" --rpc-url base_sepolia"
+        );
     }
 
     /// @notice Everything `run` broadcasts, with the broadcast lifted out.
@@ -247,11 +259,8 @@ contract DeployTestnet is DeployBase {
         // `address(this)`.
         bond.setRewardPool(address(farm));
 
-        Externals memory e = Externals({
-            bond: IDexFiBond(address(bond)),
-            farm: IDexFiFarm(address(farm)),
-            usdc: IERC20(address(usdc))
-        });
+        Externals memory e =
+            Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
 
         d = _deployProtocol(e, p, deployer);
 
@@ -260,7 +269,6 @@ contract DeployTestnet is DeployBase {
         bond.setWhitelisted(address(farm), true);
         bond.setWhitelisted(address(d.adapter), true);
     }
-
 }
 
 /// @notice Base mainnet deployment. Still gated, but the gate is now a checklist of
@@ -283,9 +291,9 @@ contract DeployMainnet is DeployBase {
         if (block.chainid != BASE_CHAIN_ID) revert WrongChain(block.chainid);
 
         // A stray `forge script` should not be able to reach mainnet by accident.
-        if (
-            keccak256(bytes(_envOrString("RECOUP_MAINNET_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))
-        ) revert MainnetConfirmationMissing();
+        if (keccak256(bytes(_envOrString("RECOUP_MAINNET_CONFIRM", ""))) != keccak256(bytes(CONFIRM_PHRASE))) {
+            revert MainnetConfirmationMissing();
+        }
 
         // The custody decision (direct-call vs a Safe-based backend) is a human
         // judgement that depends on DexFi's whitelist answer. Force it to be stated.
@@ -309,9 +317,7 @@ contract DeployMainnet is DeployBase {
         GovParams memory p = _resolveParams(msg.sender);
 
         Externals memory e = Externals({
-            bond: IDexFiBond(Config.DEXFI_BOND_NFT),
-            farm: IDexFiFarm(Config.DEXFI_FARM),
-            usdc: IERC20(Config.USDC_BASE)
+            bond: IDexFiBond(Config.DEXFI_BOND_NFT), farm: IDexFiFarm(Config.DEXFI_FARM), usdc: IERC20(Config.USDC_BASE)
         });
 
         vm.startBroadcast();
@@ -321,5 +327,12 @@ contract DeployMainnet is DeployBase {
         _assertWiring(d, p);
         _log(d, p);
         console.log("Next: send DexFi the adapter address above for addWhitelist().");
+        // **This target is the one with no chain-reading post-condition at all**, which is why the
+        // instruction matters most here: there is no mock stack, so `AssertMockStackLocked` is
+        // inapplicable, and the written deployment runbook is a Base Sepolia document. The census
+        // above ran in the simulation; run it again against the chain before telling anybody the
+        // deployment is up.
+        console.log("THEN, and it is not optional - that census ran in the SIMULATION:");
+        console.log("  forge script script/WirePhase4.s.sol:WirePhase4 --sig \"assertDeployedOnly()\" --rpc-url base");
     }
 }

@@ -823,7 +823,23 @@ contract R56A01BorrowerJourneyTest is Test {
         assertEq(bob.balance, PAYMENT, "bob keeps his ETH");
     }
 
-    function test_R56A01_negative_withdrawalAndRepayStayOpenWhileCustodyIsInsolvent() public {
+    /// @dev 🟥 **This test used to be called
+    ///      `test_R56A01_negative_withdrawalAndRepayStayOpenWhileCustodyIsInsolvent` and it never
+    ///      called a withdrawal.** Round 59's A1 executed the missing half: with the hatch thrown,
+    ///      `withdrawBonds` is UNGATED and still cannot succeed, because the unstake reaches a farm
+    ///      position that is no longer there. So the sentence the old name asserted was true about
+    ///      the guard and false about the outcome, and the body asserted neither. The withdrawal is
+    ///      in the body now and the name says what was measured.
+    ///
+    ///      The same half-truth is still written in `CreditManager.borrow`'s own comment
+    ///      ("Withdrawals and liquidation views deliberately stay open"), which is `src/` and is
+    ///      frozen for this round: a comment is a metadata change and moves the bytecode. Carried
+    ///      rather than fixed here.
+    ///
+    ///      The revert selector is `MockFarm`'s, so on mainnet the exact error is DexFi's. The
+    ///      shape is arithmetic rather than a policy choice: no unstake of 1,000 units out of 0
+    ///      succeeds anywhere.
+    function test_R56A01_negative_withdrawalIsUngatedButCannotSucceedWhileCustodyIsInsolvent() public {
         _deposit(alice, 1000);
         _deposit(bob, 100);
         vm.prank(bob);
@@ -839,5 +855,13 @@ contract R56A01BorrowerJourneyTest is Test {
         vm.prank(alice);
         vm.expectRevert(CreditManager.CustodyInsolvent.selector);
         credit.borrow(500e6);
+        // And the withdrawal, which the old name asserted and nothing executed. Alice is square
+        // with the protocol - she never borrowed - and her ledger entry still says the bonds are
+        // hers, so nothing in the vault refuses her. The farm does.
+        assertEq(adapter.stakedBalance(), 0, "nothing is staked to unstake");
+        assertEq(vault.bondCount(alice), 1000, "her ledger entry is untouched by the hatch");
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("InsufficientStake(uint256,uint256)", uint256(1000), uint256(0)));
+        vault.withdrawBonds(1000);
     }
 }

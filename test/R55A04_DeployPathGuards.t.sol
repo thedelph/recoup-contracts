@@ -103,12 +103,7 @@ contract R55A04LockedProbe is AssertMockStackLocked {
         return fallbackValue;
     }
 
-    function _envOrString(string memory, string memory fallbackValue)
-        internal
-        pure
-        override
-        returns (string memory)
-    {
+    function _envOrString(string memory, string memory fallbackValue) internal pure override returns (string memory) {
         return fallbackValue;
     }
 
@@ -130,12 +125,7 @@ contract R55A04ReferralHarness is DeployReferralRegistry {
         _phraseSet = true;
     }
 
-    function _envOrString(string memory, string memory fallbackValue)
-        internal
-        view
-        override
-        returns (string memory)
-    {
+    function _envOrString(string memory, string memory fallbackValue) internal view override returns (string memory) {
         return _phraseSet ? _phrase : fallbackValue;
     }
 }
@@ -172,12 +162,7 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         return fallbackValue;
     }
 
-    function _envOrString(string memory, string memory fallbackValue)
-        internal
-        pure
-        override
-        returns (string memory)
-    {
+    function _envOrString(string memory, string memory fallbackValue) internal pure override returns (string memory) {
         return fallbackValue;
     }
 
@@ -294,7 +279,9 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         vm.expectRevert(abi.encodeWithSelector(DeployBase.AddressMalformed.selector, "RECOUP_KEEPER", "0xtypo"));
         this.exposedAddressFromRaw("RECOUP_KEEPER", "0xtypo", keeper);
         vm.expectRevert(
-            abi.encodeWithSelector(DeployBase.AddressMalformed.selector, "RECOUP_KEEPER", "0XE61B6087Bc2dFD22ddB382832c1F8aeeFbef1e6a")
+            abi.encodeWithSelector(
+                DeployBase.AddressMalformed.selector, "RECOUP_KEEPER", "0XE61B6087Bc2dFD22ddB382832c1F8aeeFbef1e6a"
+            )
         );
         this.exposedAddressFromRaw("RECOUP_KEEPER", "0XE61B6087Bc2dFD22ddB382832c1F8aeeFbef1e6a", keeper);
     }
@@ -354,7 +341,8 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
     }
 
     function _externals() internal view returns (Externals memory) {
-        return Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
+        return
+            Externals({bond: IDexFiBond(address(bond)), farm: IDexFiFarm(address(farm)), usdc: IERC20(address(usdc))});
     }
 
     function _params(address owner_) internal view returns (GovParams memory) {
@@ -384,8 +372,13 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         returns (string memory)
     {
         string memory head = string.concat(
-            '{"chainId":', vm.toString(BASE_SEPOLIA), ',"operators":{"owner":"', vm.toString(owner_), '","keeper":"',
-            keeperRaw, '"},'
+            '{"chainId":',
+            vm.toString(BASE_SEPOLIA),
+            ',"operators":{"owner":"',
+            vm.toString(owner_),
+            '","keeper":"',
+            keeperRaw,
+            '"},'
         );
         string memory first = string.concat(
             '"contracts":{',
@@ -470,8 +463,13 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         returns (string memory)
     {
         return string.concat(
-            '{"chainId":', vm.toString(BASE_SEPOLIA), ',"deployer":"', vm.toString(address(this)),
-            '","operators":{"keeper":"', vm.toString(keeperRow), '"},"mocks":{',
+            '{"chainId":',
+            vm.toString(BASE_SEPOLIA),
+            ',"deployer":"',
+            vm.toString(address(this)),
+            '","operators":{"keeper":"',
+            vm.toString(keeperRow),
+            '"},"mocks":{',
             _row("MockUSDC", address(usdc), false),
             _rowRaw("MockBond", bondRaw, false),
             _row("MockFarm", address(farm), true),
@@ -673,12 +671,27 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         string memory lockRow = string.concat(
             ',"lockState":{"status":"CLOSED","verifiedBy":"forge script","verifiedAtUtc":"2026-09-07T00:00:00Z",',
             '"verifiedAtTree":"9a01996","verifiedAtBlock":1,',
-            '"MockUSDC":{"admin":"', vm.toString(address(this)), '","operator":"', vm.toString(lockKeeper),
-            '","lockAuthority":"', vm.toString(address(this)), '"},',
-            '"MockBond":{"admin":"', vm.toString(address(this)), '","operator":"', vm.toString(lockKeeper),
-            '","lockAuthority":"', vm.toString(address(this)), '"},',
-            '"MockFarm":{"admin":"', vm.toString(address(this)), '","operator":"', vm.toString(lockKeeper),
-            '","lockAuthority":"', vm.toString(address(this)), '"}}'
+            '"MockUSDC":{"admin":"',
+            vm.toString(address(this)),
+            '","operator":"',
+            vm.toString(lockKeeper),
+            '","lockAuthority":"',
+            vm.toString(address(this)),
+            '"},',
+            '"MockBond":{"admin":"',
+            vm.toString(address(this)),
+            '","operator":"',
+            vm.toString(lockKeeper),
+            '","lockAuthority":"',
+            vm.toString(address(this)),
+            '"},',
+            '"MockFarm":{"admin":"',
+            vm.toString(address(this)),
+            '","operator":"',
+            vm.toString(lockKeeper),
+            '","lockAuthority":"',
+            vm.toString(address(this)),
+            '"}}'
         );
         R55A04LockedProbe probe = new R55A04LockedProbe();
         probe.setRecord(_lockedRecord(vm.toString(address(bond)), strangerKeeper, lockRow));
@@ -695,7 +708,13 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
 
     function _recordWithOperators(address owner_, string memory extraRows) internal pure returns (string memory) {
         return string.concat(
-            '{"chainId":', vm.toString(BASE_SEPOLIA), ',"operators":{"owner":"', vm.toString(owner_), '"', extraRows, "}}"
+            '{"chainId":',
+            vm.toString(BASE_SEPOLIA),
+            ',"operators":{"owner":"',
+            vm.toString(owner_),
+            '"',
+            extraRows,
+            "}}"
         );
     }
 
@@ -727,7 +746,8 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         _installAllButKeeperAndConfirmer(script, owner_);
         script.setRecord(
             _recordWithOperators(
-                owner_, string.concat(',"keeper":"', vm.toString(keeper), '","navConfirmer":"', vm.toString(keeper), '"')
+                owner_,
+                string.concat(',"keeper":"', vm.toString(keeper), '","navConfirmer":"', vm.toString(keeper), '"')
             )
         );
 
@@ -757,8 +777,15 @@ contract R55A04DeployPathGuardsTest is Test, DeployBase {
         address recordTimelock = makeAddr("r55a04.recordTimelock");
         address envTimelock = makeAddr("r55a04.envTimelock");
         string memory withTimelock = string.concat(
-            '{"chainId":', vm.toString(BASE_SEPOLIA), ',"operators":{"owner":"', vm.toString(owner_), '","timelock":"',
-            vm.toString(recordTimelock), '"},"contracts":{', _row("NAVOracle", address(d.oracle), true), "}}"
+            '{"chainId":',
+            vm.toString(BASE_SEPOLIA),
+            ',"operators":{"owner":"',
+            vm.toString(owner_),
+            '","timelock":"',
+            vm.toString(recordTimelock),
+            '"},"contracts":{',
+            _row("NAVOracle", address(d.oracle), true),
+            "}}"
         );
         script.setRecord(withTimelock);
 
