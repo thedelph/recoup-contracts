@@ -9,9 +9,12 @@ import {LenderPool} from "../src/LenderPool.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
 /// @title Round 60, S1: adversarial probes on the request-draw memory (33audits H-03, issue #47).
-/// @notice Every probe runs on the tree that carries the memory. Where a figure differs on the
-///         shipped tree (`68ac048`, before the memory) the docstring says what it read there, so
-///         the file states what the fix changed and what it left alone.
+/// @notice Every probe runs on the tree that carries the memory AND the cash floor (session 42,
+///         `LenderPool._floorTotal`). Where a figure differs on the shipped trees before them
+///         (`68ac048` before the memory, `5239dfb` with the memory and the fraction) the docstring
+///         says what it read there, so the file states what each fix changed and what it left
+///         alone. Probes 1, 2, 3, 4 and 7 asserted the fraction's figures and were flipped to the
+///         floor's in session 42, the fraction's kept beside them as history.
 ///
 /// @dev The memory is `mapping(address => RequestDraw) private _requestDraws` at slot 32 with no
 ///      getter; `_draw` reads it through `vm.load` and probe 10 pins that slot by writing through
@@ -127,11 +130,11 @@ contract R60S1_H03Probes is Test {
     // 1 and 2. The two routes the memory does not see, and the mixed route
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice The stepped sync door is untouched by the memory: 4,999.999998 over 53 calls, the
-    ///         shipped tree's figure to the wei (`R60S1_H03Routes`). And the MIXED route - one
-    ///         permitted draw, cancel, then walk the returned shares through the sync door -
-    ///         reaches the same total, so the memory closes the same-controller request loop
-    ///         and nothing beside it.
+    /// @notice The stepped sync door was untouched by the memory: 4,999.999998 over 53 calls on
+    ///         `5239dfb`, the shipped tree's figure to the wei (`R60S1_H03Routes`), and the MIXED
+    ///         route - one permitted draw, cancel, then walk the returned shares through the sync
+    ///         door - reached the same total. Under the floor both stop at 2,500.000000: the
+    ///         sync loop in one call, and the mixed route's sync door reads ZERO after the draw.
     function test_R60S1_probe01_theSyncLoopIsUnchangedAndTheMixedRouteDrainsToo() public {
         _counterCase();
         uint256 clean = vm.snapshotState();
@@ -152,18 +155,25 @@ contract R60S1_H03Probes is Test {
         console2.log("MEASURED mixed route, sync calls            ", mixedCalls);
         console2.log("MEASURED blocker serviceable after mixed    ", _serviceable(blocker));
 
-        assertEq(syncTotal, 4_999_999_998, "the memory moved the sync loop");
-        assertEq(syncCalls, 53, "the memory moved the sync loop's call count");
+        // Fraction (`5239dfb`): 4,999.999998 over 53 calls; mixed 2,500 + 2,499.999998 over 52.
+        assertEq(syncTotal, 2_500e6, "the sync loop reached other than the one-call 2,500");
+        assertEq(syncCalls, 1, "the sync loop took other than one call");
         assertEq(drawn, 2_500e6, "the one permitted draw paid other than 2,500");
-        assertGt(drawn + mixedSync, 4_999e6, "the mixed route did not drain the queued lender");
+        assertEq(mixedSync, 0, "the sync door paid after the one permitted draw");
+        assertEq(mixedCalls, 0, "the sync door opened after the one permitted draw");
+        assertEq(_serviceable(blocker), 2_500e6, "the mixed route moved the queued lender's figure");
     }
 
-    /// @notice The sequential address split under the memory: identical to the shipped tree,
-    ///         because every fresh controller reads an empty memory. Forty addresses, one draw
-    ///         each, cancel, move the remainder on.
+    /// @notice The sequential address split under the memory alone was identical to the shipped
+    ///         tree, 4,999.999773 over 40 addresses, because every fresh controller reads an
+    ///         empty memory. Under the floor the first address draws 2,500.000000, every later
+    ///         address reads 0 (its fresh floor is priced out of `E - 2,500 = 0` and its live arm
+    ///         is capped at the same zero), and the memory of the one controller that drew stays
+    ///         with it. Forty addresses, one draw each, cancel, move the remainder on.
     function test_R60S1_probe02_theSequentialAddressSplitIsUnchanged() public {
         _counterCase();
         uint256 total;
+        uint256 paying;
         address holder = attacker;
         for (uint256 i = 0; i < 40; i++) {
             uint256 shares = pool.balanceOf(holder);
@@ -171,7 +181,10 @@ contract R60S1_H03Probes is Test {
             vm.startPrank(holder);
             pool.requestWithdrawal(shares, holder);
             uint256 serviceable = pool.maxRequestRedeem(holder);
-            if (serviceable != 0) total += pool.serviceWithdrawalRequest(holder, serviceable, 0);
+            if (serviceable != 0) {
+                total += pool.serviceWithdrawalRequest(holder, serviceable, 0);
+                ++paying;
+            }
             (,, uint256 remaining,,) = pool.withdrawalRequest(holder);
             if (remaining != 0) pool.cancelWithdrawalRequest();
             address next = address(uint160(0x60520000 + i));
@@ -179,12 +192,20 @@ contract R60S1_H03Probes is Test {
             if (left != 0) pool.transfer(next, left);
             vm.stopPrank();
             (uint256 memShares,) = _draw(holder);
-            assertGt(memShares, 0, "the drained controller's memory was cleared with shares moved out");
+            if (serviceable != 0) {
+                assertGt(memShares, 0, "the drained controller's memory was cleared with shares moved out");
+            } else {
+                assertEq(memShares, 0, "a controller that drew nothing acquired a memory");
+            }
             holder = next;
         }
         console2.log("MEASURED sequential split under the memory  ", total);
+        console2.log("MEASURED addresses that were paid           ", paying);
         console2.log("MEASURED blocker serviceable after          ", _serviceable(blocker));
-        assertEq(total, 4_999_999_773, "the memory moved the sequential split");
+        // Fraction (`5239dfb`): 4,999.999773 over 40 paying addresses.
+        assertEq(total, 2_500e6, "the sequential split reached other than the one-call 2,500");
+        assertEq(paying, 1, "more than one address in the split was paid");
+        assertEq(_serviceable(blocker), 2_500e6, "the split moved the queued lender's figure");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -192,11 +213,12 @@ contract R60S1_H03Probes is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice After the attacker's one permitted draw its remaining 7,500 queued shares are
-    ///         entitled to NOTHING more, yet `queueCashReserve` still counts them: the reserve
-    ///         reads 2,500 while the sum of every controller's serviceable cash is 1,428.571428.
-    ///         The difference is cash nobody can draw: not the blocker, not the sync door, not
-    ///         `lend`. A full repayment restores E/S to the ratio at the draw and the phantom
-    ///         closes; a partial one does not.
+    ///         entitled to NOTHING more, and under the fraction `queueCashReserve` still counted
+    ///         them: 2,500 reserved while the sum of every controller's serviceable cash was
+    ///         1,428.571428, a phantom of 1,071.428572 that nobody could draw. Under the floor
+    ///         the blocker's floor of 2,500.000000 absorbs the cash the spent shares were
+    ///         reserving: the reserve still reads 2,500 and the serviceable sum is 2,500, so the
+    ///         phantom is 0. A full repayment leaves it at 0.
     function test_R60S1_probe03_thePhantomReserve() public {
         _counterCase();
         uint256 drawn = _drawOnce(attacker);
@@ -212,10 +234,13 @@ contract R60S1_H03Probes is Test {
         console2.log("MEASURED unreservedIdle                     ", pool.unreservedIdle());
         console2.log("MEASURED available()                        ", pool.available());
 
+        // Fraction (`5239dfb`): sum 1,428.571428, phantom 1,071.428572.
         assertEq(reserve, 2_500e6, "the reserve after the draw is not 2,500");
-        assertEq(sum, 1_428_571_428, "the serviceable sum is not 1,428.571428");
-        assertEq(reserve - sum, 1_071_428_572, "the phantom is not 1,071.428572");
-        assertEq(pool.unreservedIdle(), 0, "the phantom left the sync door open");
+        assertEq(sum, 2_500e6, "the serviceable sum is not the blocker's whole 2,500");
+        assertEq(_serviceable(blocker), 2_500e6, "the blocker's figure is not her floor");
+        assertEq(_serviceable(attacker), 0, "the drawn controller kept a slice");
+        assertEq(reserve - sum, 0, "a phantom remains where the floor binds");
+        assertEq(pool.unreservedIdle(), 0, "the sync door is open with the floor holding the cash");
 
         // A full repayment: E / S returns to 1, the ratio at the draw, and the phantom closes.
         _repay(15_000e6);
@@ -228,9 +253,13 @@ contract R60S1_H03Probes is Test {
         assertEq(reserveAfter - sumAfter, 0, "a full repayment did not close the phantom");
     }
 
-    /// @notice The phantom seen by a third lender: with the attacker's spent queue still counted,
-    ///         the bystander's `maxRedeem` and the manager's `available()` are both smaller than
-    ///         the cash nobody is entitled to would allow. Three lenders, 20,000 lent.
+    /// @notice The phantom seen by a third lender: with the attacker's spent queue still counted
+    ///         by the FRACTION arm of the reserve, the bystander's `maxRedeem` and the manager's
+    ///         `available()` are both smaller than the cash nobody is entitled to would allow.
+    ///         Three lenders, 20,000 lent. Here the fraction (`ceil(3,000 * 18,000 / 23,000)` =
+    ///         2,347.826087) exceeds the floor (2,000.000000), so a phantom of 347.826087 remains
+    ///         under the floor against 1,043.478261 under the fraction, and the bystander reads
+    ///         652.173913 either way.
     function test_R60S1_probe03b_thePhantomShutsTheBystanderOut() public {
         _deposit(blocker, 10_000e6);
         _deposit(attacker, 10_000e6);
@@ -255,6 +284,12 @@ contract R60S1_H03Probes is Test {
         console2.log("MEASURED available()                        ", pool.available());
         assertGt(reserve, sum, "no phantom in the three-lender state");
         assertLt(bystanderAfter, _executable() - sum, "the bystander could reach the un-entitled cash");
+        // Session 42: the floor's figures in this state, pinned. Fraction: sum 1,304.347826,
+        // phantom 1,043.478261.
+        assertEq(reserve, 2_347_826_087, "the reserve is not the fraction's 2,347.826087");
+        assertEq(sum, 2_000e6, "the serviceable sum is not the blocker's floor of 2,000");
+        assertEq(reserve - sum, 347_826_087, "the phantom is not 347.826087");
+        assertEq(bystanderAfter, 652_173_913, "the bystander reads other than 652.173913");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -263,9 +298,12 @@ contract R60S1_H03Probes is Test {
 
     /// @notice A controller who requested HALF her position and was fully serviced keeps the
     ///         memory (her balance is non-zero). When E / S later falls below the ratio she drew
-    ///         at, her next request is under-paid against a fresh address holding the same shares:
-    ///         `(S - req)(E * dS - S * dA) / (S (S + dS))`, negative here. And a sync exit to zero
-    ///         does NOT clear the memory, so it follows her into a re-deposit.
+    ///         at, her live arm reads less than a fresh address holding the same shares:
+    ///         `(S - req)(E * dS - S * dA) / (S (S + dS))`, negative here, and under the fraction
+    ///         she read 0 against a fresh holder's 750.000000. Under the floor her request is
+    ///         quoted the fresh slice when it is filed, so she reads the same 750.000000. A sync
+    ///         exit to zero still does NOT clear the memory, and it follows her into a re-deposit,
+    ///         where the floor again holds her to the fresh figure.
     function test_R60S1_probe04_theMemoryOutlivesThePositionItPriced() public {
         _deposit(carol, 10_000e6);
         _deposit(bystander, 10_000e6);
@@ -299,12 +337,12 @@ contract R60S1_H03Probes is Test {
         // (S - req)(S * dA - E * dS) / (S (S + dS)), the sign flipped so it is the under-pay.
         uint256 predicted = ((S - 5_000e9) * (S * dA - E * dS)) / (S * (S + dS));
         console2.log("MEASURED predicted under-pay, unclamped     ", predicted);
-        // The door clamps the entitlement at zero, so the under-pay cannot exceed the fresh
-        // slice: here the formula says 2,125.000000 and carol is under-paid the whole 750.000000.
-        if (predicted > freshNow) predicted = freshNow;
-        assertLt(carolNow, freshNow, "the memory did not under-pay carol against a fresh holder");
-        assertApproxEqAbs(freshNow - carolNow, predicted, 2, "the under-pay is not the formula's");
-        assertEq(carolNow, 0, "carol reads other than ZERO with the ratio below her draw");
+        // The door clamps the live arm at zero, so under the fraction the under-pay could not
+        // exceed the fresh slice: the formula says 2,125.000000 and carol was under-paid the whole
+        // 750.000000 (`5239dfb`: `carolNow` 0). Under the floor she reads the fresh slice.
+        assertGt(predicted, freshNow, "fixture: the memory's live arm should be clamped to zero here");
+        assertEq(carolNow, freshNow, "the floor did not hold carol to a fresh holder's slice");
+        assertEq(carolNow, 750e6, "carol reads other than 750.000000");
 
         // She cancels, the loan repays so the sync door can pay her whole balance, she
         // sync-redeems to ZERO, and the memory is still there.
@@ -329,7 +367,8 @@ contract R60S1_H03Probes is Test {
         uint256 freshRe = _freshSlice(reShares);
         console2.log("MEASURED re-deposit request, carol          ", carolRe);
         console2.log("MEASURED re-deposit request, fresh holder   ", freshRe);
-        assertLt(carolRe, freshRe, "the stale memory did not follow carol into her re-deposit");
+        // Fraction (`5239dfb`): `carolRe` below `freshRe`, the stale memory pricing the new position.
+        assertEq(carolRe, freshRe, "the floor did not hold carol's re-deposit to a fresh holder's slice");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -405,7 +444,11 @@ contract R60S1_H03Probes is Test {
     }
 
     /// @notice Yield delivered between draws, then the stream released. The drawn controller's
-    ///         entitlement rises with E, the blocker's too, and neither exceeds executable cash.
+    ///         entitlement rises with E, and neither exceeds executable cash. The blocker's live
+    ///         arm, 2,000.000000 after the release, is BELOW her floor of 2,500.000000, so she
+    ///         reads her floor at the new exit price: 2,499.999999, one wei of `previewRedeem`
+    ///         rounding on a cash-denominated floor, against 1,999.999999 under the fraction
+    ///         (`5239dfb`), where the yield "followed" was a rise from the re-sliced 1,428.571428.
     function test_R60S1_probe07_yieldBetweenDrawsIsFollowed() public {
         _counterCase();
         _drawOnce(attacker);
@@ -424,7 +467,9 @@ contract R60S1_H03Probes is Test {
         console2.log("MEASURED blocker before                     ", blockerBefore);
         console2.log("MEASURED blocker after                      ", _serviceable(blocker));
         assertGt(_serviceable(attacker), attackerBefore, "the drawn controller did not follow the yield");
-        assertGt(_serviceable(blocker), blockerBefore, "the blocker did not follow the yield");
+        // Fraction (`5239dfb`): the blocker 1,428.571428 before and 1,999.999999 after.
+        assertEq(blockerBefore, 2_500e6, "the blocker did not open at her floor");
+        assertEq(_serviceable(blocker), 2_499_999_999, "the blocker reads other than her floor at the new price");
         assertLe(_serviceable(attacker) + _serviceable(blocker), exec + 1, "request cash exceeded executable cash");
     }
 

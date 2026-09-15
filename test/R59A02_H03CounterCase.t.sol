@@ -35,11 +35,13 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///      2,500.000000 in one call against one sync redeem of 2,500.000000, and 0 of 60 grid
 ///      cells. The shipped-tree figures they used to assert are kept in each docstring as
 ///      history: 4,999.999998 over 53 calls, 45 of 60 cells, best excess 3,999.999995.
-///      `test_R59A02_H03_theExcessComesOutOfTheQueuedLendersOwnReserve` stays GREEN under the
-///      memory, deliberately: after the attacker's ONE permitted draw the blocker's serviceable
-///      figure still falls from 2,500.000000 to 1,428.571428, because the reserve was never a
-///      cash guarantee. And the closed state is one route of three: `R60S1_H03Routes.t.sol`
-///      measures the stepped sync door and the sequential address split at the same total.
+///      `test_R59A02_H03_theExcessComesOutOfTheQueuedLendersOwnReserve` stayed GREEN under the
+///      memory alone, deliberately: after the attacker's ONE permitted draw the blocker's
+///      serviceable figure still fell from 2,500.000000 to 1,428.571428, because the reserve was
+///      a fraction and never a cash guarantee. Session 42 shipped the cash floor
+///      (`LenderPool._floorTotal`) and that test was flipped too: the blocker keeps her
+///      2,500.000000 through the draw. `R60S1_H03Routes.t.sol` measures the stepped sync door
+///      and the sequential address split closed at the same one-call figure.
 contract R59A02_H03CounterCase is Test {
     MockUSDC internal usdc;
     LenderPool internal pool;
@@ -183,10 +185,12 @@ contract R59A02_H03CounterCase is Test {
         assertLe(captured, syncPaid, "the control moved: the loop beat the sync door with no other queue");
     }
 
-    /// @notice The damage the excess does, stated in the only terms that matter: the cash the loop
-    ///         took out of the shared junior pot is exactly what the lender who queued honestly
-    ///         and waited can no longer be paid. The blocker's own serviceable figure is measured
-    ///         before and after the attacker's loop.
+    /// @notice The damage the excess did, stated in the only terms that matter: the cash the loop
+    ///         took out of the shared junior pot was exactly what the lender who queued honestly
+    ///         and waited could no longer be paid. The blocker's own serviceable figure is
+    ///         measured before and after the attacker's loop. Fraction (`5239dfb`): 2,500.000000
+    ///         to 1,428.571428, a loss of 1,071.428572. Floor: 2,500.000000 to 2,500.000000, and
+    ///         the attacker's draw is the sync door's 2,500.000000 exactly.
     function test_R59A02_H03_theExcessComesOutOfTheQueuedLendersOwnReserve() public {
         _deposit(blocker, 10_000e6);
         _deposit(attacker, 10_000e6);
@@ -210,7 +214,9 @@ contract R59A02_H03CounterCase is Test {
         emit log_named_uint(
             "MEASURED blocker's loss of serviceable   ", blockerServiceableBefore - blockerServiceableAfter
         );
-        assertLt(blockerServiceableAfter, blockerServiceableBefore, "the reserved lender lost nothing");
+        assertEq(blockerServiceableBefore, 2_500e6, "the blocker did not open at 2,500");
+        assertEq(captured, 2_500e6, "the attacker's draw was other than the sync door's 2,500");
+        assertEq(blockerServiceableAfter, blockerServiceableBefore, "the reserved lender lost serviceable cash");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

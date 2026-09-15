@@ -35,18 +35,23 @@ import {ILenderPool} from "./interfaces/ILenderPool.sol";
 ///      follows cash as loans repay, and the controller's own earlier draws are added back into
 ///      that slice and deducted from the answer (`_requestDraws`), so servicing ONE request in
 ///      steps reaches exactly one slice and not more (external review, 33audits H-03, the
-///      reviewers' shape; pinned in `Impairment.integration.t.sol`). What that does NOT bound:
-///      the reserve every queued lender is protected by, `ceil(executable * queuedShares /
-///      supply)`, is a FRACTION of live cash and not an amount of it. Every exit lowers the cash
-///      that fraction is taken of, so a holder who steps the synchronous `redeem` door, or walks
-///      a position through fresh controllers one request each, reaches the same total the
-///      stepped request loop reached before the memory, and a queued lender's serviceable figure
-///      falls with each step (measured in `R60S1_H03Routes.t.sol`: 4,999.999998 through either
-///      door with another lender's 10,000 queued and 15,000 lent, her serviceable figure
-///      2,500.000000 to 0.000001). So the sync door is not a ceiling on the request door and
-///      neither door is a cash guarantee for a queued lender; a re-derivable cash floor is the
-///      design change that would make one, and it is a decision rather than a patch.
-///      `R59A02_H03CounterCase.t.sol` pins the counter-case closed on the request door.
+///      reviewers' shape; pinned in `Impairment.integration.t.sol`). And a queued lender is
+///      owed a cash AMOUNT, not only a fraction: `requestWithdrawal` quotes a floor out of the
+///      cash no earlier request is owed (`_freshFloor`), the sum of every live floor
+///      (`_floorTotal`) is held in the reserve against `lend` and against every synchronous
+///      exit, and `maxRequestRedeem` pays `max(floor, live slice)` capped at the cash not owed
+///      to OTHER requests. The floor is spent by service and released by cancel; it is never
+///      re-sliced by another holder's exit, so stepping the synchronous `redeem` door or walking
+///      a position through fresh controllers reaches exactly what one sync `redeem` reaches, the
+///      cash nobody is owed, and a queued lender's figure does not fall with either walk
+///      (measured in `R60S1_H03Routes.t.sol`: 2,500.000000 through either door with another
+///      lender's 10,000 queued and 15,000 lent, her figure 2,500.000000 before and after; the
+///      fraction's figures were 4,999.999998 and 0.000001). What the floor does NOT do: it does
+///      not rise on a repayment (the live slice does, and other exits re-slice that lift down
+///      to the floor), and it does not fall on a loss, so after a loss the floors can exceed
+///      the cash and the shortfall is cash no door reaches until a repayment or a cancel
+///      (`R42S1_H03Floor.t.sol`, probe F). `R59A02_H03CounterCase.t.sol` pins the counter-case
+///      closed on the request door.
 ///
 ///      **4. Service timing belongs to the controller.** Only the controller or an operator they
 ///      approve may choose the amount and execution block. The receiver is fixed when the request
@@ -314,6 +319,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         uint256 requestId;
         address receiver;
         uint256 shares;
+        /// @dev The cash this request is still owed: quoted by `_freshFloor` when it was filed,
+        ///      spent down by every service and released whole by cancel. A field of the mapping
+        ///      value, so no state-variable slot moved when it was added.
+        uint256 floor;
     }
 
     /// @dev One live request per controller. Request IDs are monotonic event identifiers; they do
@@ -374,17 +383,28 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     ///      shipped loop's own figure. Declared LAST so no slot below `wasCreditManager` moves
     ///      (`LenderPoolFormulaPins.test_pins_theStorageLayoutTheyDependOn` pins the layout).
     ///
-    ///      **What it does not close, measured in `R60S1_H03Routes.t.sol`**: a stepped `redeem`
-    ///      never services a request and never writes here, and a position walked through FRESH
-    ///      controllers meets an empty memory at every step. Both reach the request loop's total
-    ///      from the same state. This memory closes the same-controller request loop and nothing
-    ///      else; the header's rule 3 states the relationship it leaves standing.
+    ///      **What it does not close on its own, measured in `R60S1_H03Routes.t.sol`**: a stepped
+    ///      `redeem` never services a request and never writes here, and a position walked through
+    ///      FRESH controllers meets an empty memory at every step. This memory closes the
+    ///      same-controller request loop; the cash floor below (`_floorTotal`, header rule 3) is
+    ///      what closes the other two walks, and the memory stays because under a floor it is
+    ///      what keeps one request to one slice of the cash above the floor.
     struct RequestDraw {
         uint256 shares;
         uint256 assets;
     }
 
     mapping(address controller => RequestDraw draw) private _requestDraws;
+
+    /// @dev The sum of every live request's remaining `floor`: the cash the queued lenders are
+    ///      owed, held in `_queueCashReserve` against `lend` and against synchronous exits, and
+    ///      the term `maxRequestRedeem` caps each request against (the cash not owed to the
+    ///      others). Raised by `requestWithdrawal`, lowered by service and by cancel. Never
+    ///      written down on a loss, so after one it can exceed executable cash; the reserve then
+    ///      clamps to the cash that exists and each request to the cash the others are not owed.
+    ///      Declared LAST, slot 33, so no slot below `_requestDraws` moves
+    ///      (`LenderPoolFormulaPins.test_pins_theStorageLayoutTheyDependOn` pins the layout).
+    uint256 private _floorTotal;
 
     constructor(IERC20 usdc_, address initialOwner)
         ERC20("Recoup Lender Pool", "rcUSDC")
@@ -1266,19 +1286,22 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         );
     }
 
-    /// @notice Executable cash reserved pro rata for all currently requested shares, at this
-    ///         instant. A reservation against `lend` and against synchronous exits, recomputed on
-    ///         every read; not a cumulative entitlement of the requesters and not a cash guarantee.
+    /// @notice Executable cash reserved for all currently requested shares, at this instant: the
+    ///         larger of the queued shares' pro-rata fraction of the cash and the cash the live
+    ///         requests are owed (`_floorTotal`), never above the cash that exists. A reservation
+    ///         against `lend` and against synchronous exits, recomputed on every read.
     /// @dev The entry-price cash reserve is removed first because it is senior while principal can
     ///      still be lost. Both numerator and result are cash-denominated. Ceiling rounding gives
-    ///      the request side the one indivisible executable cash unit at the boundary. The figure
-    ///      is a FRACTION of live executable cash: every synchronous exit lowers the cash and the
-    ///      supply by the same amount, so the reserve falls with each one and a holder stepping
-    ///      `redeem(maxRedeem)` drains it (`R60S1_H03Routes.t.sol`; header rule 3). It also counts
-    ///      queued shares whose controller has already drawn their whole slice, so after such a
-    ///      draw it exceeds the sum of every request's serviceable cash, and the difference is cash
-    ///      no door can reach until executable cash or supply moves (`R60S1_H03Probes.t.sol`,
-    ///      probe 3: 2,500.000000 reserved against 1,428.571428 serviceable, 1,071.428572 idle).
+    ///      the request side the one indivisible executable cash unit at the boundary. The
+    ///      fraction arm falls with every synchronous exit (each lowers the cash and the supply by
+    ///      the same amount); the floor arm does not, which is what stops a holder stepping
+    ///      `redeem(maxRedeem)` past the cash the queued lenders were quoted
+    ///      (`R60S1_H03Routes.t.sol`; header rule 3). The fraction arm still counts queued shares
+    ///      whose controller has already drawn their whole slice, so where it exceeds the floors
+    ///      the difference is cash no door can reach until executable cash or supply moves
+    ///      (`R60S1_H03Probes.t.sol`, probe 3, closed to 0 in the two-lender state where the
+    ///      floor binds; 347.826087 remains in the three-lender state where the fraction does).
+    ///      The clamp at the executable cash is where the floors exceed it after a loss.
     function queueCashReserve() public view returns (uint256) {
         uint256 raw = _rawBalance();
         return _queueCashReserve(_executablePoolCash(raw));
@@ -1287,7 +1310,10 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     function _queueCashReserve(uint256 executableCash) private view returns (uint256) {
         uint256 shares = queuedShares;
         if (shares == 0) return 0;
-        return Math.mulDiv(executableCash, shares, totalSupply(), Math.Rounding.Ceil);
+        uint256 reserve = Math.mulDiv(executableCash, shares, totalSupply(), Math.Rounding.Ceil);
+        uint256 floors = _floorTotal;
+        if (floors > reserve) reserve = floors;
+        return reserve > executableCash ? executableCash : reserve;
     }
 
     /// @notice Executable USDC not reserved for live withdrawal requests.
@@ -2397,7 +2423,9 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
 
     /// @notice Escrow shares in a request controlled only by the caller.
     /// @dev Escrowed shares stay outstanding, continue to earn yield and carry losses. The receiver
-    ///      is fixed for the request's lifetime.
+    ///      is fixed for the request's lifetime, and so is the cash floor it is quoted here
+    ///      (`_freshFloor`), read after the escrow and before `queuedShares` advances so the
+    ///      reserve it is priced out of is the one the EARLIER requests hold.
     function requestWithdrawal(uint256 shares, address receiver) external nonReentrant {
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
@@ -2408,14 +2436,36 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
 
         _transfer(msg.sender, address(this), shares);
 
+        uint256 floor = _freshFloor(shares);
         uint256 requestId = _nextWithdrawalRequestId++;
-        _withdrawalRequests[msg.sender] = WithdrawalRequest({requestId: requestId, receiver: receiver, shares: shares});
+        _withdrawalRequests[msg.sender] =
+            WithdrawalRequest({requestId: requestId, receiver: receiver, shares: shares, floor: floor});
         queuedShares += shares;
+        _floorTotal += floor;
 
         emit WithdrawalRequested(msg.sender, requestId, receiver, shares);
     }
 
+    /// @dev The cash a request of `shares` is owed when it is filed: the executable cash NOT
+    ///      already reserved for the requests live before it, pro rata over the shares not yet
+    ///      queued. With no floor binding, `(E - ceil(E * qO / S)) * shares / (S - qO)` is the
+    ///      ordinary slice `E * shares / S`; where the earlier floors hold the whole cash the
+    ///      answer is 0 and nothing is over-promised (a plain `E * shares / S` here would leave
+    ///      `_floorTotal` above `E` the moment two requests exist, and clamp the reserve to `E`
+    ///      for everybody). Called with the caller's shares already in escrow and `queuedShares`
+    ///      still excluding them, so `S - qO` is at least `shares` and the floor is at most the
+    ///      unreserved cash; `_floorTotal` therefore never exceeds `E` at request time, and
+    ///      only a loss can push it above. Floor rounding: the reserve rounds up, the floor down.
+    function _freshFloor(uint256 shares) private view returns (uint256) {
+        uint256 executable = _executablePoolCash(_rawBalance());
+        uint256 reservedForOthers = _queueCashReserve(executable);
+        if (executable <= reservedForOthers) return 0;
+        return Math.mulDiv(executable - reservedForOthers, shares, totalSupply() - queuedShares, Math.Rounding.Floor);
+    }
+
     /// @notice Cancel the caller's live request and recover its remaining shares.
+    /// @dev Releases the whole remaining floor; the shares come back at the live price and the
+    ///      request-draw memory stays (the rule on `_requestDraws`).
     function cancelWithdrawalRequest() external nonReentrant {
         WithdrawalRequest storage request = _withdrawalRequests[msg.sender];
         uint256 requestId = request.requestId;
@@ -2425,6 +2475,7 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         uint256 shares = request.shares;
 
         queuedShares -= shares;
+        _floorTotal -= request.floor;
         delete _withdrawalRequests[msg.sender];
 
         _transfer(address(this), msg.sender, shares);
@@ -2444,39 +2495,55 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         return _requestOperators[controller][operator];
     }
 
-    /// @notice The most requested shares this controller's pro-rata slice of the cash executable
-    ///         NOW funds, net of what the controller has already drawn. Re-derived on every read.
-    /// @dev The slice is `(E + drawnAssets) * (requested + drawnShares) / (supply + drawnShares)`
-    ///      less `drawnAssets`, with `E` the executable cash now: the controller's own earlier
-    ///      service is added back into all three terms and taken off the answer, so a request
-    ///      serviced in steps reaches exactly one slice of the cash as it stands, and the slice
-    ///      still rises when a loan repays or yield releases and falls when cash is lent or lost
-    ///      (33audits H-03, the reviewers' shape; `R60S1_H03RequestDraw.t.sol`). Before the memory
-    ///      each call re-sliced a base the previous call had drained, and with another lender's
-    ///      request holding the reserve the loop out-paid one sync `redeem` by 2,499.999998.
-    ///      Two properties of the memory to know: it is keyed to the controller and survives
-    ///      `cancelWithdrawalRequest`, a whole-position sync exit and a re-deposit, so a
-    ///      controller whose ratio of cash to supply has since fallen is paid less than a fresh
-    ///      address for the same shares (`R60S1_H03Probes.t.sol`, probe 4); and it binds ONE
-    ///      controller only, so a position walked through fresh controllers, or the stepped sync
-    ///      door, still reaches what the loop reached (header rule 3, `R60S1_H03Routes.t.sol`).
-    ///      The conversion back to shares is deliberately the gross ERC-4626 conversion, while
-    ///      execution pays the live exit price through `previewRedeem`.
+    /// @notice The most requested shares the cash this controller's request is owed NOW funds: the
+    ///         larger of its remaining cash floor and its pro-rata slice of the executable cash
+    ///         net of what the controller has already drawn, capped at the cash not owed to other
+    ///         requests. Re-derived on every read.
+    /// @dev The live slice is `(E + drawnAssets) * (requested + drawnShares) / (supply +
+    ///      drawnShares)` less `drawnAssets`, with `E` the executable cash now: the controller's
+    ///      own earlier service is added back into all three terms and taken off the answer, so a
+    ///      request serviced in steps reaches exactly one slice of the cash as it stands, and the
+    ///      slice still rises when a loan repays or yield releases and falls when cash is lent or
+    ///      lost (33audits H-03, the reviewers' shape; `R60S1_H03RequestDraw.t.sol`). Before the
+    ///      memory each call re-sliced a base the previous call had drained, and with another
+    ///      lender's request holding the reserve the loop out-paid one sync `redeem` by
+    ///      2,499.999998. The floor (`WithdrawalRequest.floor`, header rule 3) is what the
+    ///      request was quoted when it was filed, less what it has drawn since: the slice can be
+    ///      re-sliced below it by other holders' exits, the floor cannot, and `max` of the two is
+    ///      why a lender who queued in a drought still sees the slice rise when a loan repays (a
+    ///      floor alone would freeze her at the drought's figure). The cap, `E` less the other
+    ///      live requests' floors, is the request-door twin of `_unreservedIdle`: without it a
+    ///      fresh controller's empty memory re-slices the whole `E`, floors included, and the
+    ///      sequential address split is open again. It also holds every request inside the
+    ///      cash that exists when the floors exceed it after a loss. Two properties of the
+    ///      memory to know: it is keyed to the controller and survives `cancelWithdrawalRequest`,
+    ///      a whole-position sync exit and a re-deposit, so it can price a re-request below the
+    ///      slice a fresh address would read (`R60S1_H03Probes.t.sol`, probe 4), and the floor
+    ///      priced at request time is the floor under that; and it binds ONE controller only,
+    ///      which is why the cap is per request and not per controller. The conversion back to
+    ///      shares is deliberately the gross ERC-4626 conversion, while execution pays the live
+    ///      exit price through `previewRedeem`.
     function maxRequestRedeem(address controller) public view returns (uint256 shares) {
-        uint256 requestedShares = _withdrawalRequests[controller].shares;
+        WithdrawalRequest storage request = _withdrawalRequests[controller];
+        uint256 requestedShares = request.shares;
         if (requestedShares == 0 || claimLiquidityDeficit() != 0) return 0;
 
         RequestDraw storage draw = _requestDraws[controller];
         uint256 drawnShares = draw.shares;
         uint256 drawnAssets = draw.assets;
+        uint256 executable = _executablePoolCash(_rawBalance());
 
         uint256 entitlement = Math.mulDiv(
-            _executablePoolCash(_rawBalance()) + drawnAssets,
-            requestedShares + drawnShares,
-            totalSupply() + drawnShares,
-            Math.Rounding.Floor
+            executable + drawnAssets, requestedShares + drawnShares, totalSupply() + drawnShares, Math.Rounding.Floor
         );
         uint256 requestCash = entitlement > drawnAssets ? entitlement - drawnAssets : 0;
+        uint256 floor = request.floor;
+        if (floor > requestCash) requestCash = floor;
+        // `_floorTotal` is the sum of every live floor, this one included, so the subtraction
+        // cannot underflow; the cap can, after a loss, so it saturates at zero.
+        uint256 owedToOthers = _floorTotal - floor;
+        uint256 reachable = executable > owedToOthers ? executable - owedToOthers : 0;
+        if (requestCash > reachable) requestCash = reachable;
         uint256 cashFundedShares = convertToShares(requestCash);
         shares = cashFundedShares < requestedShares ? cashFundedShares : requestedShares;
 
@@ -2542,6 +2609,15 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
 
         claimable[receiver] += assetsOut;
         totalClaimable += assetsOut;
+
+        // The floor is spent by what this service paid, and whatever is left of it goes with the
+        // request when the request is gone. A service above the floor (the live slice, after a
+        // repayment) spends the whole floor and no more.
+        uint256 floor = request.floor;
+        uint256 floorSpent = assetsOut < floor ? assetsOut : floor;
+        if (remainingShares == 0) floorSpent = floor;
+        request.floor = floor - floorSpent;
+        _floorTotal -= floorSpent;
 
         RequestDraw storage draw = _requestDraws[controller];
         draw.shares += shares;

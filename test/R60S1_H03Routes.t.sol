@@ -10,34 +10,41 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 /// @title Round 60, S1: the THREE routes to the queued lender's cash, measured on the same state.
 /// @notice Issue #47 (H-03) has been argued as ONE route: the same controller servicing its own
 ///         request in steps. The auditor's request-draw memory closes that route. This file
-///         measures the two others from the identical fixture, and the answer is that they drain
-///         the same cash by the same recurrence, because the reserve is a FRACTION of live cash
-///         rather than an amount of it, and every exit lowers the cash the fraction is taken of.
+///         measures the two others from the identical fixture. Under the FRACTION (the tree at
+///         `5239dfb`) they drained the same cash by the same recurrence, because the reserve was
+///         a fraction of live cash and every exit lowered the cash the fraction was taken of.
+///         Under the CASH FLOOR (session 42, `LenderPool._floorTotal`) both stop at the sync
+///         door's one-call figure, and the assertions below hold the closed figures with the
+///         fraction's kept in each test as history.
 ///
 /// @dev Fixture: blocker deposits 10,000, attacker deposits 10,000, the manager lends 15,000, the
 ///      blocker queues everything and sits. Executable cash E = 5,000; supply S = 20,000; queued
-///      q = 10,000; price 1. The reserve is `ceil(E * q / S)` and the sync door pays out of
-///      `E - reserve`, so one `redeem` pays 2,500.000000.
+///      q = 10,000; price 1. The blocker's floor is `E * q / S` = 2,500.000000, the reserve is
+///      `max(ceil(E * q / S), floors)` and the sync door pays out of `E - reserve`, so one
+///      `redeem` pays 2,500.000000 either way.
 ///
-///      The sync loop: with price 1 every `redeem` lowers E and S by the SAME amount, so after a
-///      payout of U the reserve is `(E - U) * q / (S - U)`, which is smaller than `E * q / S`
-///      whenever `q < S`. The unreserved remainder is `E (S - q) / S`, and with `S - q` fixed at
-///      5,000 by the principal out, it is zero only when E is. The loop therefore reaches the
-///      whole 5,000, and the request-draw memory cannot see it because no request was serviced.
+///      The sync loop under the fraction: with price 1 every `redeem` lowers E and S by the SAME
+///      amount, so after a payout of U the reserve is `(E - U) * q / (S - U)`, smaller than
+///      `E * q / S` whenever `q < S`; the unreserved remainder `E (S - q) / S` is zero only when
+///      E is, so the loop reached the whole 5,000. Under the floor the reserve after the first
+///      redeem is `max(ceil(2,500 * 10,000 / 17,500), 2,500) = 2,500 = E`, the remainder is zero
+///      and the loop stops after one call.
 ///
 ///      The sequential address split: request all, service `maxRequestRedeem` once, cancel,
 ///      transfer the remainder to a FRESH address, repeat. Every fresh controller has no memory,
-///      so each step is the shipped recurrence with the address changed. The auditor's split test
-///      chunks the position in PARALLEL (each chunk requests its own slice of the same base), which
-///      converts less as it gets finer; that is a different walk and not the one that drains.
+///      so under the fraction each step was the shipped recurrence with the address changed.
+///      Under the floor the second address's fresh floor is priced out of `E - 2,500 = 0` and
+///      its live arm is capped at the same zero, so it reads 0 and the walk stops. The auditor's
+///      split test chunks the position in PARALLEL (each chunk requests its own slice of the same
+///      base), which converts less as it gets finer; that is a different walk.
 ///
-///      Every figure logged as MEASURED was read from the run that pins it, on the shipped tree at
-///      `68ac048` with forge 1.8.1, and the assertions hold the figures rather than the direction:
-///      the stepped sync door 4,999.999998 over 53 calls (the request loop's own total and call
-///      count, `R59A02_H03CounterCase`), the blocker left 1 wei serviceable; the 40-address
-///      sequential split 4,999.999773 through EITHER door, the blocker left 151 wei; the parallel
-///      40-chunk walk 4,867.321159 on the shipped tree (it is the request-draw memory that takes
-///      the auditor's figure down to 2,064.515667, and it does nothing to the two walks above).
+///      Every figure logged as MEASURED was read from the run that pins it, with forge 1.8.1.
+///      On the fraction tree (`68ac048`, then `5239dfb` with the memory): the stepped sync door
+///      4,999.999998 over 53 calls, the blocker left 1 wei; the 40-address sequential split
+///      4,999.999773 through EITHER door, the blocker left 151 wei; the parallel 40-chunk walk
+///      4,867.321159 before the memory and 2,064.515667 with it. On the floor tree: 2,500.000000
+///      through every walk in one step, the blocker's 2,500.000000 untouched, the parallel walk
+///      still 2,064.515667.
 contract R60S1_H03Routes is Test {
     MockUSDC internal usdc;
     LenderPool internal pool;
@@ -123,11 +130,17 @@ contract R60S1_H03Routes is Test {
         console2.log("MEASURED blocker serviceable after         ", _blockerServiceable());
         console2.log("MEASURED queueCashReserve after            ", pool.queueCashReserve());
 
+        // Fraction (`5239dfb`): 4,999.999998 over 53 calls, the blocker left 1 wei. Floor: after
+        // the first redeem E is 2,500 and the reserve is max(ceil(2,500 * 10,000 / 17,500),
+        // 2,500) = 2,500, so `unreservedIdle` is zero and the walk stops at the sync door's
+        // one-call figure with 7,500 shares still on the attacker.
         assertEq(first, 2_500e6, "one redeem pays other than the sync door's 2,500");
-        assertEq(total, 4_999_999_998, "the stepped sync door reached other than 4,999.999998");
-        assertEq(calls, 53, "the stepped sync door took other than 53 calls");
+        assertEq(total, 2_500e6, "the stepped sync door reached other than the one-call 2,500");
+        assertEq(calls, 1, "the stepped sync door took other than 1 call");
         assertEq(blockerBefore, 2_500e6, "the blocker's serviceable figure did not open at 2,500");
-        assertEq(_blockerServiceable(), 1, "the blocker was left other than one wei serviceable");
+        assertEq(_blockerServiceable(), 2_500e6, "the blocker's serviceable figure moved");
+        assertEq(pool.balanceOf(attacker), 7_500e9, "the attacker's remaining shares moved");
+        assertEq(pool.unreservedIdle(), 0, "the sync door stayed open under the floor");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -169,9 +182,13 @@ contract R60S1_H03Routes is Test {
         console2.log("MEASURED blocker serviceable before        ", blockerBefore);
         console2.log("MEASURED blocker serviceable after         ", _blockerServiceable());
 
-        assertEq(total, 4_999_999_773, "the sequential split reached other than 4,999.999773");
-        assertEq(steps, 40, "the sequential split paid on other than every address");
-        assertEq(_blockerServiceable(), 151, "the blocker was left other than 151 wei serviceable");
+        // Fraction (`5239dfb`): 4,999.999773 over 40 addresses, the blocker left 151 wei. Floor:
+        // the second address's fresh floor is priced out of E - 2,500 = 0 and its live arm is
+        // capped at the same zero, so the walk stops after one draw with 7,500 shares on it.
+        assertEq(total, 2_500e6, "the sequential split reached other than the one-call 2,500");
+        assertEq(steps, 1, "the sequential split paid on other than one address");
+        assertEq(pool.balanceOf(holder), 7_500e9, "the walk did not strand 7,500 shares on the last address");
+        assertEq(_blockerServiceable(), 2_500e6, "the blocker's serviceable figure moved");
     }
 
     /// @notice The same sequential split through the sync door: redeem the maximum once, move
@@ -200,9 +217,10 @@ contract R60S1_H03Routes is Test {
         console2.log("MEASURED sync door, address split, steps   ", steps);
         console2.log("MEASURED blocker serviceable after         ", _blockerServiceable());
 
-        assertEq(total, 4_999_999_773, "the split sync walk reached other than 4,999.999773");
-        assertEq(steps, 40, "the split sync walk took other than 40 steps");
-        assertEq(_blockerServiceable(), 151, "the blocker was left other than 151 wei serviceable");
+        // Fraction (`5239dfb`): 4,999.999773 over 40 steps, the blocker left 151 wei.
+        assertEq(total, 2_500e6, "the split sync walk reached other than the one-call 2,500");
+        assertEq(steps, 1, "the split sync walk took other than 1 step");
+        assertEq(_blockerServiceable(), 2_500e6, "the blocker's serviceable figure moved");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -235,6 +253,9 @@ contract R60S1_H03Routes is Test {
 
         console2.log("MEASURED parallel chunks, 40, total        ", total);
         console2.log("MEASURED blocker serviceable after         ", _blockerServiceable());
-        assertLt(total, 4_999_999_998, "parallel chunking reached the sequential figure");
+        // 2,064.515667 under the memory, fraction or floor; the blocker read 1,636.690862 under
+        // the fraction and keeps her 2,500.000000 under the floor.
+        assertEq(total, 2_064_515_667, "parallel chunking reached other than 2,064.515667");
+        assertEq(_blockerServiceable(), 2_500e6, "the blocker's serviceable figure moved");
     }
 }

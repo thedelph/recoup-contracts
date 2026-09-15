@@ -22,7 +22,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Base mainnet | No Recoup contracts deployed |
 | Lender pool | Source and testnet instance exist. The testnet pool is empty and blocked from activation, and it is not wired as the protocol's liquidity source; its own pointers to the manager and the harvester are set, so "unwired" is true in one direction only. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
 | Referral registry | Source fixed through partner self-registration; the carried-over Sepolia instance remains defective and unused, and live replacement is disabled and unauthorised |
-| External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11; as of the 2026-09-14 sync every one of them has a code change in this source, and [`KNOWN_RISKS.md`](KNOWN_RISKS.md) records what each closes and what H-03's leaves open. Not completed |
+| External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11; as of the 2026-09-15 sync every one of them has a code change in this source, and [`KNOWN_RISKS.md`](KNOWN_RISKS.md) records what each closes and what the H-03 cash floor costs. Not completed |
 
 For non-reserved referral codes, the only registration path now assigns the code to its caller. A
 partner's payout wallet or Safe must call `register(bytes32)` before the code is published;
@@ -121,15 +121,24 @@ outright. Remappings are pinned in `foundry.toml` rather than auto-detected from
 on disk, so the build is byte-identical either way: verified from a cold clone, 4,997 bytes of
 `CreditWiring` initcode and two remappings in the metadata in both cases.
 
-As of 2026-09-14, `forge test` on this tree gives 1,901 passed, 0 failed and 32 skipped across 149
-suites, 1,933 total, measured on a fresh build of this repository in five `--match-contract` groups
-run one at a time with nothing else running, whose suite and test counts sum to those figures. The
-figure is dated because it is derived from the test tree by a checker that does not live in this
-repository, so nothing here can hold it to the truth; it read 1,798 across 137 suites until this
-sync, and 1,245 across 62 before the sync of 2026-09-12. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
+As of 2026-09-15, `forge test` on this tree gives 1,921 passed, 0 failed and 32 skipped across 150
+suites, 1,953 total, measured with forge 1.8.1 on a fresh clone and a clean build of this repository
+in six `--match-contract` groups run one at a time with nothing else running, whose suite and test
+counts sum to those figures. The figure is dated because it is derived from the test tree by a
+checker that does not live in this repository, so nothing here can hold it to the truth; it read
+1,901 across 149 suites from the sync of 2026-09-14 until this one, 1,798 across 137 before that,
+and 1,245 across 62 before the sync of 2026-09-12. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
 an explicit opt-in; nothing else is skipped. Counting test declarations in those fork files gives 29
 rather than 32, because three of them subclass a fixture and inherit its suite. CI runs the full
-unit and invariant suite on every push and pull request.
+unit and invariant suite on every push and pull request. The workflow installs Foundry's stable
+release, which resolved to forge 1.8.1 through 2026-09-14 and to 1.8.3 from 2026-09-15. The figures
+above are from 1.8.1; the lender-pool, H-03 and vault-seam suites were re-run on 1.8.3 on this tree
+and the pull request's own run is the whole-suite check on the current stable release. One measurement
+moved between the two versions on identical bytecode, the `depositETH` gas pair in
+`test_a7_measureLocalDepositEthGas` (808,296 under isolation on 1.8.1 against 955,996 on 1.8.3,
+and 808,860 without isolation on both), so since 2026-09-15 that test pins its execution mode with
+an inline `forge-config` line and keeps its 900,000 ceiling on the pair rather than pinning a
+number.
 
 ### Mainnet fork tests
 

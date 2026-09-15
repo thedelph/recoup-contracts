@@ -137,18 +137,10 @@ contract A7VaultSeamTest is Test {
             admin
         );
         vault = new CollateralVault(
-            IDexFiBond(address(bond)),
-            INAVOracle(address(oracle)),
-            IRiskParams(address(riskParams)),
-            admin
+            IDexFiBond(address(bond)), INAVOracle(address(oracle)), IRiskParams(address(riskParams)), admin
         );
         adapter = new DirectCallAdapter(
-            IDexFiBond(address(bond)),
-            IDexFiFarm(address(farm)),
-            usdc,
-            address(vault),
-            admin,
-            yieldSink
+            IDexFiBond(address(bond)), IDexFiFarm(address(farm)), usdc, address(vault), admin, yieldSink
         );
         credit.setVault(address(vault));
         credit.setRiskParams(address(riskParams));
@@ -184,10 +176,7 @@ contract A7VaultSeamTest is Test {
         address receiver = adapter.predictMintReceiver(alice, attempt);
         treasury.arm(
             address(vault),
-            abi.encodeCall(
-                CollateralVault.depositETH,
-                (bytes32(uint256(12)), _encoded(999, 0, receiver, 1, 0))
-            )
+            abi.encodeCall(CollateralVault.depositETH, (bytes32(uint256(12)), _encoded(999, 0, receiver, 1, 0)))
         );
         _deposit(alice, attempt, 201, MINT_AMOUNT, PAYMENT);
         assertTrue(treasury.fired(), "the treasury callback must have run");
@@ -222,10 +211,7 @@ contract A7VaultSeamTest is Test {
         farm.setPendingYield(secondReceiver, own);
 
         // 3. DexFi's treasury re-enters the ADAPTER (not the vault) during the mint.
-        treasury.arm(
-            address(adapter),
-            abi.encodeCall(DirectCallAdapter.flushMintAttemptYield, (alice, first))
-        );
+        treasury.arm(address(adapter), abi.encodeCall(DirectCallAdapter.flushMintAttemptYield, (alice, first)));
 
         vm.recordLogs();
         _deposit(alice, second, 302, MINT_AMOUNT, PAYMENT);
@@ -241,10 +227,7 @@ contract A7VaultSeamTest is Test {
             if (logs[i].emitter == address(vault) && logs[i].topics[0] == YieldHarvested.selector) {
                 reportedByVault = abi.decode(logs[i].data, (uint256));
             }
-            if (
-                logs[i].emitter == address(adapter)
-                    && logs[i].topics[0] == MintAttemptYieldFlushed.selector
-            ) {
+            if (logs[i].emitter == address(adapter) && logs[i].topics[0] == MintAttemptYieldFlushed.selector) {
                 ++flushes;
                 (, uint256 swept) = abi.decode(logs[i].data, (uint256, uint256));
                 reportedByFlush = swept;
@@ -252,11 +235,7 @@ contract A7VaultSeamTest is Test {
         }
         assertEq(flushes, 1, "the nested flush emitted its own event");
         assertEq(reportedByFlush, parked, "the flush reported the parked money");
-        assertEq(
-            reportedByVault,
-            own + parked,
-            "the vault's YieldHarvested reports the other path's settlement too"
-        );
+        assertEq(reportedByVault, own + parked, "the vault's YieldHarvested reports the other path's settlement too");
         assertEq(adapter.farmYieldDelivered(), own + parked, "counter moved by both");
         assertEq(usdc.balanceOf(yieldSink), own + parked, "the money itself moved only once");
     }
@@ -382,12 +361,22 @@ contract A7VaultSeamTest is Test {
     ///        | isolate (1.8.0 default) | 451,996 | 352,198 | 804,194 |
     ///        | `--no-isolate`          | 508,828 | 295,930 | 804,758 |
     ///
+    ///      And on forge 1.8.3 (2026-09-15, session 42), IDENTICAL bytecode, one run each:
+    ///
+    ///        | mode                    | first   | second  | TOTAL   |
+    ///        |-------------------------|---------|---------|---------|
+    ///        | isolate                 | 536,447 | 419,549 | 955,996 |
+    ///        | `--no-isolate`          | 510,879 | 297,981 | 808,860 |
+    ///
     ///      Either call alone moves by 56,832 gas - 12.6% - between modes, in opposite directions,
     ///      because isolate redistributes warm and cold account access between the two
     ///      transactions. The TOTAL moves by 564, which is 0.070%. So a per-call bound would need
     ///      more than 12% of slack purely for a switch that changes no code, while a bound on the
     ///      sum needs none of it and can therefore be tight enough to catch something. Pin the
-    ///      invariant, not the measurement.
+    ///      invariant, not the measurement. Forge 1.8.3 moved isolate-mode refund accounting, so
+    ///      the isolate TOTAL rose by 151,802 on bytecode whose hash did not change while the
+    ///      no-isolate total moved by 4,102; this test therefore pins the MODE (the inline
+    ///      `forge-config` below runs it without isolation on every forge) and keeps the ceiling.
     ///
     ///      THE NUMBER. 900,000 is 11.84% above the larger of the two measured totals, which
     ///      satisfies the >= 11% of slack the execution-mode spread was costed at, with the spread
@@ -399,6 +388,7 @@ contract A7VaultSeamTest is Test {
     ///      `MintAttemptReceiver.t.sol`, which is where that belongs.
     uint256 internal constant DEPOSIT_ETH_GAS_PAIR_CEILING = 900_000;
 
+    /// forge-config: default.isolate = false
     function test_a7_measureLocalDepositEthGas() public {
         bytes32 attempt = bytes32(uint256(71));
         address receiver = adapter.predictMintReceiver(alice, attempt);

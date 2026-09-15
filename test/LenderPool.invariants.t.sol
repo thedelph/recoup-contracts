@@ -255,8 +255,10 @@ contract CanonicalLenderHandler is Test {
     ///      to forget the cash half of its memory read zero drawn, paid a second slice, and the
     ///      campaign stayed GREEN (measured, round 60). The mirror below is written from what
     ///      the door actually paid and cleared on the rule the pool documents, so a pool that
-    ///      forgets is caught by a figure it cannot write.
-    uint256 public cumulativeDrawExceededEntitlement;
+    ///      forgets is caught by a figure it cannot write. Session 42 rewrote the comparison for
+    ///      the cash floor: the counter is now `serviceExceededItsEntitlement` below, and the
+    ///      entitlement is derived BEFORE the service (`_entitlementBefore`) as the larger of the
+    ///      mirrored floor and this live slice, capped at the cash not owed to the other requests.
     mapping(address controller => uint256 shares) private _mirrorDrawShares;
     mapping(address controller => uint256 assets) private _mirrorDrawAssets;
     /// @dev Partner of the above: services on which the comparison was made.
@@ -267,6 +269,49 @@ contract CanonicalLenderHandler is Test {
     ///      exit or a transfer out after a partial service leaves it behind (`R60S1_H03Probes`,
     ///      probe 4). Reported from `afterInvariant` like `subFloorStatesSeen`.
     uint256 public staleDrawFrames;
+
+    /**
+     * -- SESSION-42 CASH-FLOOR GHOSTS (33audits H-03, issue #47, the floor) -------------------
+     */
+    /// @dev `LenderPool._floorTotal` has no getter; it is slot 33, declared last
+    ///      (`LenderPoolFormulaPins.test_pins_theStorageLayoutTheyDependOn` pins it). A request's
+    ///      own `floor` is the fourth word of the `WithdrawalRequest` value under
+    ///      `_withdrawalRequests` at slot 25. Both are read by `vm.load`, and only ever for the
+    ///      ghost that compares them with a figure the handler wrote itself.
+    uint256 private constant FLOOR_TOTAL_SLOT = 33;
+    uint256 private constant WITHDRAWAL_REQUESTS_SLOT = 25;
+    uint256 private constant REQUEST_FLOOR_WORD = 3;
+    /// @dev The handler's own mirror of each live request's remaining floor: quoted at request
+    ///      time from the PUBLIC views (`E - queueCashReserve`, pro rata over `totalSupply -
+    ///      queuedShares`, read before the door moves them), spent by what each service paid and
+    ///      cleared on cancel and on the service that empties the request. Same rule as the
+    ///      round-60 draw mirror: a pool that forgets to spend or to release its floor is caught
+    ///      by a figure it cannot write.
+    mapping(address controller => uint256 floor) private _mirrorFloor;
+    /// @dev VIOLATION, asserted zero (ghost A, rewritten for the floor). A service paid more than
+    ///      the entitlement the handler derived BEFORE it from its own mirrors: the larger of the
+    ///      request's remaining floor and its live slice `(E + dA)(r + dS) / (S + dS) - dA`,
+    ///      capped at `E` less the other live requests' floors (which is also at most `E`).
+    ///      Exact: `previewRedeem(convertToShares(x)) <= x`, and the handler's arithmetic is the
+    ///      door's over public views.
+    uint256 public serviceExceededItsEntitlement;
+    /// @dev VIOLATION, asserted zero (ghost C). A service paid more than the executable cash on
+    ///      hand before it, or more than that cash less what the OTHER live requests were owed.
+    uint256 public servicePaidBeyondExecutableCash;
+    /// @dev VIOLATION, asserted zero (ghost B). After a watched action, `_floorTotal` differed from
+    ///      the sum of every live request's stored floor, or a live request's stored floor
+    ///      differed from the handler's mirror of it.
+    uint256 public floorTotalMismatches;
+    uint256 public requestFloorMismatches;
+    /// @dev Partner of the two above: watched actions after which the sum was compared.
+    uint256 public floorSumChecks;
+    /// @dev CENSUS: frames after a watched action where the floor arm of the reserve BOUND, that
+    ///      is `_floorTotal > ceil(E * queuedShares / supply)`. The state every floor property is
+    ///      about; asserted reached in the tripwire, never a floor on a campaign run.
+    uint256 public boundFloorFrames;
+    /// @dev CENSUS: services that paid more than the live slice would have, which is a request
+    ///      drawing its floor. Reached on purpose in the tripwire.
+    uint256 public floorBoundServices;
 
     mapping(address controller => bytes32 fingerprint) private _requestBefore;
     /// @dev `_requestFingerprint` of a controller with no request.
@@ -725,9 +770,18 @@ contract CanonicalLenderHandler is Test {
 
     function _requestBare(address controller, address receiver, uint256 shares) private {
         _observeOtherRequests(controller);
+        // Session 42: the floor this request is owed, quoted from the public views BEFORE the
+        // door moves them: the executable cash not reserved for the requests already live, pro
+        // rata over the shares not yet queued.
+        uint256 reservedForOthers = pool.queueCashReserve();
+        uint256 executable = pool.unreservedIdle() + reservedForOthers;
+        uint256 quote = executable > reservedForOthers
+            ? Math.mulDiv(executable - reservedForOthers, shares, pool.totalSupply() - pool.queuedShares())
+            : 0;
         vm.prank(controller);
         pool.requestWithdrawal(shares, receiver);
         ++requestsDone;
+        _mirrorFloor[controller] = quote;
         _settleOtherRequests(controller);
     }
 
@@ -740,6 +794,7 @@ contract CanonicalLenderHandler is Test {
         vm.prank(controller);
         pool.cancelWithdrawalRequest();
         ++cancellationsDone;
+        delete _mirrorFloor[controller];
         _settleOtherRequests(controller);
     }
 
@@ -779,6 +834,35 @@ contract CanonicalLenderHandler is Test {
         return pool.maxRequestRedeem(controller);
     }
 
+    /// @dev The entitlement the handler derives for a service BEFORE it, from its own mirrors and
+    ///      the public views: `live` is the round-60 slice over the mirrored draw, `floor` the
+    ///      mirrored remaining floor, `reachable` the executable cash less the OTHER live
+    ///      requests' mirrored floors.
+    struct Entitlement {
+        uint256 executable;
+        uint256 live;
+        uint256 floor;
+        uint256 reachable;
+        uint256 bound;
+    }
+
+    function _entitlementBefore(address controller, uint256 requestShares) private view returns (Entitlement memory e) {
+        e.executable = pool.unreservedIdle() + pool.queueCashReserve();
+        uint256 drawnShares = _mirrorDrawShares[controller];
+        uint256 drawnAssets = _mirrorDrawAssets[controller];
+        uint256 slice =
+            Math.mulDiv(e.executable + drawnAssets, requestShares + drawnShares, pool.totalSupply() + drawnShares);
+        e.live = slice > drawnAssets ? slice - drawnAssets : 0;
+        e.floor = _mirrorFloor[controller];
+        uint256 owedToOthers;
+        for (uint256 i = 0; i < actors.length; i++) {
+            if (actors[i] != controller) owedToOthers += _mirrorFloor[actors[i]];
+        }
+        e.reachable = e.executable > owedToOthers ? e.executable - owedToOthers : 0;
+        e.bound = e.live > e.floor ? e.live : e.floor;
+        if (e.bound > e.reachable) e.bound = e.reachable;
+    }
+
     function _serviceBare(address controller, address caller, uint256 shares) private {
         (, address receiver, uint256 requestShares,,) = pool.withdrawalRequest(controller);
         uint256 expectedAssets = pool.previewRedeem(shares);
@@ -786,6 +870,7 @@ contract CanonicalLenderHandler is Test {
         uint256 totalBefore = pool.totalClaimable();
         uint256 supplyBefore = pool.totalSupply();
         uint256 queuedBefore = pool.queuedShares();
+        Entitlement memory before = _entitlementBefore(controller, requestShares);
         _observeOtherRequests(controller);
 
         vm.prank(caller);
@@ -797,7 +882,7 @@ contract CanonicalLenderHandler is Test {
                 || pool.totalClaimable() != totalBefore + assets || pool.totalSupply() != supplyBefore - shares
                 || pool.queuedShares() != queuedBefore - shares || remainingShares != requestShares - shares
         ) ++serviceAccountingMismatches;
-        _checkDrawEntitlement(controller, shares, assets, remainingShares);
+        _checkDrawEntitlement(controller, shares, assets, remainingShares, before);
         _settleOtherRequests(controller);
     }
 
@@ -807,14 +892,28 @@ contract CanonicalLenderHandler is Test {
         drawnAssets = uint256(vm.load(address(pool), bytes32(uint256(base) + 1)));
     }
 
-    /// @dev Round 60: the cumulative draw against the entitlement reconstructed over it, read
-    ///      AFTER the service. The draw is the handler's mirror of what the door paid, added
-    ///      here and cleared on the pool's own rule (request empty AND balance zero). `E` is the
-    ///      executable cash now (`unreservedIdle + queueCashReserve`, the two halves of
-    ///      `_executablePoolCash`).
-    function _checkDrawEntitlement(address controller, uint256 shares, uint256 assets, uint256 remainingShares)
-        private
-    {
+    function _storedFloorOf(address controller) private view returns (uint256) {
+        bytes32 base = keccak256(abi.encode(controller, WITHDRAWAL_REQUESTS_SLOT));
+        return uint256(vm.load(address(pool), bytes32(uint256(base) + REQUEST_FLOOR_WORD)));
+    }
+
+    function _storedFloorTotal() private view returns (uint256) {
+        return uint256(vm.load(address(pool), bytes32(FLOOR_TOTAL_SLOT)));
+    }
+
+    /// @dev Round 60, rewritten in session 42 for the floor: what the service PAID against the
+    ///      entitlement derived before it (`_entitlementBefore`). The draw is the handler's mirror
+    ///      of what the door paid, added here and cleared on the pool's own rule (request empty
+    ///      AND balance zero); the floor mirror is spent by the payment and cleared with the
+    ///      request. Ghost A is the bound, ghost C the executable cash, and a payment above the
+    ///      live slice is the floor-bound census.
+    function _checkDrawEntitlement(
+        address controller,
+        uint256 shares,
+        uint256 assets,
+        uint256 remainingShares,
+        Entitlement memory before
+    ) private {
         uint256 drawnShares = _mirrorDrawShares[controller] + shares;
         uint256 drawnAssets = _mirrorDrawAssets[controller] + assets;
         if (remainingShares == 0 && pool.balanceOf(controller) == 0) {
@@ -824,11 +923,16 @@ contract CanonicalLenderHandler is Test {
             _mirrorDrawShares[controller] = drawnShares;
             _mirrorDrawAssets[controller] = drawnAssets;
         }
+        if (remainingShares == 0) {
+            delete _mirrorFloor[controller];
+        } else {
+            uint256 spent = assets < before.floor ? assets : before.floor;
+            _mirrorFloor[controller] = before.floor - spent;
+        }
         ++drawEntitlementChecks;
-        uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
-        uint256 entitlement =
-            Math.mulDiv(executable + drawnAssets, remainingShares + drawnShares, pool.totalSupply() + drawnShares);
-        if (drawnAssets > entitlement) ++cumulativeDrawExceededEntitlement;
+        if (assets > before.bound) ++serviceExceededItsEntitlement;
+        if (assets > before.executable || assets > before.reachable) ++servicePaidBeyondExecutableCash;
+        if (assets > before.live) ++floorBoundServices;
     }
 
     function claim(uint256 actorSeed) external watched {
@@ -1041,6 +1145,32 @@ contract CanonicalLenderHandler is Test {
             (uint256 drawnShares, uint256 drawnAssets) = _drawOf(actor);
             if (drawnShares != 0 || drawnAssets != 0) ++staleDrawFrames;
         }
+        // Session 42, ghost B: the stored floor total is the sum of the live requests' stored
+        // floors, and each stored floor is the one the handler quoted and spent itself. Every
+        // controller is an actor, so the sum over the actors is the sum over the live requests.
+        uint256 storedSum;
+        for (uint256 i = 0; i < actors.length; i++) {
+            address actor = actors[i];
+            (uint256 requestId,,,,) = pool.withdrawalRequest(actor);
+            uint256 stored = _storedFloorOf(actor);
+            if (requestId == 0) {
+                if (stored != 0) ++requestFloorMismatches;
+                continue;
+            }
+            storedSum += stored;
+            if (stored != _mirrorFloor[actor]) ++requestFloorMismatches;
+        }
+        uint256 floorTotal = _storedFloorTotal();
+        ++floorSumChecks;
+        if (floorTotal != storedSum) ++floorTotalMismatches;
+        // Session 42, the census: the floor arm of the reserve is BOUND when the live floors
+        // exceed the queued shares' fraction of the executable cash.
+        uint256 queued = pool.queuedShares();
+        if (queued != 0) {
+            uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
+            uint256 fraction = Math.mulDiv(executable, queued, pool.totalSupply(), Math.Rounding.Ceil);
+            if (floorTotal > fraction) ++boundFloorFrames;
+        }
     }
 }
 
@@ -1093,6 +1223,8 @@ contract LenderPoolInvariants is Test {
         uint256 stale = handler.staleDrawFrames();
         if (stale != 0) emit log_named_uint("stale request-draw frames seen in the replayed run", stale);
         emit log_named_uint("draw-entitlement checks in the replayed run", handler.drawEntitlementChecks());
+        emit log_named_uint("bound-floor frames seen in the replayed run", handler.boundFloorFrames());
+        emit log_named_uint("floor-bound services in the replayed run", handler.floorBoundServices());
     }
 
     /// @notice The stored yield tail never exceeds the stored gross book that backs it.
@@ -1273,14 +1405,34 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.serviceAccountingMismatches(), 0, "request service stopped conserving its fixed claim");
     }
 
-    /// @notice A request serviced in steps never draws more than one slice of the cash as it
-    ///         stands: the controller's cumulative draw never exceeds the entitlement
-    ///         reconstructed over it (round 60, 33audits H-03, the request-draw memory).
-    /// @dev Its partner `drawEntitlementChecks` is asserted non-zero in the tripwire. What this
-    ///      does NOT say: nothing about the stepped sync door or a position walked through fresh
-    ///      controllers, which reach the loop's old total (`R60S1_H03Routes.t.sol`).
+    /// @notice No service pays more than the request is owed: the larger of its remaining cash
+    ///         floor and one slice of the live cash net of what the controller has already drawn,
+    ///         capped at the cash not owed to the other live requests (round 60, 33audits H-03,
+    ///         the request-draw memory; session 42, the cash floor).
+    /// @dev Every term is the handler's own, derived before the service from public views and
+    ///      the handler's mirrors of the draw and the floor. Its partner `drawEntitlementChecks`
+    ///      is asserted non-zero in the tripwire, and so is `floorBoundServices`, the census
+    ///      that a request drew its floor rather than its slice.
     function invariant_oneRequestNeverDrawsMoreThanOneSliceOfTheLiveCash() public view {
-        assertEq(handler.cumulativeDrawExceededEntitlement(), 0, "a request's cumulative draw exceeded its slice");
+        assertEq(handler.serviceExceededItsEntitlement(), 0, "a service paid more than the request was owed");
+    }
+
+    /// @notice The stored floor total is the sum of the live requests' stored floors, and each
+    ///         stored floor is the one the handler quoted at request time and spent on service.
+    /// @dev Session 42, ghost B. Read through `vm.load` at the slots the layout pin names, and
+    ///      compared with a mirror the pool cannot write. A neuter that stops releasing on cancel
+    ///      or spending on service lands here.
+    function invariant_theFloorTotalIsTheSumOfTheLiveFloors() public view {
+        assertEq(handler.floorTotalMismatches(), 0, "_floorTotal is not the sum of the live requests' floors");
+        assertEq(handler.requestFloorMismatches(), 0, "a stored request floor is not the one the handler quoted");
+    }
+
+    /// @notice No service ever pays beyond the executable cash on hand, nor beyond that cash less
+    ///         what the other live requests are owed.
+    /// @dev Session 42, ghost C. After a loss the floors can exceed the cash; this is the
+    ///      property that keeps the promises mutually exclusive rather than paid twice.
+    function invariant_noServiceEverPaysBeyondTheExecutableCash() public view {
+        assertEq(handler.servicePaidBeyondExecutableCash(), 0, "a service paid beyond the executable cash");
     }
 
     /// @notice Every ERC-4626 door pays or charges exactly what its preview quoted.
@@ -1447,15 +1599,26 @@ contract LenderPoolInvariants is Test {
         // stays behind either way, which is the census's point.
         handler.transferShares(1, 2, 1e18);
 
+        // Session 42: the floor ghosts ran over every request door action above and held, and
+        // the walk reached a BOUND floor on its own (the lends and losses above lower the queued
+        // shares' fraction of the cash while the floors quoted before them stand). The
+        // floor-bound SERVICE is reached in `test_handlerCanReachABoundFloorAndAFloorBoundService`,
+        // a walk of its own, because reaching it here reshapes the cash every exit below needs.
+        assertGt(handler.floorSumChecks(), 0, "the floor sum was never compared");
+        assertGt(handler.boundFloorFrames(), 0, "a bound floor was never reached");
+        assertEq(handler.floorTotalMismatches(), 0, "_floorTotal is not the sum of the live requests' floors");
+        assertEq(handler.requestFloorMismatches(), 0, "a stored request floor is not the one the handler quoted");
+        assertEq(handler.servicePaidBeyondExecutableCash(), 0, "a service paid beyond the executable cash");
+
         handler.repay(3_000e6);
         handler.redeemViaAllowance(1, 0);
         assertGt(handler.allowanceExitsDone(), 0, "an allowance exit was never reached");
         handler.withdrawAll(0);
         handler.redeemAll(2);
         assertGt(handler.exhaustiveExitsDone(), 0, "an exit at the exact maximum was never reached");
-        // Round 60: the draw-entitlement comparison ran on the services above, and held.
+        // Round 60 and session 42: the entitlement comparison ran on the services above, and held.
         assertGt(handler.drawEntitlementChecks(), 0, "no service was ever checked against its draw");
-        assertEq(handler.cumulativeDrawExceededEntitlement(), 0, "a request's cumulative draw exceeded its slice");
+        assertEq(handler.serviceExceededItsEntitlement(), 0, "a service paid more than the request was owed");
 
         handler.destroyAllRawCash();
         assertGt(handler.fullDestructionsDone(), 0, "whole-balance destruction was never reached");
@@ -1469,6 +1632,39 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.mintMismatches(), 0, "mint charged other than its preview");
         assertEq(handler.withdrawMismatches(), 0, "withdraw burned other than its preview");
         assertEq(handler.redeemMismatches(), 0, "redeem paid other than its preview");
+    }
+
+    /// @notice The handler reaches a BOUND floor and a floor-bound service through its own
+    ///         actions (session 42, 33audits H-03, the cash floor), so the floor properties are
+    ///         proven reachable here rather than sampled from a replayed run.
+    /// @dev Actor 1 queues everything and is quoted `E * shares / S`, 5,000 of the 10,000 on
+    ///      hand. A lend of 1,000 lowers the cash and the queued shares' fraction of it to 4,500
+    ///      while the floor stands, so the floor arm of the reserve binds. A socialised loss of
+    ///      500 lowers the live slice to 4,250, and the service that follows pays the floor at
+    ///      the fallen exit price (4,750 for the 5,000 shares) rather than the slice: a
+    ///      floor-bound service, within the entitlement and within the cash. The cancel that
+    ///      follows the exhausted request is a no-op by then; the ghosts are read at the end.
+    function test_handlerCanReachABoundFloorAndAFloorBoundService() public {
+        handler.deposit(0, 5_000e6);
+        handler.deposit(1, 5_000e6);
+        handler.requestAll(1, 1);
+        assertEq(handler.boundFloorFrames(), 0, "fixture: the floor bound before anything lowered the cash");
+        handler.lend(1_000e6);
+        assertGt(handler.boundFloorFrames(), 0, "a bound floor was never reached");
+        handler.socialiseLoss(500e6);
+        uint256 servicesBefore = handler.servicesDone();
+        handler.serviceWithdrawalRequestMaximum(1);
+        assertGt(handler.servicesDone(), servicesBefore, "the floor-bound service never ran");
+        assertGt(handler.floorBoundServices(), 0, "a floor-bound service was never reached");
+        handler.cancelWithdrawalRequest(1);
+        handler.claim(1);
+
+        assertGt(handler.floorSumChecks(), 0, "the floor sum was never compared");
+        assertEq(handler.serviceExceededItsEntitlement(), 0, "the floor-bound service paid more than the floor");
+        assertEq(handler.servicePaidBeyondExecutableCash(), 0, "a service paid beyond the executable cash");
+        assertEq(handler.floorTotalMismatches(), 0, "_floorTotal is not the sum of the live requests' floors");
+        assertEq(handler.requestFloorMismatches(), 0, "a stored request floor is not the one the handler quoted");
+        assertEq(handler.otherRequestMutations(), 0, "one controller rewrote another request");
     }
 
     /// @notice The handler reaches the sub-floor entry price through its own actions, so the

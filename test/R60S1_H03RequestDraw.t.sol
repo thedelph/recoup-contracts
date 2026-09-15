@@ -14,6 +14,11 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///         under the `R60S1_` prefix and nothing else changed: their figures are the assertions.
 ///         The three split tests log only, as posted; `R60S1_H03Routes.t.sol` is where the split
 ///         is measured in the SEQUENTIAL form that the parallel form here does not reach.
+///         Their five verification tests of 2026-09-15 (issue #47, comment `5680966008`) are
+///         ported below the eight under the `R42S1_verify47_` prefix, their logs kept verbatim
+///         and the floor's figures asserted beside them. One assertion of the eight was flipped
+///         when the cash floor shipped (session 42): the queued lender in
+///         `theSteppedLoopOutPaysTheSyncDoor` keeps 2,500.000000 rather than 1,428.571428.
 /// @dev Fixture: the auditor's, two lenders of 10,000 with 15,000 lent and the second lender
 ///      queued. The pool is owned by this contract and capped at `GLOBAL_BORROW_CAP_MAX` so the
 ///      grid's larger deposits fit.
@@ -102,7 +107,9 @@ contract R60S1_H03RequestDraw is Test {
 
         assertEq(total, 2_500e6, "the loop must not out-pay the sync door");
         assertEq(calls, 1, "the slice is a budget, not a rate");
-        assertEq(pool.previewRedeem(queuedServiceable), 1_428_571_428, "the queued lender keeps her cash");
+        // The auditor's figure under the fraction was 1,428.571428: one slice re-sliced by the
+        // attacker's draw. Under the floor she keeps the 2,500.000000 she was quoted.
+        assertEq(pool.previewRedeem(queuedServiceable), 2_500e6, "the queued lender keeps her cash");
     }
 
     /// @dev The behaviour a request-time-frozen entitlement loses: a lender who queues during a
@@ -199,6 +206,160 @@ contract R60S1_H03RequestDraw is Test {
 
     function test_R60S1_H03_bypass_split_600() public {
         console2.log("n=600 total", _split(600));
+    }
+
+    // Independent checks of the routes and side effects thedelph reported on #47 (2026-09-14).
+    // Ported verbatim from 33audits' comment `5680966008` (2026-09-15) with the `R42S1_` prefix.
+    // Their tests log only; the `assertEq` lines under each log are the floor's figures, added
+    // in session 42, with the fraction's figure they measured on `29af396` in the comment beside.
+    // ---------------------------------------------------------------------------------------
+
+    function _queuedServiceableAssets() internal view returns (uint256) {
+        return pool.previewRedeem(pool.maxRequestRedeem(queued));
+    }
+
+    /// Route 2: step the synchronous door until it reads zero. No request is serviced.
+    function test_R42S1_verify47_route2_syncDoorStepped() public {
+        _state();
+        uint256 total;
+        uint256 calls;
+        for (uint256 i = 0; i < 512; i++) {
+            uint256 m = pool.maxRedeem(attacker);
+            if (m == 0) break;
+            vm.prank(attacker);
+            total += pool.redeem(m, attacker, attacker);
+            calls++;
+        }
+        console2.log("sync stepped total     ", total);
+        console2.log("calls                  ", calls);
+        console2.log("queued serviceable     ", _queuedServiceableAssets());
+        // Fraction: 4,999.999998 in 53 calls, the queued lender left 0.000001.
+        assertEq(total, 2_500e6, "the stepped sync door reached other than the one-call 2,500");
+        assertEq(calls, 1, "the stepped sync door took other than one call");
+        assertEq(_queuedServiceableAssets(), 2_500e6, "the queued lender's figure moved");
+    }
+
+    /// Route 3a: sequential split through the request door. Each holder requests everything,
+    /// takes one service, cancels, and hands the remainder to a fresh address.
+    function test_R42S1_verify47_route3_sequentialSplitRequestDoor() public {
+        _state();
+        address cur = attacker;
+        uint256 total;
+        for (uint256 i = 0; i < 40; i++) {
+            uint256 bal = pool.balanceOf(cur);
+            if (bal == 0) break;
+            vm.startPrank(cur);
+            pool.requestWithdrawal(bal, cur);
+            uint256 svc = pool.maxRequestRedeem(cur);
+            if (svc != 0) total += pool.serviceWithdrawalRequest(cur, svc, 0);
+            (,, uint256 remaining,,) = pool.withdrawalRequest(cur);
+            if (remaining != 0) pool.cancelWithdrawalRequest();
+            address next = address(uint160(0xA0000 + i));
+            uint256 rest = pool.balanceOf(cur);
+            if (rest != 0) pool.transfer(next, rest);
+            vm.stopPrank();
+            cur = next;
+        }
+        console2.log("sequential request-door", total);
+        console2.log("queued serviceable     ", _queuedServiceableAssets());
+        // Fraction: 4,999.999773 through either door.
+        assertEq(total, 2_500e6, "the sequential split reached other than the one-call 2,500");
+        assertEq(_queuedServiceableAssets(), 2_500e6, "the queued lender's figure moved");
+    }
+
+    /// Route 3b: sequential split through the sync door.
+    function test_R42S1_verify47_route3_sequentialSplitSyncDoor() public {
+        _state();
+        address cur = attacker;
+        uint256 total;
+        for (uint256 i = 0; i < 40; i++) {
+            uint256 m = pool.maxRedeem(cur);
+            vm.startPrank(cur);
+            if (m != 0) total += pool.redeem(m, cur, cur);
+            address next = address(uint160(0xB0000 + i));
+            uint256 rest = pool.balanceOf(cur);
+            if (rest != 0) pool.transfer(next, rest);
+            vm.stopPrank();
+            cur = next;
+        }
+        console2.log("sequential sync-door   ", total);
+        console2.log("queued serviceable     ", _queuedServiceableAssets());
+        // Fraction: 4,999.999773 through either door.
+        assertEq(total, 2_500e6, "the split sync walk reached other than the one-call 2,500");
+        assertEq(_queuedServiceableAssets(), 2_500e6, "the queued lender's figure moved");
+    }
+
+    /// Side effect 1: the reserve still counts shares the memory has priced at nothing.
+    function test_R42S1_verify47_phantomReserve() public {
+        uint256 attackerShares = _state();
+        vm.prank(attacker);
+        pool.requestWithdrawal(attackerShares, attacker);
+        uint256 svc = pool.maxRequestRedeem(attacker);
+        vm.prank(attacker);
+        uint256 paid = pool.serviceWithdrawalRequest(attacker, svc, 0);
+
+        uint256 reserve = pool.queueCashReserve();
+        uint256 attackerLeft = pool.previewRedeem(pool.maxRequestRedeem(attacker));
+        uint256 queuedLeft = _queuedServiceableAssets();
+        console2.log("attacker paid          ", paid);
+        console2.log("queueCashReserve       ", reserve);
+        console2.log("attacker serviceable   ", attackerLeft);
+        console2.log("queued serviceable     ", queuedLeft);
+        console2.log("reserved, unreachable  ", reserve - attackerLeft - queuedLeft);
+        console2.log("unreservedIdle         ", pool.unreservedIdle());
+        // Fraction: 1,071.428572 of cash nobody could reach. Floor: the queued lender's floor
+        // absorbs it, 0.
+        assertEq(paid, 2_500e6, "the one permitted draw paid other than 2,500");
+        assertEq(reserve, 2_500e6, "the reserve after the draw is not 2,500");
+        assertEq(attackerLeft, 0, "the drawn controller kept a slice");
+        assertEq(queuedLeft, 2_500e6, "the queued lender's figure is not her floor");
+        assertEq(reserve - attackerLeft - queuedLeft, 0, "a phantom remains where the floor binds");
+        assertEq(pool.unreservedIdle(), 0, "the sync door is open with the floor holding the cash");
+    }
+
+    /// Side effect 2: the memory outlives the position it priced. Same shares, same state,
+    /// one arm keeps them on the holder with the memory, the other hands them to a fresh address.
+    function test_R42S1_verify47_staleMemory() public {
+        uint256 ls = _deposit(attacker, 10_000e6);
+        _deposit(queued, 10_000e6);
+        uint256 half = ls / 2;
+
+        vm.startPrank(attacker);
+        pool.requestWithdrawal(half, attacker);
+        uint256 servedAssets;
+        for (uint256 i = 0; i < 8; i++) {
+            uint256 s = pool.maxRequestRedeem(attacker);
+            if (s == 0) break;
+            servedAssets += pool.serviceWithdrawalRequest(attacker, s, 0);
+        }
+        (,, uint256 remaining,,) = pool.withdrawalRequest(attacker);
+        if (remaining != 0) pool.cancelWithdrawalRequest();
+        vm.stopPrank();
+        console2.log("first request served   ", servedAssets);
+
+        _lendUpTo(15_000e6);
+        uint256 holding = pool.balanceOf(attacker);
+        uint256 probe = holding < half ? holding : half;
+        uint256 snap = vm.snapshotState();
+
+        vm.prank(attacker);
+        pool.requestWithdrawal(probe, attacker);
+        uint256 withMemory = pool.previewRedeem(pool.maxRequestRedeem(attacker));
+
+        vm.revertToState(snap);
+        address freshHolder = makeAddr("fresh");
+        vm.prank(attacker);
+        pool.transfer(freshHolder, probe);
+        vm.prank(freshHolder);
+        pool.requestWithdrawal(probe, freshHolder);
+        uint256 withoutMemory = pool.previewRedeem(pool.maxRequestRedeem(freshHolder));
+
+        console2.log("same shares, with memory", withMemory);
+        console2.log("same shares, fresh addr ", withoutMemory);
+        // Fraction: the same shares got 0 with the memory and 750.000000 on a fresh address.
+        // Floor: both are quoted the fresh slice when the request is filed.
+        assertEq(withoutMemory, 750e6, "a fresh holder reads other than 750.000000");
+        assertEq(withMemory, withoutMemory, "the memory priced the same shares below a fresh holder");
     }
 
     function _fresh() internal {
