@@ -47,6 +47,9 @@ contract LenderPoolFormulaPins is Test {
     uint256 private constant P_ENDS = 18;
     uint256 private constant P_QUEUED = 28;
     uint256 private constant P_CLAIMS = 30;
+    /// @dev Session 42 (33audits H-03, the cash floor): `_floorTotal`, declared last, no getter.
+    ///      `_requestDraws` at 32 is pinned by `R60S1_H03Probes` probe 10 the same way.
+    uint256 private constant P_FLOOR_TOTAL = 33;
 
     // CanonicalCashModel, `forge inspect CanonicalCashModel storage-layout` at 8631498.
     uint256 private constant M_RAW = 0;
@@ -91,7 +94,33 @@ contract LenderPoolFormulaPins is Test {
     /// @dev A distinct sentinel per slot, read back through the public getter of the variable the
     ///      constant claims to address. `_accountedCash` has no getter and is read back as
     ///      `cashDeficit()` against a zero token balance, which is that view's whole body.
+    ///      `_floorTotal` has no getter either: it is pinned first, on a snapshot, by writing a
+    ///      request through the door and reading its floor back at the slot, then storing a
+    ///      sentinel at the slot and reading it back through `queueCashReserve`, whose floor arm
+    ///      it is (the sentinel sits between the fraction and the executable cash so neither
+    ///      clamp hides it).
     function test_pins_theStorageLayoutTheyDependOn() public {
+        uint256 clean = vm.snapshotState();
+        usdc.mint(actor, 1_000e6);
+        vm.startPrank(actor);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.deposit(1_000e6, actor);
+        pool.requestWithdrawal(500e9, actor);
+        vm.stopPrank();
+        uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
+        uint256 expectedFloor = (executable * 500e9) / pool.totalSupply();
+        assertEq(expectedFloor, 500e6, "fixture: the floor of half a 1,000 deposit is not 500");
+        assertEq(
+            uint256(vm.load(address(pool), bytes32(P_FLOOR_TOTAL))),
+            expectedFloor,
+            "P_FLOOR_TOTAL no longer addresses _floorTotal (the door's write was not read back)"
+        );
+        _store(address(pool), P_FLOOR_TOTAL, 700e6);
+        assertEq(
+            pool.queueCashReserve(), 700e6, "P_FLOOR_TOTAL no longer addresses _floorTotal (the reserve's floor arm)"
+        );
+        vm.revertToState(clean);
+
         _store(address(pool), P_SUPPLY, 1_002);
         _store(address(pool), P_ACC, 1_010);
         _store(address(pool), P_PRINCIPAL, 1_011);
@@ -213,7 +242,8 @@ contract LenderPoolFormulaPins is Test {
         uint256 executable = idle > existingPriceReserve ? idle - existingPriceReserve : 0;
 
         uint256 queued = pool.queuedShares();
-        uint256 expectedReserve = queued == 0 ? 0 : Math.mulDiv(executable, queued, pool.totalSupply(), Math.Rounding.Ceil);
+        uint256 expectedReserve =
+            queued == 0 ? 0 : Math.mulDiv(executable, queued, pool.totalSupply(), Math.Rounding.Ceil);
         assertEq(pool.queueCashReserve(), expectedReserve, "queueCashReserve formula");
 
         if (pool.totalSupply() < MIN_SUPPLY) {
@@ -221,7 +251,8 @@ contract LenderPoolFormulaPins is Test {
             return;
         }
         uint256 lendingCash = idle > prospectivePriceReserve ? idle - prospectivePriceReserve : 0;
-        uint256 requestReserve = queued == 0 ? 0 : Math.mulDiv(lendingCash, queued, pool.totalSupply(), Math.Rounding.Ceil);
+        uint256 requestReserve =
+            queued == 0 ? 0 : Math.mulDiv(lendingCash, queued, pool.totalSupply(), Math.Rounding.Ceil);
         uint256 postRequestBook = pool.totalAssets() - requestReserve;
         uint256 hotFloat = Math.mulDiv(postRequestBook, Config.RESERVE_RATIO_BPS, Config.BPS);
         uint256 held = requestReserve + hotFloat;
