@@ -12,10 +12,12 @@ concurrency:
 
 # One job, and it runs the unit and invariant suites only.
 #
-# The fork suite is deliberately not here. Its three files read `BASE_RPC_URL` through
-# `vm.envOr` and skip themselves when it is unset, so they cost nothing by being absent -
-# and wiring a mainnet RPC secret into a public repository's Actions is a larger decision
-# than a test job. Run them locally with `BASE_RPC_URL` set; the README says how.
+# The fork suite is deliberately not here. Its six files under `test/fork/` skip themselves
+# unless an opt-in is set (`RUN_FORK_TESTS=true` for five of them, `RUN_DEXFI_MINT_PROOF=true`
+# for the mint proof), and read `BASE_RPC_URL` through `vm.envOr` with the public endpoint as
+# the default, so they cost nothing by being absent - and wiring a mainnet RPC secret into a
+# public repository's Actions is a larger decision than a test job. Run them locally with the
+# opt-in set; the README says how. (This comment said "three files" until 2026-09-17.)
 #
 # Allow several minutes. The invariant suites dominate: `foundry.toml` sets 256 runs at
 # depth 500, and that is the setting that makes them worth having.

@@ -30,9 +30,9 @@ Credit, harvest, liquidation and referral logic sit above this custody boundary.
 ## Where can your bonds go once they are in the adapter?
 
 `DirectCallAdapter.transferBonds` (`src/adapters/DirectCallAdapter.sol`) is the only function
-that moves a bond out of Recoup, and it is `onlyVault`. It has exactly three call sites, all in
-`CollateralVault`, plus one owner-only break-glass on the adapter itself. That is the complete
-list.
+that moves credited collateral out of Recoup, and it is `onlyVault`. It has exactly three call
+sites, all in `CollateralVault`, plus two owner-only paths on the adapter itself, the break-glass
+and the mint-attempt recovery in the last two rows. That is the complete list.
 
 | Exit | Destination | What constrains it |
 |---|---|---|
@@ -40,10 +40,13 @@ list.
 | `CollateralVault.seize` (`src/CollateralVault.sol`) | the address the auction nominates | `msg.sender` must be the wired liquidation auction, and the position must actually be liquidatable |
 | `CollateralVault.disposeTo` (`src/CollateralVault.sol`) | the address the auction nominates | `msg.sender` must be the wired liquidation auction. Deliberately not gated on liquidatability, because by this point the lot belongs to the auction and carries no debt, so that check would refuse it every time |
 | `DirectCallAdapter.emergencyUnstake` (`src/adapters/DirectCallAdapter.sol`) | a governance address chosen by the owner | `onlyOwner`. Break-glass: it calls the farm's `emergencyWithdraw` and forfeits pending rewards, so it is a last resort rather than a convenience |
+| `DirectCallAdapter.recoverMintAttempt` (`src/adapters/DirectCallAdapter.sol`) | the `recoveryRecipient` the owner names in the call | `onlyOwner`. Reaches only the bonds of a front-run or donated mint attempt sitting at that attempt's receiver clone, which are never credited as collateral and never pooled with it; `_recoverTo` pulls them through the adapter and sends them on in the same transaction. Credited collateral is out of its reach |
 
 There is no function anywhere that lets an arbitrary caller move a bond, and no owner path that
-sends bonds to an arbitrary address other than the break-glass in the last row. That last row is
-named here rather than left to be found.
+sends credited collateral to an arbitrary address other than the break-glass in the second-last
+row; the last row is the one other owner path that moves bonds at all, and it reaches uncredited
+mint-attempt bonds only. Until 2026-09-17 this sentence and the owner-powers paragraph below named
+the break-glass alone. Both rows are named here rather than left to be found.
 
 ## Can Recoup sell or redeem your bonds?
 
@@ -73,15 +76,24 @@ redeploy and no disturbance to live state.
 This is stated plainly because Recoup also asks DexFi about *their* admin-key plans, and asking a
 question you have not answered yourself is the one thing that would make that ask land badly.
 
-What the owner can do: `setYieldRecipient`, `setHarvester` and `emergencyUnstake`. Those three are
+What the owner can do, which is every `onlyOwner` function on the adapter (grep for the modifier
+in `src/adapters/DirectCallAdapter.sol`; seven sites at 68c0c26): `setYieldRecipient`, `setHarvester`,
+`emergencyUnstake`, `recoverMintAttempt`, `emergencyRecoverMintAttempt` and `restakeLoose`, and the
+seventh, `renounceOwnership`, which reverts. `recoverMintAttempt` moves the bonds of a front-run or
+donated mint attempt, never credited as collateral, to the `recoveryRecipient` the owner names in
+the call; `emergencyRecoverMintAttempt` escapes a broken farm and leaves those bonds at the
+attempt's receiver clone; `restakeLoose` re-stakes bond units the adapter already holds and credits
+nothing. Until 2026-09-17 this paragraph named the first three only. The six are
 named rather than cited by line: this paragraph carried the line numbers `:95`, `:125` and `:260`
 until 2026-09-12, and by then all three pointed at unrelated code, because a line number is wrong
 the first time anything above it moves and nothing checks it. A symbol survives every insertion, so
 grep for it.
 
 What the owner cannot do: `renounceOwnership` reverts, so ownership can never be dropped
-and the contract can never be orphaned. There is no path for the owner to move bonds to an
-arbitrary address other than the break-glass above, and no upgrade path at all. These contracts
+and the contract can never be orphaned. There is no path for the owner to move credited collateral to an
+arbitrary address other than the break-glass above; the one other owner path that moves bonds,
+`recoverMintAttempt`, reaches an uncredited mint attempt's bonds only; and there is no upgrade path
+at all. These contracts
 are immutable by choice.
 
 ## What is that standing `setApprovalForAll` in the constructor?
@@ -118,6 +130,18 @@ mainnet fork, fork-at-latest, no archive node needed:
 RUN_FORK_TESTS=true forge test --match-contract Fork -vv
 ```
 
+Expect 27 passed, 0 failed and 5 skipped of 32 across the six suites, which is what that command
+printed on 2026-09-17 at 68c0c26 against a fork at latest. The five skips are by design, not a
+missing RPC: `test/fork/CollateralVault.fork.t.sol`, `test/fork/CreditCore.fork.t.sol` and
+`test/fork/Liquidation.fork.t.sol` each inherit `test_fixtureDerivationsFollowALiveParameterChange`
+from `test/helpers/RiskParamsFixture.sol` and override `_riskParamsOwner` to the zero address, which
+skips it, because there is no deployed `RiskParams` to retune until the fork is selected; and both
+tests in `test/fork/DexFiMintAttempt.fork.t.sol` skip unless `RUN_DEXFI_MINT_PROOF` is set, the
+second also needing a DexFi keeper signature in `DEXFI_MINT_SIGNATURE` and its block in
+`DEXFI_MINT_PROOF_BLOCK`, because it is the real mint handoff and needs your keeper to sign. Until
+2026-09-17 no sentence here said which tests stay skipped, so a reader counting green tests against
+six suites had to work it out.
+
 `test/fork/CollateralVault.fork.t.sol` is the one to read first. It confirms the configured
 addresses really are your live contracts and behave as documented, shows that deposits revert
 today at your whitelist gate (the current mainnet reality), and then impersonates a single
@@ -134,22 +158,29 @@ that ever changes on your side, this is the test that goes red first.
 `test/fork/Liquidation.fork.t.sol` covers a lot filling at 82% of NAV and an unfilled one falling
 through to the workout path.
 
-There is also a live deployment on Base Sepolia against a mock DexFi stack, all verified, with
+There is also a live deployment on Base Sepolia against a mock DexFi stack, explorer-verified at
+deployment and not at parity with this source, with
 addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json). The mocks mirror
 your verified ABIs including the whitelist gate. The fork tests are the stronger evidence; the
 testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Seven suite files declaring 72 `invariant_*` functions, fuzzed over randomised call sequences:
-`test/*.invariants.t.sol`. Sixty-four of those names are distinct; the gap is the frame guard
+Seven suite files declaring 76 `invariant_*` functions, fuzzed over randomised call sequences:
+`test/*.invariants.t.sol`. Sixty-eight of those names are distinct; the gap is the frame guard
 `invariant_theHandlerNeverDropsAFrame`, declared once in each of the seven campaign contracts,
 plus `invariant_everyInHandlerPropertyHeld`, declared in three of them, across the fourteen
 contracts those seven files hold - one handler and one campaign each. An eighth campaign lives
 outside that glob in `test/CanonicalCashModel.t.sol` with nine more declarations, so the tree-wide
-count is 81. Counted by declaration rather than by assertion, which is the only basis on which all
+count is 85. Counted by declaration rather than by assertion, which is the only basis on which all
 of those numbers agree; `grep -c "function invariant_" test/*.invariants.t.sol` reproduces the
-per-file figures. Measured on 2026-09-12; the figures read 66 and 60 at the 2026-09-01 sync.
+per-file figures, 6, 9, 23, 15, 13, 6 and 4 in the glob's file order at 68c0c26, and the two
+figures above are that grep's sum and its distinct names. Measured on 2026-09-17 at 68c0c26. This
+paragraph read 72, 64 and 81 from 2026-09-12 until 2026-09-17: true at the 2026-09-12 sync, 74, 66
+and 83 from the 2026-09-14 sync (`invariant_noIndexEverOvertakesTheAccumulator` and one more) and
+the figures above from the 2026-09-15 sync (`invariant_theFloorTotalIsTheSumOfTheLiveFloors` and
+`invariant_noServiceEverPaysBeyondTheExecutableCash`), and the sentence was not re-derived until
+the third sync had passed; it read 66 and 60 at the 2026-09-01 sync.
 
 The one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no
 state
