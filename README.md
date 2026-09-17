@@ -121,12 +121,15 @@ outright. Remappings are pinned in `foundry.toml` rather than auto-detected from
 on disk, so the build is byte-identical either way: verified from a cold clone, 4,997 bytes of
 `CreditWiring` initcode and two remappings in the metadata in both cases.
 
-As of 2026-09-15, `forge test` on this tree gives 1,921 passed, 0 failed and 32 skipped across 150
-suites, 1,953 total, measured with forge 1.8.1 on a fresh clone and a clean build of this repository
-in six `--match-contract` groups run one at a time with nothing else running, whose suite and test
-counts sum to those figures. The figure is dated because it is derived from the test tree by a
+As of 2026-09-17, `forge test` on this tree gives 1,940 passed, 0 failed and 32 skipped across 151
+suites, 1,972 total, measured with forge 1.8.1 on a clean build of this repository in two
+`--match-path` groups run one at a time with nothing else running, whose suite and test counts sum
+to those figures: the seven invariant campaign files, 7 suites and 90 tests in 1,768.41s, and
+everything else, 144 suites and 1,882 tests in 203.28s. The figure is dated because it is derived
+from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
-1,901 across 149 suites from the sync of 2026-09-14 until this one, 1,798 across 137 before that,
+1,921 across 150 suites from the sync of 2026-09-15 until this one, 1,901 across 149 before that,
+1,798 across 137 before that,
 and 1,245 across 62 before the sync of 2026-09-12. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
 an explicit opt-in; nothing else is skipped. With the opt-in set, 27 of those 32 run and 5 still
 skip by design; the fork-test section below says which. Counting test declarations in those fork files gives 29
@@ -134,11 +137,13 @@ rather than 32, because three of them subclass a fixture and inherit its suite. 
 unit and invariant suite on every push and pull request. The workflow installs Foundry's stable
 release, which resolved to forge 1.8.1 through 2026-09-14 and to 1.8.3 from 2026-09-15. The figures
 above are from 1.8.1; the lender-pool, H-03 and vault-seam suites were re-run on 1.8.3 on this tree
-before the sync, and the public CI run on its merge (run 35032144995, the push to main at 68c0c26
-on 2026-09-15, forge 1.8.3) printed the same totals, 1,921 passed, 0 failed and 32 skipped across
-150 suites, 1,953 total, and the same contract sizes row for row, so the figures hold on both
-releases; until 2026-09-17 this sentence pointed at "the pull request's own run" without naming
-it. One measurement
+before the 2026-09-15 sync, and the public CI run on its merge (run 35032144995, the push to main
+at 68c0c26 on 2026-09-15, forge 1.8.3) printed the totals of that sync on both releases, 1,921
+passed, 0 failed and 32 skipped across
+150 suites, 1,953 total, and the same contract sizes row for row, so the figures held on both;
+until 2026-09-17 this sentence pointed at "the pull request's own run" without naming
+it. The 2026-09-17 figures above add one suite and 19 tests to that measurement and were taken on
+1.8.1 only; the CI run on this sync's merge is the 1.8.3 reading of them. One measurement
 moved between the two versions on identical bytecode, the `depositETH` gas pair in
 `test_a7_measureLocalDepositEthGas` (808,296 under isolation on 1.8.1 against 955,996 on 1.8.3,
 and 808,860 without isolation on both), so since 2026-09-15 that test pins its execution mode with
