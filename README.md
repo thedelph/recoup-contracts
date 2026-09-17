@@ -128,12 +128,17 @@ counts sum to those figures. The figure is dated because it is derived from the 
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
 1,901 across 149 suites from the sync of 2026-09-14 until this one, 1,798 across 137 before that,
 and 1,245 across 62 before the sync of 2026-09-12. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
-an explicit opt-in; nothing else is skipped. Counting test declarations in those fork files gives 29
+an explicit opt-in; nothing else is skipped. With the opt-in set, 27 of those 32 run and 5 still
+skip by design; the fork-test section below says which. Counting test declarations in those fork files gives 29
 rather than 32, because three of them subclass a fixture and inherit its suite. CI runs the full
 unit and invariant suite on every push and pull request. The workflow installs Foundry's stable
 release, which resolved to forge 1.8.1 through 2026-09-14 and to 1.8.3 from 2026-09-15. The figures
 above are from 1.8.1; the lender-pool, H-03 and vault-seam suites were re-run on 1.8.3 on this tree
-and the pull request's own run is the whole-suite check on the current stable release. One measurement
+before the sync, and the public CI run on its merge (run 35032144995, the push to main at 68c0c26
+on 2026-09-15, forge 1.8.3) printed the same totals, 1,921 passed, 0 failed and 32 skipped across
+150 suites, 1,953 total, and the same contract sizes row for row, so the figures hold on both
+releases; until 2026-09-17 this sentence pointed at "the pull request's own run" without naming
+it. One measurement
 moved between the two versions on identical bytecode, the `depositETH` gas pair in
 `test_a7_measureLocalDepositEthGas` (808,296 under isolation on 1.8.1 against 955,996 on 1.8.3,
 and 808,860 without isolation on both), so since 2026-09-15 that test pins its execution mode with
@@ -146,6 +151,14 @@ number.
 RUN_FORK_TESTS=true forge test --match-contract Fork -vv
 # optionally: BASE_RPC_URL=<your rpc> (defaults to https://mainnet.base.org)
 ```
+
+On 2026-09-17 at 68c0c26 that printed 27 passed, 0 failed and 5 skipped of 32 across the six
+suites. The 5 skip by design: three are one fixture test inherited by
+`test/fork/CollateralVault.fork.t.sol`, `test/fork/CreditCore.fork.t.sol` and
+`test/fork/Liquidation.fork.t.sol`, which needs a retunable `RiskParams` and has none on a fresh
+fork; two are `test/fork/DexFiMintAttempt.fork.t.sol`, which runs only with `RUN_DEXFI_MINT_PROOF`
+set and, for the handoff itself, a DexFi keeper signature. The review tour names each beside the
+same command.
 
 The fork suite covers the custody lifecycle against the live DexFi contracts, including the current
 whitelist rejection and the single adapter whitelist required to unlock it. It also exercises the
