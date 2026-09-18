@@ -80,15 +80,17 @@ remappings = [
 # The census, the nine detectors that fired zero times tree-wide, and a disposition for every
 # `high` and `med` hit in `src/` are all recorded by audit round 44.
 #
-# CI gates `--severity high med` over `src/` only, as the contracts job's last step before Slither,
-# and its steady state is ZERO. It is not a gate over `test/` or `script/`; both are triaged in the document
-# instead, and the step says so on every run.
+# The development tree's CI gates `--severity high med` over `src/` only, as its contracts job's
+# last step before Slither, and its steady state is ZERO; the published repository's workflow runs
+# no lint. It is not a gate over `test/` or `script/`; both are triaged in the document instead,
+# and the step says so on every run.
 lint_on_build = false
 
 # EVERY ENTRY HERE IS A LINT THAT IS WRONG ABOUT THIS CODEBASE, never one that is merely loud.
 # `--severity` handles volume; this list handles wrongness, and the two must not be confused.
 # **No `high` or `med` lint may ever appear here.** Those get a per-site
-# `// forge-lint: disable-next-line(<id>)` carrying a written reason - 66 of them in `src/` today,
+# `// forge-lint: disable-next-line(<id>)` carrying a written reason - 66 sites in `src/` on
+# 2026-09-18, 61 `disable-next-line` comments and 5 `disable-start`/`disable-end` pairs,
 # costing zero runtime bytes, MEASURED - which is what stops the gate being bought green by
 # omission. An entry needs the convention the lint contradicts AND a hit count at a stated commit.
 #

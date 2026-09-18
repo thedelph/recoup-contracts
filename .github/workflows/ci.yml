@@ -116,8 +116,9 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
 
-      # Documentation-only pull requests skip the build and the suite, which is thirteen
-      # minutes they cannot affect the outcome of.
+      # Documentation-only pull requests skip the build and the suite, which on the push run at
+      # 0f49e61 (run 35287480369, 2026-09-17) took nineteen and a half minutes they cannot
+      # affect the outcome of.
       #
       # 🟥 **Deliberately an in-job gate rather than a workflow-level `paths:` filter, and
       # the reason is the step immediately above this one.** A `paths:` filter would skip the whole
