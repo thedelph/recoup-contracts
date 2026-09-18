@@ -19,9 +19,11 @@ The first external review began on 2026-09-07, over six files at commit b66023d,
 preliminary issues on 2026-09-11. On 2026-09-16 the reviewers verified, on commit 68c0c26, the
 fixes for #45, #46 and #48 and the three drain routes of #47; the post-loss lock #47's fix retains
 was disposed by the maintainer on 2026-09-17 as held and disclosed at Low (comment 5715504360 on
-#47); the reviewers answered the same day, corrected the bound this commit restates and asked for
+#47); the reviewers answered the same day, corrected the bound 0f49e61 restates and asked for
 the lock to be recorded separately at Low, acknowledged and retained by design, which is issue
-#61. The review is not complete. It is not part of this
+[#61](https://github.com/thedelph/recoup-contracts/issues/61). On 2026-09-18 they reported the
+corrected bound reviewed on 0f49e61 and supported closing the original H-03 as verified fixed, with
+the lock tracked under #61. The review is not complete. It is not part of this
 internal log; the disposition of each issue in the current source is recorded in
 [KNOWN_RISKS.md](KNOWN_RISKS.md).
 

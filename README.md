@@ -22,7 +22,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Base mainnet | No Recoup contracts deployed |
 | Lender pool | Source and testnet instance exist. The testnet pool is empty and blocked from activation, and it is not wired as the protocol's liquidity source; its own pointers to the manager and the harvester are set, so "unwired" is true in one direction only. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
 | Referral registry | Source fixed through partner self-registration; the carried-over Sepolia instance remains defective and unused, and live replacement is disabled and unauthorised |
-| External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11; as of the 2026-09-15 sync every one of them has a code change in this source, and [`KNOWN_RISKS.md`](KNOWN_RISKS.md) records what each closes and what the H-03 cash floor costs. Not completed |
+| External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11; as of the 2026-09-15 sync every one of them has a code change in this source, and [`KNOWN_RISKS.md`](KNOWN_RISKS.md) records what each closes and what the H-03 cash floor costs. The post-loss lock that floor retains is a separate Low, #61 (2026-09-17), acknowledged and retained by design, not fixed. Not completed |
 
 For non-reserved referral codes, the only registration path now assigns the code to its caller. A
 partner's payout wallet or Safe must call `register(bytes32)` before the code is published;
@@ -81,7 +81,7 @@ lender pool this source replaces, and their status against what is actually here
 | Finding | Status in this source |
 |---|---|
 | Round 22 F3, principal-cap accounting | **Closed.** There are no principal units, so the residuals that were properties of them cannot be reproduced. Cap usage is `max(accountedCash + outstandingPrincipal - totalClaimable, 0)`, and the quotient bound is held explicitly by `minimumEntryAssets`, `entryPriceCashReserve` and `maximumShareSupply` |
-| Round 21 F7, queue over-reservation | **Closed.** `_queueCashReserve` is a pro-rata slice of executable cash taken over every outstanding request at once, and `maxRequestRedeem` is the per-controller one. The old code priced the exit against the whole book and subtracted it from cash alone, which is why the over-reservation equalled leverage; that multiplier is gone by construction |
+| Round 21 F7, queue over-reservation | **Closed as the leverage multiplier.** `_queueCashReserve` is the larger of a pro-rata slice of executable cash taken over every outstanding request at once and `_floorTotal`, the cash the live requests were quoted when they queued, clamped at the executable cash; `maxRequestRedeem` is the per-controller figure, capped at the cash the other live requests are not owed. Both arms are cash, so the old code's pricing of the exit against the whole book, which is why the over-reservation equalled leverage, is gone by construction. Until 2026-09-18 this row described the pro-rata arm alone. The floors are not written down on a raw loss, so after one they can reserve more than the cash and lock it: that residual is #61, in the list below |
 | Round 22 F12, uncollectable claims | **Half closed.** `serviceWithdrawalRequest` reverts unless the caller is the controller or an operator it approved, so service is no longer permissionless. A claim recorded for a receiver the asset refuses to pay is still uncollectable, and that half is accepted rather than fixed |
 
 Round 22 F11 and F6a were listed here in earlier revisions and are fixed: F11 rated non-epoch
@@ -94,8 +94,12 @@ the old one's remaining time.
 2. A fresh internal review of the merged principal-accounting and entry-pricing changes. They are
    substantial, they are recent, and they have not been reviewed as shipped.
 3. An external audit, which is a hard gate for any third-party capital.
-4. Round 17's transaction-ordering window and F10's lack of historical loss-bearer entitlement,
-   which are material residual risks rather than blockers.
+4. Round 17's transaction-ordering window, F10's lack of historical loss-bearer entitlement and
+   the post-loss lock of #61 (Low, acknowledged and retained by design, since 2026-09-17), which
+   are material residual risks rather than blockers. The lock needs a raw loss of pool cash, which,
+   on a reading of the source and the measurements in [`KNOWN_RISKS.md`](KNOWN_RISKS.md), no loss
+   path inside the protocol produces, and it is released only by a repayment, a new deposit
+   or a floor holder's cancel, with no guaranteed recovery time.
 
 [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the mechanism behind each of these and names the function
 that implements it, so every claim above can be checked against the source rather than believed.
@@ -125,7 +129,11 @@ As of 2026-09-17, `forge test` on this tree gives 1,940 passed, 0 failed and 32 
 suites, 1,972 total, measured with forge 1.8.1 on a clean build of this repository in two
 `--match-path` groups run one at a time with nothing else running, whose suite and test counts sum
 to those figures: the seven invariant campaign files, 7 suites and 90 tests in 1,768.41s, and
-everything else, 144 suites and 1,882 tests in 203.28s. The figure is dated because it is derived
+everything else, 144 suites and 1,882 tests in 203.28s. The sync of 2026-09-18 adds one suite,
+[`test/R61A4_PublicLockClaims.t.sol`](test/R61A4_PublicLockClaims.t.sol), 24 tests of which 5 are
+new bodies and 19 are the `R60S2_H03LockBound` tests it inherits and runs again, measured alone on
+forge 1.8.1 at 24 passed; with it the tree reads 1,964 passed, 0 failed and 32 skipped across 152
+suites, 1,996 total, as that sum and not as one run. The figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
 1,921 across 150 suites from the sync of 2026-09-15 until this one, 1,901 across 149 before that,
@@ -142,8 +150,11 @@ at 68c0c26 on 2026-09-15, forge 1.8.3) printed the totals of that sync on both r
 passed, 0 failed and 32 skipped across
 150 suites, 1,953 total, and the same contract sizes row for row, so the figures held on both;
 until 2026-09-17 this sentence pointed at "the pull request's own run" without naming
-it. The 2026-09-17 figures above add one suite and 19 tests to that measurement and were taken on
-1.8.1 only; the CI run on this sync's merge is the 1.8.3 reading of them. One measurement
+it. The 2026-09-17 figures above add one suite and 19 tests to that measurement, of which 7 are new
+test bodies and 12 are the `R42S1_H03Floor` tests the new suite inherits and runs a second time,
+and were taken on 1.8.1 only; the CI run on that sync's merge (run 35287480369, the push to main at
+0f49e61 on 2026-09-17, forge 1.8.3) printed the same totals, 1,940 passed, 0 failed and 32
+skipped across 151 suites. One measurement
 moved between the two versions on identical bytecode, the `depositETH` gas pair in
 `test_a7_measureLocalDepositEthGas` (808,296 under isolation on 1.8.1 against 955,996 on 1.8.3,
 and 808,860 without isolation on both), so since 2026-09-15 that test pins its execution mode with
