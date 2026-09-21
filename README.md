@@ -149,15 +149,41 @@ fixture [`test/R63A3_Fixture.sol`](test/R63A3_Fixture.sol): the reproduction for
 serviced down to one share-wei keeping the rest of its cash floor. It pins that finding as the
 source stands, so its two dust-held-floor tests are expected to flip the day a fix lands. Measured
 alone on forge 1.8.1 at 5 passed; with it the tree reads 1,996 passed, 0 failed and 32 skipped
-across 154 suites, 2,028 total, again as a sum. The figure is dated because it is derived
+across 154 suites, 2,028 total, again as a sum, which was also re-derived here as one whole run on
+forge 1.8.1. The sync that carries the round-63 audit seats adds eight more suites and 74
+tests. Six of them were taken as one whole run; the last two were added after that run and are
+measured alone, so the totals below are a sum again. The second reproduction for #64,
+[`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) over the
+four-contract graph fixture
+[`test/R62A3_GraphFixture.sol`](test/R62A3_GraphFixture.sol), whose assertions are expected to
+flip with the first one's; three more over the same bare pool as the first,
+[`test/R63A3_YieldDoorRepeated.t.sol`](test/R63A3_YieldDoorRepeated.t.sol),
+[`test/R63A3_ShutOutAndDepositDoor.t.sol`](test/R63A3_ShutOutAndDepositDoor.t.sol) and the
+campaign [`test/R63A3_PoolDoors.invariants.t.sol`](test/R63A3_PoolDoors.invariants.t.sol), which
+is the eighth invariant file; and the mint-signature pair
+[`test/R63A2_KeeperSignatureSeat.t.sol`](test/R63A2_KeeperSignatureSeat.t.sol) with its fork twin
+[`test/fork/R63A2_RealBondFork.t.sol`](test/fork/R63A2_RealBondFork.t.sol), whose 10 tests skip
+without the opt-in. Those six read 2,042 passed, 0 failed and 42 skipped across 160 suites, 2,084
+total, measured as ONE run on forge 1.8.1 in 1,680.68s and not as a sum, of which the new campaign
+took 617.46s. Two more follow them:
+[`test/R64A4_DustFloorCurve.t.sol`](test/R64A4_DustFloorCurve.t.sol), 13 tests mapping the
+threshold curve of the same finding on the same bare pool, measured alone at 13 passed; and
+[`test/R64A1_RealFarmPausedUsdcFork.t.sol`](test/R64A1_RealFarmPausedUsdcFork.t.sol), a fork
+suite whose 5 tests all skip without the opt-in, measured alone at 0 passed and 5 skipped. With
+those two the tree reads 2,055 passed, 0 failed and 47 skipped across 162 suites, 2,102 total, as
+a sum. The
+figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
 1,921 across 150 suites from the sync of 2026-09-15 until this one, 1,901 across 149 before that,
 1,798 across 137 before that,
-and 1,245 across 62 before the sync of 2026-09-12. All 32 skips are the six `test/fork/` suites, which need a live Base RPC or
-an explicit opt-in; nothing else is skipped. With the opt-in set, 27 of those 32 run and 5 still
-skip by design; the fork-test section below says which. Counting test declarations in those fork files gives 29
-rather than 32, because three of them subclass a fixture and inherit its suite. CI runs the full
+and 1,245 across 62 before the sync of 2026-09-12. All 47 skips are the eight fork suites, the seven under `test/fork/` plus
+[`test/R64A1_RealFarmPausedUsdcFork.t.sol`](test/R64A1_RealFarmPausedUsdcFork.t.sol), which sits
+beside the fixtures it imports; every one of the eight is selected by `--match-contract Fork`, which
+is how the section below says to run them, and every one needs a live Base RPC or an explicit
+opt-in. Nothing else is skipped. With the opt-in set, 41 of those 47 run and 6 still
+skip by design; the fork-test section below says which. Counting test declarations in those eight files gives 43
+rather than 47, because four of them subclass a fixture and inherit its suite. CI runs the full
 unit and invariant suite on every push and pull request. The workflow installs Foundry's stable
 release, which resolved to forge 1.8.1 through 2026-09-14 and to 1.8.3 from 2026-09-15. The figures
 above are from 1.8.1; the lender-pool, H-03 and vault-seam suites were re-run on 1.8.3 on this tree
@@ -184,10 +210,11 @@ RUN_FORK_TESTS=true forge test --match-contract Fork -vv
 # optionally: BASE_RPC_URL=<your rpc> (defaults to https://mainnet.base.org)
 ```
 
-On 2026-09-17 at 68c0c26 that printed 27 passed, 0 failed and 5 skipped of 32 across the six
-suites. The 5 skip by design: three are one fixture test inherited by
+With all eight fork suites present that printed 41 passed, 0 failed and 6 skipped of 47 in 48.55s,
+against a fork at latest on the public endpoint; with seven it printed 37 of 42, and on 2026-09-17
+at 68c0c26, with six, 27 passed, 0 failed and 5 skipped of 32. The 6 skip by design: four are one fixture test inherited by
 `test/fork/CollateralVault.fork.t.sol`, `test/fork/CreditCore.fork.t.sol` and
-`test/fork/Liquidation.fork.t.sol`, which needs a retunable `RiskParams` and has none on a fresh
+`test/fork/Liquidation.fork.t.sol` and `test/R64A1_RealFarmPausedUsdcFork.t.sol`, which needs a retunable `RiskParams` and has none on a fresh
 fork; two are `test/fork/DexFiMintAttempt.fork.t.sol`, which runs only with `RUN_DEXFI_MINT_PROOF`
 set and, for the handoff itself, a DexFi keeper signature. The review tour names each beside the
 same command.

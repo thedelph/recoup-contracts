@@ -123,24 +123,27 @@ permanently whitelisted unwind address or notice before revocation.
 
 ## Why believe any of it works?
 
-Run it. The six suites under `test/fork/` execute against the **live** DexFi contracts on a Base
+Run it. The eight fork suites, the seven under `test/fork/` plus `test/R64A1_RealFarmPausedUsdcFork.t.sol` beside the fixtures it imports, execute against the **live** DexFi contracts on a Base
 mainnet fork, fork-at-latest, no archive node needed:
 
 ```sh
 RUN_FORK_TESTS=true forge test --match-contract Fork -vv
 ```
 
-Expect 27 passed, 0 failed and 5 skipped of 32 across the six suites, which is what that command
-printed on 2026-09-17 at 68c0c26 against a fork at latest. The five skips are by design, not a
-missing RPC: `test/fork/CollateralVault.fork.t.sol`, `test/fork/CreditCore.fork.t.sol` and
-`test/fork/Liquidation.fork.t.sol` each inherit `test_fixtureDerivationsFollowALiveParameterChange`
+Expect 41 passed, 0 failed and 6 skipped of 47 across the eight suites, which is what that command
+printed on 2026-09-21 against a fork at latest; with seven of them it printed 37 of 42 the same
+day, and before
+[`test/fork/R63A2_RealBondFork.t.sol`](test/fork/R63A2_RealBondFork.t.sol) was added it printed 27
+of 32, on 2026-09-17 at 68c0c26. The five skips are by design, not a
+missing RPC: `test/fork/CollateralVault.fork.t.sol`, `test/fork/CreditCore.fork.t.sol`,
+`test/fork/Liquidation.fork.t.sol` and `test/R64A1_RealFarmPausedUsdcFork.t.sol` each inherit `test_fixtureDerivationsFollowALiveParameterChange`
 from `test/helpers/RiskParamsFixture.sol` and override `_riskParamsOwner` to the zero address, which
 skips it, because there is no deployed `RiskParams` to retune until the fork is selected; and both
 tests in `test/fork/DexFiMintAttempt.fork.t.sol` skip unless `RUN_DEXFI_MINT_PROOF` is set, the
 second also needing a DexFi keeper signature in `DEXFI_MINT_SIGNATURE` and its block in
 `DEXFI_MINT_PROOF_BLOCK`, because it is the real mint handoff and needs your keeper to sign. Until
 2026-09-17 no sentence here said which tests stay skipped, so a reader counting green tests against
-six suites had to work it out.
+the suites had to work it out. The five skips became six when the fourth inheritor arrived.
 
 `test/fork/CollateralVault.fork.t.sol` is the one to read first. It confirms the configured
 addresses really are your live contracts and behave as documented, shows that deposits revert

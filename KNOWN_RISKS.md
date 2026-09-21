@@ -416,9 +416,9 @@ shortfall by the cancelled floor; a repayment, a new deposit or a released yield
 the cash and lowers it by that amount while no claim liquidity deficit stands. Where one does,
 serviced claims waiting uncollected after a loss of nearly all the cash, `_poolBalance` nets the
 claims out first, so arriving cash fills that hole before it reaches a floor and `maxDeposit`
-reads 0 until it has (in a test on this source not yet in this repository, 60.000000 of released
-yield lowered a shortfall of 100.000000 by 40.000000, the other 20.000000 having covered the
-deficit). For N equal floors of F and a loss L the cancels that end the
+reads 0 until it has (`test_R63A3_6_theYieldDoorWhileAClaimLiquidityDeficitStands`: 60.000000 of
+released yield lowered a shortfall of 100.000000 by 40.000000, the other 20.000000 having covered
+the deficit). For N equal floors of F and a loss L the cancels that end the
 lock are therefore floor(L / F), at most N - 1, and the first door then opens to F less the
 remainder: fuzzed over 2 to 12 floors and every loss inside the book, with the reviewers' two rows
 as fixed points, one cancel at 100.000000 lost and two at 200.000000
@@ -438,9 +438,9 @@ opens each door by what it has released and no more: 30.000000 delivered opens e
 (`test_R62S1_Q1_yieldBelowEqualAndAboveTheShortfall`). That bounds a door and not what the yield
 can end: a door pays the smaller of its cap and what its shares are worth, and a completing
 service releases its whole floor, so where every share is not queued, yield under the shortfall
-can end the lock whole (in a test on this source not yet in this repository, three queued floors
-of 100.000000 beside two unqueued holders of 100.000000 with 300.000000 lost: 60.000000 delivered
-against a shortfall of 100.000000 let 156.000000 out and left no floor). With
+can end the lock whole (`test_R63A3_5_withDormantHoldersYieldUnderTheShortfallCascades`: three
+queued floors of 100.000000 beside two unqueued holders of 100.000000 with 300.000000 lost,
+60.000000 delivered against a shortfall of 100.000000 let 156.000000 out and left no floor). With
 150.000000 lent, three floors of 50.000000 and 50.000000 lost, 50.000000 delivered reopens every
 door to 50.000000 with the loan standing (`test_R62S1_Q1_theYieldDoorOpensWithTheLoanStanding`).
 After one cancel from the 200.000000 loss, a deposit of 30.000000 or a released yield of 30.000000
@@ -459,12 +459,15 @@ a wei, so with no stream running the lock costs her time and not money
 (`test_R62S1_Q3_aDepositUnderTheThresholdJoinsTheLockWhole`, the counterexample's arithmetic
 copied from the seat that found it). While a stream is running, which is when the fourth door is
 opening, she pays the gross entry price of #51 below, the unreleased yield included, and the lock
-holds her to the end of the stream to earn it back: in a test on this source not yet in this
-repository, 60.000000 deposited into the lock mid-stream bought shares worth 46.901262 that block
-and 59.999999 once the stream ended. All of it but the figures marked as not in this repository is
-in
+holds her to the end of the stream to earn it back: in
+`test_R63A3_T2_aStreamIntoTheLockMovesTheThresholdAndTheEntryPrice`, 60.000000 deposited into the
+lock mid-stream bought shares worth 46.901262 that block and 59.999999 once the stream ended. All
+of it is in
 [`test/R62S1_YieldDoorAndSecondCancel.t.sol`](test/R62S1_YieldDoorAndSecondCancel.t.sol), 27 tests
-of which 8 are new bodies and 19 are `R60S2_H03LockBound` inherited.
+of which 8 are new bodies and 19 are `R60S2_H03LockBound` inherited, except the three figures
+named above by test, which are in
+[`test/R63A3_YieldDoorRepeated.t.sol`](test/R63A3_YieldDoorRepeated.t.sol) and
+[`test/R63A3_ShutOutAndDepositDoor.t.sol`](test/R63A3_ShutOutAndDepositDoor.t.sol).
 
 **The alternatives, costed and refused.** A floor write-down on a raw loss, one storage word applied
 to every floor read, was measured by the maintainer on a copy of this source and posted on #47
