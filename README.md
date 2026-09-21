@@ -142,7 +142,14 @@ suites, 1,996 total, as that sum and not as one run. The sync of 2026-09-19 adds
 [`test/R62S1_YieldDoorAndSecondCancel.t.sol`](test/R62S1_YieldDoorAndSecondCancel.t.sol), 27 tests
 of which 8 are new bodies and 19 are the same inherited `R60S2_H03LockBound` tests run a third
 time, measured alone on forge 1.8.1 at 27 passed; with it the tree reads 1,991 passed, 0 failed and
-32 skipped across 153 suites, 2,023 total, again as a sum. The figure is dated because it is derived
+32 skipped across 153 suites, 2,023 total, again as a sum, which this repository's CI then measured
+as one run on forge 1.8.3 on 2026-09-21. The sync of 2026-09-21 adds one more suite,
+[`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol), 5 tests over the bare-pool
+fixture [`test/R63A3_Fixture.sol`](test/R63A3_Fixture.sol): the reproduction for #64, a request
+serviced down to one share-wei keeping the rest of its cash floor. It pins that finding as the
+source stands, so its two dust-held-floor tests are expected to flip the day a fix lands. Measured
+alone on forge 1.8.1 at 5 passed; with it the tree reads 1,996 passed, 0 failed and 32 skipped
+across 154 suites, 2,028 total, again as a sum. The figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
 1,921 across 150 suites from the sync of 2026-09-15 until this one, 1,901 across 149 before that,
