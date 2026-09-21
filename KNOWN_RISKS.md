@@ -315,8 +315,8 @@ simulated by transferring USDC out of the pool.
 the other live requests are not owed, and a synchronous exit is capped at the cash none of them is
 owed, so `unreservedIdle`, an unqueued lender's `maxRedeem` and `available()` read 0 while the lock
 stands. The shortfall sits with the pool, as recognised shareholder cash promised twice, until a
-repayment or a new deposit lifts the executable cash above the floors or a floor holder cancels.
-When a holder
+repayment, a new deposit or a released yield delivery lifts the executable cash above the floors or
+a floor holder cancels. When a holder
 cancels, `cancelWithdrawalRequest` releases her floor whole and the cash it held becomes reachable
 by the other live request first, so the unwind is by whoever releases first: in the reviewers' own
 regression on this source, one controller cancelling restores 500.000000 of serviceable cash to the
@@ -324,18 +324,50 @@ other request, and with three equal floors of 100.000000 after a loss of 100.000
 moves each remaining cap from 0 to 100.000000, of which the next holder draws 66.666666, what her
 escrowed shares are worth at the post-loss price; the third then draws 66.666667, the floors reach
 0 and the lock is gone, with 66.666667 unreserved and the canceller's `maxRedeem` at 66.666666
-(`test_R61A4_afterOneCancelBothRemainingDoorsAndWhatStaysLocked`). A new lender's deposit is a
+(`test_R61A4_afterOneCancelBothRemainingDoorsAndWhatStaysLocked`). One cancel ends that lock
+because the loss is one floor, and until 2026-09-19 this paragraph did not say so: with 200.000000
+lost from the same three floors, one cancel leaves both remaining doors at 0 and a second cancel
+opens the last holder's door to 33.333333, what her shares are worth at that price
+(`test_R62S1_Q2_twoHundredLostNeedsTwoCancels`); the count is stated under the rule below. A new
+lender's deposit is a
 third release, and until 2026-09-18 this file named two: `maxDeposit` stays open in the locked
-state, and her cash lifts the executable cash above the old floors. From three floors of
+state unless a claim liquidity deficit stands as well (`_maxDeposit` returns 0 while
+`totalClaimable` exceeds the pool's cash, which takes serviced claims left uncollected and then a
+loss of nearly all the cash), and her cash lifts the executable cash above the old floors when
+there is enough of it, and until 2026-09-19 this sentence had no "when": a deposit reopens an old
+door only where the executable cash plus the deposit exceeds the floors the other live requests
+are owed, with equal floors a deposit over the shortfall less one floor (the shortfall is the
+floors less the executable cash, and equals the loss only where the floors held the whole cash
+when it landed), and below that her whole deposit joins the lock while `maxDeposit` quotes the cap
+and nothing at the door says so (the figures are under "The rule and the fourth door" below).
+From three floors of
 100.000000 with 100.000000 lost, a deposit of 100.000000 reopens each old door to 66.666666 while
 the depositor's own `maxRedeem` and request door read 0 and her request is quoted a floor of 0; the
 old holders draw 199.999999 between them, after which her request door reads 100.000000 and she
 draws 100.000000 (`test_R61A4_aDepositIntoTheLockedPool`). Her cash is what unlocks the old floors,
 she is made whole only after they act, and nothing at the door says so. A queued lender whose floor
-is not fully serviceable is held until a repayment, a deposit or another holder's cancel, with no
-clock on any of them. **There is no guaranteed recovery time**: all three releases are somebody
-else's act, a borrower's repayment, a new lender's deposit or another holder's cancel, and none is
-owed on any schedule. Her own cancel is not a way out for her, and until 2026-09-18 this paragraph
+is not fully serviceable is held until a repayment, a deposit, a released yield delivery or another
+holder's cancel. **There is no guaranteed recovery time, and until 2026-09-19 this sentence
+overstated that**: three of the four releases are somebody else's act, a borrower's repayment, a new
+lender's deposit or another holder's cancel, and none of those is owed on any schedule; the fourth,
+an accepted epoch's yield, is the protocol's own delivery on the epoch clock and opens the doors as
+its stream releases. Read from `_rateStream`, each delivery is rated over at least
+`YIELD_STREAM_DURATION` and at most `MAX_YIELD_STREAM_DURATION`, and a later epoch re-rates
+whatever has not yet released over its own window, so the money of one delivery can finish
+releasing later than `MAX_YIELD_STREAM_DURATION` after it: that ceiling bounds each rating and not
+the recovery. It is the composition under "The epoch leg of `_rateStream` re-rates a running
+recovery stream" below, met from the lock's side. In tests on this source that are not in this
+repository yet, a delivery of 100.000000 rated over the 30-day ceiling and followed 29 days later
+by an epoch of 0.250000 still had 3.209771 of a 100.000000 shortfall closed at the 30-day mark and
+cleared it on day 56, a second epoch of 0.250000 at spacings `harvest` allows (seven days, then
+five) cleared the shortfall 255,600 seconds later than no second epoch would have, while a second
+delivery as large as the first, landing half way through its stream, cleared it sooner. So
+whenever the fund pays yield the recovery is on the epoch clock, sized by how much of the
+shortfall each delivery covers, and one delivery's window is a bound only where no later epoch
+lands on its stream (the rule and the figures are under "The rule and the fourth door" below).
+An epoch that delivers nothing opens nothing, and the yield door is then as closed as the other
+three. Her own cancel is not a way out for her, and until
+2026-09-18 this paragraph
 said it was: it releases her floor to the other live requests and leaves her own `maxRedeem` at 0
 until they draw, because the cash left is what their floors are owed, and a request she files again
 is quoted a floor of 0. In the reviewers' two-floor regression the canceller's `maxRedeem` reads 0
@@ -373,6 +405,67 @@ a request filed in the locked state is quoted a floor of 0
 (`test_R61A4_aRequestFiledInTheLockIsQuotedFloorZero`), all in
 [`test/R61A4_PublicLockClaims.t.sol`](test/R61A4_PublicLockClaims.t.sol).
 
+**The rule and the fourth door, added 2026-09-19.** Every request's cap, the executable cash the
+other live floors are not owed, is its own floor less the SHORTFALL, the floors less the executable
+cash, so every door reads 0 exactly while the shortfall is at least the largest live floor. A
+service that leaves shares in the request moves the cash and the floors down together and leaves
+the shortfall where it was, and one that completes the request releases whatever is left of its
+floor (`serviceWithdrawalRequest`: in `test_R62S1_Q2_twoHundredLostNeedsTwoCancels` the last
+holder draws 33.333333 against a floor of 100.000000 and the floors reach 0); a cancel lowers the
+shortfall by the cancelled floor; a repayment, a new deposit or a released yield delivery raises
+the cash and lowers it by that amount while no claim liquidity deficit stands. Where one does,
+serviced claims waiting uncollected after a loss of nearly all the cash, `_poolBalance` nets the
+claims out first, so arriving cash fills that hole before it reaches a floor and `maxDeposit`
+reads 0 until it has (in a test on this source not yet in this repository, 60.000000 of released
+yield lowered a shortfall of 100.000000 by 40.000000, the other 20.000000 having covered the
+deficit). For N equal floors of F and a loss L the cancels that end the
+lock are therefore floor(L / F), at most N - 1, and the first door then opens to F less the
+remainder: fuzzed over 2 to 12 floors and every loss inside the book, with the reviewers' two rows
+as fixed points, one cancel at 100.000000 lost and two at 200.000000
+(`testFuzz_R62S1_Q2_theCancelsThatEndTheLockAreFloorOfLossOverFloor`,
+`test_R62S1_Q2_theFuzzBodyReachesZeroOneAndTwoCancels`). Yield is the fourth release, and the
+reviewers reproduced it before this file named it: `distributeYield` accepts an epoch in the locked
+state, the executable cash excludes the part of it the stream has not released, and the doors open
+as it releases. From three floors of 100.000000 with 100.000000 lost, 100.000000 delivered is rated
+over exactly `YIELD_STREAM_DURATION` (432,000 seconds); at delivery every door still reads 0, half
+way through the stream each reads 49.999998, of which the three draw 149.999994 in turn while
+100.000005 stays locked, and once the stream ends each reads 100.000000 and all three draw their
+whole floor with no repayment, deposit or cancel
+(`test_R62S1_Q1_yieldEqualToTheShortfallReopensEveryDoorOverTheStream`). Yield under the shortfall
+opens each door by what it has released and no more: 30.000000 delivered opens each door to
+29.999999, lets 89.999997 out and leaves 140.000003 locked with the shortfall unmoved at
+70.000000, while 200.000000 lets 399.999998 out
+(`test_R62S1_Q1_yieldBelowEqualAndAboveTheShortfall`). That bounds a door and not what the yield
+can end: a door pays the smaller of its cap and what its shares are worth, and a completing
+service releases its whole floor, so where every share is not queued, yield under the shortfall
+can end the lock whole (in a test on this source not yet in this repository, three queued floors
+of 100.000000 beside two unqueued holders of 100.000000 with 300.000000 lost: 60.000000 delivered
+against a shortfall of 100.000000 let 156.000000 out and left no floor). With
+150.000000 lent, three floors of 50.000000 and 50.000000 lost, 50.000000 delivered reopens every
+door to 50.000000 with the loan standing (`test_R62S1_Q1_theYieldDoorOpensWithTheLoanStanding`).
+After one cancel from the 200.000000 loss, a deposit of 30.000000 or a released yield of 30.000000
+each lower the shortfall by 30.000000 and open both remaining doors to 29.999999
+(`test_R62S1_Q2_afterOneCancelADepositOrAYieldOfXReopensByX`). The same inequality sizes every
+release, the deposit included: a release of R reopens a request only where `E + R` exceeds the
+floors the other live requests are owed. Five floors of 100.000000 with 201.940593 lost put that
+threshold at 101.940593 while `maxDeposit` quotes 249,701.940593; a deposit of 1.672435 lifts the
+executable cash from 298.059407 to 299.731842 against 400.000000 owed to the other four floors at
+every old door, so every old door stays 0, her request is quoted a floor of 0, her request door and
+sync door read 0, no door reaches a wei, and her whole deposit is locked with theirs until every
+old holder cancels (her door then reads 1.672433 and she draws it), a repayment lands or a further
+deposit clears the threshold; 110.000000 from the same state opens every old door to 8.059406 at
+once. Her shares are worth 1.672434 the block she pays 1.672435, entry and exit prices agreeing to
+a wei, so with no stream running the lock costs her time and not money
+(`test_R62S1_Q3_aDepositUnderTheThresholdJoinsTheLockWhole`, the counterexample's arithmetic
+copied from the seat that found it). While a stream is running, which is when the fourth door is
+opening, she pays the gross entry price of #51 below, the unreleased yield included, and the lock
+holds her to the end of the stream to earn it back: in a test on this source not yet in this
+repository, 60.000000 deposited into the lock mid-stream bought shares worth 46.901262 that block
+and 59.999999 once the stream ended. All of it but the figures marked as not in this repository is
+in
+[`test/R62S1_YieldDoorAndSecondCancel.t.sol`](test/R62S1_YieldDoorAndSecondCancel.t.sol), 27 tests
+of which 8 are new bodies and 19 are `R60S2_H03LockBound` inherited.
+
 **The alternatives, costed and refused.** A floor write-down on a raw loss, one storage word applied
 to every floor read, was measured by the maintainer on a copy of this source and posted on #47
 (comment 5715504360, 2026-09-17): +285 bytes of `LenderPool` runtime (21,511 with 3,065 of EIP-170
@@ -399,9 +492,15 @@ the original High without the floor write-down shipping, on condition that the b
 corrected and multiple-request coverage added. Both shipped in 0f49e61 (#60) on 2026-09-17. On
 2026-09-18 the reviewers reported that commit reviewed and its test file passing, and supported
 closing the original H-03 as verified fixed, with the lock tracked under #61 as acknowledged and
-retained by design (comment 5727241497 on #47). The recovery conditions are the three named above,
-a repayment, a new deposit or a floor holder's cancel, each somebody else's act, and there is no
-guaranteed time at which any of them arrives; until 2026-09-18 this paragraph named two.
+retained by design (comment 5727241497 on #47). The recovery conditions are the four named above,
+a repayment, a new deposit, a released yield delivery or a floor holder's cancel; three are somebody
+else's act with no time at which any of them is owed, and the fourth is the protocol's own on the
+epoch clock, so the recovery has a clock whenever yield is delivered and none otherwise; that clock
+is each delivery's own rating window, and a later epoch can stretch what has not yet released, as
+stated under "Who bears it". Until
+2026-09-18 this paragraph named two and until 2026-09-19 three; the reviewers filed the yield door
+and the second cancel as qualifications on #61 on 2026-09-18 (comment 5734172519), and both were
+measured as stated.
 
 ## Open findings from internal review round 45, at the audit commit
 

@@ -98,8 +98,13 @@ the old one's remaining time.
    the post-loss lock of #61 (Low, acknowledged and retained by design, since 2026-09-17), which
    are material residual risks rather than blockers. The lock needs a raw loss of pool cash, which,
    on a reading of the source and the measurements in [`KNOWN_RISKS.md`](KNOWN_RISKS.md), no loss
-   path inside the protocol produces, and it is released only by a repayment, a new deposit
-   or a floor holder's cancel, with no guaranteed recovery time.
+   path inside the protocol produces, and it is released by a repayment, a new deposit, a
+   released yield delivery or a floor holder's cancel, each only where it lifts the executable
+   cash over the floors the other requests are owed (a deposit below that joins the lock); only
+   the yield is the protocol's own and on a clock, each delivery rated over at least
+   `YIELD_STREAM_DURATION` and at most `MAX_YIELD_STREAM_DURATION` with a later epoch re-rating
+   what has not yet released, so the recovery has a clock when the fund pays and none otherwise
+   (since 2026-09-19; until then this item named three releases, no clock and no threshold).
 
 [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the mechanism behind each of these and names the function
 that implements it, so every claim above can be checked against the source rather than believed.
@@ -133,7 +138,11 @@ everything else, 144 suites and 1,882 tests in 203.28s. The sync of 2026-09-18 a
 [`test/R61A4_PublicLockClaims.t.sol`](test/R61A4_PublicLockClaims.t.sol), 24 tests of which 5 are
 new bodies and 19 are the `R60S2_H03LockBound` tests it inherits and runs again, measured alone on
 forge 1.8.1 at 24 passed; with it the tree reads 1,964 passed, 0 failed and 32 skipped across 152
-suites, 1,996 total, as that sum and not as one run. The figure is dated because it is derived
+suites, 1,996 total, as that sum and not as one run. The sync of 2026-09-19 adds one more suite,
+[`test/R62S1_YieldDoorAndSecondCancel.t.sol`](test/R62S1_YieldDoorAndSecondCancel.t.sol), 27 tests
+of which 8 are new bodies and 19 are the same inherited `R60S2_H03LockBound` tests run a third
+time, measured alone on forge 1.8.1 at 27 passed; with it the tree reads 1,991 passed, 0 failed and
+32 skipped across 153 suites, 2,023 total, again as a sum. The figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
 1,921 across 150 suites from the sync of 2026-09-15 until this one, 1,901 across 149 before that,
