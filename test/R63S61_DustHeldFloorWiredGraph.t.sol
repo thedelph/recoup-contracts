@@ -20,9 +20,11 @@ import {R62A3_GraphFixture} from "./R62A3_GraphFixture.sol";
 ///      lender takes every unreserved unit synchronously before the loss:
 ///      `loss / X > 1 - (T - X) * o / T^2`. With g = o = X that is 75% (A3's D4 shape); with
 ///      g = X / 2, o = 9.5 X it is 14.5%.
-///      PINS AN OPEN FINDING AS THE TREE STANDS: A3's F1 is open, and keeping the floor is Chris's
-///      design decision, so every assertion below records today's behaviour and is expected to flip
-///      the day a fix lands. Round 63 seat A3's report describes the finding; this is its wired half.
+///      #64 (round 63 seat A3's F1; this is its wired half). This suite pinned the finding as the
+///      tree stood; its dust-held-floor assertions are FLIPPED to the #64 fix, which writes the
+///      floor left on dust down to what the dust is worth while the floors sit inside the
+///      executable cash. Every point here is a socialised loss inside the cash, so no point keeps
+///      a floor any more and the dormant lender reaches her whole worth to a wei or two.
 contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
     address internal griefer = makeAddr("s61-griefer");
     address internal dormant = makeAddr("s61-dormant");
@@ -237,13 +239,10 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
                 assertEq(p.kept, 0, "under the threshold a floor was kept on dust");
                 assertGe(p.dormantSyncDoor + 2, p.dormantWorth, "under the threshold the dormant lender is shut out");
             } else {
-                assertGt(p.kept, 0, "over the threshold no floor was kept");
-                assertApproxEqAbs(
-                    p.kept, p.floor - p.worth, 2, "the kept floor is not the floor less her shares' worth"
-                );
-                assertApproxEqAbs(
-                    p.dormantWorth - p.dormantSyncDoor, p.kept, 2, "the shut-out cash is not the kept floor"
-                );
+                // #64 fix: over the old threshold the dust keeps no floor and shuts nothing out.
+                assertEq(p.kept, 0, "#64: over the old threshold a floor was still kept on dust");
+                assertGt(p.floor, p.worth, "fixture: this point no longer puts the floor over the worth");
+                assertLe(p.dormantWorth - p.dormantSyncDoor, 2, "#64: the dormant lender is still shut out");
                 assertEq(p.yearLaterSync, p.dormantSyncDoor, "a year moved the sync door");
                 assertEq(p.yearLaterRequest, p.dormantRequestDoor, "a year moved the request door");
             }
@@ -275,8 +274,13 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
             pool.maxRequestRedeem(griefer),
             _serviceable(griefer)
         );
-        assertEq(_syncable(dormant), 0, "the dormant lender reaches cash");
-        assertEq(pool.available(), 0, "the pool can lend against the kept floor");
+        // #64 fix: the dust keeps no floor, so the dormant lender reaches her worth to two wei.
+        assertEq(kept, 0, "#64: one share-wei still keeps a floor");
+        assertApproxEqAbs(
+            _syncable(dormant), pool.previewRedeem(pool.balanceOf(dormant)), 2, "#64: the dormant lender is shut out"
+        );
+        // #64 fix: no floor is kept, so the pool can lend again (was 0 against the kept floor).
+        assertGt(pool.available(), 0, "#64: the pool still cannot lend");
 
         // A stranger and the dormant lender cannot service or cancel for her.
         vm.prank(dormant);
@@ -309,10 +313,14 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
         );
         vm.revertToState(shut);
 
-        // Only her own act ends it.
-        _service(griefer, 1);
+        // #64 fix: there is nothing left for her to end. Her one share-wei holds no floor, and her
+        // draw memory has spent her slice, so her door on it is 0 and only a cancel removes it
+        // (was: her completing one-wei service released the kept floor).
+        assertEq(pool.maxRequestRedeem(griefer), 0, "#64: the dust holds a door without a floor");
+        vm.prank(griefer);
+        pool.cancelWithdrawalRequest();
         console2.log(
-            "MEASURED [W2] she burns the last share-wei: floors / dormant sync door", _floorTotal(), _syncable(dormant)
+            "MEASURED [W2] she cancels the dust: floors / dormant sync door", _floorTotal(), _syncable(dormant)
         );
         assertEq(_floorTotal(), 0);
         assertGt(_syncable(dormant), 0);
@@ -334,10 +342,9 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
             if (points[i] < 1_450) {
                 assertEq(p.kept, 0, "under the threshold a floor was kept on dust");
             } else {
-                assertGt(p.kept, 0, "over the threshold no floor was kept");
-                assertApproxEqAbs(
-                    p.dormantWorth - p.dormantSyncDoor, p.kept, 2, "the shut-out cash is not the kept floor"
-                );
+                // #64 fix: over the old threshold the dust keeps no floor and shuts nothing out.
+                assertEq(p.kept, 0, "#64: over the old threshold a floor was still kept on dust");
+                assertLe(p.dormantWorth - p.dormantSyncDoor, 2, "#64: the dormant lender is still shut out");
             }
         }
     }

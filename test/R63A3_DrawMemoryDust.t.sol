@@ -154,9 +154,10 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
     ///         holders 0 and 2 complete, every floor is released and the canceller walks out
     ///         with her 33.333333. GRIEF: holder 0 services all but ONE share-wei, takes the
     ///         same cash, and her request keeps the rest of its floor for ever.
-    /// @dev PINS AN OPEN FINDING AS THE TREE STANDS: round 63 seat A3's F1, a floor kept for ever
-    ///      on one share-wei. It is open, and it is Chris's design decision, so this assertion
-    ///      records today's behaviour and is expected to flip the day a fix lands.
+    /// @dev #64 (round 63 seat A3's F1, a floor kept for ever on one share-wei). This test pinned
+    ///      the finding as the tree stood; its dust-held-floor assertions are FLIPPED to the #64
+    ///      fix, which writes the floor left on dust down to what the dust is worth while the
+    ///      floors sit inside the executable cash.
     function test_R63A3_D3_aRequestServicedToOneShareWeiKeepsItsFloor_rawLoss() public {
         _queueEqualFloors(3, EACH);
         _loseCash(50e6);
@@ -191,9 +192,11 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
         console2.log("MEASURED D3 grief: holder 0's own door (cash)          ", _serviceable(_holder(0)));
         assertEq(_requestShares(_holder(0)), 1, "fixture: the griefer did not leave exactly one share-wei");
         assertGe(grief0 + 1, honest0, "the grief cost the griefer more than a wei");
-        assertLt(_syncable(_holder(1)), honestSync, "the kept floor shut nothing out");
-        assertEq(_floorOf(_holder(0)), 16_666_667, "the floor one share-wei keeps is not 16.666667");
-        assertEq(_syncable(_holder(1)), 16_666_667, "the canceller's door is not 16.666667 of her 33.333335");
+        // #64 fix: the cancel put the floors back inside the cash, so the dust keeps no floor and
+        // the canceller's door is her honest door to a wei (33.333333 against 33.333334).
+        assertApproxEqAbs(_syncable(_holder(1)), honestSync, 1, "#64: the dust still shut the canceller out");
+        assertEq(_floorOf(_holder(0)), 0, "#64: one share-wei still keeps a floor");
+        assertEq(_syncable(_holder(1)), 33_333_333, "#64: the canceller's door is not 33.333333 of her 33.333335");
     }
 
     /// @notice The same dust on PROTOCOL paths, no raw loss: 10,000 queued beside 10,000
@@ -203,9 +206,10 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
     ///         5,000), which is what round 62's campaign asserts, but the queued floor now
     ///         exceeds what her shares are WORTH (3,333.333333), and the excess is reserved
     ///         against the dormant lender until the request is completed or cancelled.
-    /// @dev PINS AN OPEN FINDING AS THE TREE STANDS: round 63 seat A3's F1, a floor kept for ever
-    ///      on one share-wei. It is open, and it is Chris's design decision, so this assertion
-    ///      records today's behaviour and is expected to flip the day a fix lands.
+    /// @dev #64 (round 63 seat A3's F1, a floor kept for ever on one share-wei). This test pinned
+    ///      the finding as the tree stood; its dust-held-floor assertions are FLIPPED to the #64
+    ///      fix, which writes the floor left on dust down to what the dust is worth while the
+    ///      floors sit inside the executable cash.
     function test_R63A3_D4_theSameDustOnProtocolPaths_socialisedLoss() public {
         _deposit(griefer, 10_000e6);
         _deposit(other, 10_000e6);
@@ -253,9 +257,14 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
         console2.log("MEASURED D4 grief: dormant lender's request floor/door ", _floorOf(other), _serviceable(other));
         console2.log("MEASURED D4 grief: available() to lend                 ", pool.available());
         assertGe(grief + 1, honest, "the grief cost the griefer more than a wei");
-        assertEq(_syncable(other) + _serviceable(other), 0, "the dormant lender still reaches cash");
-        assertEq(kept, 1_666_666_667, "the floor one share-wei keeps is not 1,666.666667");
-        assertEq(pool.available(), 0, "the pool can still lend against the kept floor");
+        // #64 fix: the dust keeps no floor, so the dormant lender reaches her honest door to a wei
+        // (1,666.666665 against 1,666.666666), and available() is 0 only because her own request
+        // floor now reserves that cash.
+        assertApproxEqAbs(
+            _syncable(other) + _serviceable(other), honestOther, 1, "#64: the dormant lender is still shut out"
+        );
+        assertEq(kept, 0, "#64: one share-wei still keeps a floor");
+        assertEq(pool.available(), 0, "the dormant lender's own request floor does not reserve the cash");
         uint256 shut = vm.snapshotState();
 
         // The four doors against the kept floor.
@@ -274,11 +283,14 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
         );
         console2.log("MEASURED D4 cash nobody but the griefer can release    ", _executable() - pool.unreservedIdle());
 
-        // Only the griefer's own act ends it.
+        // #64 fix: there is nothing left for her to end. Her one share-wei holds no floor and, with
+        // the dormant lender's request floor reserving the cash, no door either, so only a cancel
+        // removes it (was: her completing one-wei service released the kept floor).
         vm.revertToState(shut);
-        _service(griefer, 1);
-        console2.log("MEASURED D4 she burns the last share-wei: floors left  ", _floorTotal());
-        console2.log("MEASURED D4 she burns the last share-wei: dormant door ", _serviceable(other));
+        assertEq(pool.maxRequestRedeem(griefer), 0, "#64: the dust holds a door without a floor");
+        _cancel(griefer);
+        console2.log("MEASURED D4 she cancels the dust: floors left          ", _floorTotal());
+        console2.log("MEASURED D4 after her cancel: dormant door            ", _serviceable(other));
         assertEq(_floorTotal() - _floorOf(other), 0, "her completing service did not release the kept floor");
     }
 }

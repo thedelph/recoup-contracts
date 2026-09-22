@@ -844,6 +844,9 @@ contract CanonicalLenderHandler is Test {
         uint256 floor;
         uint256 reachable;
         uint256 bound;
+        /// @dev The sum of EVERY live mirrored floor before the service, this request's included
+        ///      (the handler's own twin of `_floorTotal`).
+        uint256 floorTotal;
     }
 
     function _entitlementBefore(address controller, uint256 requestShares) private view returns (Entitlement memory e) {
@@ -861,6 +864,7 @@ contract CanonicalLenderHandler is Test {
         e.reachable = e.executable > owedToOthers ? e.executable - owedToOthers : 0;
         e.bound = e.live > e.floor ? e.live : e.floor;
         if (e.bound > e.reachable) e.bound = e.reachable;
+        e.floorTotal = e.floor + owedToOthers;
     }
 
     function _serviceBare(address controller, address caller, uint256 shares) private {
@@ -927,6 +931,17 @@ contract CanonicalLenderHandler is Test {
             delete _mirrorFloor[controller];
         } else {
             uint256 spent = assets < before.floor ? assets : before.floor;
+            // #64: the remaining floor never exceeds what the remaining escrowed shares are worth,
+            // applied only while the floors left after the plain spend sit inside the executable
+            // cash after the service. Both operands come from the PUBLIC views at the instant the
+            // door read them (`convertToAssets`, `unreservedIdle + queueCashReserve`) and the
+            // handler's own floor sum; the stored floor is never read back, so ghost B stays a
+            // comparison the pool cannot write.
+            uint256 worth = pool.convertToAssets(remainingShares);
+            uint256 executableAfter = pool.unreservedIdle() + pool.queueCashReserve();
+            if (before.floor - spent > worth && before.floorTotal - spent <= executableAfter) {
+                spent = before.floor - worth;
+            }
             _mirrorFloor[controller] = before.floor - spent;
         }
         ++drawEntitlementChecks;
