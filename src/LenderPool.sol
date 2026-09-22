@@ -2616,6 +2616,17 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         uint256 floor = request.floor;
         uint256 floorSpent = assetsOut < floor ? assetsOut : floor;
         if (remainingShares == 0) floorSpent = floor;
+        // #64: what is left of a floor never exceeds what the shares left in escrow are worth, so
+        // a request serviced down to dust cannot keep a reservation its shares can never draw.
+        if (remainingShares != 0) {
+            uint256 worth = convertToAssets(remainingShares);
+            // Only while the floors are inside the executable cash, so the #61 lock (floors over
+            // the cash after a raw loss) keeps every figure it has today.
+            if (
+                floor - floorSpent > worth
+                    && _floorTotal - floorSpent <= _executablePoolCash(_rawBalance())
+            ) floorSpent = floor - worth;
+        }
         request.floor = floor - floorSpent;
         _floorTotal -= floorSpent;
 
