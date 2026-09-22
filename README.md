@@ -171,7 +171,15 @@ threshold curve of the same finding on the same bare pool, measured alone at 13 
 [`test/R64A1_RealFarmPausedUsdcFork.t.sol`](test/R64A1_RealFarmPausedUsdcFork.t.sol), a fork
 suite whose 5 tests all skip without the opt-in, measured alone at 0 passed and 5 skipped. With
 those two the tree reads 2,055 passed, 0 failed and 47 skipped across 162 suites, 2,102 total, as
-a sum. The
+a sum. The #64 fix of 2026-09-22 (see [`KNOWN_RISKS.md`](KNOWN_RISKS.md)) flips the
+dust-held-floor assertions of those three reproductions and of the `R63A3_PoolDoorsInvariants`
+reach test, as they said it would, and adds three suites and 37 tests:
+[`test/Issue64_MarkRoute.t.sol`](test/Issue64_MarkRoute.t.sol),
+[`test/Issue64_DustCensusReplay.t.sol`](test/Issue64_DustCensusReplay.t.sol) and
+[`test/Issue64_DustUnderShortfall.t.sol`](test/Issue64_DustUnderShortfall.t.sol). With them the
+tree reads 2,092 passed, 0 failed and 47 skipped across 165 suites, 2,139 total, measured on forge
+1.8.1 with `--force` as the sum of three runs (the invariant campaigns in two, everything else in
+one). The
 figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read

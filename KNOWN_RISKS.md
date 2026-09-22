@@ -505,6 +505,70 @@ stated under "Who bears it". Until
 and the second cancel as qualifications on #61 on 2026-09-18 (comment 5734172519), and both were
 measured as stated.
 
+### #64, 33audits M-06: a request serviced down to one share-wei kept the rest of its cash floor. Medium, fixed in this source by the change that added this heading; a Low residual remains, dated 2026-09-22
+
+**What it was.** `serviceWithdrawalRequest` spent a request's floor by what each service paid and
+released the rest only with the final share. Once a price fall (a socialised loss, or the whole-debt
+impairment mark of a routine liquidation that is later cleared in full) left the floor above what
+the request's shares were worth, a requester could take everything a complete service would pay and
+stop one share-wei short. The rest of her floor stayed reserved against that share-wei, every other
+lender's door and `available` read it as owed, and only her own completing service or her cancel
+released it. 33audits' final report of 2026-09-22 rates it Medium, Accepted Risk, on f6893cb, and
+the public main branch up to and including f6893cb does not carry the change described next.
+
+**The change.** After the plain spend, `serviceWithdrawalRequest` now caps what is left of a
+partially serviced request's floor at `convertToAssets(remainingShares)`, but only while the floors
+left after the plain spend sit inside the executable cash:
+`_floorTotal - floorSpent <= _executablePoolCash(_rawBalance())`. The second condition is what keeps #61 as it is: after a raw
+loss that puts the floors over the cash, no floor is written down, and every figure the #61 section
+above states still holds (`test_R64A4_C7_orderOfService_underARawLoss`,
+`test_R63A3_3_unequalFloorsOpenLargestFirst` and both `R62S1_YieldDoorAndSecondCancel` Q1 tests pass
+unchanged). Cost: +85 bytes of `LenderPool` runtime and +85 of initcode, measured with
+`forge build --sizes` on a clean build; `CreditManager` is unchanged.
+
+**What it closes.** Every dust service made while the floors are within the executable cash now
+leaves a floor no larger than what the dust is worth, which for one share-wei is 0. That covers the
+three reproductions, whose dust-held-floor assertions are flipped and marked #64 at each assertion:
+[`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol),
+[`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) and
+[`test/R64A4_DustFloorCurve.t.sol`](test/R64A4_DustFloorCurve.t.sol), where every socialised-loss
+and mark row of the threshold curve now keeps nothing at any fall and none of the twelve
+asset-denominated round trips of C5f leaves a floor. It covers the no-loss mark route on the wired
+graph in [`test/Issue64_MarkRoute.t.sol`](test/Issue64_MarkRoute.t.sol) (a routine auction that
+clears in full, a workout rescued in full, a short fill inside the cash), and the seeded census
+replay in [`test/Issue64_DustCensusReplay.t.sol`](test/Issue64_DustCensusReplay.t.sol), which keeps
+no floor on dust before a raw loss on the replay or on the walk with a mark, and none at all on the
+walk that has no loss of any kind. Internal review also measured six further shapes on the same
+`LenderPool` source, each of which kept a floor under the old rule and keeps none under this one:
+floors priced through the real `NAVOracle`, yield streamed between filing and service, a partial
+workout tranche, a forced workout close followed by `recoverLoss`, a deposit-cap change, and a
+request filed for part of a position. Those six tests are not in this repository. The
+`LenderPool` invariant suite's handler models the change, so its floor-sum ghost holds the stored
+floors to it in every campaign.
+
+**A side effect, measured.** The kept floor was also what held a dust request's door open. With the
+floor written down to 0, a request left on one share-wei has a door of 0 while its draw memory has
+spent its slice (`maxRequestRedeem` returns 0), until the price rises past that memory; a cancel
+removes it at any time. The share-wei is worth 0 and reserves nothing, so no other lender is
+affected, but a completing one-wei service is no longer always available. The flipped tails of D4,
+W2 and C6 and the reach test of `R63A3_PoolDoorsInvariants` show it.
+
+**The residual, disclosed. Low.** A dust service made while the floors EXCEED the executable cash
+keeps its floor, exactly as the old rule did, and the kept floor outlives the shortfall: nothing
+re-examines it once the cash returns, so only her completing service or her cancel releases it.
+[`test/Issue64_DustUnderShortfall.t.sol`](test/Issue64_DustUnderShortfall.t.sol) pins it as it
+stands: two requesters of 20,000 filed in an idle book of 100,000, 40,000 lent, a 10,000 socialised
+loss and a 25,000 raw loss put the floors (40,000) over the cash (35,000); one requester services to
+one share-wei and keeps 7,000.000000; the loan then repays in full and the last lender out still
+leaves 7,000.000001 behind. It is Low because it needs an external event first, a raw cash loss,
+which no path inside the protocol produces (see #61 above), and then the requester's own dust
+service while that shortfall stands. The unconditional cap would close it and was not chosen,
+because it writes floors down under the #61 lock: with it, C7, the unequal-floors test and both
+Q1 tests above go red, and so does the residual pin itself.
+
+**Status.** The change is offered to the reviewers on #64 for verification. Until they report on
+it, the report's status on f6893cb stands.
+
 ### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
 
 `DirectCallAdapter` moves its own USDC on a best-effort basis, so its own transfer cannot revert a
