@@ -505,6 +505,106 @@ stated under "Who bears it". Until
 and the second cancel as qualifications on #61 on 2026-09-18 (comment 5734172519), and both were
 measured as stated.
 
+### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
+
+`DirectCallAdapter` moves its own USDC on a best-effort basis, so its own transfer cannot revert a
+bond movement. That covers the adapter's leg and nothing else. The live DexFi farm is
+MasterChef-style and settles the position's pending USDC inside `deposit` and `withdraw`, which are
+the two calls the adapter makes to move bonds, and that settlement is a plain token transfer nothing
+here wraps. [`src/interfaces/IDexFiFarm.sol`](src/interfaces/IDexFiFarm.sol) has recorded since
+round 34 that `withdraw(0)` is the claim primitive; what was not written down until now is that
+every other `withdraw`, and every `deposit`, claims as well.
+
+So while USDC is paused, and for as long as the adapter carries any pending farm yield,
+`withdrawBonds`, `depositBonds` and `harvestYield` revert with the token's own pause string, and so
+do `seize`, `disposeTo`, `restakeLoose` and the mint paths, which make the same farm calls.
+Measured on a Base fork against the real token, paused by impersonating its own pauser, with 5 bonds
+staked: three days of accrual leaves 0.695611 USDC pending; `withdrawBonds(5)` succeeds with the
+token live and reverts "Pausable: paused" once it is paused; `depositBonds(5)`, which is the cure a
+borrower reaches for when the NAV falls, reverts the same way; `harvestYield` reverts the same way.
+The threshold is one second of accrual, not a large balance: in the same block as the escape hatch,
+with nothing pending, `withdrawBonds(5)` goes through UNDER the pause, and one second later, with
+0.000003 USDC pending on those 5 bonds, the same call reverts. `seize`, `disposeTo`, `restakeLoose`
+and the mint paths were read from the source rather than executed on the fork; the three doors above
+were executed.
+
+The same weld holds with no pause at all: with the ADAPTER blacklisted on real USDC,
+`withdrawBonds` and `depositBonds` both revert with the token's blacklist string, for as long as the
+listing stands.
+
+The only lever is the owner-only `emergencyUnstake`, which calls the farm's `emergencyWithdraw`:
+it forfeits the pending rewards, moves EVERY bond unit to one address, and leaves
+`custodyIsSolvent` reading false, so it is a protocol-wide act taken to release one position. After
+it, on the local twin, the owner can return the bonds and `restakeLoose` under a standing pause
+because nothing is pending at that moment, and an exit in that same block goes through. That
+sequence is an operator procedure rather than a mechanism, and no such procedure is published
+yet.
+
+What is NOT true of this: it is not a loss. No USDC is taken, no debt moves, and everything works
+again when the token does. What it costs is the ability to exit collateral, to ADD collateral, and
+to harvest, for the duration - and see the separate entry on the protocol's clocks, which do not
+stop while this holds.
+
+Status: open, not fixed, no design decision taken. Severity Medium, conditional on a USDC pause or a
+blacklisting of the adapter; the impact is high while it lasts and Circle has never paused USDC.
+The reproduction is [`test/R64A1_RealFarmPausedUsdcFork.t.sol`](test/R64A1_RealFarmPausedUsdcFork.t.sol),
+a fork test on the same `src/` as this repository, public since #66. It uses the same `RUN_FORK_TESTS`
+opt-in as the suites under [`test/fork/`](test/fork), so it self-skips in CI the way they do, and it
+pauses the real token by impersonating its own pauser. Run it with
+`RUN_FORK_TESTS=true forge test --match-contract '^R64A1_RealFarmPausedUsdcFork$' -vv -j 1`;
+at block 51619708 it read 4 passed, 0 failed, 1 skipped of 5.
+Earlier internal rounds could not see this at all, because the farm mock here pays its rewards by
+minting and a paused token still allows a mint, so on the mocks a paused token never bites inside
+the farm.
+
+### A USDC pause shuts every cure while the liquidation and workout clocks keep running. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
+
+No interest accrues in this protocol, so a borrower's debt does not grow while a token is paused.
+What moves is the NAV and three clocks: the six-hour auction, the 48-hour reset window and the
+fourteen-day workout. `liquidate`, `start`, the in-place re-strike, `expireToWorkout`, `closeWorkout`
+and `cancel` touch no token, so all of them run under a paused USDC. Every cure does touch one.
+`repay`, `repayFor` and `bid` move USDC, and `depositBonds` - adding collateral, the answer to a
+falling NAV - reverts for the separate reason in the entry above, because the farm settles its
+pending USDC inside the same call.
+
+Measured on the four-contract graph with a paused token, a borrower at the ceiling owing 628.750000
+who holds the WHOLE debt in her wallet, 50 spare bonds, a funded rescuer and a bidder ready since
+before the pause: `repay` of everything reverts; `repayFor` by the rescuer reverts; `depositBonds`
+of the 50 spare bonds reverts; `liquidate` by the keeper succeeds; `bid` by the waiting bidder
+reverts; `expireToWorkout` succeeds at six hours after the pause and pays its caller the 25.000000
+bounty at once; `workoutSettle` reverts; `closeWorkout` by a stranger succeeds at 342 hours after
+the pause, socialising 628.750000 onto the lenders, whose worth falls from 20,000.000000 to
+19,371.250000. With the token LIVE and the same NAV move, the same borrower keeps 471.562500 and the
+lenders lose nothing. Under the pause she keeps 0, and 503.000000 of her equity sits on a lot worth
+1,131.750000 at the moved NAV that only the owner can dispose of. The lenders are made whole only if
+somebody pays the late tranche, which is capped at the written-down debt, streamed back over up to
+thirty days, to whoever holds shares then.
+
+Six hours is enough on its own. Pause one minute into a live auction and at six hours one minute
+anyone's `expireToWorkout` goes through under the pause; after the unpause the lot is out of the
+auction for good, `bid` and `liquidate` both revert on it, and one workout stands open. Both of
+those doors are permissionless and the lapse pays its caller immediately. Past the 48-hour reset
+window the workout is the only door: the re-strike reverts, though a cure after the unpause still
+works, and the lapse then cancels.
+
+No Recoup lever stops this. With `pause` engaged on the credit manager, on the pool and on the
+vault, and bond deposits paused as well, `liquidate`, `expireToWorkout` and `closeWorkout` all still
+succeed and the same 628.750000 is socialised. The one lever that reaches a LIVE auction is the
+owner ratcheting `liquidationThresholdBps` to its bound of 5,800, which makes a position at 5,555
+bps healthy again so the permissionless `cancel` returns the lot. That reaches a NAV move of at most
+about 13.8 percent past the old threshold, reaches nothing once a workout is open, and in production
+sits behind the 48-hour risk timelock against a six-hour auction, which is read from the intended
+governance design rather than executed.
+
+The workout design itself is deliberate and is disclosed above: the mark values the loan at zero
+while an auction or workout stands, and the lot is offered to the market before it is written down.
+What the pause breaks is its premise. The design reads "no bid" as evidence about the collateral,
+and under a pause no bid is evidence of nothing.
+
+Status: open, not fixed, no design decision taken. Severity Medium, conditional on a USDC pause:
+impact high, likelihood low, and Circle has never paused USDC. The reproduction is on the same
+`src/` as this repository and is NOT in this repository yet.
+
 ## Open findings from internal review round 45, at the audit commit
 
 In the week before the external audit, a twelve-reader internal adversarial pass was run over the
