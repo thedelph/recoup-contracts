@@ -535,9 +535,10 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         }
         address last = _dormant(s.dormants - 1);
         console2.log("MEASURED C6 everybody leaves: took / stranded / last door ", took, stranded, _syncable(last));
-        // #64 fix: nothing is kept, so nothing is stranded but rounding (was the kept floor, with
-        // the last lender's door at 0).
-        assertEq(kept, 0, "#64: a floor was kept on dust");
+        // #64 fix: the dust keeps only its worth rounded UP, 1 wei (was 0 under the rounded-down
+        // worth), so nothing is stranded but rounding and that wei (was the kept floor, with the
+        // last lender's door at 0). The requester keeps the wei; the last lender loses at most it.
+        assertEq(kept, 1, "#64: the dust keeps more than its rounded-up worth");
         assertLe(stranded, 10, "#64: the last lender out was stranded");
         assertApproxEqAbs(stranded, kept, 10, "C6: what is stranded is not the kept floor");
 
@@ -560,11 +561,14 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         assertApproxEqAbs(_syncable(last), stranded, 10, "C6: the release did not reopen the door");
         vm.revertToState(snap);
 
-        // #64 fix: her one share-wei holds no floor and her draw memory has spent her slice, so
-        // her door on it is 0: the cancel above is her only way out (was: a completing one-wei
-        // service that paid 0 and released the kept floor).
-        assertEq(pool.maxRequestRedeem(griefer), 0, "#64: the dust holds a door without a floor");
-        assertEq(_floorTotal(), 0, "#64: a floor is kept on dust");
+        // #64 fix: her one share-wei holds a floor of 1 wei, which keeps a door of one share-wei
+        // open, so a completing one-wei service is her other way out: it pays 0 and releases the
+        // wei of floor.
+        assertEq(pool.maxRequestRedeem(griefer), 1, "#64: the 1-wei floor does not hold her one share-wei's door");
+        uint256 paid = _service(griefer, 1);
+        console2.log("MEASURED C6 she burns the last share-wei: paid / floors   ", paid, _floorTotal());
+        assertEq(paid, 0, "C6: the last share-wei paid cash");
+        assertEq(_floorTotal(), 0, "C6: the completing service did not release the floor");
     }
 
     // ───────────────────────────────────────────────────

@@ -239,8 +239,10 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
                 assertEq(p.kept, 0, "under the threshold a floor was kept on dust");
                 assertGe(p.dormantSyncDoor + 2, p.dormantWorth, "under the threshold the dormant lender is shut out");
             } else {
-                // #64 fix: over the old threshold the dust keeps no floor and shuts nothing out.
-                assertEq(p.kept, 0, "#64: over the old threshold a floor was still kept on dust");
+                // #64 fix: over the old threshold the dust keeps only its worth rounded UP, 1 wei
+                // (was 0 under the rounded-down worth): the griefer keeps that wei of reservation,
+                // the dormant lender loses at most it, and nothing more is shut out.
+                assertEq(p.kept, 1, "#64: over the old threshold the dust keeps more than its rounded-up worth");
                 assertGt(p.floor, p.worth, "fixture: this point no longer puts the floor over the worth");
                 assertLe(p.dormantWorth - p.dormantSyncDoor, 2, "#64: the dormant lender is still shut out");
                 assertEq(p.yearLaterSync, p.dormantSyncDoor, "a year moved the sync door");
@@ -274,8 +276,9 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
             pool.maxRequestRedeem(griefer),
             _serviceable(griefer)
         );
-        // #64 fix: the dust keeps no floor, so the dormant lender reaches her worth to two wei.
-        assertEq(kept, 0, "#64: one share-wei still keeps a floor");
+        // #64 fix: the dust keeps only its worth rounded UP, 1 wei (was 0 under the rounded-down
+        // worth), so the dormant lender reaches her worth to two wei. The griefer keeps that wei.
+        assertEq(kept, 1, "#64: one share-wei keeps more than its rounded-up worth");
         assertApproxEqAbs(
             _syncable(dormant), pool.previewRedeem(pool.balanceOf(dormant)), 2, "#64: the dormant lender is shut out"
         );
@@ -313,14 +316,12 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
         );
         vm.revertToState(shut);
 
-        // #64 fix: there is nothing left for her to end. Her one share-wei holds no floor, and her
-        // draw memory has spent her slice, so her door on it is 0 and only a cancel removes it
-        // (was: her completing one-wei service released the kept floor).
-        assertEq(pool.maxRequestRedeem(griefer), 0, "#64: the dust holds a door without a floor");
-        vm.prank(griefer);
-        pool.cancelWithdrawalRequest();
+        // #64 fix: her one share-wei holds a floor of 1 wei, which keeps a door of one share-wei
+        // open, so her own completing one-wei service ends the request.
+        assertEq(pool.maxRequestRedeem(griefer), 1, "#64: the 1-wei floor does not hold her one share-wei's door");
+        _service(griefer, 1);
         console2.log(
-            "MEASURED [W2] she cancels the dust: floors / dormant sync door", _floorTotal(), _syncable(dormant)
+            "MEASURED [W2] she burns the last share-wei: floors / dormant sync door", _floorTotal(), _syncable(dormant)
         );
         assertEq(_floorTotal(), 0);
         assertGt(_syncable(dormant), 0);
@@ -342,8 +343,10 @@ contract R63S61_DustHeldFloorWiredGraph is R62A3_GraphFixture {
             if (points[i] < 1_450) {
                 assertEq(p.kept, 0, "under the threshold a floor was kept on dust");
             } else {
-                // #64 fix: over the old threshold the dust keeps no floor and shuts nothing out.
-                assertEq(p.kept, 0, "#64: over the old threshold a floor was still kept on dust");
+                // #64 fix: over the old threshold the dust keeps only its worth rounded UP, 1 wei
+                // (was 0 under the rounded-down worth): the griefer keeps that wei of reservation,
+                // the dormant lender loses at most it, and nothing more is shut out.
+                assertEq(p.kept, 1, "#64: over the old threshold the dust keeps more than its rounded-up worth");
                 assertLe(p.dormantWorth - p.dormantSyncDoor, 2, "#64: the dormant lender is still shut out");
             }
         }

@@ -517,41 +517,53 @@ released it. 33audits' final report of 2026-09-22 rates it Medium, Accepted Risk
 the public main branch up to and including f6893cb does not carry the change described next.
 
 **The change.** After the plain spend, `serviceWithdrawalRequest` now caps what is left of a
-partially serviced request's floor at `convertToAssets(remainingShares)`, but only while the floors
-left after the plain spend sit inside the executable cash:
+partially serviced request's floor at what the remaining shares are worth, the gross conversion
+`convertToAssets` uses rounded UP rather than down, but only while the floors left after the plain
+spend sit inside the executable cash:
 `_floorTotal - floorSpent <= _executablePoolCash(_rawBalance())`. The second condition is what keeps #61 as it is: after a raw
 loss that puts the floors over the cash, no floor is written down, and every figure the #61 section
 above states still holds (`test_R64A4_C7_orderOfService_underARawLoss`,
 `test_R63A3_3_unequalFloorsOpenLargestFirst` and both `R62S1_YieldDoorAndSecondCancel` Q1 tests pass
-unchanged). Cost: +85 bytes of `LenderPool` runtime and +85 of initcode, measured with
-`forge build --sizes` on a clean build; `CreditManager` is unchanged.
+unchanged). Cost: +91 bytes of `LenderPool` runtime and +91 of initcode over f6893cb (+85 each for
+the cap as first offered on 2026-09-22 with the worth rounded down, and +6 each for rounding it up on
+2026-09-24), measured with `forge build --sizes` on a clean build; `CreditManager` is unchanged.
 
 **What it closes.** Every dust service made while the floors are within the executable cash now
-leaves a floor no larger than what the dust is worth, which for one share-wei is 0. That covers the
+leaves a floor no larger than what the dust is worth rounded up, which for one share-wei (worth about
+a thousandth of a wei) is 1 wei. That covers the
 three reproductions, whose dust-held-floor assertions are flipped and marked #64 at each assertion:
 [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol),
 [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) and
 [`test/R64A4_DustFloorCurve.t.sol`](test/R64A4_DustFloorCurve.t.sol), where every socialised-loss
-and mark row of the threshold curve now keeps nothing at any fall and none of the twelve
-asset-denominated round trips of C5f leaves a floor. It covers the no-loss mark route on the wired
+and mark row of the threshold curve now keeps at most a wei per request at any fall and none of the
+twelve asset-denominated round trips of C5f leaves a floor of 1.000000 or more. It covers the no-loss mark route on the wired
 graph in [`test/Issue64_MarkRoute.t.sol`](test/Issue64_MarkRoute.t.sol) (a routine auction that
 clears in full, a workout rescued in full, a short fill inside the cash), and the seeded census
 replay in [`test/Issue64_DustCensusReplay.t.sol`](test/Issue64_DustCensusReplay.t.sol), which keeps
-no floor on dust before a raw loss on the replay or on the walk with a mark, and none at all on the
-walk that has no loss of any kind. Internal review also measured six further shapes on the same
-`LenderPool` source, each of which kept a floor under the old rule and keeps none under this one:
+no floor of 1.000000 or more on dust before a raw loss on the replay or on the walk with a mark, and
+none at all on the walk that has no loss of any kind. Internal review also measured six further
+shapes on the same `LenderPool` source, each of which kept a floor under the old rule and kept none
+under the change as first offered, with the worth rounded down (they were not re-run with it rounded
+up):
 floors priced through the real `NAVOracle`, yield streamed between filing and service, a partial
 workout tranche, a forced workout close followed by `recoverLoss`, a deposit-cap change, and a
 request filed for part of a position. Those six tests are not in this repository. The
-`LenderPool` invariant suite's handler models the change, so its floor-sum ghost holds the stored
-floors to it in every campaign.
+`LenderPool` invariant suite's handler models the change, the rounding included, so its floor-sum
+ghost holds the stored floors to it in every campaign.
 
-**A side effect, measured.** The kept floor was also what held a dust request's door open. With the
-floor written down to 0, a request left on one share-wei has a door of 0 while its draw memory has
-spent its slice (`maxRequestRedeem` returns 0), until the price rises past that memory; a cancel
-removes it at any time. The share-wei is worth 0 and reserves nothing, so no other lender is
-affected, but a completing one-wei service is no longer always available. The flipped tails of D4,
-W2 and C6 and the reach test of `R63A3_PoolDoorsInvariants` show it.
+**Why the worth rounds up, measured.** The kept floor was also what held a request's door open, and
+the change as first offered wrote it down to the worth rounded DOWN. That left a request on one
+share-wei with a floor of 0 and a door of 0 while its draw memory had spent its slice, and it broke
+an honest exit: after a socialised loss, a requester who serviced half her request and then ran the
+ordinary `maxRequestRedeem` loop was paid 8,999.999999 of the 9,000.000000 her remaining shares
+were worth and left with 13 share-wei behind a door of 0, a cancel being her only way out. With the
+worth rounded up the same loop pays 9,000.000000 in one call and completes, and one share-wei keeps
+a floor of 1 wei, which holds a door of one share-wei open, so a completing one-wei service ends the
+request again; a cancel still removes it at any time.
+[`test/Issue64_HonestCompletion.t.sol`](test/Issue64_HonestCompletion.t.sol) pins both, and the
+tails of D4, W2 and C6 end with that completing service. The cost is one wei, and it goes to the
+requester: her reservation sits at most one wei above what her remaining shares are worth, and every
+other lender's reach is short by at most that wei per live request until she completes or cancels.
 
 **The residual, disclosed. Low.** A dust service made while the floors EXCEED the executable cash
 keeps its floor, exactly as the old rule did, and the kept floor outlives the shortfall: nothing
@@ -566,8 +578,9 @@ service while that shortfall stands. The unconditional cap would close it and wa
 because it writes floors down under the #61 lock: with it, C7, the unequal-floors test and both
 Q1 tests above go red, and so does the residual pin itself.
 
-**Status.** The change is offered to the reviewers on #64 for verification. Until they report on
-it, the report's status on f6893cb stands.
+**Status.** The change is offered to the reviewers on #64 for verification. It was first offered on
+2026-09-22 with the worth rounded down; the rounding was changed to up on 2026-09-24, before they
+reported, for the reason given above. Until they report on it, the report's status on f6893cb stands.
 
 ### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
 

@@ -2618,14 +2618,21 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         if (remainingShares == 0) floorSpent = floor;
         // #64: what is left of a floor never exceeds what the shares left in escrow are worth, so
         // a request serviced down to dust cannot keep a reservation its shares can never draw.
+        // The worth rounds UP: a floor written down to the rounded-down worth leaves the ordinary
+        // `maxRequestRedeem` loop short by the rounding after a loss, stranding share dust behind
+        // a door of zero. Rounding up keeps at most one wei per request above the exact worth.
         if (remainingShares != 0) {
-            uint256 worth = convertToAssets(remainingShares);
+            uint256 worth = _saturatingMulDiv(
+                remainingShares,
+                Math.saturatingAdd(totalAssets(), 1),
+                Math.saturatingAdd(totalSupply(), 10 ** _decimalsOffset()),
+                Math.Rounding.Ceil
+            );
             // Only while the floors are inside the executable cash, so the #61 lock (floors over
             // the cash after a raw loss) keeps every figure it has today.
-            if (
-                floor - floorSpent > worth
-                    && _floorTotal - floorSpent <= _executablePoolCash(_rawBalance())
-            ) floorSpent = floor - worth;
+            if (floor - floorSpent > worth && _floorTotal - floorSpent <= _executablePoolCash(_rawBalance())) {
+                floorSpent = floor - worth;
+            }
         }
         request.floor = floor - floorSpent;
         _floorTotal -= floorSpent;

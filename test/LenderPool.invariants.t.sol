@@ -934,10 +934,12 @@ contract CanonicalLenderHandler is Test {
             // #64: the remaining floor never exceeds what the remaining escrowed shares are worth,
             // applied only while the floors left after the plain spend sit inside the executable
             // cash after the service. Both operands come from the PUBLIC views at the instant the
-            // door read them (`convertToAssets`, `unreservedIdle + queueCashReserve`) and the
-            // handler's own floor sum; the stored floor is never read back, so ghost B stays a
-            // comparison the pool cannot write.
-            uint256 worth = pool.convertToAssets(remainingShares);
+            // door read them (`totalAssets`, `totalSupply`, `unreservedIdle + queueCashReserve`)
+            // and the handler's own floor sum; the stored floor is never read back, so ghost B
+            // stays a comparison the pool cannot write. The worth is the gross conversion rounded
+            // UP, recomputed here rather than read from `convertToAssets` (which rounds down).
+            uint256 worth =
+                Math.mulDiv(remainingShares, pool.totalAssets() + 1, pool.totalSupply() + 1_000, Math.Rounding.Ceil);
             uint256 executableAfter = pool.unreservedIdle() + pool.queueCashReserve();
             if (before.floor - spent > worth && before.floorTotal - spent <= executableAfter) {
                 spent = before.floor - worth;

@@ -192,10 +192,12 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
         console2.log("MEASURED D3 grief: holder 0's own door (cash)          ", _serviceable(_holder(0)));
         assertEq(_requestShares(_holder(0)), 1, "fixture: the griefer did not leave exactly one share-wei");
         assertGe(grief0 + 1, honest0, "the grief cost the griefer more than a wei");
-        // #64 fix: the cancel put the floors back inside the cash, so the dust keeps no floor and
-        // the canceller's door is her honest door to a wei (33.333333 against 33.333334).
+        // #64 fix: the cancel put the floors back inside the cash, so the dust keeps only what it
+        // is worth rounded UP: one share-wei is worth about a thousandth of a wei, so 1 wei (was
+        // 0 under the rounded-down worth). The requester keeps that wei of reservation; the
+        // canceller loses at most that wei of reach against her honest door.
         assertApproxEqAbs(_syncable(_holder(1)), honestSync, 1, "#64: the dust still shut the canceller out");
-        assertEq(_floorOf(_holder(0)), 0, "#64: one share-wei still keeps a floor");
+        assertEq(_floorOf(_holder(0)), 1, "#64: one share-wei keeps more than its rounded-up worth");
         assertEq(_syncable(_holder(1)), 33_333_333, "#64: the canceller's door is not 33.333333 of her 33.333335");
     }
 
@@ -263,7 +265,9 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
         assertApproxEqAbs(
             _syncable(other) + _serviceable(other), honestOther, 1, "#64: the dormant lender is still shut out"
         );
-        assertEq(kept, 0, "#64: one share-wei still keeps a floor");
+        // #64 fix: the dust keeps only its worth rounded UP, 1 wei (was 0 under the rounded-down
+        // worth). The griefer keeps that wei of reservation; the dormant lender loses at most it.
+        assertEq(kept, 1, "#64: one share-wei keeps more than its rounded-up worth");
         assertEq(pool.available(), 0, "the dormant lender's own request floor does not reserve the cash");
         uint256 shut = vm.snapshotState();
 
@@ -283,14 +287,15 @@ contract R63A3_DrawMemoryDust is R63A3_Fixture {
         );
         console2.log("MEASURED D4 cash nobody but the griefer can release    ", _executable() - pool.unreservedIdle());
 
-        // #64 fix: there is nothing left for her to end. Her one share-wei holds no floor and, with
-        // the dormant lender's request floor reserving the cash, no door either, so only a cancel
-        // removes it (was: her completing one-wei service released the kept floor).
+        // #64 fix: her one share-wei holds a floor of 1 wei, which keeps a door of one share-wei
+        // open, so her completing one-wei service ends the request (a cancel would too).
         vm.revertToState(shut);
-        assertEq(pool.maxRequestRedeem(griefer), 0, "#64: the dust holds a door without a floor");
-        _cancel(griefer);
-        console2.log("MEASURED D4 she cancels the dust: floors left          ", _floorTotal());
-        console2.log("MEASURED D4 after her cancel: dormant door            ", _serviceable(other));
+        assertEq(pool.maxRequestRedeem(griefer), 1, "#64: the 1-wei floor does not hold her one share-wei's door");
+        _service(griefer, 1);
+        (uint256 idAfter,,,,) = pool.withdrawalRequest(griefer);
+        assertEq(idAfter, 0, "#64: her completing one-wei service did not end the request");
+        console2.log("MEASURED D4 she burns the last share-wei: floors left  ", _floorTotal());
+        console2.log("MEASURED D4 she burns the last share-wei: dormant door ", _serviceable(other));
         assertEq(_floorTotal() - _floorOf(other), 0, "her completing service did not release the kept floor");
     }
 }
