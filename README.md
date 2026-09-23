@@ -245,6 +245,9 @@ See [`REVIEW.md`](REVIEW.md) for the suggested reading order and the exact integ
 - [`KNOWN_RISKS.md`](KNOWN_RISKS.md) - current activation blockers, residual risks and pre-launch gates
 - [`REVIEW.md`](REVIEW.md) - code-level reading guide for DexFi and other reviewers
 - [`AUDITS.md`](AUDITS.md) - historical internal review log; currently written through round nine
+- [`audits/`](audits/) - external audit reports, with their sha256
+- [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) - what each door does while USDC is paused or blacklists a
+  Recoup address, and what the operator does (external review finding L-03, #68)
 - [`deployments/base-sepolia.json`](deployments/base-sepolia.json) - current testnet addresses and state
 
 Internal adversarial review and invariant testing are not an external audit. Please report
