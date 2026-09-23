@@ -23,9 +23,10 @@ was disposed by the maintainer on 2026-09-17 as held and disclosed at Low (comme
 the lock to be recorded separately at Low, acknowledged and retained by design, which is issue
 [#61](https://github.com/thedelph/recoup-contracts/issues/61). On 2026-09-18 they reported the
 corrected bound reviewed on 0f49e61 and supported closing the original H-03 as verified fixed, with
-the lock tracked under #61. The review is not complete. It is not part of this
-internal log; the disposition of each issue in the current source is recorded in
-[KNOWN_RISKS.md](KNOWN_RISKS.md).
+the lock tracked under #61. The review completed on 2026-09-22 with 13 findings, 10 Fixed and
+3 Acknowledged / Accepted Risk (M-06 #64, L-02 #61, L-03 #68), remediation reviewed through f6893cb;
+the final report and its sha256 are in [`audits/`](audits/). It is not part of this internal log;
+the disposition of each issue in the current source is recorded in [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
 That count is adversarial review passes as this file defines them, one per round. Remediation
 passes are numbered on their own sequence and run higher; the two are different bases and are not

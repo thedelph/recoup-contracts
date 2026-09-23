@@ -7,11 +7,12 @@ borrows USDC, and the bonds' realised yield pays the debt down over time. This r
 the public Solidity contracts, tests, deployment record and reviewer documentation.
 
 > [!WARNING]
-> Recoup is pre-audit and not deployed on Base mainnet. The Base Sepolia deployment uses mock USDC,
-> mock bonds and a mock farm. Its `LenderPool` is empty and is not wired as the protocol's liquidity
-> source. Do not fund or activate it. All listed activation blockers must close before any capital,
-> including the author's, is connected to the pool. An external audit is an additional hard gate
-> before third-party capital.
+> Recoup is not deployed on Base mainnet. An external audit by 33Labs of six lender-pool files
+> completed on 2026-09-22 ([`audits/`](audits/)); every other contract in `src/` has had internal
+> review only. The Base Sepolia deployment uses mock USDC, mock bonds and a mock farm, predates the
+> audit's fixes, and is not what the audit describes. Its `LenderPool` is empty and is not wired as
+> the protocol's liquidity source. Do not fund or activate it. All listed activation blockers must
+> close before any capital, including the author's, is connected to the pool.
 
 ## Current status
 
@@ -22,7 +23,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Base mainnet | No Recoup contracts deployed |
 | Lender pool | Source and testnet instance exist. The testnet pool is empty and blocked from activation, and it is not wired as the protocol's liquidity source; its own pointers to the manager and the harvester are set, so "unwired" is true in one direction only. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
 | Referral registry | Source fixed through partner self-registration; the carried-over Sepolia instance remains defective and unused, and live replacement is disabled and unauthorised |
-| External audit | In progress from 2026-09-07 over six files at commit b66023d. Ten preliminary issues were filed on 2026-09-11; as of the 2026-09-15 sync every one of them has a code change in this source, and [`KNOWN_RISKS.md`](KNOWN_RISKS.md) records what each closes and what the H-03 cash floor costs. The post-loss lock that floor retains is a separate Low, #61 (2026-09-17), acknowledged and retained by design, not fixed. Not completed |
+| External audit | Completed 2026-09-22. 33Labs reviewed six files (`LenderPool.sol`, `CreditWiring.sol`, `TreasuryLiquiditySource.sol`, `ProtocolFeeSplitter.sol`, `Config.sol`, `LtvMath.sol`) at commit b66023d from 2026-09-07, with remediation reviewed through f6893cb. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, and M-06 #64, L-02 #61 and L-03 #68 Acknowledged / Accepted Risk. The final report and its sha256 are in [`audits/`](audits/); [`KNOWN_RISKS.md`](KNOWN_RISKS.md) records each disposition. The other contracts in `src/` were outside the scope |
 
 For non-reserved referral codes, the only registration path now assigns the code to its caller. A
 partner's payout wallet or Safe must call `register(bytes32)` before the code is published;
@@ -93,7 +94,11 @@ the old one's remaining time.
 1. The accepted F12 residual above, which is disclosed rather than closed.
 2. A fresh internal review of the merged principal-accounting and entry-pricing changes. They are
    substantial, they are recent, and they have not been reviewed as shipped.
-3. An external audit, which is a hard gate for any third-party capital.
+3. An external audit, which is a hard gate for any third-party capital. 33Labs completed it on
+   2026-09-22 over six files ([`audits/`](audits/)). Its conclusion recommends four things before
+   third-party capital: revisiting M-06 (#64) together with the L-02 (#61) trade-off, publishing
+   the L-03 (#68) incident runbook, retaining the activation gate, and verifying that the
+   deployment matches the source.
 4. Round 17's transaction-ordering window, F10's lack of historical loss-bearer entitlement and
    the post-loss lock of #61 (Low, acknowledged and retained by design, since 2026-09-17), which
    are material residual risks rather than blockers. The lock needs a raw loss of pool cash, which,
@@ -240,6 +245,9 @@ See [`REVIEW.md`](REVIEW.md) for the suggested reading order and the exact integ
 - [`KNOWN_RISKS.md`](KNOWN_RISKS.md) - current activation blockers, residual risks and pre-launch gates
 - [`REVIEW.md`](REVIEW.md) - code-level reading guide for DexFi and other reviewers
 - [`AUDITS.md`](AUDITS.md) - historical internal review log; currently written through round nine
+- [`audits/`](audits/) - external audit reports, with their sha256
+- [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) - what each door does while USDC is paused or blacklists a
+  Recoup address, and what the operator does (external review finding L-03, #68)
 - [`deployments/base-sepolia.json`](deployments/base-sepolia.json) - current testnet addresses and state
 
 Internal adversarial review and invariant testing are not an external audit. Please report
