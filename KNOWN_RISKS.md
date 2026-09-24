@@ -603,13 +603,41 @@ it applies to: a requester serviced half-way under the shortfall and then trimme
 6,500.000000, exactly what she draws untrimmed, and her request completes. The `LenderPool`
 invariant handler calls the trim as a fuzz action, predicts each release from its own floor and
 mark mirrors and the rounded-up worth recomputed from the public views, and asserts both the
-release and the mark (`invariant_aTrimReleasesExactlyThePredictedExcess`). Cost: +417 bytes of
+release and the mark (`invariant_aTrimReleasesExactlyThePredictedExcess`). Its single actions
+rarely line up a shortfall, a recovery and a trim in that order (2 trims in 2 of 256 runs of one
+unseeded campaign, measured with a per-run census on a copy of this tree), so the handler also
+composes the three in one action, `composeShortfallRecoveryAndTrim`: the same campaign then takes
+263 trims in 165 of its 256 runs, and with the trim's worth rounded down instead of up it goes red
+on its own. Cost: +417 bytes of
 `LenderPool` runtime and +417 of initcode over the rounded-up change above, measured with
 `forge build --sizes` on a clean build, the event and the view included. The trim writes the
 rounded-up worth out itself: a private helper shared with the service path measured 4 bytes more,
 so it was not used. The trim, the view and the event are declared on
 `LenderPool` and not in `ILenderPool`, so no other source file changes and every other contract,
 `CreditManager` and the CREATE2 initcode of `CreditWiring` included, builds byte-identical.
+
+**Who picks the moment, and what a re-trim moves.** The mark is cleared only with the request,
+never by a trim, so a request trimmed once is trimmed again, by anyone, after any later price fall,
+to the same worth her own next service would write it down to. In
+`test_trimTiming_theMarkSurvivesATrimSoALaterFallIsTrimmedAgain` in
+[`test/Issue64_TrimTiming.t.sol`](test/Issue64_TrimTiming.t.sol), on the shape above, the first
+trim releases 6,999.999999 and leaves a floor of 6,500.000001; a later 3,000 socialised loss leaves
+the floors (6,500.000001) inside the executable cash (15,500), a second trim releases 428.571429,
+and she still completes. Because anyone may call it, a stranger chooses the moment, and can trim
+her at a trough that a recovery then reverses. What that moves is her liquidity priority, the cash
+held for her ahead of lending and of synchronous exits, never the value of her shares:
+`test_trimTiming_aStrangerTrimAtATroughMovesPriorityNeverValue` runs that 3,000 loss, a 3,000
+recovery, the manager lending all it may and a dormant lender exiting first, with and without a
+trim at the trough. Untrimmed, her floor of 13,500 leaves the manager 200 to lend, and she draws
+6,500.000002 at once. Trimmed, her floor is 6,071.428572, 6,514.285714 is lent, and she
+draws 6,071.428571 at once while 428.571430 stays escrowed at its full worth until cash comes back:
+1 wei less in total, and later. The untrimmed column is the #64 shape itself, about 6,300 of
+lending held back by a floor 7,000 above her worth. Clearing the mark on a taken trim would stop
+the re-trim, at +16 bytes of `LenderPool` runtime measured on a copy, and was not taken: after a
+loss that lands once the first trim is taken, on a request nobody services again, the floor would
+stay above its worth with nothing able to lower it, which is the shape #64 fixes. Measured on a
+copy with the mark cleared, the same later loss leaves the floor 428.571429 above its worth, the
+second trim releases 0, and `available` reads 3,600.000000 where the sticky mark gives 3,964.285714.
 
 **The trim's own residual. Low.** The trim waits for the floors, the kept one included, to sit
 inside the executable cash. If a SECOND raw loss lands after the shortfall has ended and before
@@ -885,6 +913,20 @@ multiplier does not return with it. The file header, the `maxRequestRedeem` docs
 `queueCashReserve` docstring in `LenderPool` say all of this; at commit b66023d they overstated the
 bound as a reservation, at the 2026-09-12 sync they understated what the stepped loop could reach,
 and since 2026-09-15 the reservation is an amount.
+
+Two consequences of the floor at the request door, measured in
+[`test/RequestDoorResidue.t.sol`](test/RequestDoorResidue.t.sol) on a book half lent with yield
+streaming, where a requester services half her request and then runs the ordinary
+`maxRequestRedeem` loop; neither loses anyone money. Spending a floor rounds down twice, so at most
+1 wei of floor stays behind per live request, and the door that wei holds open is 983 share-wei
+whose `previewRedeem` is 0: a service there with `minAssetsOut` of 1 is refused and one with 0
+burns her own share-wei for nothing, so a loop should stop on a door that previews 0 and not only
+on a door of 0. And her yield above her floor is paid only once the cash comes back: the floor was
+spent by those first steps, and what her remaining shares earn after that is paid only by her live
+slice of the executable cash, net of what she has already drawn. With 50,000 still lent and 5,000
+of yield an epoch, her 327,868,851,802 remaining share-wei stay escrowed for nine epochs while
+their worth grows from 367.346938 to 530.612243, and are paid in the tenth. A cancel then a
+synchronous `redeem` pays the same remainder at once, at its full worth.
 
 ### `CreditWiring.sourceStillAnswersToUs` reverts instead of answering false on a dirty word. Low
 
