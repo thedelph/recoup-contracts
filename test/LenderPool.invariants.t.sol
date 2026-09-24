@@ -61,6 +61,9 @@ contract CanonicalLenderHandler is Test {
     ///      numeric-reserve regime was guarded by the deterministic tripwire alone.
     uint256 private constant MAX_STRESS_CYCLES_PER_ACTION = 16;
     uint256 private constant MAX_STRESS_CYCLES_TOTAL = 128;
+    /// @dev The #64 trim reach: how many destroy-and-reconcile passes the composed trim action takes to
+    ///      bring the executable cash under the floors (see `_composeShortfall`).
+    uint256 private constant COMPOSED_DESTRUCTION_PASSES = 4;
     uint256 private constant MIN_SUPPLY_FOR_YIELD = (10 ** 3) * Config.BPS;
 
     LenderPool public immutable pool;
@@ -331,6 +334,15 @@ contract CanonicalLenderHandler is Test {
     /// @dev VIOLATION, asserted zero (#64 trim): after an action, the pool's
     ///      `requestWriteDownDeclined` disagreed with the handler's mark mirror for some actor.
     uint256 public declinedMarkMismatches;
+    /// @dev CENSUS (#64 trim reach, the composed trim action): calls that passed its entry guard, that
+    ///      reached floors standing over the executable cash, whose service under that shortfall
+    ///      declined the write-down (marked the request), whose recovery put the floors back
+    ///      inside the cash, and whose trim was taken.
+    uint256 public composedAttempts;
+    uint256 public composedShortfalls;
+    uint256 public composedMarks;
+    uint256 public composedRecoveries;
+    uint256 public composedTrimsTaken;
 
     mapping(address controller => bytes32 fingerprint) private _requestBefore;
     /// @dev `_requestFingerprint` of a controller with no request.
@@ -853,13 +865,145 @@ contract CanonicalLenderHandler is Test {
     ///      the stored floor is never read back here, so ghost B still compares the pool against
     ///      a figure it cannot write.
     function trimRequestFloor(uint256 actorSeed, uint256 callerSeed) external watched {
-        address controller = _actor(actorSeed);
+        _trimBare(_actor(actorSeed), _actor(callerSeed));
+    }
+
+    /// @dev #64 trim reach. Before this action the campaign took a trim in about 0.3 to 0.5% of
+    ///      its runs (measured over two whole-suite samples), and a 256-run campaign could pass
+    ///      with none, because a trim needs three things in order that the single actions rarely
+    ///      line up: a request serviced while the floors stand over the executable cash (which
+    ///      marks it), then cash coming back until the floors sit inside it again, then somebody
+    ///      trimming. This action composes the three from whatever state the campaign is in,
+    ///      through the same bare legs and the same mirrors the single actions use, so every
+    ///      ghost still judges each leg:
+    ///      1. File: the controller requests her whole balance if she has no live request,
+    ///         entering first when she holds nothing.
+    ///      2. Shortfall: if the floors sit inside the executable cash, destroy raw cash until the
+    ///         executable cash is a seeded amount below the floors, and reconcile it (a raw loss,
+    ///         which lowers the price and the cash together). Then service a seeded part of her
+    ///         door, never her whole request, so a floor is left over a worth that fell.
+    ///      3. Recovery: a seeded amount around what the floors need comes back as a deposit by
+    ///         another actor, a principal repayment, or a recovered loss whose stream is then
+    ///         run out.
+    ///      4. Trim: a seeded caller trims her. The recovery is seeded to fall short sometimes,
+    ///         so a trim refused under a standing shortfall is reached here as well.
+    ///      Any leg whose precondition does not hold ends the action there, bare and unreverted.
+    function composeShortfallRecoveryAndTrim(
+        uint256 actorSeed,
+        uint256 callerSeed,
+        uint96 depthSeed,
+        uint96 recoverySeed
+    ) external watched {
+        if (
+            pool.paused() || canonical.cashDeficit() != 0 || canonical.claimLiquidityDeficit() != 0
+                || canonical.entryPriceDeficit() != 0
+        ) return;
+        uint256 index = actorSeed % actors.length;
+        address controller = actors[index];
+        ++composedAttempts;
+
+        // 1. File.
+        (uint256 requestId,,,,) = pool.withdrawalRequest(controller);
+        if (requestId == 0) {
+            if (pool.balanceOf(controller) == 0) _enter(controller, controller, 2_000e6);
+            uint256 balance = pool.balanceOf(controller);
+            if (balance == 0) return;
+            _requestBare(controller, controller, balance);
+        }
+
+        // 2. Shortfall, then a partial service under it.
+        if (!_composeShortfall(controller, depthSeed)) return;
+
+        // 3. Recovery.
+        _composeRecovery(index, recoverySeed);
+
+        // 4. Trim.
+        uint256 takenBefore = trimsTaken;
+        _trimBare(controller, _actor(callerSeed));
+        if (trimsTaken != takenBefore) ++composedTrimsTaken;
+    }
+
+    /// @dev Leg 2 of the composed action. Returns false, having done nothing further, when the
+    ///      floors still sit inside the executable cash (a floor total too small to undercut).
+    function _composeShortfall(address controller, uint96 depthSeed) private returns (bool) {
+        uint256 floorTotal = _mirrorFloorTotal();
+        uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
+        if (floorTotal <= executable) {
+            if (floorTotal < 2) return false;
+            uint256 target = bound(uint256(depthSeed), 1, floorTotal - 1);
+            // Raw cash outside the executable figure (an unreleased yield tail, which the
+            // reconciliation writes off first) absorbs a destruction before the executable cash
+            // does, so the gap is taken again after each reconciliation, a bounded number of times.
+            for (uint256 pass; pass < COMPOSED_DESTRUCTION_PASSES && executable > target; ++pass) {
+                vm.prank(address(pool));
+                if (usdc.transfer(destructionSink, executable - target)) ++destructionsDone;
+                (uint256 lost,) = canonical.reconcileCashDeficit();
+                if (lost != 0) ++reconciliationsDone;
+                executable = pool.unreservedIdle() + pool.queueCashReserve();
+            }
+        }
+        if (_mirrorFloorTotal() <= pool.unreservedIdle() + pool.queueCashReserve()) return false;
+        ++composedShortfalls;
         (,, uint256 requestShares,,) = pool.withdrawalRequest(controller);
-        uint256 floor = _mirrorFloor[controller];
-        uint256 floorTotal;
+        uint256 door = pool.maxRequestRedeem(controller);
+        if (door >= requestShares) door = requestShares - 1;
+        if (door != 0) {
+            uint256 declinedBefore = writeDownsDeclined;
+            _serviceBare(controller, controller, bound(uint256(depthSeed), 1, door));
+            if (writeDownsDeclined != declinedBefore) ++composedMarks;
+        }
+        return true;
+    }
+
+    /// @dev Leg 3 of the composed action. `need` is what puts the floors back inside the
+    ///      executable cash; the seed lands the recovery between half of it and half again over
+    ///      it, and picks its route: another actor's deposit, a principal repayment (capped at
+    ///      the principal, so no surplus is streamed), or a recovered loss whose stream is run out.
+    function _composeRecovery(uint256 index, uint96 recoverySeed) private {
+        uint256 floorTotal = _mirrorFloorTotal();
+        uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
+        if (floorTotal <= executable) return;
+        uint256 need = floorTotal - executable;
+        uint256 amount = bound(uint256(recoverySeed), need / 2 + 1, need + need / 2 + 1);
+        uint256 mode = uint256(recoverySeed) % 3;
+        uint256 principal = pool.outstandingPrincipal();
+        if (mode == 1 && principal != 0) {
+            if (amount > principal) amount = principal;
+            _mint(creditManager, amount);
+            vm.prank(creditManager);
+            try pool.repayPrincipal(amount) {
+                ++repaysDone;
+            } catch (bytes memory reason) {
+                _recordOutcome(bytes4(0), _selectorOf(reason));
+            }
+        } else if (mode == 2) {
+            _mint(creditManager, amount);
+            vm.prank(creditManager);
+            pool.recoverLoss(amount);
+            ++recoveriesDone;
+            // Past the longest stream the pool can write, so the recovery is released cash.
+            skip(Config.MAX_YIELD_STREAM_DURATION);
+            ++timeAdvances;
+        } else {
+            uint256 offset = 1 + (uint256(recoverySeed) >> 2) % (actors.length - 1);
+            address other = actors[(index + offset) % actors.length];
+            uint256 room = pool.maxDeposit(other);
+            if (amount > room) amount = room;
+            if (amount != 0) _enter(other, other, amount);
+        }
+        if (_mirrorFloorTotal() <= pool.unreservedIdle() + pool.queueCashReserve()) ++composedRecoveries;
+    }
+
+    function _mirrorFloorTotal() private view returns (uint256 floorTotal) {
         for (uint256 i = 0; i < actors.length; i++) {
             floorTotal += _mirrorFloor[actors[i]];
         }
+    }
+
+    function _trimBare(address controller, address caller) private {
+        (,, uint256 requestShares,,) = pool.withdrawalRequest(controller);
+        uint256 floor = _mirrorFloor[controller];
+        uint256 floorTotal = _mirrorFloorTotal();
         uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
         // The rounded-up worth the service mirror uses, from the same public views.
         uint256 worth =
@@ -871,7 +1015,7 @@ contract CanonicalLenderHandler is Test {
             else ++trimsRefusedUnderShortfall;
         }
         _observeOtherRequests(controller);
-        vm.prank(_actor(callerSeed));
+        vm.prank(caller);
         uint256 released = pool.trimRequestFloor(controller);
         if (released != expected) ++trimMismatches;
         if (expected != 0) {
@@ -1266,6 +1410,12 @@ contract CanonicalLenderHandler is Test {
 ///      falsify - or a handler ghost that some reachable transition could move.
 contract LenderPoolInvariants is Test {
     uint256 private constant MIN_SUPPLY_FOR_PRINCIPAL = (10 ** 3) * Config.BPS;
+    /// @dev #64 trim reach: the seeds the reach walk hands the composed trim action. The depth seed is
+    ///      the executable cash the raw loss leaves (bounded under the floors) and the size of
+    ///      the service under it; the recovery seed is a multiple of 3, which picks the deposit
+    ///      route, and lands the deposit inside the band the action bounds it to.
+    uint96 private constant COMPOSED_DEPTH_SEED = 1_000e6;
+    uint96 private constant COMPOSED_RECOVERY_SEED = 3_000e6;
 
     MockUSDC internal usdc;
     LenderPool internal pool;
@@ -1309,6 +1459,7 @@ contract LenderPoolInvariants is Test {
         emit log_named_uint(
             "#64 trims refused under a shortfall in the replayed run", handler.trimsRefusedUnderShortfall()
         );
+        emit log_named_uint("#64 composed trims taken in the replayed run", handler.composedTrimsTaken());
     }
 
     /// @notice The stored yield tail never exceeds the stored gross book that backs it.
@@ -1711,6 +1862,23 @@ contract LenderPoolInvariants is Test {
         // Round 60 and session 42: the entitlement comparison ran on the services above, and held.
         assertGt(handler.drawEntitlementChecks(), 0, "no service was ever checked against its draw");
         assertEq(handler.serviceExceededItsEntitlement(), 0, "a service paid more than the request was owed");
+
+        // #64 trim reach: the composed action reaches a taken trim in ONE call from the state the walk
+        // has reached (actor 0's live request, a raw loss that stands the floors over the cash, a
+        // service that declines the write-down, a deposit by another actor that puts the floors
+        // back inside the cash, and actor 2's trim), so the trim is reached by the campaign's own actions and not only
+        // by the hand-built walk in `test_handlerCanReachADeclinedWriteDownAndATrim`.
+        handler.composeShortfallRecoveryAndTrim(0, 2, COMPOSED_DEPTH_SEED, COMPOSED_RECOVERY_SEED);
+        emit log_named_uint("composed shortfalls", handler.composedShortfalls());
+        emit log_named_uint("composed marks", handler.composedMarks());
+        emit log_named_uint("composed recoveries", handler.composedRecoveries());
+        emit log_named_uint("composed trims taken", handler.composedTrimsTaken());
+        assertGt(handler.composedShortfalls(), 0, "the composed action never stood the floors over the cash");
+        assertGt(handler.composedMarks(), 0, "the composed service never declined the write-down");
+        assertGt(handler.composedRecoveries(), 0, "the composed recovery never put the floors inside the cash");
+        assertGt(handler.composedTrimsTaken(), 0, "the composed trim was never taken");
+        assertEq(handler.trimMismatches(), 0, "a trim released other than the predicted excess");
+        assertEq(handler.declinedMarkMismatches(), 0, "a request's mark is not the one the handler modelled");
 
         handler.destroyAllRawCash();
         assertGt(handler.fullDestructionsDone(), 0, "whole-balance destruction was never reached");
