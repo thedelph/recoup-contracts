@@ -153,6 +153,12 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     );
     /// @notice Recognised cash with no remaining owner was removed permanently from the book.
     event CashDerecognised(uint256 amount);
+    /// @notice `trimRequestFloor` lowered a request's floor by `released`; emitted only when it did.
+    /// @dev Local, not interface, like the trim itself: declaring either in `ILenderPool` changes
+    ///      that file's source, and with it the metadata trailer of every contract that imports
+    ///      it, including the CREATE2 initcode of the `CreditWiring` library. Kept here, the trim
+    ///      leaves every contract but this one byte-identical.
+    event RequestFloorTrimmed(address indexed controller, uint256 indexed requestId, uint256 released);
     /// @notice A caller restored part of the minimum entry-price backing after an abnormal loss.
     event EntryPriceDeficitCovered(address indexed payer, uint256 amount, uint256 remaining);
     /// @dev Fixed-point scale for `yieldRate`, matching `CreditManager.ACC_PRECISION`. An unscaled
@@ -318,6 +324,11 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
     struct WithdrawalRequest {
         uint256 requestId;
         address receiver;
+        /// @dev Set when a service left this request's floor above what its remaining shares are
+        ///      worth and declined the #64 write-down because the floors stood over the executable
+        ///      cash. Only such a request can be trimmed by `trimRequestFloor`. Packed beside
+        ///      `receiver`, so no word of the mapping value moved.
+        bool writeDownDeclined;
         uint256 shares;
         /// @dev The cash this request is still owed: quoted by `_freshFloor` when it was filed,
         ///      spent down by every service and released whole by cancel. A field of the mapping
@@ -2438,8 +2449,9 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
 
         uint256 floor = _freshFloor(shares);
         uint256 requestId = _nextWithdrawalRequestId++;
-        _withdrawalRequests[msg.sender] =
-            WithdrawalRequest({requestId: requestId, receiver: receiver, shares: shares, floor: floor});
+        _withdrawalRequests[msg.sender] = WithdrawalRequest({
+            requestId: requestId, receiver: receiver, writeDownDeclined: false, shares: shares, floor: floor
+        });
         queuedShares += shares;
         _floorTotal += floor;
 
@@ -2630,8 +2642,11 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
             );
             // Only while the floors are inside the executable cash, so the #61 lock (floors over
             // the cash after a raw loss) keeps every figure it has today.
-            if (floor - floorSpent > worth && _floorTotal - floorSpent <= _executablePoolCash(_rawBalance())) {
-                floorSpent = floor - worth;
+            // Declined, the request is marked, so the same write-down can be applied by
+            // `trimRequestFloor` once the floors are back inside the cash.
+            if (floor - floorSpent > worth) {
+                if (_floorTotal - floorSpent <= _executablePoolCash(_rawBalance())) floorSpent = floor - worth;
+                else request.writeDownDeclined = true;
             }
         }
         request.floor = floor - floorSpent;
@@ -2650,6 +2665,40 @@ contract LenderPool is ERC4626, ILenderPool, Ownable, Pausable, ReentrancyGuard 
         _derecogniseEmptyPoolResidual();
 
         emit WithdrawalRequestServiced(controller, requestId, receiver, shares, assetsOut);
+    }
+
+    /// @notice Apply the #64 write-down a service declined under a shortfall, once the floors are
+    ///         back inside the executable cash. Anyone may call it; it only ever lowers one floor,
+    ///         and returns 0 without reverting when there is nothing to release.
+    /// @dev A service made while the floors exceeded the executable cash keeps its floor (the #61
+    ///      lock keeps its figures), and nothing re-examined that floor when the cash returned.
+    ///      This is the same write-down, on the same predicate, evaluated as a zero-share service:
+    ///      only for a request whose service declined it (`writeDownDeclined`), and only while
+    ///      `_floorTotal`, this floor included, sits inside the executable cash, so no floor is
+    ///      written down under the #61 lock. An unserviced request is never touched, so a price
+    ///      fall never moves an honest requester's filing-time reservation to anyone else.
+    function trimRequestFloor(address controller) external nonReentrant returns (uint256 released) {
+        WithdrawalRequest storage request = _withdrawalRequests[controller];
+        if (!request.writeDownDeclined) return 0;
+        uint256 floor = request.floor;
+        // The same worth the service path writes a floor down to, rounded UP.
+        uint256 worth = _saturatingMulDiv(
+            request.shares,
+            Math.saturatingAdd(totalAssets(), 1),
+            Math.saturatingAdd(totalSupply(), 10 ** _decimalsOffset()),
+            Math.Rounding.Ceil
+        );
+        if (floor <= worth || _floorTotal > _executablePoolCash(_rawBalance())) return 0;
+        released = floor - worth;
+        request.floor = worth;
+        _floorTotal -= released;
+        emit RequestFloorTrimmed(controller, request.requestId, released);
+    }
+
+    /// @notice Whether a service of `controller`'s live request declined the #64 write-down, which
+    ///         is what makes the request trimmable once the floors are back inside the cash.
+    function requestWriteDownDeclined(address controller) external view returns (bool) {
+        return _withdrawalRequests[controller].writeDownDeclined;
     }
 
     /// @notice Collect USDC a serviced withdrawal set aside for the caller.
