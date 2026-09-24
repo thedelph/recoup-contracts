@@ -14,7 +14,10 @@ import {R63A3_Fixture} from "./R63A3_Fixture.sol";
 ///         floors sit inside the executable cash, so the #61 lock keeps its figures; here they do
 ///         not, the fix declines, and she keeps her floor exactly as the rule before the fix did.
 ///         The kept floor then OUTLIVES the shortfall: the loan repays in full and the last lender
-///         out still leaves the kept floor behind, until she completes or cancels.
+///         out still leaves the kept floor behind, until she completes or cancels, or until
+///         anyone calls `trimRequestFloor` once the shortfall has ended. This suite calls no
+///         trim, so its figures are the ones nobody acting leaves; `Issue64_FloorTrim` is the same
+///         shape with the trim.
 /// @dev THIS SUITE PINS A DISCLOSED LOW RESIDUAL, NOT A PROPERTY THE FIX WANTS. It asserts the fix's
 ///      CURRENT behaviour (kept 7,000.000000; the last lender out short 7,000.000001) so that any
 ///      later change to it is a visible, deliberate one. Low because it needs an external event

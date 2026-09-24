@@ -312,6 +312,25 @@ contract CanonicalLenderHandler is Test {
     /// @dev CENSUS: services that paid more than the live slice would have, which is a request
     ///      drawing its floor. Reached on purpose in the tripwire.
     uint256 public floorBoundServices;
+    /// @dev The handler's mirror of a request's `writeDownDeclined` mark: set where its own model
+    ///      of the #64 write-down declines under a standing shortfall, cleared with the request.
+    mapping(address controller => bool declined) private _mirrorDeclined;
+    /// @dev CENSUS (#64): services where the write-down was TAKEN, and where it was DECLINED
+    ///      because the floors stood over the executable cash (the branch that sets the mark).
+    uint256 public writeDownsTaken;
+    uint256 public writeDownsDeclined;
+    /// @dev CENSUS (#64 trim): `trimRequestFloor` calls that released a floor, that were refused
+    ///      on a marked request because the floors stood over the cash, and that met an unmarked
+    ///      request whose floor exceeded its worth (left alone by design).
+    uint256 public trimsTaken;
+    uint256 public trimsRefusedUnderShortfall;
+    uint256 public trimsOnUnmarkedOverWorth;
+    /// @dev VIOLATION, asserted zero (#64 trim): a trim released anything but the excess the
+    ///      handler derived before the call from its own mirrors and the public views.
+    uint256 public trimMismatches;
+    /// @dev VIOLATION, asserted zero (#64 trim): after an action, the pool's
+    ///      `requestWriteDownDeclined` disagreed with the handler's mark mirror for some actor.
+    uint256 public declinedMarkMismatches;
 
     mapping(address controller => bytes32 fingerprint) private _requestBefore;
     /// @dev `_requestFingerprint` of a controller with no request.
@@ -795,6 +814,7 @@ contract CanonicalLenderHandler is Test {
         pool.cancelWithdrawalRequest();
         ++cancellationsDone;
         delete _mirrorFloor[controller];
+        delete _mirrorDeclined[controller];
         _settleOtherRequests(controller);
     }
 
@@ -826,6 +846,39 @@ contract CanonicalLenderHandler is Test {
         pool.setRequestOperator(operator, true);
         _serviceBare(controller, operator, maximum);
         ++operatorServicesDone;
+    }
+
+    /// @dev #64 trim: anyone trims any controller's floor. The release is predicted BEFORE the
+    ///      call from the handler's own floor mirror, its own mark mirror and the public views;
+    ///      the stored floor is never read back here, so ghost B still compares the pool against
+    ///      a figure it cannot write.
+    function trimRequestFloor(uint256 actorSeed, uint256 callerSeed) external watched {
+        address controller = _actor(actorSeed);
+        (,, uint256 requestShares,,) = pool.withdrawalRequest(controller);
+        uint256 floor = _mirrorFloor[controller];
+        uint256 floorTotal;
+        for (uint256 i = 0; i < actors.length; i++) {
+            floorTotal += _mirrorFloor[actors[i]];
+        }
+        uint256 executable = pool.unreservedIdle() + pool.queueCashReserve();
+        // The rounded-up worth the service mirror uses, from the same public views.
+        uint256 worth =
+            Math.mulDiv(requestShares, pool.totalAssets() + 1, pool.totalSupply() + 1_000, Math.Rounding.Ceil);
+        uint256 expected;
+        if (floor > worth) {
+            if (!_mirrorDeclined[controller]) ++trimsOnUnmarkedOverWorth;
+            else if (floorTotal <= executable) expected = floor - worth;
+            else ++trimsRefusedUnderShortfall;
+        }
+        _observeOtherRequests(controller);
+        vm.prank(_actor(callerSeed));
+        uint256 released = pool.trimRequestFloor(controller);
+        if (released != expected) ++trimMismatches;
+        if (expected != 0) {
+            ++trimsTaken;
+            _mirrorFloor[controller] = floor - expected;
+        }
+        _settleOtherRequests(controller);
     }
 
     function _serviceableShares(address controller) private view returns (uint256) {
@@ -929,6 +982,7 @@ contract CanonicalLenderHandler is Test {
         }
         if (remainingShares == 0) {
             delete _mirrorFloor[controller];
+            delete _mirrorDeclined[controller];
         } else {
             uint256 spent = assets < before.floor ? assets : before.floor;
             // #64: the remaining floor never exceeds what the remaining escrowed shares are worth,
@@ -941,8 +995,14 @@ contract CanonicalLenderHandler is Test {
             uint256 worth =
                 Math.mulDiv(remainingShares, pool.totalAssets() + 1, pool.totalSupply() + 1_000, Math.Rounding.Ceil);
             uint256 executableAfter = pool.unreservedIdle() + pool.queueCashReserve();
-            if (before.floor - spent > worth && before.floorTotal - spent <= executableAfter) {
-                spent = before.floor - worth;
+            if (before.floor - spent > worth) {
+                if (before.floorTotal - spent <= executableAfter) {
+                    spent = before.floor - worth;
+                    ++writeDownsTaken;
+                } else {
+                    _mirrorDeclined[controller] = true;
+                    ++writeDownsDeclined;
+                }
             }
             _mirrorFloor[controller] = before.floor - spent;
         }
@@ -1170,6 +1230,7 @@ contract CanonicalLenderHandler is Test {
             address actor = actors[i];
             (uint256 requestId,,,,) = pool.withdrawalRequest(actor);
             uint256 stored = _storedFloorOf(actor);
+            if (pool.requestWriteDownDeclined(actor) != _mirrorDeclined[actor]) ++declinedMarkMismatches;
             if (requestId == 0) {
                 if (stored != 0) ++requestFloorMismatches;
                 continue;
@@ -1242,6 +1303,12 @@ contract LenderPoolInvariants is Test {
         emit log_named_uint("draw-entitlement checks in the replayed run", handler.drawEntitlementChecks());
         emit log_named_uint("bound-floor frames seen in the replayed run", handler.boundFloorFrames());
         emit log_named_uint("floor-bound services in the replayed run", handler.floorBoundServices());
+        emit log_named_uint("#64 write-downs taken in the replayed run", handler.writeDownsTaken());
+        emit log_named_uint("#64 write-downs declined in the replayed run", handler.writeDownsDeclined());
+        emit log_named_uint("#64 trims taken in the replayed run", handler.trimsTaken());
+        emit log_named_uint(
+            "#64 trims refused under a shortfall in the replayed run", handler.trimsRefusedUnderShortfall()
+        );
     }
 
     /// @notice The stored yield tail never exceeds the stored gross book that backs it.
@@ -1392,6 +1459,14 @@ contract LenderPoolInvariants is Test {
 
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_theHandlerNeverDropsAFrame() public view {}
+
+    /// @notice #64 trim: a trim releases exactly the excess the handler predicted, and nothing
+    ///         where it predicted nothing; and a request is marked exactly where the handler's own
+    ///         model of the write-down declined it, and unmarked once it is gone.
+    function invariant_aTrimReleasesExactlyThePredictedExcess() public view {
+        assertEq(handler.trimMismatches(), 0, "a trim released other than the predicted excess");
+        assertEq(handler.declinedMarkMismatches(), 0, "a request's mark is not the one the handler modelled");
+    }
 
     function invariant_lifetimeAndPrincipalCountersMoveOnlyOnTheirNamedFlows() public view {
         assertEq(handler.lifetimeLossFell(), 0, "lifetime loss fell");
@@ -1682,6 +1757,56 @@ contract LenderPoolInvariants is Test {
         assertEq(handler.floorTotalMismatches(), 0, "_floorTotal is not the sum of the live requests' floors");
         assertEq(handler.requestFloorMismatches(), 0, "a stored request floor is not the one the handler quoted");
         assertEq(handler.otherRequestMutations(), 0, "one controller rewrote another request");
+    }
+
+    /// @notice #64 trim: the handler reaches a declined write-down, a trim refused under the
+    ///         shortfall that declined it, and a trim taken once the shortfall has ended, through
+    ///         its own actions, so the campaign's trim branches are proven reachable here rather
+    ///         than sampled from a replayed run.
+    /// @dev Book 10,000: two requesters of 2,000 filed in an idle book, two holders of 3,000, then
+    ///      4,000 lent, a 1,000 socialised loss and a 2,500 raw loss (reconciled), which puts the
+    ///      floors (4,000) over the executable cash (3,500). Actor 0 services all but one share-wei,
+    ///      is left with a floor above what that share-wei is worth, and is marked. Actor
+    ///      1's completing service ends the shortfall, and a stranger's trim then releases it.
+    function test_handlerCanReachADeclinedWriteDownAndATrim() public {
+        handler.deposit(0, 2_000e6);
+        handler.deposit(1, 2_000e6);
+        handler.deposit(2, 3_000e6);
+        handler.deposit(3, 3_000e6);
+        handler.requestAll(0, 0);
+        handler.requestAll(1, 1);
+        handler.lend(4_000e6);
+        handler.socialiseLoss(1_000e6);
+        handler.destroyRawCash(2_500e6);
+        handler.reconcileCashDeficit();
+
+        (,, uint256 requestShares,,) = pool.withdrawalRequest(handler.actors(0));
+        assertGe(pool.maxRequestRedeem(handler.actors(0)), requestShares - 1, "fixture: her door is too narrow");
+        handler.serviceWithdrawalRequest(0, requestShares - 1);
+        assertGt(handler.writeDownsDeclined(), 0, "no write-down was declined under the shortfall");
+        assertTrue(pool.requestWriteDownDeclined(handler.actors(0)), "the declined request is not marked");
+        handler.trimRequestFloor(0, 2);
+        assertGt(handler.trimsRefusedUnderShortfall(), 0, "no trim met the shortfall");
+        assertEq(handler.trimsTaken(), 0, "a trim was taken under the shortfall");
+
+        address honest = handler.actors(1);
+        for (uint256 i; i < 8; ++i) {
+            (uint256 requestId,,,,) = pool.withdrawalRequest(honest);
+            if (requestId == 0 || pool.maxRequestRedeem(honest) == 0) break;
+            handler.serviceWithdrawalRequestMaximum(1);
+        }
+        (uint256 honestRequestId,,,,) = pool.withdrawalRequest(honest);
+        assertEq(honestRequestId, 0, "fixture: the honest requester did not complete");
+        handler.trimRequestFloor(0, 3);
+
+        emit log_named_uint("write-downs declined", handler.writeDownsDeclined());
+        emit log_named_uint("trims refused under a shortfall", handler.trimsRefusedUnderShortfall());
+        emit log_named_uint("trims taken", handler.trimsTaken());
+        assertGt(handler.trimsTaken(), 0, "no trim was taken once the shortfall ended");
+        assertEq(handler.trimMismatches(), 0, "a trim released other than the predicted excess");
+        assertEq(handler.declinedMarkMismatches(), 0, "a request's mark is not the one the handler modelled");
+        assertEq(handler.requestFloorMismatches(), 0, "a stored request floor is not the one the handler quoted");
+        assertEq(handler.floorTotalMismatches(), 0, "_floorTotal is not the sum of the live requests' floors");
     }
 
     /// @notice The handler reaches the sub-floor entry price through its own actions, so the
