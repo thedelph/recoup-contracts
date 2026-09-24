@@ -182,7 +182,15 @@ reach test, as they said it would, and adds four suites and 39 tests:
 assertions from 0 to 1 wei. With them the tree reads 2,094 passed, 0 failed and 47 skipped across
 166 suites, 2,141 total, measured on forge 1.8.1 as the sum of nine runs (each of the eight
 invariant campaign files alone, everything else in one, that one with `--force`). It read 2,092
-across 165 suites, 2,139 total, on 2026-09-22 before the rounding change. The
+across 165 suites, 2,139 total, on 2026-09-22 before the rounding change.
+The #64 trim of 2026-09-24 adds two suites and 7 tests,
+[`test/Issue64_FloorTrim.t.sol`](test/Issue64_FloorTrim.t.sol) and
+[`test/Issue64_KeptFloorAfterShortfall.t.sol`](test/Issue64_KeptFloorAfterShortfall.t.sol), and two
+tests to `LenderPoolInvariants` (the trim campaign and its reach test). With them the tree reads
+2,103 passed, 0 failed and 47 skipped across 168 suites, 2,150 total, measured on forge 1.8.1 as
+the sum of eleven runs on one commit: everything but the invariant files as one run with `--force`
+(160 suites, 2,004 passed and 47 skipped), then the eight invariant files one at a time, the
+`R63A3_PoolDoorsInvariants` file in three slices (99 passed). The
 figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read

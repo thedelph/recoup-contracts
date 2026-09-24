@@ -505,7 +505,7 @@ stated under "Who bears it". Until
 and the second cancel as qualifications on #61 on 2026-09-18 (comment 5734172519), and both were
 measured as stated.
 
-### #64, 33audits M-06: a request serviced down to one share-wei kept the rest of its cash floor. Medium, fixed in this source by the change that added this heading; a Low residual remains, dated 2026-09-22
+### #64, 33audits M-06: a request serviced down to one share-wei kept the rest of its cash floor. Medium, fixed in this source by the change that added this heading; a Low residual remains, dated 2026-09-22, narrowed by a permissionless trim on 2026-09-24
 
 **What it was.** `serviceWithdrawalRequest` spent a request's floor by what each service paid and
 released the rest only with the final share. Once a price fall (a socialised loss, or the whole-debt
@@ -566,21 +566,65 @@ requester: her reservation sits at most one wei above what her remaining shares 
 other lender's reach is short by at most that wei per live request until she completes or cancels.
 
 **The residual, disclosed. Low.** A dust service made while the floors EXCEED the executable cash
-keeps its floor, exactly as the old rule did, and the kept floor outlives the shortfall: nothing
-re-examines it once the cash returns, so only her completing service or her cancel releases it.
-[`test/Issue64_DustUnderShortfall.t.sol`](test/Issue64_DustUnderShortfall.t.sol) pins it as it
-stands: two requesters of 20,000 filed in an idle book of 100,000, 40,000 lent, a 10,000 socialised
-loss and a 25,000 raw loss put the floors (40,000) over the cash (35,000); one requester services to
-one share-wei and keeps 7,000.000000; the loan then repays in full and the last lender out still
-leaves 7,000.000001 behind. It is Low because it needs an external event first, a raw cash loss,
-which no path inside the protocol produces (see #61 above), and then the requester's own dust
-service while that shortfall stands. The unconditional cap would close it and was not chosen,
-because it writes floors down under the #61 lock: with it, C7, the unequal-floors test and both
-Q1 tests above go red, and so does the residual pin itself.
+keeps its floor, exactly as the old rule did, and the kept floor outlives the shortfall: no service
+re-examines it once the cash returns, so her completing service, her cancel or a trim (next
+paragraph) is what releases it.
+[`test/Issue64_DustUnderShortfall.t.sol`](test/Issue64_DustUnderShortfall.t.sol) pins it with
+nobody trimming: two requesters of 20,000 filed in an idle book of 100,000, 40,000 lent, a 10,000
+socialised loss and a 25,000 raw loss put the floors (40,000) over the cash (35,000); one requester
+services to one share-wei and keeps 7,000.000000; the loan then repays in full and the last lender
+out still leaves 7,000.000001 behind.
+[`test/Issue64_KeptFloorAfterShortfall.t.sol`](test/Issue64_KeptFloorAfterShortfall.t.sol) reads the
+same shape at the instant the shortfall ends, which is before any repayment: when the other
+requester completes, the floors (7,000) are back inside the executable cash (9,000), so the
+change's own condition holds with the kept floor counted, and still nothing but a trim takes it.
+It is Low because it needs an external event first, a raw cash loss, which no path inside the
+protocol produces (see #61 above), and then the requester's own dust service while that shortfall
+stands. The unconditional cap would close it and was not chosen, because it writes floors down
+under the #61 lock: with it, C7, the unequal-floors test and both Q1 tests above go red, and so
+does the residual pin itself.
+
+**The trim, added 2026-09-24.** A service that declines the write-down above because the floors
+stand over the executable cash now marks the request (`writeDownDeclined`, read by
+`requestWriteDownDeclined`), and `trimRequestFloor(controller)` applies the same write-down later,
+on the same condition, as if it were a service of zero shares. Anyone may call it, for any
+controller: it acts only on a marked request, only while `_floorTotal`, the marked floor included,
+sits inside `_executablePoolCash`, and only ever lowers that one floor to the worth a service
+writes it to, the escrowed shares' gross conversion rounded up, reducing `_floorTotal` by the same amount and emitting
+`RequestFloorTrimmed`; anywhere else it returns 0 without reverting or emitting. An unserviced
+request is never marked, so a price fall never moves an honest requester's filing-time floor to
+anyone else, and no floor is ever written down under the #61 lock. Nothing calls it automatically:
+a keeper, a waiting lender or the requester has to. Measured in
+[`test/Issue64_FloorTrim.t.sol`](test/Issue64_FloorTrim.t.sol) on the shape above: under the
+shortfall the trim releases 0; once the other requester completes it releases 6,999.999999,
+leaving her one share-wei a floor of 1 wei (its worth rounded up), and after the loan repays the
+last lender out leaves 0 behind (7,000.000001 without it). A trim takes no cash from the requester
+it applies to: a requester serviced half-way under the shortfall and then trimmed draws
+6,500.000000, exactly what she draws untrimmed, and her request completes. The `LenderPool`
+invariant handler calls the trim as a fuzz action, predicts each release from its own floor and
+mark mirrors and the rounded-up worth recomputed from the public views, and asserts both the
+release and the mark (`invariant_aTrimReleasesExactlyThePredictedExcess`). Cost: +417 bytes of
+`LenderPool` runtime and +417 of initcode over the rounded-up change above, measured with
+`forge build --sizes` on a clean build, the event and the view included. The trim writes the
+rounded-up worth out itself: a private helper shared with the service path measured 4 bytes more,
+so it was not used. The trim, the view and the event are declared on
+`LenderPool` and not in `ILenderPool`, so no other source file changes and every other contract,
+`CreditManager` and the CREATE2 initcode of `CreditWiring` included, builds byte-identical.
+
+**The trim's own residual. Low.** The trim waits for the floors, the kept one included, to sit
+inside the executable cash. If a SECOND raw loss lands after the shortfall has ended and before
+anyone has trimmed, the floors are over the cash again and the kept floor becomes a #61 lock held
+by one share-wei: in `test_trim_residual_aSecondRawLossBeforeAnyTrim`, a further 3,000 raw loss
+leaves executable cash 6,000 against floors 7,000, both dormant lenders' doors read 0 and the trim
+releases 0. It ends the way #61 ends, when the cash covers the floors again, and then at the next
+trim: after a 5,000 repayment the trim releases 6,999.999999 and a dormant lender's door reads
+10,999.999998. Until someone trims after that, the kept floor stays reserved. It needs two external
+raw losses and nobody trimming in the window between them.
 
 **Status.** The change is offered to the reviewers on #64 for verification. It was first offered on
 2026-09-22 with the worth rounded down; the rounding was changed to up on 2026-09-24, before they
 reported, for the reason given above. Until they report on it, the report's status on f6893cb stands.
+The trim is a separate change on top of it, and neither is on the public main branch.
 
 ### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
 
