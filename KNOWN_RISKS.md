@@ -607,7 +607,7 @@ release and the mark (`invariant_aTrimReleasesExactlyThePredictedExcess`). Its s
 rarely line up a shortfall, a recovery and a trim in that order (2 trims in 2 of 256 runs of one
 unseeded campaign, measured with a per-run census on a copy of this tree), so the handler also
 composes the three in one action, `composeShortfallRecoveryAndTrim`: the same campaign then takes
-263 trims in 165 of its 256 runs, and with the trim's worth rounded down instead of up it goes red
+267 trims in 161 of its 256 runs, and with the trim's worth rounded down instead of up it goes red
 on its own. Cost: +417 bytes of
 `LenderPool` runtime and +417 of initcode over the rounded-up change above, measured with
 `forge build --sizes` on a clean build, the event and the view included. The trim writes the
