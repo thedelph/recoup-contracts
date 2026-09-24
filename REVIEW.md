@@ -45,8 +45,7 @@ and the mint-attempt recovery in the last two rows. That is the complete list.
 There is no function anywhere that lets an arbitrary caller move a bond, and no owner path that
 sends credited collateral to an arbitrary address other than the break-glass in the second-last
 row; the last row is the one other owner path that moves bonds at all, and it reaches uncredited
-mint-attempt bonds only. Until 2026-09-17 this sentence and the owner-powers paragraph below named
-the break-glass alone. Both rows are named here rather than left to be found.
+mint-attempt bonds only.
 
 ## Can Recoup sell or redeem your bonds?
 
@@ -77,16 +76,13 @@ This is stated plainly because Recoup also asks DexFi about *their* admin-key pl
 question you have not answered yourself is the one thing that would make that ask land badly.
 
 What the owner can do, which is every `onlyOwner` function on the adapter (grep for the modifier
-in `src/adapters/DirectCallAdapter.sol`; seven sites at 68c0c26): `setYieldRecipient`, `setHarvester`,
+in `src/adapters/DirectCallAdapter.sol`; seven sites): `setYieldRecipient`, `setHarvester`,
 `emergencyUnstake`, `recoverMintAttempt`, `emergencyRecoverMintAttempt` and `restakeLoose`, and the
 seventh, `renounceOwnership`, which reverts. `recoverMintAttempt` moves the bonds of a front-run or
 donated mint attempt, never credited as collateral, to the `recoveryRecipient` the owner names in
 the call; `emergencyRecoverMintAttempt` escapes a broken farm and leaves those bonds at the
 attempt's receiver clone; `restakeLoose` re-stakes bond units the adapter already holds and credits
-nothing. Until 2026-09-17 this paragraph named the first three only. The six are
-named rather than cited by line: this paragraph carried the line numbers `:95`, `:125` and `:260`
-until 2026-09-12, and by then all three pointed at unrelated code, because a line number is wrong
-the first time anything above it moves and nothing checks it. A symbol survives every insertion, so
+nothing. They are named rather than cited by line, because a symbol survives every insertion, so
 grep for it.
 
 What the owner cannot do: `renounceOwnership` reverts, so ownership can never be dropped
@@ -131,19 +127,14 @@ RUN_FORK_TESTS=true forge test --match-contract Fork -vv
 ```
 
 Expect 41 passed, 0 failed and 6 skipped of 47 across the eight suites, which is what that command
-printed on 2026-09-21 against a fork at latest; with seven of them it printed 37 of 42 the same
-day, and before
-[`test/fork/R63A2_RealBondFork.t.sol`](test/fork/R63A2_RealBondFork.t.sol) was added it printed 27
-of 32, on 2026-09-17 at 68c0c26. The five skips are by design, not a
+printed on 2026-09-21 against a fork at latest. The six skips are by design, not a
 missing RPC: `test/fork/CollateralVault.fork.t.sol`, `test/fork/CreditCore.fork.t.sol`,
 `test/fork/Liquidation.fork.t.sol` and `test/R64A1_RealFarmPausedUsdcFork.t.sol` each inherit `test_fixtureDerivationsFollowALiveParameterChange`
 from `test/helpers/RiskParamsFixture.sol` and override `_riskParamsOwner` to the zero address, which
 skips it, because there is no deployed `RiskParams` to retune until the fork is selected; and both
 tests in `test/fork/DexFiMintAttempt.fork.t.sol` skip unless `RUN_DEXFI_MINT_PROOF` is set, the
 second also needing a DexFi keeper signature in `DEXFI_MINT_SIGNATURE` and its block in
-`DEXFI_MINT_PROOF_BLOCK`, because it is the real mint handoff and needs your keeper to sign. Until
-2026-09-17 no sentence here said which tests stay skipped, so a reader counting green tests against
-the suites had to work it out. The five skips became six when the fourth inheritor arrived.
+`DEXFI_MINT_PROOF_BLOCK`, because it is the real mint handoff and needs your keeper to sign.
 
 `test/fork/CollateralVault.fork.t.sol` is the one to read first. It confirms the configured
 addresses really are your live contracts and behave as documented, shows that deposits revert
@@ -169,21 +160,15 @@ testnet deployment is there if you would rather click around than run Foundry.
 
 ## The invariant suites, and why they might have been lying
 
-Seven suite files declaring 76 `invariant_*` functions, fuzzed over randomised call sequences:
+Eight suite files declaring 78 `invariant_*` functions, fuzzed over randomised call sequences:
 `test/*.invariants.t.sol`. Sixty-eight of those names are distinct; the gap is the frame guard
-`invariant_theHandlerNeverDropsAFrame`, declared once in each of the seven campaign contracts,
-plus `invariant_everyInHandlerPropertyHeld`, declared in three of them, across the fourteen
-contracts those seven files hold - one handler and one campaign each. An eighth campaign lives
-outside that glob in `test/CanonicalCashModel.t.sol` with nine more declarations, so the tree-wide
-count is 85. Counted by declaration rather than by assertion, which is the only basis on which all
-of those numbers agree; `grep -c "function invariant_" test/*.invariants.t.sol` reproduces the
-per-file figures, 6, 9, 23, 15, 13, 6 and 4 in the glob's file order at 68c0c26, and the two
-figures above are that grep's sum and its distinct names. Measured on 2026-09-17 at 68c0c26. This
-paragraph read 72, 64 and 81 from 2026-09-12 until 2026-09-17: true at the 2026-09-12 sync, 74, 66
-and 83 from the 2026-09-14 sync (`invariant_noIndexEverOvertakesTheAccumulator` and one more) and
-the figures above from the 2026-09-15 sync (`invariant_theFloorTotalIsTheSumOfTheLiveFloors` and
-`invariant_noServiceEverPaysBeyondTheExecutableCash`), and the sentence was not re-derived until
-the third sync had passed; it read 66 and 60 at the 2026-09-01 sync.
+`invariant_theHandlerNeverDropsAFrame`, declared once in each of the eight campaigns, plus
+`invariant_everyInHandlerPropertyHeld`, declared in four of them. A ninth campaign lives outside
+that glob in `test/CanonicalCashModel.t.sol` with nine more declarations, so the tree-wide count is
+87. Counted by declaration rather than by assertion;
+`grep -c "function invariant_" test/*.invariants.t.sol` reproduces the per-file figures, 6, 9,
+23, 15, 13, 2, 6 and 4 in the glob's file order, and the figures above are that grep's sum and its distinct names. Measured on
+2026-09-24 at 466e04c.
 
 The one worth reading is `invariant_everyLiveAuctionHasAReachableExit`, which asserts there is no
 state
@@ -238,13 +223,13 @@ opening none from 20 of 20 to 0 of 20.
 includes deterministic regressions, stateful invariants and live-contract fork tests;
 [KNOWN_RISKS.md](KNOWN_RISKS.md) records the open posture and activation gates.
 
-An external audit is in progress and is not complete. It began on 2026-09-07 over `LenderPool`,
-`CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit
-b66023d, and ten preliminary issues were filed on 2026-09-11; the disposition of each in this
-source is in [KNOWN_RISKS.md](KNOWN_RISKS.md). This sentence said no external audit had been
-commissioned until 2026-09-12, which was true when it was written and false from 2026-09-07 on.
-Internal review and passing tests do not replace that gate before third-party capital, and neither
-does an audit that has not finished.
+The external audit by 33Labs completed on 2026-09-22. It covered `LenderPool`, `CreditWiring`,
+`TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d, with
+remediation reviewed through f6893cb: 13 findings, 10 Fixed and 3 Acknowledged / Accepted Risk. The
+report is in [`audits/`](audits/) and the disposition of each finding in this source is in
+[KNOWN_RISKS.md](KNOWN_RISKS.md). M-06 (#64) is still present on the main branch: a fix is on an open pull
+request (#69), not yet merged. The custody contracts this guide walks through (`CollateralVault`,
+`DirectCallAdapter`) were outside the audit's scope and have had internal review only.
 
 ## Questions
 
