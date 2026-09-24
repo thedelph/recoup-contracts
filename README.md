@@ -190,7 +190,12 @@ tests to `LenderPoolInvariants` (the trim campaign and its reach test). With the
 2,103 passed, 0 failed and 47 skipped across 168 suites, 2,150 total, measured on forge 1.8.1 as
 the sum of eleven runs on one commit: everything but the invariant files as one run with `--force`
 (160 suites, 2,004 passed and 47 skipped), then the eight invariant files one at a time, the
-`R63A3_PoolDoorsInvariants` file in three slices (99 passed). The
+`R63A3_PoolDoorsInvariants` file in three slices (99 passed). The tests that follow the trim add two
+suites and 7 tests, [`test/Issue64_TrimTiming.t.sol`](test/Issue64_TrimTiming.t.sol) and
+[`test/RequestDoorResidue.t.sol`](test/RequestDoorResidue.t.sol), and a composed shortfall,
+recovery and trim action to the `LenderPoolInvariants` handler; with them the tree reads 2,110
+passed, 0 failed and 47 skipped across 170 suites, 2,157 total, measured on forge 1.8.1 as ONE run
+with `--force` in 1,612.92s on 2026-09-24. The
 figure is dated because it is derived
 from the test tree by a
 checker that does not live in this repository, so nothing here can hold it to the truth; it read
