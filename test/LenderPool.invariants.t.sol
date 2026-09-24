@@ -888,12 +888,18 @@ contract CanonicalLenderHandler is Test {
     ///      4. Trim: a seeded caller trims her. The recovery is seeded to fall short sometimes,
     ///         so a trim refused under a standing shortfall is reached here as well.
     ///      Any leg whose precondition does not hold ends the action there, bare and unreverted.
+    ///      The action is NOT one watched frame: each protocol leg (the filing, each
+    ///      reconciliation, the service, the recovery and the trim) is observed and settled as its
+    ///      own frame, exactly as the single action for that leg is, and the raw destruction runs
+    ///      between frames, as `destroyRawCash` does. One frame around the lot measured a raw
+    ///      loss as a protocol-controlled flow (`invariant_protocolControlledFlowsCannotManufactureAnEntryPriceDeficit`
+    ///      went red on the destruction's own entry-price deficit).
     function composeShortfallRecoveryAndTrim(
         uint256 actorSeed,
         uint256 callerSeed,
         uint96 depthSeed,
         uint96 recoverySeed
-    ) external watched {
+    ) external {
         if (
             pool.paused() || canonical.cashDeficit() != 0 || canonical.claimLiquidityDeficit() != 0
                 || canonical.entryPriceDeficit() != 0
@@ -903,24 +909,32 @@ contract CanonicalLenderHandler is Test {
         ++composedAttempts;
 
         // 1. File.
-        (uint256 requestId,,,,) = pool.withdrawalRequest(controller);
-        if (requestId == 0) {
-            if (pool.balanceOf(controller) == 0) _enter(controller, controller, 2_000e6);
-            uint256 balance = pool.balanceOf(controller);
-            if (balance == 0) return;
-            _requestBare(controller, controller, balance);
-        }
+        _observe();
+        bool filed = _composeFile(controller);
+        _settle();
+        if (!filed) return;
 
         // 2. Shortfall, then a partial service under it.
         if (!_composeShortfall(controller, depthSeed)) return;
 
-        // 3. Recovery.
+        // 3. Recovery, then 4. the trim, one frame.
+        _observe();
         _composeRecovery(index, recoverySeed);
-
-        // 4. Trim.
         uint256 takenBefore = trimsTaken;
         _trimBare(controller, _actor(callerSeed));
         if (trimsTaken != takenBefore) ++composedTrimsTaken;
+        _settle();
+    }
+
+    /// @dev Leg 1 of the composed action. False when the controller has no request and no shares.
+    function _composeFile(address controller) private returns (bool) {
+        (uint256 requestId,,,,) = pool.withdrawalRequest(controller);
+        if (requestId != 0) return true;
+        if (pool.balanceOf(controller) == 0) _enter(controller, controller, 2_000e6);
+        uint256 balance = pool.balanceOf(controller);
+        if (balance == 0) return false;
+        _requestBare(controller, controller, balance);
+        return true;
     }
 
     /// @dev Leg 2 of the composed action. Returns false, having done nothing further, when the
@@ -937,8 +951,10 @@ contract CanonicalLenderHandler is Test {
             for (uint256 pass; pass < COMPOSED_DESTRUCTION_PASSES && executable > target; ++pass) {
                 vm.prank(address(pool));
                 if (usdc.transfer(destructionSink, executable - target)) ++destructionsDone;
+                _observe();
                 (uint256 lost,) = canonical.reconcileCashDeficit();
                 if (lost != 0) ++reconciliationsDone;
+                _settle();
                 executable = pool.unreservedIdle() + pool.queueCashReserve();
             }
         }
@@ -949,7 +965,9 @@ contract CanonicalLenderHandler is Test {
         if (door >= requestShares) door = requestShares - 1;
         if (door != 0) {
             uint256 declinedBefore = writeDownsDeclined;
+            _observe();
             _serviceBare(controller, controller, bound(uint256(depthSeed), 1, door));
+            _settle();
             if (writeDownsDeclined != declinedBefore) ++composedMarks;
         }
         return true;
