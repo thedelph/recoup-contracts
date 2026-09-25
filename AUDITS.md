@@ -4,34 +4,16 @@ Every finding listed here is **fixed and covered by a regression test**, unless 
 named as accepted or deferred. Current open risks are tracked separately in
 [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
-This file is the historical record. Each round is an internal 12-agent adversarial review pass, and
-rounds are appended newest first.
+This file is the historical record of the internal review. Each round is an internal 12-agent
+adversarial review pass, and rounds are appended newest first. **The write-up stops at round nine**;
+later internal rounds are reflected in the code, the tests and [KNOWN_RISKS.md](KNOWN_RISKS.md), not
+here.
 
-**This log currently stops at round nine. As of 2026-09-15 the protocol had completed fifty-nine
-rounds, and that number only rises.** It is dated on purpose: it is derived from the internal
-review record rather than from anything in this repository, so no check here can hold it to the
-truth, and an undated figure would go quietly wrong every time a round ran. It read fifty-eight
-from 2026-09-12 until 2026-09-14, forty-two from 2026-08-31 until 2026-09-12, and before that
-thirty-nine, which had been correct for about two hours when it was written. A dated figure ages
-instead of going false, which is a state a reader can reason about.
-
-The first external review began on 2026-09-07, over six files at commit b66023d, and filed ten
-preliminary issues on 2026-09-11. On 2026-09-16 the reviewers verified, on commit 68c0c26, the
-fixes for #45, #46 and #48 and the three drain routes of #47; the post-loss lock #47's fix retains
-was disposed by the maintainer on 2026-09-17 as held and disclosed at Low (comment 5715504360 on
-#47); the reviewers answered the same day, corrected the bound 0f49e61 restates and asked for
-the lock to be recorded separately at Low, acknowledged and retained by design, which is issue
-[#61](https://github.com/thedelph/recoup-contracts/issues/61). On 2026-09-18 they reported the
-corrected bound reviewed on 0f49e61 and supported closing the original H-03 as verified fixed, with
-the lock tracked under #61. The review completed on 2026-09-22 with 13 findings, 10 Fixed and
-3 Acknowledged / Accepted Risk (M-06 #64, L-02 #61, L-03 #68), remediation reviewed through f6893cb;
-the final report and its sha256 are in [`audits/`](audits/). It is not part of this internal log;
-the disposition of each issue in the current source is recorded in [KNOWN_RISKS.md](KNOWN_RISKS.md).
-
-That count is adversarial review passes as this file defines them, one per round. Remediation
-passes are numbered on their own sequence and run higher; the two are different bases and are not
-interchangeable. The code, tests and `KNOWN_RISKS.md` reflect the later work. The remaining
-historical write-up is still to be added.
+The external audit is separate from this log. 33Labs reviewed six files at commit b66023d from
+2026-09-07 and completed on 2026-09-22 with 13 findings, 10 Fixed and 3 Acknowledged / Accepted Risk
+(M-06 #64, L-02 #61, L-03 #68), remediation reviewed through f6893cb. The final report and its
+sha256 are in [`audits/`](audits/); the disposition of each finding in the current source is in
+[KNOWN_RISKS.md](KNOWN_RISKS.md).
 
 ---
 
