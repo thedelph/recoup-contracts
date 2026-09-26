@@ -23,7 +23,8 @@ they are not an external audit.
 - An **activation blocker** prevents wiring or funding `LenderPool`, including with the author's
   capital.
 - A **third-party capital gate** is additional. Even after the activation blockers close, no public,
-  DexFi or Bond Fund capital is accepted before an external audit.
+  DexFi or Bond Fund capital is accepted until the recommendations the external audit report makes
+  before third-party capital are met (see the External audit row under Deployment facts).
 - A **residual risk** is a known limitation that must stay disclosed and be reconsidered at go-live,
   even when it is not an activation blocker.
 
@@ -32,7 +33,7 @@ closed by construction and one narrowed to a disclosed residual; the section "`L
 below names the function that carries each. Until 2026-09-17 this paragraph and the definition
 above still counted three live blockers, which that section contradicted. What blocks activation
 now is process rather than an open finding: the fresh internal review in the next paragraph and
-the external audit. Closing findings is necessary but not sufficient for mainnet; the governance,
+the audit report's recommendations before third-party capital. Closing findings is necessary but not sufficient for mainnet; the governance,
 wiring, deployment and review gates below still apply.
 
 The merged principal-accounting and active-tail entry-pricing mechanisms require a fresh internal
@@ -49,7 +50,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047 against the 2026-09-01 source, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacked 26 selectors that source had, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy; the 2026-09-12 sync adds `wasCreditManager` to the pool and changes the signatures of `writeDownLoss` and `recoverWrittenDownLoss` on the manager, the 2026-09-14 sync adds the request-draw memory and the stream ceiling to the pool and the bool-gated `_settle` to the manager, and the 2026-09-15 sync adds the cash floor (`_floorTotal`) to the pool, so the gap is wider than that reading. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live `EpochHarvester` (the pool has no such selector and the call reverts there; until 2026-09-17 this cell attributed the figure to the pool) read 259.795831 USDC at block 46942219 on 2026-09-17, parked with nobody to deliver it to; it read 124.885415 USDC when this cell was first written, undated, and it rises with every harvest while the pool stays unwired |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
 | Current-source parity | **None, deliberately.** This source is current as of 2026-09-15 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
-| External audit | In progress from 2026-09-07 over `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d. Ten preliminary issues, #45 to #54, were filed on 2026-09-11; their disposition in this source is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below. The post-loss lock the H-03 fix retains was filed separately on 2026-09-17 as a Low, #61, acknowledged and retained by design, not fixed; it is under the heading "33audits H-03, the post-loss lock the floor retains" below, and until 2026-09-18 this cell did not name it. Not completed |
+| External audit | Completed 2026-09-22. 33Labs reviewed `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d from 2026-09-07, with remediation reviewed through f6893cb. The final report is in [`audits/`](audits/) with its sha256. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, and three Acknowledged / Accepted Risk, M-06 (#64), L-02 (#61) and L-03 (#68). The report renumbers some issues: #53 is H-04, #54 is L-01 and #61 is L-02. The disposition of the ten preliminary issues, #45 to #54, filed on 2026-09-11, is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below; the post-loss lock is under the heading "33audits H-03, the post-loss lock the floor retains". Every other contract in `src/` was outside the scope. M-06 (#64) is fixed in this source by #69 (see the #64 heading below), and the reproductions in [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol) and [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) now assert the fixed behaviour. The report in `audits/` predates that fix. Before third-party capital the report recommends revisiting M-06 with the L-02 trade-off, publishing the L-03 incident runbook, retaining the activation gate, and verifying deployment and source parity |
 | Third-party funds | Not accepted |
 
 The mock assets have no real value, and their mint and test-control functions are permissionless.
@@ -68,8 +69,8 @@ disclosed residual. Each claim below names the function that carries it, so it c
 against the source rather than believed.
 
 **Closing them does not open activation.** The third-party capital gate is separate and unchanged:
-no public, DexFi or Bond Fund capital is accepted before an external audit, whatever this section
-says.
+no public, DexFi or Bond Fund capital is accepted until the audit report's recommendations before
+third-party capital are met, whatever this section says.
 
 ### Round 22 F3: principal-cap accounting. CLOSED, by removing the mechanism
 
@@ -185,7 +186,7 @@ over what happens to a lender on the worst day this design permits. None of them
 Each is a deliberate property of the design, each is pinned in this tree by a test that asserts the
 behaviour rather than forbidding it, and each is held rather than fixed, because in every case the
 fix is either a change to a file under external audit or a larger piece of accounting than is
-prudent to write while that audit is open. They are recorded here because nothing a lender reads on
+prudent to write while that audit was open. They are recorded here because nothing a lender reads on
 the exit path says any of it. Severities are assigned by the author, not by an auditor, and every
 figure is an executed reproduction on the fixture its own sentence states.
 
@@ -649,10 +650,10 @@ trim: after a 5,000 repayment the trim releases 6,999.999999 and a dormant lende
 10,999.999998. Until someone trims after that, the kept floor stays reserved. It needs two external
 raw losses and nobody trimming in the window between them.
 
-**Status.** The change is offered to the reviewers on #64 for verification. It was first offered on
-2026-09-22 with the worth rounded down; the rounding was changed to up on 2026-09-24, before they
-reported, for the reason given above. Until they report on it, the report's status on f6893cb stands.
-The trim is a separate change on top of it, and neither is on the public main branch.
+**Status.** On the main branch, merged by #69 together with the trim. The change was first offered
+to the reviewers on #64 on 2026-09-22 with the worth rounded down; the rounding was changed to up on
+2026-09-24, before they reported, for the reason given above. The report in `audits/` records the
+status on f6893cb, before this change.
 
 ### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
 
@@ -1049,7 +1050,7 @@ On 2026-09-16 the reviewers verified, on this source at 68c0c26, the fixes for #
 the three drain routes of #47 (their comments 5700959027, 5700962106, 5700964558 and 5700944284 on
 the respective issues). The post-loss liquidity lock the #47 row discloses was disposed by the maintainer on 2026-09-17 as
 held and disclosed at Low (comment 5715504360 on #47; the heading under material residual risks
-above states it present tense). The reviewers answered on 2026-09-17 (comment 5718920756): record the residual separately as a Low, acknowledged and retained by design, and close the original High without the write-down once the stated bound is corrected, which 0f49e61 (#60) did; the Low is #61. On 2026-09-18 they reported 0f49e61 reviewed and supported closing the original H-03 as verified fixed (comment 5727241497 on #47). The audit is not complete. Those five are the verification comments as
+above states it present tense). The reviewers answered on 2026-09-17 (comment 5718920756): record the residual separately as a Low, acknowledged and retained by design, and close the original High without the write-down once the stated bound is corrected, which 0f49e61 (#60) did; the Low is #61. On 2026-09-18 they reported 0f49e61 reviewed and supported closing the original H-03 as verified fixed (comment 5727241497 on #47). The audit completed on 2026-09-22; the final report is in [`audits/`](audits/). Those five are the verification comments as
 of 2026-09-18; the other six rows stand on this record's own tests.
 
 | Issue | Title as filed | Status in this source | Runtime bytes |
@@ -1192,7 +1193,8 @@ position yield to insurance, and a live position can temporarily block the trans
   fingerprint and the L-02 fix re-keyed two, none of which changed the count). Slither now runs in the development tree's CI on every
   contracts change, and a committed baseline of those 45 fails the build on any finding that appears
   or disappears. This repository does not run Slither itself.
-- The external audit remains a hard gate before third-party capital regardless of internal review
+- The external audit completed on 2026-09-22, but it does not lift the third-party capital gate on
+  its own: that gate also needs the report's recommendations met, whatever the internal review
   count or CI status.
 
 ## What this source contains
