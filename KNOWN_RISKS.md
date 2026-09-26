@@ -50,7 +50,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047 against the 2026-09-01 source, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacked 26 selectors that source had, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy; the 2026-09-12 sync adds `wasCreditManager` to the pool and changes the signatures of `writeDownLoss` and `recoverWrittenDownLoss` on the manager, the 2026-09-14 sync adds the request-draw memory and the stream ceiling to the pool and the bool-gated `_settle` to the manager, and the 2026-09-15 sync adds the cash floor (`_floorTotal`) to the pool, so the gap is wider than that reading. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live `EpochHarvester` (the pool has no such selector and the call reverts there; until 2026-09-17 this cell attributed the figure to the pool) read 259.795831 USDC at block 46942219 on 2026-09-17, parked with nobody to deliver it to; it read 124.885415 USDC when this cell was first written, undated, and it rises with every harvest while the pool stays unwired |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
 | Current-source parity | **None, deliberately.** This source is current as of 2026-09-15 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
-| External audit | Completed 2026-09-22. 33Labs reviewed `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d from 2026-09-07, with remediation reviewed through f6893cb. The final report is in [`audits/`](audits/) with its sha256. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, and three Acknowledged / Accepted Risk, M-06 (#64), L-02 (#61) and L-03 (#68). The report renumbers some issues: #53 is H-04, #54 is L-01 and #61 is L-02. The disposition of the ten preliminary issues, #45 to #54, filed on 2026-09-11, is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below; the post-loss lock is under the heading "33audits H-03, the post-loss lock the floor retains". Every other contract in `src/` was outside the scope. M-06 (#64) is still present in this source: a fix is on an open pull request (#69), not yet merged, and the reproductions in [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol) and [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) pin the behaviour as it stands. Before third-party capital the report recommends revisiting M-06 with the L-02 trade-off, publishing the L-03 incident runbook, retaining the activation gate, and verifying deployment and source parity |
+| External audit | Completed 2026-09-22. 33Labs reviewed `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d from 2026-09-07, with remediation reviewed through f6893cb. The final report is in [`audits/`](audits/) with its sha256. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, and three Acknowledged / Accepted Risk, M-06 (#64), L-02 (#61) and L-03 (#68). The report renumbers some issues: #53 is H-04, #54 is L-01 and #61 is L-02. The disposition of the ten preliminary issues, #45 to #54, filed on 2026-09-11, is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below; the post-loss lock is under the heading "33audits H-03, the post-loss lock the floor retains". Every other contract in `src/` was outside the scope. M-06 (#64) is fixed in this source by #69 (see the #64 heading below), and the reproductions in [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol) and [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) now assert the fixed behaviour. The report in `audits/` predates that fix. Before third-party capital the report recommends revisiting M-06 with the L-02 trade-off, publishing the L-03 incident runbook, retaining the activation gate, and verifying deployment and source parity |
 | Third-party funds | Not accepted |
 
 The mock assets have no real value, and their mint and test-control functions are permissionless.
@@ -506,6 +506,155 @@ stated under "Who bears it". Until
 and the second cancel as qualifications on #61 on 2026-09-18 (comment 5734172519), and both were
 measured as stated.
 
+### #64, 33audits M-06: a request serviced down to one share-wei kept the rest of its cash floor. Medium, fixed in this source by the change that added this heading; a Low residual remains, dated 2026-09-22, narrowed by a permissionless trim on 2026-09-24
+
+**What it was.** `serviceWithdrawalRequest` spent a request's floor by what each service paid and
+released the rest only with the final share. Once a price fall (a socialised loss, or the whole-debt
+impairment mark of a routine liquidation that is later cleared in full) left the floor above what
+the request's shares were worth, a requester could take everything a complete service would pay and
+stop one share-wei short. The rest of her floor stayed reserved against that share-wei, every other
+lender's door and `available` read it as owed, and only her own completing service or her cancel
+released it. 33audits' final report of 2026-09-22 rates it Medium, Accepted Risk, on f6893cb, and
+the public main branch up to and including f6893cb does not carry the change described next.
+
+**The change.** After the plain spend, `serviceWithdrawalRequest` now caps what is left of a
+partially serviced request's floor at what the remaining shares are worth, the gross conversion
+`convertToAssets` uses rounded UP rather than down, but only while the floors left after the plain
+spend sit inside the executable cash:
+`_floorTotal - floorSpent <= _executablePoolCash(_rawBalance())`. The second condition is what keeps #61 as it is: after a raw
+loss that puts the floors over the cash, no floor is written down, and every figure the #61 section
+above states still holds (`test_R64A4_C7_orderOfService_underARawLoss`,
+`test_R63A3_3_unequalFloorsOpenLargestFirst` and both `R62S1_YieldDoorAndSecondCancel` Q1 tests pass
+unchanged). Cost: +91 bytes of `LenderPool` runtime and +91 of initcode over f6893cb (+85 each for
+the cap as first offered on 2026-09-22 with the worth rounded down, and +6 each for rounding it up on
+2026-09-24), measured with `forge build --sizes` on a clean build; `CreditManager` is unchanged.
+
+**What it closes.** Every dust service made while the floors are within the executable cash now
+leaves a floor no larger than what the dust is worth rounded up, which for one share-wei (worth about
+a thousandth of a wei) is 1 wei. That covers the
+three reproductions, whose dust-held-floor assertions are flipped and marked #64 at each assertion:
+[`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol),
+[`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) and
+[`test/R64A4_DustFloorCurve.t.sol`](test/R64A4_DustFloorCurve.t.sol), where every socialised-loss
+and mark row of the threshold curve now keeps at most a wei per request at any fall and none of the
+twelve asset-denominated round trips of C5f leaves a floor of 1.000000 or more. It covers the no-loss mark route on the wired
+graph in [`test/Issue64_MarkRoute.t.sol`](test/Issue64_MarkRoute.t.sol) (a routine auction that
+clears in full, a workout rescued in full, a short fill inside the cash), and the seeded census
+replay in [`test/Issue64_DustCensusReplay.t.sol`](test/Issue64_DustCensusReplay.t.sol), which keeps
+no floor of 1.000000 or more on dust before a raw loss on the replay or on the walk with a mark, and
+none at all on the walk that has no loss of any kind. Internal review also measured six further
+shapes on the same `LenderPool` source, each of which kept a floor under the old rule and kept none
+under the change as first offered, with the worth rounded down (they were not re-run with it rounded
+up):
+floors priced through the real `NAVOracle`, yield streamed between filing and service, a partial
+workout tranche, a forced workout close followed by `recoverLoss`, a deposit-cap change, and a
+request filed for part of a position. Those six tests are not in this repository. The
+`LenderPool` invariant suite's handler models the change, the rounding included, so its floor-sum
+ghost holds the stored floors to it in every campaign.
+
+**Why the worth rounds up, measured.** The kept floor was also what held a request's door open, and
+the change as first offered wrote it down to the worth rounded DOWN. That left a request on one
+share-wei with a floor of 0 and a door of 0 while its draw memory had spent its slice, and it broke
+an honest exit: after a socialised loss, a requester who serviced half her request and then ran the
+ordinary `maxRequestRedeem` loop was paid 8,999.999999 of the 9,000.000000 her remaining shares
+were worth and left with 13 share-wei behind a door of 0, a cancel being her only way out. With the
+worth rounded up the same loop pays 9,000.000000 in one call and completes, and one share-wei keeps
+a floor of 1 wei, which holds a door of one share-wei open, so a completing one-wei service ends the
+request again; a cancel still removes it at any time.
+[`test/Issue64_HonestCompletion.t.sol`](test/Issue64_HonestCompletion.t.sol) pins both, and the
+tails of D4, W2 and C6 end with that completing service. The cost is one wei, and it goes to the
+requester: her reservation sits at most one wei above what her remaining shares are worth, and every
+other lender's reach is short by at most that wei per live request until she completes or cancels.
+
+**The residual, disclosed. Low.** A dust service made while the floors EXCEED the executable cash
+keeps its floor, exactly as the old rule did, and the kept floor outlives the shortfall: no service
+re-examines it once the cash returns, so her completing service, her cancel or a trim (next
+paragraph) is what releases it.
+[`test/Issue64_DustUnderShortfall.t.sol`](test/Issue64_DustUnderShortfall.t.sol) pins it with
+nobody trimming: two requesters of 20,000 filed in an idle book of 100,000, 40,000 lent, a 10,000
+socialised loss and a 25,000 raw loss put the floors (40,000) over the cash (35,000); one requester
+services to one share-wei and keeps 7,000.000000; the loan then repays in full and the last lender
+out still leaves 7,000.000001 behind.
+[`test/Issue64_KeptFloorAfterShortfall.t.sol`](test/Issue64_KeptFloorAfterShortfall.t.sol) reads the
+same shape at the instant the shortfall ends, which is before any repayment: when the other
+requester completes, the floors (7,000) are back inside the executable cash (9,000), so the
+change's own condition holds with the kept floor counted, and still nothing but a trim takes it.
+It is Low because it needs an external event first, a raw cash loss, which no path inside the
+protocol produces (see #61 above), and then the requester's own dust service while that shortfall
+stands. The unconditional cap would close it and was not chosen, because it writes floors down
+under the #61 lock: with it, C7, the unequal-floors test and both Q1 tests above go red, and so
+does the residual pin itself.
+
+**The trim, added 2026-09-24.** A service that declines the write-down above because the floors
+stand over the executable cash now marks the request (`writeDownDeclined`, read by
+`requestWriteDownDeclined`), and `trimRequestFloor(controller)` applies the same write-down later,
+on the same condition, as if it were a service of zero shares. Anyone may call it, for any
+controller: it acts only on a marked request, only while `_floorTotal`, the marked floor included,
+sits inside `_executablePoolCash`, and only ever lowers that one floor to the worth a service
+writes it to, the escrowed shares' gross conversion rounded up, reducing `_floorTotal` by the same amount and emitting
+`RequestFloorTrimmed`; anywhere else it returns 0 without reverting or emitting. An unserviced
+request is never marked, so a price fall never moves an honest requester's filing-time floor to
+anyone else, and no floor is ever written down under the #61 lock. Nothing calls it automatically:
+a keeper, a waiting lender or the requester has to. Measured in
+[`test/Issue64_FloorTrim.t.sol`](test/Issue64_FloorTrim.t.sol) on the shape above: under the
+shortfall the trim releases 0; once the other requester completes it releases 6,999.999999,
+leaving her one share-wei a floor of 1 wei (its worth rounded up), and after the loan repays the
+last lender out leaves 0 behind (7,000.000001 without it). A trim takes no cash from the requester
+it applies to: a requester serviced half-way under the shortfall and then trimmed draws
+6,500.000000, exactly what she draws untrimmed, and her request completes. The `LenderPool`
+invariant handler calls the trim as a fuzz action, predicts each release from its own floor and
+mark mirrors and the rounded-up worth recomputed from the public views, and asserts both the
+release and the mark (`invariant_aTrimReleasesExactlyThePredictedExcess`). Its single actions
+rarely line up a shortfall, a recovery and a trim in that order (2 trims in 2 of 256 runs of one
+unseeded campaign, measured with a per-run census on a copy of this tree), so the handler also
+composes the three in one action, `composeShortfallRecoveryAndTrim`: the same campaign then takes
+267 trims in 161 of its 256 runs, and with the trim's worth rounded down instead of up it goes red
+on its own. Cost: +417 bytes of
+`LenderPool` runtime and +417 of initcode over the rounded-up change above, measured with
+`forge build --sizes` on a clean build, the event and the view included. The trim writes the
+rounded-up worth out itself: a private helper shared with the service path measured 4 bytes more,
+so it was not used. The trim, the view and the event are declared on
+`LenderPool` and not in `ILenderPool`, so no other source file changes and every other contract,
+`CreditManager` and the CREATE2 initcode of `CreditWiring` included, builds byte-identical.
+
+**Who picks the moment, and what a re-trim moves.** The mark is cleared only with the request,
+never by a trim, so a request trimmed once is trimmed again, by anyone, after any later price fall,
+to the same worth her own next service would write it down to. In
+`test_trimTiming_theMarkSurvivesATrimSoALaterFallIsTrimmedAgain` in
+[`test/Issue64_TrimTiming.t.sol`](test/Issue64_TrimTiming.t.sol), on the shape above, the first
+trim releases 6,999.999999 and leaves a floor of 6,500.000001; a later 3,000 socialised loss leaves
+the floors (6,500.000001) inside the executable cash (15,500), a second trim releases 428.571429,
+and she still completes. Because anyone may call it, a stranger chooses the moment, and can trim
+her at a trough that a recovery then reverses. What that moves is her liquidity priority, the cash
+held for her ahead of lending and of synchronous exits, never the value of her shares:
+`test_trimTiming_aStrangerTrimAtATroughMovesPriorityNeverValue` runs that 3,000 loss, a 3,000
+recovery, the manager lending all it may and a dormant lender exiting first, with and without a
+trim at the trough. Untrimmed, her floor of 13,500 leaves the manager 200 to lend, and she draws
+6,500.000002 at once. Trimmed, her floor is 6,071.428572, 6,514.285714 is lent, and she
+draws 6,071.428571 at once while 428.571430 stays escrowed at its full worth until cash comes back:
+1 wei less in total, and later. The untrimmed column is the #64 shape itself, about 6,300 of
+lending held back by a floor 7,000 above her worth. Clearing the mark on a taken trim would stop
+the re-trim, at +16 bytes of `LenderPool` runtime measured on a copy, and was not taken: after a
+loss that lands once the first trim is taken, on a request nobody services again, the floor would
+stay above its worth with nothing able to lower it, which is the shape #64 fixes. Measured on a
+copy with the mark cleared, the same later loss leaves the floor 428.571429 above its worth, the
+second trim releases 0, and `available` reads 3,600.000000 where the sticky mark gives 3,964.285714.
+
+**The trim's own residual. Low.** The trim waits for the floors, the kept one included, to sit
+inside the executable cash. If a SECOND raw loss lands after the shortfall has ended and before
+anyone has trimmed, the floors are over the cash again and the kept floor becomes a #61 lock held
+by one share-wei: in `test_trim_residual_aSecondRawLossBeforeAnyTrim`, a further 3,000 raw loss
+leaves executable cash 6,000 against floors 7,000, both dormant lenders' doors read 0 and the trim
+releases 0. It ends the way #61 ends, when the cash covers the floors again, and then at the next
+trim: after a 5,000 repayment the trim releases 6,999.999999 and a dormant lender's door reads
+10,999.999998. Until someone trims after that, the kept floor stays reserved. It needs two external
+raw losses and nobody trimming in the window between them.
+
+**Status.** On the main branch, merged by #69 together with the trim. The change was first offered
+to the reviewers on #64 on 2026-09-22 with the worth rounded down; the rounding was changed to up on
+2026-09-24, before they reported, for the reason given above. The report in `audits/` records the
+status on f6893cb, before this change.
+
 ### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
 
 `DirectCallAdapter` moves its own USDC on a best-effort basis, so its own transfer cannot revert a
@@ -765,6 +914,20 @@ multiplier does not return with it. The file header, the `maxRequestRedeem` docs
 `queueCashReserve` docstring in `LenderPool` say all of this; at commit b66023d they overstated the
 bound as a reservation, at the 2026-09-12 sync they understated what the stepped loop could reach,
 and since 2026-09-15 the reservation is an amount.
+
+Two consequences of the floor at the request door, measured in
+[`test/RequestDoorResidue.t.sol`](test/RequestDoorResidue.t.sol) on a book half lent with yield
+streaming, where a requester services half her request and then runs the ordinary
+`maxRequestRedeem` loop; neither loses anyone money. Spending a floor rounds down twice, so at most
+1 wei of floor stays behind per live request, and the door that wei holds open is 983 share-wei
+whose `previewRedeem` is 0: a service there with `minAssetsOut` of 1 is refused and one with 0
+burns her own share-wei for nothing, so a loop should stop on a door that previews 0 and not only
+on a door of 0. And her yield above her floor is paid only once the cash comes back: the floor was
+spent by those first steps, and what her remaining shares earn after that is paid only by her live
+slice of the executable cash, net of what she has already drawn. With 50,000 still lent and 5,000
+of yield an epoch, her 327,868,851,802 remaining share-wei stay escrowed for nine epochs while
+their worth grows from 367.346938 to 530.612243, and are paid in the tenth. A cancel then a
+synchronous `redeem` pays the same remainder at once, at its full worth.
 
 ### `CreditWiring.sourceStillAnswersToUs` reverts instead of answering false on a dirty word. Low
 

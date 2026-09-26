@@ -17,7 +17,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Area | Status |
 |---|---|
 | External audit | Completed 2026-09-22 by 33Labs over six files (`LenderPool.sol`, `CreditWiring.sol`, `TreasuryLiquiditySource.sol`, `ProtocolFeeSplitter.sol`, `Config.sol`, `LtvMath.sol`) at commit b66023d, remediation reviewed through f6893cb. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, 3 Acknowledged / Accepted Risk. Final report and sha256 in [`audits/`](audits/). Every other contract in `src/` has had internal review only |
-| Open remediation | M-06 ([#64](https://github.com/thedelph/recoup-contracts/issues/64)): a fix is on an open pull request ([#69](https://github.com/thedelph/recoup-contracts/pull/69)), not yet merged, so the main branch still carries the behaviour its reproduction tests pin. L-02 (#61) is retained by design; L-03 (#68) is answered by [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) |
+| Remediation after the report | M-06 ([#64](https://github.com/thedelph/recoup-contracts/issues/64)) is fixed in this source by [#69](https://github.com/thedelph/recoup-contracts/pull/69), which also adds a permissionless floor trim; a Low residual is disclosed in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). The report in `audits/` predates that fix. L-02 (#61) is retained by design; L-03 (#68) is answered by [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) |
 | Core loan path | Implemented and tested: custody, NAV, borrowing, yield application, liquidation and workout |
 | Base Sepolia | Historic mock-stack deployment, explorer-verified at deployment but not at parity with this source. Addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
 | Base mainnet | No Recoup contracts deployed |

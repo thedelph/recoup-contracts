@@ -21,6 +21,11 @@ import {R63A3_Fixture} from "./R63A3_Fixture.sol";
 ///      (u0 * T + dLent)`, and a request filed in an idle book (u0 = 0) keeps a floor at ANY
 ///      fall, a mark included. Six-decimal USDC base units; every `MEASURED` line was read from a
 ///      run before the figure beside it was asserted.
+///      #64: this suite mapped the curve as the tree stood. Its dust-held-floor assertions are
+///      FLIPPED to the #64 fix, which writes the floor left on dust down to what the dust is worth
+///      while the floors sit inside the executable cash: every socialised-loss and mark row now
+///      keeps nothing at any fall (the threshold is NONE), and C7, the #61 lock under a raw loss,
+///      is unchanged.
 contract R64A4_DustFloorCurve is R63A3_Fixture {
     uint256 internal constant T = 100_000e6;
     uint256 internal constant BPS = 10_000;
@@ -220,13 +225,9 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
             // r = 10%, lent up to 70% of the book in all, nobody exits.
             Shape memory s = Shape(1_000, 1, 3, u0[k], 7_000 - u0[k], 0);
             measured[k] = _row("C2 lent up to 70% after the filing", s, SOCIALISED);
-            uint256 paper = _paperThreshold(s);
-            // Keeping 1.000000 needs r * (L - paper) >= 1e6, so L = paper + 1e6 / r.
-            assertApproxEqAbs(measured[k], paper + 10e6, 1e4, "C2: the measured threshold left the paper rule");
+            // #64 fix: no fall up to the whole debt keeps 1.000000 on dust (was paper + 10.000000).
+            assertEq(measured[k], type(uint256).max, "#64: some fall still keeps a floor on dust");
         }
-        // The idle-book filing: a loss of 10.000000 in a 70,000.000000 debt (1.4 bps of it) already
-        // keeps 1.000000, and the curve is linear from there.
-        assertLt(measured[0] * BPS / 70_000e6, 2, "C2: an idle-book filing needed a material loss");
         Shape memory idle = Shape(1_000, 1, 3, 0, 7_000, 0);
         uint256 snap = vm.snapshotState();
         Result memory r = _run(idle, SOCIALISED, 3_500e6, 1);
@@ -235,7 +236,8 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         console2.log(
             "MEASURED C2   dormant worth / sync cash / lendable        ", r.dormantWorth, r.syncCash, r.lendable
         );
-        assertApproxEqAbs(r.kept, 350e6, 10, "C2: kept is not r * L for an idle-book filing");
+        // #64 fix: the idle-book filing keeps nothing (was r * L = 350.000000).
+        assertLe(r.kept, 1, "#64: an idle-book filing kept a floor on dust");
     }
 
     // ───────────────────────────────────────────────────
@@ -249,10 +251,8 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
             for (uint256 b; b < rr.length; ++b) {
                 Shape memory s = Shape(rr[b], 1, 2, u0[a], 0, BPS);
                 uint256 measured = _row("C3 every dormant lender takes her whole sync door", s, SOCIALISED);
-                uint256 paper = _paperThreshold(s);
-                uint256 step = 1e6 * BPS / rr[b]; // r * (L - paper) * T / (T - X) >= 1e6, bounded by this
-                assertGe(measured + 1e4, paper, "C3: a floor was kept UNDER the paper threshold");
-                assertLe(measured, paper + step + 1e4, "C3: the measured threshold left the paper rule");
+                // #64 fix: no fall keeps a floor on dust (was the paper threshold u0 * (T - X)).
+                assertEq(measured, type(uint256).max, "#64: some fall still keeps a floor on dust");
             }
         }
         // Round 63's two executed points, recovered from the rule: 75% and 14.5% of the debt.
@@ -267,9 +267,8 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         for (uint256 k; k < x.length; ++k) {
             Shape memory s = Shape(500, 1, 2, 2_500, 0, x[k]);
             uint256 measured = _row("C3b the dormant lenders take part of their sync door", s, SOCIALISED);
-            uint256 paper = _paperThreshold(s);
-            assertGe(measured + 1e4, paper, "C3b: a floor was kept UNDER the paper threshold");
-            assertLe(measured, paper + 20e6 + 1e4, "C3b: the measured threshold left the paper rule");
+            // #64 fix: no fall keeps a floor on dust (was the paper threshold u0 * (T - X)).
+            assertEq(measured, type(uint256).max, "#64: some fall still keeps a floor on dust");
         }
     }
 
@@ -311,10 +310,11 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         assertEq(pool.exitReserve(), 0, "C4: the mark is still standing");
         assertEq(honest.kept, 0, "C4: the honest twin kept a floor");
         assertEq(grief.dustShares, 1, "C4: she did not end on one share-wei");
-        assertApproxEqAbs(grief.kept, 500e6, 10, "C4: kept is not r * M");
+        // #64 fix: the no-loss mark keeps nothing on dust (was r * M = 500.000000), at any mark.
+        assertLe(grief.kept, 1, "#64: a released mark kept a floor on dust");
         vm.revertToState(snap);
         uint256 threshold = _row("C4 the same shape, the mark swept", s, MARK_THEN_RELEASED);
-        assertApproxEqAbs(threshold, 10e6, 1e4, "C4: the mark threshold left the paper rule");
+        assertEq(threshold, type(uint256).max, "#64: some mark still keeps a floor on dust");
     }
 
     // ───────────────────────────────────────────────────
@@ -335,10 +335,11 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
                 "MEASURED C5   dormant worth / sync cash / lendable     ", r.dormantWorth, r.syncCash, r.lendable
             );
             if (k == 0) first = r.kept;
-            assertApproxEqAbs(r.kept, first, 100, "C5: splitting the requesters changed what is kept");
+            // #64 fix: nothing is kept however the requesters are split (was R * L = 1,800.000000).
+            assertLe(r.kept, n[k], "#64: a requester kept a floor on dust");
             assertEq(r.dustShares, n[k], "C5: a requester did not end on one share-wei");
         }
-        assertApproxEqAbs(first, 1_800e6, 10, "C5: kept is not R * L");
+        assertLe(first, 1, "#64: one requester kept a floor on dust");
     }
 
     /// @dev What a growing share of careless idle filers costs the dormant lenders. They are shut out
@@ -358,7 +359,8 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
                 100,
                 "C5b: the dormant lenders are not short by exactly the kept floors"
             );
-            assertApproxEqAbs(r.kept, 15_000e6 * uint256(rBps[k]) / BPS, 100, "C5b: kept is not R * L");
+            // #64 fix: nothing is kept, so the dormant lenders are short by nothing (was R * L).
+            assertLe(r.kept, 5, "#64: the requesters kept a floor on dust");
             vm.revertToState(snap);
         }
     }
@@ -402,7 +404,8 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
             );
         }
         // Paper: fall per book dollar 30%; the idle filer keeps 10,000 * 0.30, the 40% filer nothing.
-        assertApproxEqAbs(keptEarly[0], 3_000e6, 10, "C5c: the idle filer did not keep r * T * (l - 0)");
+        // #64 fix: the idle filer keeps nothing either (was r * T * (l - 0) = 3,000.000000).
+        assertLe(keptEarly[0], 1, "#64: the idle filer kept a floor on dust");
         assertLe(keptLate[0], 1, "C5c: a request filed at 40% lent kept a floor at a 30% fall");
         assertApproxEqAbs(keptEarly[0], keptEarly[1], 10, "C5c: order of service moved the idle filer's kept floor");
         assertApproxEqAbs(keptLate[0], keptLate[1], 10, "C5c: order of service moved the late filer's kept floor");
@@ -422,8 +425,10 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
                 "MEASURED C5d bps of a 75,000 debt lost / drew / kept        ", lostBpsOfDebt[k], r.drawn, r.kept
             );
             console2.log("MEASURED C5d   kept per 10,000 drawn                        ", r.kept * BPS / r.drawn);
-            assertApproxEqAbs(r.kept, loss / 10, 10, "C5d: kept is not r * L");
-            assertApproxEqAbs(r.drawn + r.kept, 10_000e6, 10, "C5d: drawn plus kept is not the floor she filed");
+            // #64 fix: nothing is kept (was r * L); she still draws her floor less r * L, the
+            // worth of her shares, exactly as before.
+            assertLe(r.kept, 1, "#64: a floor was kept on dust");
+            assertApproxEqAbs(r.drawn + loss / 10, 10_000e6, 10, "C5d: she did not draw her floor less r * L");
         }
     }
 
@@ -488,7 +493,9 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
             vm.revertToState(snap);
         }
         console2.log("MEASURED C5f shapes tried / shapes that kept a floor of 1.000000 or more", tried, keptSomewhere);
-        assertEq(keptSomewhere, tried, "C5f: an asset-denominated service completed the request in some shape");
+        // #64 fix: the asset-denominated round trip still leaves share dust, but no dust keeps a
+        // floor (was every one of the twelve shapes).
+        assertEq(keptSomewhere, 0, "#64: an asset-denominated service left a floor on dust");
     }
 
     // ───────────────────────────────────────────────────
@@ -528,13 +535,18 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         }
         address last = _dormant(s.dormants - 1);
         console2.log("MEASURED C6 everybody leaves: took / stranded / last door ", took, stranded, _syncable(last));
+        // #64 fix: the dust keeps only its worth rounded UP, 1 wei (was 0 under the rounded-down
+        // worth), so nothing is stranded but rounding and that wei (was the kept floor, with the
+        // last lender's door at 0). The requester keeps the wei; the last lender loses at most it.
+        assertEq(kept, 1, "#64: the dust keeps more than its rounded-up worth");
+        assertLe(stranded, 10, "#64: the last lender out was stranded");
         assertApproxEqAbs(stranded, kept, 10, "C6: what is stranded is not the kept floor");
-        assertEq(_syncable(last), 0, "C6: the last lender still reaches cash");
 
         // A request from the stranded lender does not reach it either; the owner has no lever.
         _requestAll(last);
         console2.log("MEASURED C6 the stranded lender's request floor / door    ", _floorOf(last), _serviceable(last));
-        assertEq(_serviceable(last), 0, "C6: a request reached the kept floor");
+        // #64 fix: her request reaches everything that is left, the rounding (was 0).
+        assertEq(_serviceable(last), stranded, "#64: the stranded lender's request does not reach the rest");
         _cancel(last);
 
         // A stranger cannot end it; she can, in either of two ways.
@@ -549,6 +561,10 @@ contract R64A4_DustFloorCurve is R63A3_Fixture {
         assertApproxEqAbs(_syncable(last), stranded, 10, "C6: the release did not reopen the door");
         vm.revertToState(snap);
 
+        // #64 fix: her one share-wei holds a floor of 1 wei, which keeps a door of one share-wei
+        // open, so a completing one-wei service is her other way out: it pays 0 and releases the
+        // wei of floor.
+        assertEq(pool.maxRequestRedeem(griefer), 1, "#64: the 1-wei floor does not hold her one share-wei's door");
         uint256 paid = _service(griefer, 1);
         console2.log("MEASURED C6 she burns the last share-wei: paid / floors   ", paid, _floorTotal());
         assertEq(paid, 0, "C6: the last share-wei paid cash");

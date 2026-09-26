@@ -182,7 +182,14 @@ contract R63A3_PoolDoorsInvariants is Test {
         assertGt(handler.excessFloorFramesWithoutARawLoss(), 0, "no floor exceeded its shares' worth on protocol paths");
         handler.serviceAllButOneShareWei(0);
         assertEq(handler.dustServicesDone(), 1, "the dust service was never reached");
-        assertGt(handler.keptFloorOnDustFramesWithoutARawLoss(), 0, "no floor was kept on dust before a raw loss");
+        // #64 fix: the same dust service keeps no floor of 1.000000 or more before a raw loss (was
+        // > 0); it keeps its worth rounded up, 1 wei, under what this census counts.
+        assertEq(handler.keptFloorOnDustFramesWithoutARawLoss(), 0, "#64: a floor was kept on dust before a raw loss");
+        // An epoch streams before the completing service. The fix as first offered, with the worth
+        // rounded down, needed it (its dust kept a floor of 0 and a door of 0); with the 1-wei floor
+        // the door is open without it, and the rest of this walk is built on the state it leaves.
+        handler.deliverEpoch(100e6);
+        handler.passTime(uint32(7 days));
         handler.serviceMax(0);
         assertEq(handler.completionsDone(), 1, "no request completed");
         assertEq(handler.memoryKeptByDust(), 1, "the stranger's dust did not keep the memory alive");

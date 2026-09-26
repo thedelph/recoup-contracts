@@ -227,8 +227,8 @@ The external audit by 33Labs completed on 2026-09-22. It covered `LenderPool`, `
 `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d, with
 remediation reviewed through f6893cb: 13 findings, 10 Fixed and 3 Acknowledged / Accepted Risk. The
 report is in [`audits/`](audits/) and the disposition of each finding in this source is in
-[KNOWN_RISKS.md](KNOWN_RISKS.md). M-06 (#64) is still present on the main branch: a fix is on an open pull
-request (#69), not yet merged. The custody contracts this guide walks through (`CollateralVault`,
+[KNOWN_RISKS.md](KNOWN_RISKS.md). M-06 (#64) is fixed on the main branch by #69; the report predates
+that fix. The custody contracts this guide walks through (`CollateralVault`,
 `DirectCallAdapter`) were outside the audit's scope and have had internal review only.
 
 ## Questions
