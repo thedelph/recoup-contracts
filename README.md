@@ -16,8 +16,8 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 
 | Area | Status |
 |---|---|
-| External audit | Completed 2026-09-22 by 33Labs over six files (`LenderPool.sol`, `CreditWiring.sol`, `TreasuryLiquiditySource.sol`, `ProtocolFeeSplitter.sol`, `Config.sol`, `LtvMath.sol`) at commit b66023d, remediation reviewed through f6893cb. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, 3 Acknowledged / Accepted Risk. Final report and sha256 in [`audits/`](audits/). Every other contract in `src/` has had internal review only |
-| Remediation after the report | M-06 ([#64](https://github.com/thedelph/recoup-contracts/issues/64)) is fixed in this source by [#69](https://github.com/thedelph/recoup-contracts/pull/69), which also adds a permissionless floor trim; a Low residual is disclosed in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). The report in `audits/` predates that fix. L-02 (#61) is retained by design; L-03 (#68) is answered by [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) |
+| External audit | Completed 2026-09-22 by 33Labs over six files (`LenderPool.sol`, `CreditWiring.sol`, `TreasuryLiquiditySource.sol`, `ProtocolFeeSplitter.sol`, `Config.sol`, `LtvMath.sol`) at commit b66023d, contract remediation reviewed through f6893cb; final report re-issued 2026-09-26. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, 1 Fix Verified / Pending Merge (M-06), 2 Acknowledged / Accepted Risk. Final report and sha256 in [`audits/`](audits/). Every other contract in `src/` has had internal review only |
+| Remediation after the report | M-06 ([#64](https://github.com/thedelph/recoup-contracts/issues/64)) is fixed in this source by [#69](https://github.com/thedelph/recoup-contracts/pull/69), which also adds a permissionless floor trim. 33Labs verified #69 at 35f0a58, trim included; it is merged as 566a9eb with the same source and tests. A Low residual is disclosed in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). L-02 (#61) is retained by design; L-03 (#68) is answered by [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) |
 | Core loan path | Implemented and tested: custody, NAV, borrowing, yield application, liquidation and workout |
 | Base Sepolia | Historic mock-stack deployment, explorer-verified at deployment but not at parity with this source. Addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
 | Base mainnet | No Recoup contracts deployed |
@@ -67,9 +67,10 @@ liquidation threshold and the borrow caps live in bounded storage in
 The lender pool is not approved to wire or fund, including with the author's capital, and no
 public, DexFi or Bond Fund capital is accepted. Before any of that:
 
-1. The audit report's recommendations before third-party capital: revisit M-06 (#64) together with
-   the L-02 (#61) trade-off, keep the activation gate, and verify that a deployment matches the
-   source. The L-03 (#68) runbook is published as [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md).
+1. The audit report's recommendations before third-party capital: merge the verified M-06 (#64)
+   remediation (done: #69, 566a9eb), keep its regression and #61-preservation coverage, keep the
+   activation gate, and verify that a deployment matches the source. The L-03 (#68) runbook is
+   published as [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md).
 2. A fresh internal review of the principal-accounting and entry-pricing changes as shipped.
 3. The mainnet go-live gates in [`KNOWN_RISKS.md`](KNOWN_RISKS.md): governance (timelock and Safe),
    wiring, a rehearsed deployment, and an agreed DexFi whitelist and custody policy.

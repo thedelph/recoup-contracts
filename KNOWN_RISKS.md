@@ -50,7 +50,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 | Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047 against the 2026-09-01 source, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacked 26 selectors that source had, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy; the 2026-09-12 sync adds `wasCreditManager` to the pool and changes the signatures of `writeDownLoss` and `recoverWrittenDownLoss` on the manager, the 2026-09-14 sync adds the request-draw memory and the stream ceiling to the pool and the bool-gated `_settle` to the manager, and the 2026-09-15 sync adds the cash floor (`_floorTotal`) to the pool, so the gap is wider than that reading. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live `EpochHarvester` (the pool has no such selector and the call reverts there; until 2026-09-17 this cell attributed the figure to the pool) read 259.795831 USDC at block 46942219 on 2026-09-17, parked with nobody to deliver it to; it read 124.885415 USDC when this cell was first written, undated, and it rises with every harvest while the pool stays unwired |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
 | Current-source parity | **None, deliberately.** This source is current as of 2026-09-15 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
-| External audit | Completed 2026-09-22. 33Labs reviewed `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d from 2026-09-07, with remediation reviewed through f6893cb. The final report is in [`audits/`](audits/) with its sha256. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, and three Acknowledged / Accepted Risk, M-06 (#64), L-02 (#61) and L-03 (#68). The report renumbers some issues: #53 is H-04, #54 is L-01 and #61 is L-02. The disposition of the ten preliminary issues, #45 to #54, filed on 2026-09-11, is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below; the post-loss lock is under the heading "33audits H-03, the post-loss lock the floor retains". Every other contract in `src/` was outside the scope. M-06 (#64) is fixed in this source by #69 (see the #64 heading below), and the reproductions in [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol) and [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) now assert the fixed behaviour. The report in `audits/` predates that fix. Before third-party capital the report recommends revisiting M-06 with the L-02 trade-off, publishing the L-03 incident runbook, retaining the activation gate, and verifying deployment and source parity |
+| External audit | Completed 2026-09-22. 33Labs reviewed `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d from 2026-09-07, with contract remediation reviewed through f6893cb. The final report, re-issued on 2026-09-26, is in [`audits/`](audits/) with its sha256. 13 findings (4 High, 6 Medium, 3 Low): 10 Fixed, one Fix Verified / Pending Merge, M-06 (#64), and two Acknowledged / Accepted Risk, L-02 (#61) and L-03 (#68). The report renumbers some issues: #53 is H-04, #54 is L-01 and #61 is L-02. The disposition of the ten preliminary issues, #45 to #54, filed on 2026-09-11, is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below; the post-loss lock is under the heading "33audits H-03, the post-loss lock the floor retains". Every other contract in `src/` was outside the scope. M-06 (#64) is fixed in this source by #69 (see the #64 heading below), and the reproductions in [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol) and [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) now assert the fixed behaviour. The report verifies that fix on #69 at 35f0a58, trim included, and dates it unmerged; #69 is merged as 566a9eb with the same source and tests. Before third-party capital the report recommends merging the verified M-06 remediation (done), retaining its regression and #61-preservation coverage, publishing the L-03 incident runbook, retaining the activation gate, and verifying deployment and source parity |
 | Third-party funds | Not accepted |
 
 The mock assets have no real value, and their mint and test-control functions are permissionless.
@@ -514,8 +514,10 @@ impairment mark of a routine liquidation that is later cleared in full) left the
 the request's shares were worth, a requester could take everything a complete service would pay and
 stop one share-wei short. The rest of her floor stayed reserved against that share-wei, every other
 lender's door and `available` read it as owed, and only her own completing service or her cancel
-released it. 33audits' final report of 2026-09-22 rates it Medium, Accepted Risk, on f6893cb, and
-the public main branch up to and including f6893cb does not carry the change described next.
+released it. 33audits' final report rates it Medium; the first issue of 2026-09-22 classed it
+Accepted Risk on f6893cb, and the re-issue of 2026-09-26 classes it Fix Verified / Pending Merge on
+#69 at 35f0a58. The public main branch up to and including f6893cb does not carry the change
+described next.
 
 **The change.** After the plain spend, `serviceWithdrawalRequest` now caps what is left of a
 partially serviced request's floor at what the remaining shares are worth, the gross conversion
@@ -652,8 +654,10 @@ raw losses and nobody trimming in the window between them.
 
 **Status.** On the main branch, merged by #69 together with the trim. The change was first offered
 to the reviewers on #64 on 2026-09-22 with the worth rounded down; the rounding was changed to up on
-2026-09-24, before they reported, for the reason given above. The report in `audits/` records the
-status on f6893cb, before this change.
+2026-09-24, before they reported, for the reason given above. The re-issued report in `audits/`
+records 33Labs' verification of #69 at 35f0a58, which carries the trim: 72 of 72 fix-focused tests
+and 104 of 104 #61-preservation tests passed. `src/`, `test/` and `script/` are identical between
+35f0a58 and the merge commit 566a9eb, and this repository's CI passed on 566a9eb.
 
 ### A paused or blacklisting USDC shuts every bond door, because the farm settles its pending USDC inside the same call. Medium, conditional on a USDC pause; open, not fixed, dated 2026-09-21
 
@@ -1193,7 +1197,8 @@ position yield to insurance, and a live position can temporarily block the trans
   fingerprint and the L-02 fix re-keyed two, none of which changed the count). Slither now runs in the development tree's CI on every
   contracts change, and a committed baseline of those 45 fails the build on any finding that appears
   or disappears. This repository does not run Slither itself.
-- The external audit completed on 2026-09-22, but it does not lift the third-party capital gate on
+- The external audit completed on 2026-09-22 and its report was re-issued on 2026-09-26, but it
+  does not lift the third-party capital gate on
   its own: that gate also needs the report's recommendations met, whatever the internal review
   count or CI status.
 
