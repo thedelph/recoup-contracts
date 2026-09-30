@@ -9,12 +9,10 @@ adversarial review pass, and rounds are appended newest first. **The write-up st
 later internal rounds are reflected in the code, the tests and [KNOWN_RISKS.md](KNOWN_RISKS.md), not
 here.
 
-The external audit is separate from this log. 33Labs reviewed six files at commit b66023d from
-2026-09-07 and completed on 2026-09-22; the final report was re-issued on 2026-09-29 with 13
-findings: 11 Fixed and 2 Acknowledged / Accepted Risk (L-02 #61, L-03 #68). M-06 (#64) is Fixed:
-#69 was merged into main as 566a9eb after successful repository CI, and 33Labs independently
-verified it before merge at 35f0a58. The base remediation snapshot is f6893cb and main was reviewed
-through 566a9eb. The final report and its sha256 are in [`audits/`](audits/); the
+The external audit is separate from this log. 33Labs reviewed six files at commit b66023d,
+2026-09-07 to 2026-09-26; the final report has 13 findings: 11 Fixed and 2 Acknowledged / Accepted
+Risk (L-02 #61, L-03 #68). M-06 (#64) is Fixed in 566a9eb, and 33Labs independently verified its
+fix at 35f0a58. The base remediation snapshot is f6893cb and main was reviewed through 566a9eb. The final report and its sha256 are in [`audits/`](audits/); the
 disposition of each finding in the current source is in
 [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
@@ -111,7 +109,7 @@ they covered:
 | Yield routing | Harvested USDC could only ever land in the immutable, egress-less vault, where nothing could move it out again. It now routes to a settable `yieldRecipient`, and the reported figure counts real farm yield rather than the raw balance, so a stray USDC transfer cannot inflate it. |
 | Mint accounting | Credit is pinned to the signed `amountNfts`, and the mint delta is measured, so over-credit, under-credit and donated bonds are all excluded. |
 | Custody swaps | `setCustodyAdapter` now refuses a swap while the outgoing adapter holds a live position, and requires the incoming adapter to be bound to this vault. |
-| Exits | The USDC sweep on `unstake` is best-effort, so the adapter's own USDC leg cannot brick a bond movement. An owner-gated `emergencyUnstake` adds a farm escape hatch. **Corrected 2026-09-21:** this row read "so a token pause or blacklist cannot brick a withdrawal", and that is false against the live DexFi farm, which settles the position's pending USDC inside its own `deposit` and `withdraw` - the calls the adapter makes to move bonds - outside anything the sweep covers. While USDC is paused, or while the adapter is blacklisted, `withdrawBonds`, `depositBonds` and `harvestYield` revert as soon as the position has any pending yield, and `emergencyUnstake` is the only lever left. Measured on a Base fork against the real token; the residual is in [KNOWN_RISKS.md](KNOWN_RISKS.md). |
+| Exits | The USDC sweep on `unstake` is best-effort, so the adapter's own USDC leg cannot brick a bond movement. An owner-gated `emergencyUnstake` adds a farm escape hatch. A token pause or blacklist can still stop a bond movement, because the live DexFi farm settles the position's pending USDC inside its own `deposit` and `withdraw` - the calls the adapter makes to move bonds - outside anything the sweep covers. While USDC is paused, or while the adapter is blacklisted, `withdrawBonds`, `depositBonds` and `harvestYield` revert as soon as the position has any pending yield, and `emergencyUnstake` is the only lever left. Measured on a Base fork against the real token; the residual is in [KNOWN_RISKS.md](KNOWN_RISKS.md). |
 | Yield pipeline | `claimYield` is callable by the vault or a settable harvester, so the immutable adapter can be pointed at the batch harvester later with no redeploy. |
 | Oracle safety | `withdrawBonds` reverts on a stale NAV in the debt-bearing branch. |
 | Auction floor | Raised so the floor always clears debt plus penalty at the first triggerable liquidation; the full relation is now asserted in `Config.t.sol`. |

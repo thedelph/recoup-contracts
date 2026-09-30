@@ -223,13 +223,13 @@ opening none from 20 of 20 to 0 of 20.
 includes deterministic regressions, stateful invariants and live-contract fork tests;
 [KNOWN_RISKS.md](KNOWN_RISKS.md) records the open posture and activation gates.
 
-The external audit by 33Labs completed on 2026-09-22. It covered `LenderPool`, `CreditWiring`,
+The external audit by 33Labs covered `LenderPool`, `CreditWiring`,
 `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d, with
-the base remediation snapshot at f6893cb and main reviewed through 566a9eb. The final report,
-re-issued on 2026-09-29, has 13 findings: 11 Fixed and 2 Acknowledged / Accepted Risk. It is in
+the base remediation snapshot at f6893cb and main reviewed through 566a9eb. The final report has
+13 findings: 11 Fixed and 2 Acknowledged / Accepted Risk. It is in
 [`audits/`](audits/) and the disposition of each finding in this source is in
-[KNOWN_RISKS.md](KNOWN_RISKS.md). M-06 (#64) is Fixed: #69 was merged into main as 566a9eb after
-successful repository CI, and 33Labs independently verified it before merge at 35f0a58. The
+[KNOWN_RISKS.md](KNOWN_RISKS.md). M-06 (#64) is Fixed in 566a9eb, and
+33Labs independently verified its fix at 35f0a58. The
 custody contracts this guide walks through (`CollateralVault`,
 `DirectCallAdapter`) were outside the audit's scope and have had internal review only.
 
