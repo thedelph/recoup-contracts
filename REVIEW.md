@@ -225,12 +225,12 @@ includes deterministic regressions, stateful invariants and live-contract fork t
 
 The external audit by 33Labs completed on 2026-09-22. It covered `LenderPool`, `CreditWiring`,
 `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d, with
-contract remediation reviewed through f6893cb. The final report, re-issued on 2026-09-26, has 13
-findings: 10 Fixed, 1 Fix Verified / Pending Merge and 2 Acknowledged / Accepted Risk. It is in
+the base remediation snapshot at f6893cb and main reviewed through 566a9eb. The final report,
+re-issued on 2026-09-29, has 13 findings: 11 Fixed and 2 Acknowledged / Accepted Risk. It is in
 [`audits/`](audits/) and the disposition of each finding in this source is in
-[KNOWN_RISKS.md](KNOWN_RISKS.md). The one pending merge is M-06 (#64): 33Labs verified #69 at
-35f0a58, trim included, and #69 is merged on the main branch as 566a9eb with the same source and
-tests. The custody contracts this guide walks through (`CollateralVault`,
+[KNOWN_RISKS.md](KNOWN_RISKS.md). M-06 (#64) is Fixed: #69 was merged into main as 566a9eb after
+successful repository CI, and 33Labs independently verified it before merge at 35f0a58. The
+custody contracts this guide walks through (`CollateralVault`,
 `DirectCallAdapter`) were outside the audit's scope and have had internal review only.
 
 ## Questions

@@ -10,10 +10,11 @@ later internal rounds are reflected in the code, the tests and [KNOWN_RISKS.md](
 here.
 
 The external audit is separate from this log. 33Labs reviewed six files at commit b66023d from
-2026-09-07 and completed on 2026-09-22; the final report was re-issued on 2026-09-26 with 13
-findings: 10 Fixed, 1 Fix Verified / Pending Merge (M-06 #64, verified on #69 at 35f0a58 and merged
-since as 566a9eb) and 2 Acknowledged / Accepted Risk (L-02 #61, L-03 #68), contract remediation
-reviewed through f6893cb. The final report and its sha256 are in [`audits/`](audits/); the
+2026-09-07 and completed on 2026-09-22; the final report was re-issued on 2026-09-29 with 13
+findings: 11 Fixed and 2 Acknowledged / Accepted Risk (L-02 #61, L-03 #68). M-06 (#64) is Fixed:
+#69 was merged into main as 566a9eb after successful repository CI, and 33Labs independently
+verified it before merge at 35f0a58. The base remediation snapshot is f6893cb and main was reviewed
+through 566a9eb. The final report and its sha256 are in [`audits/`](audits/); the
 disposition of each finding in the current source is in
 [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
