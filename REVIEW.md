@@ -67,9 +67,10 @@ No, and this is deliberate.
 
 ## Who controls the adapter, and what can they do?
 
-`Ownable`, owner set at construction. Today that is a single EOA, because the protocol is
-pre-launch and holds no third-party funds. A timelock and a governance multisig go in before
-go-live, and `test/Governance.t.sol` proves that flip is a plain `transferOwnership` with no
+`Ownable`, owner set at construction. On Base mainnet the owner is a `TimelockController` with a
+48-hour minimum delay whose only proposer and canceller is a 2-of-3 governance Safe, so every owner
+action on the adapter is public for 48 hours before it can run. The Base Sepolia stack is still owned
+by a single EOA. `test/Governance.t.sol` proves the handover is a plain `transferOwnership` with no
 redeploy and no disturbance to live state.
 
 This is stated plainly because Recoup also asks DexFi about *their* admin-key plans, and asking a
