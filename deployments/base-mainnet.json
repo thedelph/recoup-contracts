@@ -1,0 +1,63 @@
+{
+  "network": "base",
+  "chainId": 8453,
+  "deployedAt": "2026-10-02",
+  "note": "Recoup on Base mainnet. Deployed but not yet open to users. Operator wallets are not listed here; they are readable on chain.",
+  "source": {
+    "srcTree": "69c16afc1e7123027016b3d221e5cc726bb770a2",
+    "statement": "The deployed runtime of every contract below equals the bytecode that this repository's src/ builds with its foundry.toml and pinned libraries: exactly for NAVOracle, RiskParams, ReferralRegistry and TimelockController, and apart from constructor-set immutables for the rest. The mainnet deploy scripts are not published in this repository."
+  },
+  "verified": {
+    "sourcify": "14 of 14 exact_match",
+    "blockscout": "14 of 14",
+    "basescan": "14 of 14 Exact Match"
+  },
+  "deployBlocks": {
+    "protocol": {
+      "first": 52095163,
+      "last": 52095204
+    },
+    "referralRegistry": 52095514
+  },
+  "contracts": {
+    "NAVOracle": "0xF18ed41cfC1d00A179Eea790a2A4C7d48365681d",
+    "RiskParams": "0xf273D492310B08ba02Afc427b103659112e19ACe",
+    "CollateralVault": "0x95d5442aA3E3FDeb13DD9158fB9eCD0A1777FC53",
+    "DirectCallAdapter": "0x2a10A9f17024f98Ab9511F73f2473f82125Eb05f",
+    "CreditManager": "0x8E902D98Ef0b513613b42E3A0AA99b06bf28f748",
+    "TreasuryLiquiditySource": "0x5dD8BB9A663ABDcad4a123c6684EC423a1ab0334",
+    "LenderPool": "0x9085B96c079d8790D0A74043e2cfeB031C5d8Fb2",
+    "EpochHarvester": "0x230A5bDECAb42dCb1f7d4850E47fb02B6F3345b6",
+    "LiquidationAuction": "0x92E93BD303B1dcA297e69857711d7b77617c694F",
+    "ReferralRegistry": "0x947A94BA953E68a405527E0259bBd61Ff375a567"
+  },
+  "libraries": {
+    "CreditWiring": "0xbBd98f91088f09ABD9c1C6396b61623b7722C186"
+  },
+  "children": {
+    "MintAttemptReceiver": {
+      "address": "0xdc1D2a566baaFE3eDDDD2599A9d9eD964e953D33",
+      "deployedBy": "DirectCallAdapter"
+    }
+  },
+  "governance": {
+    "timelock": "0x8357AA0899917755744B139b51c72A8AEE0301Bf",
+    "timelockMinDelaySeconds": 172800,
+    "governanceSafe": "0x06ac4Ad08474F9C86912009b8489b8d363d3B2D3",
+    "safeThreshold": "2 of 3",
+    "proposerAndCanceller": "governanceSafe",
+    "executor": "anyone",
+    "protocolFeeSplitter": "0xA905d06704451733Ea77889FD3ac9847dcD35177"
+  },
+  "externals": {
+    "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "DexFiBond": "0x969C6eCF97c256846029cBCBB865824E505E006f",
+    "DexFiFarm": "0x0251cbB9a752331D29031eEc88c5a8BCbcDafFfa"
+  },
+  "riskParameters": {
+    "maxLtvBps": 2500,
+    "liquidationThresholdBps": 5000,
+    "globalBorrowCapUsdc": 25000,
+    "perAccountBorrowCapUsdc": 5000
+  }
+}

@@ -44,7 +44,7 @@ and re-audit their rounding, sequencing, impairment, frozen-stream, queue and re
 
 | Item | Current fact |
 |---|---|
-| Base mainnet | No Recoup contracts are deployed |
+| Base mainnet | Deployed 2026-10-02 and not yet open to users; addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json). Every deployed runtime equals the bytecode this source builds, exactly or apart from constructor-set immutables. The nine core contracts are owned by a 48-hour `TimelockController` whose only proposer and canceller is a 2-of-3 governance Safe (see Governance below). The `LenderPool` is paused, empty and not wired: `CreditManager.lenderPool()` and `EpochHarvester.lenderPool()` read zero, and the liquidity source is `TreasuryLiquiditySource` |
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty, and not wired as `CreditManager`'s liquidity source in the protocol-to-pool direction; the pool's own pointers to the manager and the harvester are set, and it is open to any depositor at the full 25,000 USDC cap |
 | Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047 against the 2026-09-01 source, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacked 26 selectors that source had, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy; the 2026-09-12 sync adds `wasCreditManager` to the pool and changes the signatures of `writeDownLoss` and `recoverWrittenDownLoss` on the manager, the 2026-09-14 sync adds the request-draw memory and the stream ceiling to the pool and the bool-gated `_settle` to the manager, and the 2026-09-15 sync adds the cash floor (`_floorTotal`) to the pool, so the gap is wider than that reading. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live `EpochHarvester` (the pool has no such selector and the call reverts there; until 2026-09-17 this cell attributed the figure to the pool) read 259.795831 USDC at block 46942219 on 2026-09-17, parked with nobody to deliver it to; it read 124.885415 USDC when this cell was first written, undated, and it rises with every harvest while the pool stays unwired |
@@ -1093,7 +1093,7 @@ development tree, which is not published.
 
 ## Other pre-launch risks and dependencies
 
-### Referral source fixed through partner self-registration; live deployment remains disabled
+### Referral source fixed through partner self-registration
 
 Delegated `registerFor(bytes32,address)` and the registry-only `ZeroAddress` error are removed. The
 remaining public registration function derives the owner from `msg.sender`, so a partner's payout
@@ -1102,10 +1102,11 @@ wallet or Safe must call `register(bytes32)` before its code is published. A raw
 wallet can self-register and resolve as the payout address. The storage layout remains the two
 existing mappings in slots 0 and 1.
 
-The standalone deploy script permits local chain ID 31337 for tests and rehearsal. Every non-local
-chain reverts with `LiveDeploymentDisabled` before the legacy confirmation phrase is considered, so
-that phrase cannot bypass the gate. This source correction is not authorisation for a public-chain
-transaction.
+This source is deployed on Base mainnet at `0x947A94BA953E68a405527E0259bBd61Ff375a567` (block
+52,095,514). Its runtime equals this source's build exactly, and its constructor registered the
+reserved codes to `NON_BINDABLE`. The standalone deploy script in this repository permits local
+chain ID 31337 for tests and rehearsal; every other chain reverts with `LiveDeploymentDisabled`
+before the legacy confirmation phrase is considered, so that phrase cannot bypass the gate.
 
 ### The deployed Sepolia `ReferralRegistry` is stale
 
@@ -1142,15 +1143,18 @@ deployment transaction, 16 constructor reservation logs and 841,101 gas. Reserve
 `NON_BINDABLE`; `DEXFI` began unclaimed; former-selector refusal, partner self-registration,
 referee binding, collision rejection and reserved-code refusal all passed; and deployed runtime
 matched the build exactly. No live key or signing material was used, no public transaction was sent
-and the committed address did not change. Replacement remains disabled and unauthorised; do not
-publish or reserve codes against the stale instance.
+and the committed address did not change. Replacing the Sepolia instance remains disabled and
+unauthorised; do not publish or reserve codes against the stale instance.
 
-### `ProtocolFeeSplitter` can strand both recipients' fees
+### `ProtocolFeeSplitter` parks a blocked recipient's fee rather than stranding both
 
-`split()` makes two unconditional USDC transfers to immutable recipients. If either recipient is
-blocked by the token, the whole call reverts and the unblocked recipient cannot collect either. The
-splitter is published but not deployed. Do not deploy or use it until fee entitlements are separated
-from delivery, for example through independent pull claims.
+`split()` pays the two immutable recipients their 80/20 shares. If USDC refuses one recipient, that
+leg is parked in `owedToWallet` (`LegParked`) and the other recipient is still paid, so one blocked
+destination cannot take the other party's fee down with it. `flushLegTo(wallet)` pays a parked leg
+once its recipient can receive again; only the two recipients can ever be keys, so nobody chooses a
+destination. If the token destroys parked USDC in place, `reconcileDestroyedLegs()` charges the
+shortfall to the parked leg rather than to both parties (audit round 25, finding F2). The splitter
+is deployed on Base mainnet as the protocol's fee wallet.
 
 ### DexFi whitelist revocation can strand collateral
 
@@ -1164,15 +1168,20 @@ Referral launch also needs an operational policy for claim-before-publication, l
 Sybil attribution and the first qualifying borrow. The registry alone does not solve those programme
 rules.
 
-### Governance is deliberately pre-launch
+### Governance: a timelock and a Safe on Base mainnet, a single EOA on Base Sepolia
 
-Every current Ownable protocol contract is controlled by the same EOA. That key can redirect yield,
-replace the auction pointer before seizure, emergency-unstake collateral, pause core paths and stop
-lender-yield delivery. Losing it permanently freezes every owner-only recovery and wiring path.
+On Base mainnet the nine Ownable core contracts are owned by a `TimelockController` with a
+172,800-second (48-hour) minimum delay. Its only proposer and canceller is a 2-of-3 governance Safe,
+and anyone may execute an operation once it is ready. A guardian address, separate from the Safe,
+can pause `CreditManager`, `CollateralVault` and `LenderPool` immediately; `unpause()` on each is
+owner-only, so resuming waits the timelock's delay. The deployer holds no role. Every owner action,
+including a change to risk parameters or wiring, is therefore public for 48 hours before it can take
+effect.
 
-There is no production timelock, multisig or separate guardian role. Go-live requires the ownership
-handover, a governance Safe, a timelock for risk changes and a pause role that does not inherit the
-timelock's delay.
+The Base Sepolia stack is still controlled by a single EOA. That key can redirect yield, replace the
+auction pointer before seizure, emergency-unstake collateral, pause core paths and stop lender-yield
+delivery there, and losing it permanently freezes every owner-only recovery and wiring path on that
+deployment.
 
 The contracts are immutable by choice. Replacing a manager requires a redeploy and pointer update;
 it does not automatically migrate assets held by the old contract. Migration must be rehearsed before

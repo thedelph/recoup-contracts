@@ -7,10 +7,10 @@ borrows USDC, and the bonds' realised yield pays the debt down over time. This r
 the public Solidity contracts, tests, deployment record and reviewer documentation.
 
 > [!WARNING]
-> Recoup is not deployed on Base mainnet and accepts no third-party funds. The only deployment is a
-> Base Sepolia testnet stack against mock USDC, bonds and farm; it predates the audit's fixes and does
-> not match this source. Its `LenderPool` is empty and not wired as the protocol's liquidity source.
-> Do not fund or activate it.
+> Recoup is deployed on Base mainnet but not yet open to users, and it accepts no third-party funds.
+> Its mainnet `LenderPool` is paused and accepts no deposits. The Base Sepolia stack against mock
+> USDC, bonds and farm predates the audit's fixes and does not match this source; its `LenderPool` is
+> empty and not wired as the protocol's liquidity source. Do not fund or activate it.
 
 ## Current status
 
@@ -20,9 +20,9 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Latest remediation | M-06 ([#64](https://github.com/thedelph/recoup-contracts/issues/64)) is Fixed: [#69](https://github.com/thedelph/recoup-contracts/pull/69), which also adds a permissionless floor trim, was merged into main as 566a9eb after successful repository CI, and 33Labs independently verified it before merge at 35f0a58. A Low residual is disclosed in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). L-02 (#61) is retained by design; L-03 (#68) is answered by [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) |
 | Core loan path | Implemented and tested: custody, NAV, borrowing, yield application, liquidation and workout |
 | Base Sepolia | Historic mock-stack deployment, explorer-verified at deployment but not at parity with this source. Addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
-| Base mainnet | No Recoup contracts deployed |
-| Lender pool | Not approved to wire or fund; [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
-| Referral registry | Source fixed; the Sepolia instance is defective and unused, and live redeployment is disabled |
+| Base mainnet | Deployed 2026-10-02 and not yet open to users. The nine core contracts are owned by a `TimelockController` with a 48-hour minimum delay, whose only proposer and canceller is a 2-of-3 governance Safe; a separate guardian can pause. Every deployed runtime equals the bytecode this repository's `src/` builds, and the source is verified on Sourcify, Blockscout and BaseScan. Addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json) |
+| Lender pool | On Base mainnet: deployed, paused, empty and not yet wired as the liquidity source. The first phase wires it through the timelock and funds it only with the maintainer's own capital; it stays closed to outside deposits. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
+| Referral registry | Source fixed. Deployed on Base mainnet, with a runtime equal to this source; the Sepolia instance is defective and unused |
 
 The real DexFi bond and farm contracts exist only on Base mainnet. Mainnet fork tests exercise them
 directly; the Sepolia mocks mirror their verified interfaces, including the bond transfer whitelist.
@@ -64,17 +64,49 @@ liquidation threshold and the borrow caps live in bounded storage in
 
 ## Activation blockers and residual risks
 
-The lender pool is not approved to wire or fund, including with the author's capital, and no
-public, DexFi or Bond Fund capital is accepted. Before any of that:
+On Base mainnet the lender pool is paused and not yet wired. The first phase wires it through the
+timelock and funds it only with the maintainer's own capital; no public, DexFi or Bond Fund capital
+is accepted. Before any third-party capital:
 
 1. The audit report's recommendations before third-party capital: keep M-06's (#64) regression
    and #61-preservation coverage, keep the activation gate, verify that a deployment matches the
    source, and verify that a production deployment includes the merged M-06 remediation commit
-   566a9eb or a descendant of it. The L-03 (#68) runbook is published as
-   [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md).
+   566a9eb or a descendant of it. The Base mainnet deployment matches this source (see
+   [Base mainnet deployment](#base-mainnet-deployment)), and this source descends from 566a9eb. The
+   L-03 (#68) runbook is published as [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md).
 2. A fresh internal review of the principal-accounting and entry-pricing changes as shipped.
-3. The mainnet go-live gates in [`KNOWN_RISKS.md`](KNOWN_RISKS.md): governance (timelock and Safe),
-   wiring, a rehearsed deployment, and an agreed DexFi whitelist and custody policy.
+3. The mainnet go-live gates in [`KNOWN_RISKS.md`](KNOWN_RISKS.md): governance (a 48-hour timelock
+   and a 2-of-3 Safe) and a rehearsed deployment are in place; the pool's wiring and an agreed DexFi
+   whitelist and custody policy remain.
+
+## Base mainnet deployment
+
+Deployed on 2026-10-02 (blocks 52,095,163 to 52,095,204, and 52,095,514 for the referral registry).
+The full record is [`deployments/base-mainnet.json`](deployments/base-mainnet.json).
+
+| Contract | Address |
+|---|---|
+| `NAVOracle` | `0xF18ed41cfC1d00A179Eea790a2A4C7d48365681d` |
+| `RiskParams` | `0xf273D492310B08ba02Afc427b103659112e19ACe` |
+| `CollateralVault` | `0x95d5442aA3E3FDeb13DD9158fB9eCD0A1777FC53` |
+| `DirectCallAdapter` | `0x2a10A9f17024f98Ab9511F73f2473f82125Eb05f` |
+| `CreditManager` | `0x8E902D98Ef0b513613b42E3A0AA99b06bf28f748` |
+| `TreasuryLiquiditySource` | `0x5dD8BB9A663ABDcad4a123c6684EC423a1ab0334` |
+| `LenderPool` | `0x9085B96c079d8790D0A74043e2cfeB031C5d8Fb2` |
+| `EpochHarvester` | `0x230A5bDECAb42dCb1f7d4850E47fb02B6F3345b6` |
+| `LiquidationAuction` | `0x92E93BD303B1dcA297e69857711d7b77617c694F` |
+| `ReferralRegistry` | `0x947A94BA953E68a405527E0259bBd61Ff375a567` |
+| `ProtocolFeeSplitter` | `0xA905d06704451733Ea77889FD3ac9847dcD35177` |
+| `CreditWiring` (library) | `0xbBd98f91088f09ABD9c1C6396b61623b7722C186` |
+| `MintAttemptReceiver` (implementation, deployed by the adapter) | `0xdc1D2a566baaFE3eDDDD2599A9d9eD964e953D33` |
+| `TimelockController` (owner of the nine core contracts) | `0x8357AA0899917755744B139b51c72A8AEE0301Bf` |
+| Governance Safe (2-of-3; the timelock's only proposer and canceller) | `0x06ac4Ad08474F9C86912009b8489b8d363d3B2D3` |
+
+Every deployed runtime equals the bytecode this repository's `src/` builds with its `foundry.toml`
+and pinned libraries: exactly for `NAVOracle`, `RiskParams`, `ReferralRegistry` and
+`TimelockController`, and apart from constructor-set immutables for the rest. Source is verified on
+Sourcify (exact match), Blockscout and BaseScan for all 14. The mainnet deploy scripts are not
+published in this repository; `script/` here holds the Base Sepolia and local paths.
 
 Disclosed residual risks, each with its mechanism and the function that implements it, are in
 [`KNOWN_RISKS.md`](KNOWN_RISKS.md). Among them: the post-loss request-floor lock (#61), the
