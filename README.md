@@ -8,7 +8,8 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 
 > [!WARNING]
 > Recoup is deployed on Base mainnet but not yet open to users, and it accepts no third-party funds.
-> Its mainnet `LenderPool` is paused and accepts no deposits. The Base Sepolia stack against mock
+> Its mainnet `LenderPool` is wired as the protocol's liquidity source and holds only the maintainer's
+> own capital; it is paused and accepts no deposits. The Base Sepolia stack against mock
 > USDC, bonds and farm predates the audit's fixes and does not match this source; its `LenderPool` is
 > empty and not wired as the protocol's liquidity source. Do not fund or activate it.
 
@@ -21,7 +22,7 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Core loan path | Implemented and tested: custody, NAV, borrowing, yield application, liquidation and workout |
 | Base Sepolia | Historic mock-stack deployment, explorer-verified at deployment but not at parity with this source. Addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
 | Base mainnet | Deployed 2026-10-02 and not yet open to users. The nine core contracts are owned by a `TimelockController` with a 48-hour minimum delay, whose only proposer and canceller is a 2-of-3 governance Safe; a separate guardian can pause. Every deployed runtime equals the bytecode this repository's `src/` builds, and the source is verified on Sourcify, Blockscout and BaseScan. Addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json) |
-| Lender pool | On Base mainnet: deployed, paused, empty and not yet wired as the liquidity source. The first phase wires it through the timelock and funds it only with the maintainer's own capital; it stays closed to outside deposits. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
+| Lender pool | On Base mainnet: wired through the timelock as `CreditManager`'s liquidity source and lender pool and as `EpochHarvester`'s lender-yield destination, and funded with 1,000 USDC of the maintainer's own capital, whose shares the governance Safe holds. It stays paused and closed to outside deposits. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
 | Referral registry | Source fixed. Deployed on Base mainnet, with a runtime equal to this source; the Sepolia instance is defective and unused |
 
 The real DexFi bond and farm contracts exist only on Base mainnet. Mainnet fork tests exercise them
@@ -42,7 +43,7 @@ CreditManager <--- NAVOracle             v
   ^               RiskParams       EpochHarvester
   |
   +--- ILiquiditySource <--- TreasuryLiquiditySource (current testnet source)
-                          \-- LenderPool (published, empty and unwired)
+                          \-- LenderPool (mainnet source, paused to deposits)
   |
   +--- LiquidationAuction ---> public bidder or workout
 ```
@@ -55,7 +56,7 @@ CreditManager <--- NAVOracle             v
 | `CreditWiring` | Deploy-time-linked library `CreditManager` reaches by delegatecall for its wiring probes, split out to fit the EIP-170 limit |
 | `EpochHarvester` | Claims realised farm yield, splits it and applies the borrower share to debt |
 | `LiquidationAuction` | Public Dutch auction with a workout fallback for unfilled positions |
-| `LenderPool` | ERC-4626 USDC pool with impairment pricing and escrowed withdrawal requests; not approved for activation |
+| `LenderPool` | ERC-4626 USDC pool with impairment pricing and escrowed withdrawal requests; wired on Base mainnet and holding only the maintainer's own capital |
 | `ReferralRegistry`, `ProtocolFeeSplitter` | Standalone referral and fee-routing utilities, outside the core deployment path |
 
 Fixed parameters and external addresses live in [`src/Config.sol`](src/Config.sol); max LTV,
@@ -64,9 +65,9 @@ liquidation threshold and the borrow caps live in bounded storage in
 
 ## Activation blockers and residual risks
 
-On Base mainnet the lender pool is paused and not yet wired. The first phase wires it through the
-timelock and funds it only with the maintainer's own capital; no public, DexFi or Bond Fund capital
-is accepted. Before any third-party capital:
+On Base mainnet the lender pool is wired through the timelock and funded only with the maintainer's
+own capital, and it stays paused; no public, DexFi or Bond Fund capital is accepted. Before any
+third-party capital:
 
 1. The audit report's recommendations before third-party capital: keep M-06's (#64) regression
    and #61-preservation coverage, keep the activation gate, verify that a deployment matches the
@@ -74,9 +75,13 @@ is accepted. Before any third-party capital:
    566a9eb or a descendant of it. The Base mainnet deployment matches this source (see
    [Base mainnet deployment](#base-mainnet-deployment)), and this source descends from 566a9eb. The
    L-03 (#68) runbook is published as [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md).
-2. A fresh internal review of the principal-accounting and entry-pricing changes as shipped.
+2. A review of the pool's principal accounting and entry pricing: both are in `LenderPool`, which
+   33Labs audited at b66023d with the remediation reviewed through 566a9eb. The report's
+   `LenderPool` findings are Fixed and verified apart from L-02 (#61), which is Acknowledged /
+   Accepted Risk. The open findings and residuals [`KNOWN_RISKS.md`](KNOWN_RISKS.md) discloses on
+   the pool remain.
 3. The mainnet go-live gates in [`KNOWN_RISKS.md`](KNOWN_RISKS.md): governance (a 48-hour timelock
-   and a 2-of-3 Safe) and a rehearsed deployment are in place; the pool's wiring and an agreed DexFi
+   and a 2-of-3 Safe), a rehearsed deployment and the pool's wiring are in place; an agreed DexFi
    whitelist and custody policy remain.
 
 ## Base mainnet deployment

@@ -25,8 +25,8 @@ What the audit covers and what it does not:
   (#51), the capped 30-day stream and newcomer full-value recovery; M-05 (#52), successive partial
   backlog delivery, with the below-ceiling anti-capture behaviour preserved; and L-01 (#54), repeated
   non-count-changing settlement preserving the same 41,254-base-unit accrual as a single settlement.
-- It is not a statement about any deployment. The Base Sepolia deployment predates the fixes, and
-  nothing is deployed on Base mainnet.
+- It is not a statement about any deployment. The Base Sepolia deployment predates the fixes; the
+  Base mainnet deployment matches this source, which descends from 566a9eb.
 - The report's own disclaimer: a security review cannot prove the absence of vulnerabilities, and it
   recommends further review, deployment verification, monitoring and a public bug bounty before
   production use.
