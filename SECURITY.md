@@ -24,12 +24,12 @@ Recoup is maintained by one developer, with no on-call rota. What you can expect
 
 ## Rewards
 
-Recoup is a small protocol with a small lending pool, and the rewards are sized to what is
-actually at risk. They rise as capital is added to the pool.
+Recoup is a small protocol with a capped lending pool, and the rewards are sized to what is
+actually at risk under that cap. They rise as the cap rises.
 
 | Severity | What counts | Reward (USDC) |
 |---|---|---|
-| Critical | Theft of, or a permanent freeze of, lender USDC or borrower bonds | 10% of funds at risk, minimum 100, maximum 500 |
+| Critical | Theft of, or a permanent freeze of, lender USDC or borrower bonds | 10% of funds at risk, minimum 100, maximum 2,500 |
 | High | Theft of yield, a temporary freeze of exits, or broken liquidation or workout accounting | 100 to 250 |
 | Medium | Griefing, or a wrong value that needs unusual but reachable conditions | 50 |
 | Low | Any other real defect | Credit in this repository |
@@ -102,7 +102,7 @@ During an active exploit, a whitehat may rescue funds from the contracts in scop
   security@recoup.fi or this repository's private report form if you cannot within six hours;
 - you may act under a pseudonym; before any bounty is paid, the payout address you nominate is
   screened against the US (OFAC), UK, EU and UN sanctions lists;
-- the bounty is 10% of the value returned, capped at 500 USD per whitehat and at 500 USD in total
+- the bounty is 10% of the value returned, capped at 2,500 USD per whitehat and at 2,500 USD in total
   for one exploit, shared pro rata if several whitehats rescue funds. It is paid in USDC by Recoup
   after the return, within 15 days; it is never deducted from the rescued funds.
 
