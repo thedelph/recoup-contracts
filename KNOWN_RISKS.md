@@ -650,6 +650,29 @@ trim: after a 5,000 repayment the trim releases 6,999.999999 and a dormant lende
 10,999.999998. Until someone trims after that, the kept floor stays reserved. It needs two external
 raw losses and nobody trimming in the window between them.
 
+**Under a mark, and after a loss. Low, disclosed 2026-11-18, raised through the bug bounty.** The
+worth a service writes a dust floor down to is the gross conversion, so while a mark or an unplaced
+loss stands (`exitReserve` above 0) the floor left on dust sits above what the dust can draw
+(`previewRedeem`) by the mark pro-rated over the dust. The source comment at the write-down says a
+request serviced down to dust cannot keep a reservation its shares can never draw; that is true of
+the gross worth only. It is not a way round the fix: what is left of a floor never exceeds the
+dust's gross worth rounded up, and a request nobody has serviced keeps its whole filing-time floor
+under the same mark, because no mark moves a floor. Measured in
+[`test/S115_FloorWorthUnderAMark.t.sol`](test/S115_FloorWorthUnderAMark.t.sol) on a 200,000 book
+with 100,000 lent and a 40,000 mark: 1% of the supply left as dust keeps 439.560440 above its draw
+of 1,600.000000 (27.5%), where an unserviced request of 20,000 keeps 4,000.000000 above its draw of
+16,000.000000 (25%). Released in full, the mark leaves the dust floor 1 wei above its draw. If the
+mark ends in a loss instead, the excess outlives it: after a 40,000 socialised loss the dust floor
+stays 439.560440 above the dust's gross worth whether the dust was serviced during the mark or
+before it, the request carries no `writeDownDeclined` mark so a trim releases 0, and only her
+completing service, her cancel or her own next service (which writes it down to 1 wei above)
+releases it. Pricing the write-down on `exitAssets` instead was measured on a copy of this source
+and not taken: it closes the first ordering and not the second, and an honest requester serviced
+half-way under a mark then needs 16 calls of the ordinary `maxRequestRedeem` loop to complete
+instead of 1, and is paid 8 wei less, because the request door converts cash to shares at the gross
+price. No funds move to anyone; what the excess holds back is liquidity priority, from the other
+requests' reach and from lending.
+
 **Status.** On the main branch with the trim, in 566a9eb. The worth is rounded up, for the reason
 given above. The report in `audits/` classes M-06 Fixed, and 33Labs independently verified 35f0a58,
 which carries the trim: 72 of 72 fix-focused tests and 104 of 104 #61-preservation tests passed. `src/`, `test/` and `script/`
