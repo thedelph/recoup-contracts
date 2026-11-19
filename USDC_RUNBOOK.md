@@ -113,8 +113,10 @@ What a user should expect while it lasts:
    transfer needs a whitelisted party, so units sent to any other address can only come back to a
    whitelisted one (such as the adapter) and cost an extra transfer in the insolvent window. Send the
    restake as close to the hatch as the owner key allows, in one batch wherever the owner can batch.
-   At f6893cb the owner is a single key; under the intended governance the adapter's owner is the
-   timelock, so both calls would carry its delay (from the intended design, not executed).
+   On Base mainnet the adapter's owner is a consent gate controlled by the timelock: the hatch aimed
+   at the adapter itself and `restakeLoose` pass through on the timelock's word alone, so both calls
+   carry its 48-hour delay and can go in one timelock batch (read from the deployed wiring, not
+   executed).
 6. **Blacklisted adapter: replace it.** Hatch-and-restake does not help durably, because the farm
    keeps paying the blacklisted address. The repair path `restakeLoose`'s NatSpec describes is written
    for a replaced farm; applying it to a blacklisted adapter on the same farm is the maintainer's reading, not a
