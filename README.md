@@ -7,11 +7,13 @@ borrows USDC, and the bonds' realised yield pays the debt down over time. This r
 the public Solidity contracts, tests, deployment record and reviewer documentation.
 
 > [!WARNING]
-> Recoup is deployed on Base mainnet but not yet open to users, and it accepts no third-party funds.
-> Its mainnet `LenderPool` is wired as the protocol's liquidity source and holds only the maintainer's
-> own capital; it is paused and accepts no deposits. The Base Sepolia stack against mock
-> USDC, bonds and farm predates the audit's fixes and does not match this source; its `LenderPool` is
-> empty and not wired as the protocol's liquidity source. Do not fund or activate it.
+> Recoup is live on Base mainnet. Its `LenderPool` is the protocol's liquidity source and has
+> accepted deposits from any address since 2026-10-18, up to a 5,000 USDC deposit cap. Lenders'
+> capital is lent to borrowers against DexFi bonds and carries the risks disclosed in
+> [`KNOWN_RISKS.md`](KNOWN_RISKS.md). Existing-bond deposits into `CollateralVault` are off, so bonds
+> enter custody only by minting through DexFi. The Base Sepolia stack against mock USDC, bonds and
+> farm predates the audit's fixes and does not match this source; its `LenderPool` is empty and not
+> wired as the protocol's liquidity source. Do not fund or activate it.
 
 ## Current status
 
@@ -21,8 +23,8 @@ the public Solidity contracts, tests, deployment record and reviewer documentati
 | Latest remediation | M-06 ([#64](https://github.com/thedelph/recoup-contracts/issues/64)) is Fixed: [#69](https://github.com/thedelph/recoup-contracts/pull/69), which also adds a permissionless floor trim, was merged into main as 566a9eb after successful repository CI, and 33Labs independently verified it before merge at 35f0a58. A Low residual is disclosed in [`KNOWN_RISKS.md`](KNOWN_RISKS.md). L-02 (#61) is retained by design; L-03 (#68) is answered by [`USDC_RUNBOOK.md`](USDC_RUNBOOK.md) |
 | Core loan path | Implemented and tested: custody, NAV, borrowing, yield application, liquidation and workout |
 | Base Sepolia | Historic mock-stack deployment, explorer-verified at deployment but not at parity with this source. Addresses in [`deployments/base-sepolia.json`](deployments/base-sepolia.json) |
-| Base mainnet | Deployed 2026-10-02 and not yet open to users. The nine core contracts are owned by a `TimelockController` with a 48-hour minimum delay, whose only proposer and canceller is a 2-of-3 governance Safe; a separate guardian can pause. Every deployed runtime equals the bytecode this repository's `src/` builds, and the source is verified on Sourcify, Blockscout and BaseScan. Addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json) |
-| Lender pool | On Base mainnet: wired through the timelock as `CreditManager`'s liquidity source and lender pool and as `EpochHarvester`'s lender-yield destination, and funded with 1,000 USDC of the maintainer's own capital, whose shares the governance Safe holds. It stays paused and closed to outside deposits. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
+| Base mainnet | Deployed 2026-10-02. Seven of the nine core contracts are owned by a `TimelockController` with a 48-hour minimum delay, whose only proposer and canceller is a 2-of-3 governance Safe; `CollateralVault` and `DirectCallAdapter` are each owned by a consent gate that the same timelock controls, and a few owner calls on those two also need a joint approver Safe's consent (see [`KNOWN_RISKS.md`](KNOWN_RISKS.md)). A separate guardian can pause. Every deployed runtime equals the bytecode this repository's `src/` builds, and the source is verified on Sourcify, Blockscout and BaseScan. Addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json) |
+| Lender pool | On Base mainnet: wired through the timelock as `CreditManager`'s liquidity source and lender pool and as `EpochHarvester`'s lender-yield destination, and open to deposits from any address since 2026-10-18 with a deposit cap of 5,000 USDC, which only an owner operation through the 48-hour timelock can change. [`KNOWN_RISKS.md`](KNOWN_RISKS.md) carries the exact state |
 | Referral registry | Source fixed. Deployed on Base mainnet, with a runtime equal to this source; the Sepolia instance is defective and unused |
 
 The real DexFi bond and farm contracts exist only on Base mainnet. Mainnet fork tests exercise them
@@ -43,7 +45,7 @@ CreditManager <--- NAVOracle             v
   ^               RiskParams       EpochHarvester
   |
   +--- ILiquiditySource <--- TreasuryLiquiditySource (current testnet source)
-                          \-- LenderPool (mainnet source, paused to deposits)
+                          \-- LenderPool (mainnet source, open to deposits)
   |
   +--- LiquidationAuction ---> public bidder or workout
 ```
@@ -56,7 +58,7 @@ CreditManager <--- NAVOracle             v
 | `CreditWiring` | Deploy-time-linked library `CreditManager` reaches by delegatecall for its wiring probes, split out to fit the EIP-170 limit |
 | `EpochHarvester` | Claims realised farm yield, splits it and applies the borrower share to debt |
 | `LiquidationAuction` | Public Dutch auction with a workout fallback for unfilled positions |
-| `LenderPool` | ERC-4626 USDC pool with impairment pricing and escrowed withdrawal requests; wired on Base mainnet and holding only the maintainer's own capital |
+| `LenderPool` | ERC-4626 USDC pool with impairment pricing and escrowed withdrawal requests; wired on Base mainnet and open to deposits up to its cap |
 | `ReferralRegistry`, `ProtocolFeeSplitter` | Standalone referral and fee-routing utilities, outside the core deployment path |
 
 Fixed parameters and external addresses live in [`src/Config.sol`](src/Config.sol); max LTV,
@@ -65,9 +67,8 @@ liquidation threshold and the borrow caps live in bounded storage in
 
 ## Activation blockers and residual risks
 
-On Base mainnet the lender pool is wired through the timelock and funded only with the maintainer's
-own capital, and it stays paused; no public, DexFi or Bond Fund capital is accepted. Before any
-third-party capital:
+On Base mainnet the lender pool is wired through the timelock and has accepted deposits from any
+address since 2026-10-18, up to its 5,000 USDC deposit cap. What the open pool rests on:
 
 1. The audit report's recommendations before third-party capital: keep M-06's (#64) regression
    and #61-preservation coverage, keep the activation gate, verify that a deployment matches the
@@ -80,9 +81,10 @@ third-party capital:
    `LenderPool` findings are Fixed and verified apart from L-02 (#61), which is Acknowledged /
    Accepted Risk. The open findings and residuals [`KNOWN_RISKS.md`](KNOWN_RISKS.md) discloses on
    the pool remain.
-3. The mainnet go-live gates in [`KNOWN_RISKS.md`](KNOWN_RISKS.md): governance (a 48-hour timelock
-   and a 2-of-3 Safe), a rehearsed deployment and the pool's wiring are in place; an agreed DexFi
-   whitelist and custody policy remain.
+3. The mainnet go-live gates in [`KNOWN_RISKS.md`](KNOWN_RISKS.md): governance (a 48-hour timelock,
+   a 2-of-3 Safe and two consent gates), a rehearsed deployment and the pool's wiring are in place;
+   an agreed DexFi whitelist and custody policy remain, and existing-bond deposits stay off until
+   then.
 
 ## Base mainnet deployment
 
@@ -104,19 +106,25 @@ The full record is [`deployments/base-mainnet.json`](deployments/base-mainnet.js
 | `ProtocolFeeSplitter` | `0xA905d06704451733Ea77889FD3ac9847dcD35177` |
 | `CreditWiring` (library) | `0xbBd98f91088f09ABD9c1C6396b61623b7722C186` |
 | `MintAttemptReceiver` (implementation, deployed by the adapter) | `0xdc1D2a566baaFE3eDDDD2599A9d9eD964e953D33` |
-| `TimelockController` (owner of the nine core contracts) | `0x8357AA0899917755744B139b51c72A8AEE0301Bf` |
+| `TimelockController` (owner of seven core contracts, and controller of both consent gates) | `0x8357AA0899917755744B139b51c72A8AEE0301Bf` |
 | Governance Safe (2-of-3; the timelock's only proposer and canceller) | `0x06ac4Ad08474F9C86912009b8489b8d363d3B2D3` |
+| Bond-deposit consent gate (owner of `CollateralVault`) | `0xF24235E22FC6c52F37512f6f330536c49f61da48` |
+| Adapter consent gate (owner of `DirectCallAdapter`) | `0x2A733afD666839998cfF09Ab5c18F5FA7746022C` |
+| Joint approver Safe (2-of-3; consents at both gates) | `0x615C34e41F031B0ba1E3ba984388FEDE9eB56819` |
 
 Every deployed runtime equals the bytecode this repository's `src/` builds with its `foundry.toml`
 and pinned libraries: exactly for `NAVOracle`, `RiskParams`, `ReferralRegistry` and
 `TimelockController`, and apart from constructor-set immutables for the rest. Source is verified on
-Sourcify (exact match), Blockscout and BaseScan for all 14. The mainnet deploy scripts are not
-published in this repository; `script/` here holds the Base Sepolia and local paths.
+Sourcify (exact match), Blockscout and BaseScan for all 14. The two consent gates are not built from
+this repository: they were deployed in blocks 52,511,119 and 52,511,124, their source is verified
+exact match on Sourcify, and they were outside the external audit's scope. The mainnet deploy
+scripts are not published in this repository; `script/` here holds the Base Sepolia and local paths.
 
 Disclosed residual risks, each with its mechanism and the function that implements it, are in
 [`KNOWN_RISKS.md`](KNOWN_RISKS.md). Among them: the post-loss request-floor lock (#61), the
-round 22 F12 uncollectable-receiver claim, round 17's transaction-ordering window, and the
-paused-USDC behaviour of the bond doors (#68).
+round 22 F12 uncollectable-receiver claim, round 17's transaction-ordering window, the
+paused-USDC behaviour of the bond doors (#68), and the open findings raised through the bug bounty
+in 2026-11.
 
 ## Build and test
 
@@ -151,8 +159,9 @@ the opt-in; [`REVIEW.md`](REVIEW.md) names them.
   agreement is in [`REVIEW.md`](REVIEW.md).
 - Liquidation transfers bonds from the adapter to the winning bidder; there is no second custody
   contract, and nothing in `src/` redeems bonds from the fund.
-- Mainnet activation needs an agreed whitelist and custody policy and caps set against DexFi's
-  admin-key and upgrade posture.
+- Opening existing-bond deposits needs an agreed whitelist and custody policy and the joint approver
+  Safe's consent at the vault's gate; the caps stay set against DexFi's admin-key and upgrade
+  posture.
 
 ## Documentation
 

@@ -22,16 +22,17 @@ they are not an external audit.
 
 - An **activation blocker** prevents wiring or funding `LenderPool`, including with the author's
   capital.
-- A **third-party capital gate** is additional. Even after the activation blockers close, no public,
-  DexFi or Bond Fund capital is accepted until the recommendations the external audit report makes
-  before third-party capital are met (see the External audit row under Deployment facts).
+- A **third-party capital gate** is additional: the recommendations the external audit report makes
+  before third-party capital (see the External audit row under Deployment facts). They are met on
+  Base mainnet, where the `LenderPool` has accepted deposits from any address since 2026-10-18, up
+  to its 5,000 USDC deposit cap.
 - A **residual risk** is a known limitation that must stay disclosed and be reconsidered at go-live,
   even when it is not an activation blocker.
 
 No activation blocker is open. The three `LenderPool` findings classed as activation blockers stand
 at two closed by construction, round 22 F3 and round 21 F7, and one narrowed to a disclosed
 residual, round 22 F12; the section "`LenderPool` findings" below names the function that carries
-each. The third-party capital gate and the mainnet go-live requirements below still apply.
+each. The mainnet go-live requirements below still apply.
 
 The pool's principal accounting and its active-tail entry pricing are in `LenderPool`, which 33Labs
 audited at b66023d with the remediation reviewed through 566a9eb; this source's `LenderPool` is
@@ -45,14 +46,14 @@ and the open findings and residuals this file discloses on the pool still stand.
 
 | Item | Current fact |
 |---|---|
-| Base mainnet | Deployed 2026-10-02 and not yet open to users; addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json). Every deployed runtime equals the bytecode this source builds, exactly or apart from constructor-set immutables. The nine core contracts are owned by a 48-hour `TimelockController` whose only proposer and canceller is a 2-of-3 governance Safe (see Governance below). The `LenderPool` is wired: `CreditManager.liquiditySource()`, `CreditManager.lenderPool()` and `EpochHarvester.lenderPool()` read the pool, set by the timelock operation `0x801a3cd7e4d3d5e934763e80d99c9439b916178553afd4377d9b07784ed4bda2` executed in block 52,265,000 (transaction `0x9401dd26bbaee3b7073e23f3c91022ac751bdafe2264315f6a339109b0bfdeba`). It holds 1,000 USDC of the maintainer's own capital, deposited by the timelock operation `0xe6ef454207ed14b7e585ef479a5b0a5bd30eeeb5ad7f134c88be91a4de79f0e2` executed in block 52,265,414 (transaction `0xc651d0d681735a9ee2d4feceb17a06789926d225f15f7e4ba0a5c3af6cf9a5a0`), and the governance Safe holds every share. The pool stays paused, so it accepts no deposits |
+| Base mainnet | Deployed 2026-10-02; addresses in [`deployments/base-mainnet.json`](deployments/base-mainnet.json). Every deployed runtime equals the bytecode this source builds, exactly or apart from constructor-set immutables. Seven of the nine core contracts are owned by a 48-hour `TimelockController` whose only proposer and canceller is a 2-of-3 governance Safe; `CollateralVault` and `DirectCallAdapter` are each owned by a consent gate that the same timelock controls, so a few owner calls on those two also need a joint approver Safe's consent (see Governance below). Existing-bond deposits are off (`bondDepositsPaused` reads true), so only newly minted bonds enter custody. The `LenderPool` is wired: `CreditManager.liquiditySource()`, `CreditManager.lenderPool()` and `EpochHarvester.lenderPool()` read the pool, set by the timelock operation `0x801a3cd7e4d3d5e934763e80d99c9439b916178553afd4377d9b07784ed4bda2` executed in block 52,265,000 (transaction `0x9401dd26bbaee3b7073e23f3c91022ac751bdafe2264315f6a339109b0bfdeba`). Its first 1,000 USDC was the maintainer's own capital, deposited by the timelock operation `0xe6ef454207ed14b7e585ef479a5b0a5bd30eeeb5ad7f134c88be91a4de79f0e2` executed in block 52,265,414 (transaction `0xc651d0d681735a9ee2d4feceb17a06789926d225f15f7e4ba0a5c3af6cf9a5a0`). Since block 52,747,165 (2026-10-18) the pool is unpaused with a deposit cap of 5,000 USDC, so any address may deposit up to the cap's remaining headroom. Read at block 59,460,998 (2026-11-19 10:02:55 UTC): `totalAssets` 2,114.272521 USDC, `outstandingPrincipal` 193.699389, `maxDeposit` 2,885.629007 for any address, no queued shares and no `exitReserve` |
 | Base Sepolia | The protocol is deployed against mock USDC, bond and farm contracts |
 | `LenderPool` | Deployed on Sepolia, empty, and not wired as `CreditManager`'s liquidity source in the protocol-to-pool direction; the pool's own pointers to the manager and the harvester are set, and it is open to any depositor at the full 25,000 USDC cap |
 | Live `LenderPool` bytecode | **Predates this source.** Read by selector at block 46291047 against the 2026-09-01 source, it still carries `serviceQueue`, `queueHead`, `queueLength`, `queuePosition`, `queueEntry` and `netDeposits`, the round 21 F7 and round 22 F3 mechanisms this file calls CLOSED below and this source has removed, and lacked 26 selectors that source had, `pause` and `guardian` among them, so there is no pause lever on it short of a redeploy; the 2026-09-12 sync adds `wasCreditManager` to the pool and changes the signatures of `writeDownLoss` and `recoverWrittenDownLoss` on the manager, the 2026-09-14 sync adds the request-draw memory and the stream ceiling to the pool and the bool-gated `_settle` to the manager, and the 2026-09-15 sync adds the cash floor (`_floorTotal`) to the pool, so the gap is wider than that reading. Every `WirePhase4` entry point, `assertOnly()` included, reverts against the live set because the graph assertion calls `guardian()` and `mintReceiverImplementation()` on contracts that do not have them. `pendingLenderYield` on the live `EpochHarvester` (the pool has no such selector and the call reverts there; until 2026-09-17 this cell attributed the figure to the pool) read 259.795831 USDC at block 46942219 on 2026-09-17, parked with nobody to deliver it to; it read 124.885415 USDC when this cell was first written, undated, and it rises with every harvest while the pool stays unwired |
 | Current testnet liquidity | Supplied by `TreasuryLiquiditySource`, not `LenderPool` |
 | Current-source parity | **None, deliberately.** This source is current as of 2026-09-15 and the Sepolia deployment predates it. The last comparison, on 2026-08-21 against an older public tree, passed the strict length-and-metadata gate for 3 of 13 checked deployments (the three mocks); that figure describes a tree this one has replaced and is not re-run here. Treat the deployment as historic and verify against the explorer, not against this source |
 | External audit | Completed. 33Labs reviewed `LenderPool`, `CreditWiring`, `TreasuryLiquiditySource`, `ProtocolFeeSplitter`, `Config` and `LtvMath` at commit b66023d from 2026-09-07, with the base remediation snapshot at f6893cb and main reviewed through 566a9eb. The final report is in [`audits/`](audits/) with its sha256. 13 findings (4 High, 6 Medium, 3 Low): 11 Fixed, and two Acknowledged / Accepted Risk, L-02 (#61) and L-03 (#68). The report renumbers some issues: #53 is H-04, #54 is L-01 and #61 is L-02. The disposition of the ten preliminary issues, #45 to #54, filed on 2026-09-11, is in the section "External review, 33audits preliminary issues #45 to #54 (2026-09-11)" below; the post-loss lock is under the heading "33audits H-03, the post-loss lock the floor retains". Every other contract in `src/` was outside the scope. M-06 (#64) is fixed in this source by #69 (see the #64 heading below), and the reproductions in [`test/R63A3_DrawMemoryDust.t.sol`](test/R63A3_DrawMemoryDust.t.sol) and [`test/R63S61_DustHeldFloorWiredGraph.t.sol`](test/R63S61_DustHeldFloorWiredGraph.t.sol) now assert the fixed behaviour. The report classes M-06 Fixed in 566a9eb, and 33Labs independently verified 35f0a58, which carries the trim. It also records 33Labs' independent verification of M-04 (#51), M-05 (#52) and L-01 (#54) on commit 29af396. Before third-party capital the report recommends retaining M-06's regression and #61-preservation coverage, publishing the L-03 incident runbook, retaining the activation gate, and verifying deployment and source parity; its M-06 section adds verifying that production deployments include merged remediation commit 566a9eb or an equivalent descendant. The Base mainnet deployment matches this source, which descends from 566a9eb; the Base Sepolia deployment predates 566a9eb |
-| Third-party funds | Not accepted |
+| Third-party funds | Accepted by the Base mainnet `LenderPool` since 2026-10-18, up to its 5,000 USDC deposit cap. The cap is an owner setting (`setDepositCap`) behind the 48-hour timelock; see "One deposit can fill the deposit cap" below |
 
 The mock assets have no real value, and their mint and test-control functions are permissionless.
 Explorer verification confirms the source attached to the deployment-era bytecode; it does not mean
@@ -68,9 +69,8 @@ The three findings below were written against an earlier `LenderPool` than this 
 disclosed residual. Each claim below names the function that carries it, so it can be checked
 against the source rather than believed.
 
-**Closing them does not open the pool to outside capital.** The third-party capital gate is separate:
-no public, DexFi or Bond Fund capital is accepted until the audit report's recommendations before
-third-party capital are met, whatever this section says.
+**Closing them is separate from the third-party capital gate**, which is the audit report's
+recommendations before third-party capital (see Gate definitions above).
 
 ### Round 22 F3: principal-cap accounting. CLOSED, by removing the mechanism
 
@@ -87,15 +87,27 @@ exist.
 
 What replaces the overflow bound is explicit rather than emergent. The entry quotient is bounded by
 `2^128` shares per asset, and three things hold that bound: `minimumEntryAssets()`,
-`entryPriceCashReserve()` while principal is at risk, and `maximumShareSupply()`. Repeated losses
-taper lending rather than multiplying a quotient toward overflow.
+`entryPriceCashReserve()` while principal is at risk, and `maximumShareSupply()`. The first two read
+0 at any realistic supply (next paragraph), so there the virtual asset in the entry conversion and
+`maximumShareSupply()` are what hold it. Repeated losses taper lending rather than multiplying a
+quotient toward overflow.
 
 Cash is now accounted rather than inferred. `_accountedCash` changes only through explicit pool
 flows, so a raw token transfer can replace missing backing up to that stored book but cannot lift
 value above it; anything above is `unmanagedSurplus()` and never enters cap usage. External balance
 loss is visible immediately through `cashDeficit()`, entry stays closed while a deficit remains, and
-the two repair doors, `coverClaimDeficit` and `coverEntryPriceDeficit`, are deficit-capped: partial
-cover is allowed and excess is refused.
+the two repair doors, `coverClaimDeficit` and `coverEntryPriceDeficit`, are deficit-capped: excess
+is refused, and `coverClaimDeficit` allows partial cover. At any realistic supply
+`coverEntryPriceDeficit` allows no cover at all. `minimumEntryAssets()` is 0 below 2^128 share-wei,
+so `entryPriceDeficit()` reduces to the claim liquidity shortfall, which the door refuses first
+(`ClaimsUnderfunded`); with no such shortfall the deficit is 0 and every amount reverts
+`EntryPriceDeficitExceeded(amount, 0)`. Measured on this source with the 25,000 USDC cap fully lent:
+`minimumEntryAssets()`, `entryPriceDeficit()` and `entryPriceCashReserve()` read 0 and
+`coverEntryPriceDeficit(1)` reverts `EntryPriceDeficitExceeded(1, 0)`; the floor first leaves 0 after
+32 consecutive whole-book write-offs, at 2 wei. That is the terminal boundary `Config.sol` describes,
+reached only after repeated catastrophic losses, rather than a missing protection, because the
+virtual asset in the entry conversion bounds the quotient at any reachable supply. Raised through
+the bug bounty, 2026-11; Low, documentation.
 
 Closed in this source, not on the testnet: the Sepolia `LenderPool` predates this source and still
 carries `netDeposits`, the principal book these residuals were properties of and which this source has removed, until it is redeployed.
@@ -636,9 +648,12 @@ draws 6,071.428571 at once while 428.571430 stays escrowed at its full worth unt
 lending held back by a floor 7,000 above her worth. Clearing the mark on a taken trim would stop
 the re-trim, at +16 bytes of `LenderPool` runtime measured on a copy, and was not taken: after a
 loss that lands once the first trim is taken, on a request nobody services again, the floor would
-stay above its worth with nothing able to lower it, which is the shape #64 fixes. Measured on a
-copy with the mark cleared, the same later loss leaves the floor 428.571429 above its worth, the
-second trim releases 0, and `available` reads 3,600.000000 where the sticky mark gives 3,964.285714.
+stay above its worth until her own next service, her completion or her cancel. Measured on a copy
+with the mark cleared, the same later loss leaves the floor 428.571429 above its worth, the second
+trim releases 0, and `available` reads 3,600.000000 where the sticky mark gives 3,964.285714. The
+sticky mark keeps that shape off a request that has been marked. It does not reach one that never
+was: a request serviced while the floors sat inside the executable cash carries no mark, and after
+a later loss it keeps exactly that shape (see "Under a mark, and after a loss" below).
 
 **The trim's own residual. Low.** The trim waits for the floors, the kept one included, to sit
 inside the executable cash. If a SECOND raw loss lands after the shortfall has ended and before
@@ -649,6 +664,53 @@ releases 0. It ends the way #61 ends, when the cash covers the floors again, and
 trim: after a 5,000 repayment the trim releases 6,999.999999 and a dormant lender's door reads
 10,999.999998. Until someone trims after that, the kept floor stays reserved. It needs two external
 raw losses and nobody trimming in the window between them.
+
+**Under a mark, and after a loss. Low, open, raised through the bug bounty, dated 2026-11-19.** The
+worth a service writes what is left of a partly serviced floor down to is the gross conversion, so
+while a mark or an unplaced loss stands (`exitReserve` above 0) the floor left on any partly
+serviced request, dust or not, sits above what its remaining shares can draw (`previewRedeem`) by
+the mark pro-rated over those shares. The source comment at the write-down says a request serviced
+down to dust cannot keep a reservation its shares can never draw; that is true of the gross worth
+only. It is not a way round the fix: what is left of a floor never exceeds the remaining shares'
+gross worth rounded up, and a request nobody has serviced keeps its whole filing-time floor under
+the same mark, because no mark moves a floor. Measured in
+[`test/S115_FloorWorthUnderAMark.t.sol`](test/S115_FloorWorthUnderAMark.t.sol) on a 200,000 book
+with 100,000 lent and a 40,000 mark: 1% of the supply left as dust keeps 439.560440 above its draw
+of 1,600.000000 (27.5%), where an unserviced request of 20,000 keeps 4,000.000000 above its draw of
+16,000.000000 (25%). Released in full, the mark leaves the dust floor 1 wei above its draw.
+
+After any later loss the excess outlives the price that set it, on any partly serviced request and
+whether or not a mark stood at the service. Only a service that declines the write-down marks a
+request (`writeDownDeclined`), and the trim acts only on a marked request, so a request serviced
+while the floors sat inside the executable cash is never re-examined: after a later socialised loss,
+or a mark that ends in one, its floor stays above its remaining shares' worth, a trim releases 0, no
+time limit or owner lever applies, and only her own next service (any size, even one share-wei,
+writes it down again), her cancel or her completion releases it. In the suite above, after a 40,000
+socialised loss the dust floor stays 439.560440 above the dust's gross worth whether the dust was
+serviced during the mark or before it. Measured on this source in a test that is not in this
+repository: in a 100,000 book with 40,000 lent, a request of 20,000 serviced half-way with no mark
+standing, then a 10,000 socialised loss, keeps a floor of 10,000.000000 against a worth of
+8,888.888888, 1,111.111112 above it; the trim releases 0, and thirty days and a full repayment later
+the floor is unmoved, so a dormant lender's door reads 69,999.999999 against a worth of
+71,111.111111. The requester completes in one call and is paid exactly 8,888.888888, and the
+dormant lender then exits at exactly 71,111.111111. With a 40,000 mark at the service that then
+ends in a 40,000 socialised loss, the excess is 4,444.444445 and a dormant lender's synchronous exit
+is 4,444.444446 short until the requester acts; she then completes at 6,000.000000. The excess is
+bounded by her remaining shares times the fall in price, so by her own share of the loss, and the
+same request left unserviced keeps more above its worth by design (2,000.000000 and 8,000.000000 in
+the two shapes). No lender loses value and no funds move to anyone; what the excess holds back is
+liquidity priority, from the other requests' reach, from synchronous exits and from lending, until
+the requester acts. On Base mainnet at block 59,460,998 `queuedShares` reads 0 and `_floorTotal`
+(storage slot 33) reads 0.
+
+Pricing the write-down on `exitAssets` instead was measured on a copy of this source and not taken:
+it closes the first ordering and not the second, and an honest requester serviced half-way under a
+mark then needs 16 calls of the ordinary `maxRequestRedeem` loop to complete instead of 1, and is
+paid 8 wei less, because the request door converts cash to shares at the gross price. Marking every
+partial service, so that the trim reaches these requests, measured 5 bytes smaller in `LenderPool`
+runtime on a copy; it would also let a stranger trim what is left of a partly serviced request's
+filing-time reservation after any fall, which moves priority and never value, and that design
+decision is not taken. `src/` is unchanged.
 
 **Status.** On the main branch with the trim, in 566a9eb. The worth is rounded up, for the reason
 given above. The report in `audits/` classes M-06 Fixed, and 33Labs independently verified 35f0a58,
@@ -684,7 +746,10 @@ listing stands.
 
 The only lever is the owner-only `emergencyUnstake`, which calls the farm's `emergencyWithdraw`:
 it forfeits the pending rewards, moves EVERY bond unit to one address, and leaves
-`custodyIsSolvent` reading false, so it is a protocol-wide act taken to release one position. After
+`custodyIsSolvent` reading false, so it is a protocol-wide act taken to release one position. On
+Base mainnet the adapter's owner is its consent gate: the hatch aimed at the adapter itself passes
+through on the timelock's word alone, and aimed at any other address it also needs the joint
+approver Safe's consent (see Governance below). After
 it, on the local twin, the owner can return the bonds and `restakeLoose` under a standing pause
 because nothing is pending at that moment, and an exit in that same block goes through. That
 sequence is an operator procedure rather than a mechanism, and no such procedure is published
@@ -754,6 +819,149 @@ and under a pause no bid is evidence of nothing.
 Status: open, not fixed, no design decision taken. Severity Medium, conditional on a USDC pause:
 impact high, likelihood low, and Circle has never paused USDC. The reproduction is on the same
 `src/` as this repository and is NOT in this repository yet.
+
+## Open findings raised through the bug bounty, 2026-11
+
+Each entry below was raised through the bug bounty in 2026-11 and reproduced or read against this
+source. None is fixed: `src/` is unchanged, and every fix is a contract change that needs a
+redeploy, which is a separate decision. Each entry says what is at risk on Base mainnet, read at
+block 59,460,998 (2026-11-19 10:02:55 UTC). Severities are the maintainer's. Findings that already
+had a home in this file are recorded there instead: the floor left above its worth after a later
+loss under the #64 heading ("Under a mark, and after a loss"), cancel-and-re-request in the #47
+row, the entry-price repair door under round 22 F3, and the wiring doors in the "Oracle, wiring and
+migration" table below (pointer probes, the manager and harvester pair, the treasury manager
+binding and lender-yield authority).
+
+### After a clean workout close, the lot's yield until its disposal goes to the insurance fund. Medium, open, dated 2026-11-19
+
+`closeWorkout`'s clean branch, where the debt is fully repaid, books the lot's accrual up to the
+close into the borrower's `yieldOwed` and takes the lot out of `_openWorkoutBonds`, but the bonds
+stay staked on the auction until the owner calls `disposeWorkoutLot`, behind the 48-hour timelock.
+What the lot earns after the close is in neither `totalWorkoutYieldOwed` nor `_openWorkoutAccrual`,
+so the permissionless `sweepWorkoutYieldToInsurance` or `sweepFreeBalanceToInsurance` moves it to
+the insurance fund, and `claimWorkoutYield` pays the borrower only what was booked at the close. The
+source draws the yield window at the close on purpose, and the same comment says a clean close's
+yield belongs to the borrower, which the tail contradicts. Who is affected: a borrower whose workout
+closes clean. The money goes to the protocol's insurance fund, not to a third party. Measured on this
+source in a test that is not in this repository, on a 100-bond lot of 200 staked: 499.999999 booked
+at the close; a second 1,000 USDC epoch then put 500.000000 of accrual on the parked lot, a
+stranger's sweep moved 500.000000 to insurance, and the borrower's claim paid 499.999999, and 0 after
+disposal. At recent realised yield the tail is about 0.30 USDC a day on a lot the size of today's
+whole book (37 bonds) and about 9 USDC a day on a lot at the 5,000 USDC per-account borrow cap. Live:
+no workout is open and no auction is live, so nothing is accruing to a parked lot. Fix not built:
+keep a closed lot in the reserve until disposal and book its tail at `disposeWorkoutLot`, in
+`LiquidationAuction`.
+
+### One deposit can fill the deposit cap and shut entry for everyone else. Low, open, dated 2026-11-19
+
+`LenderPool` has no per-lender cap and no eviction, so one deposit of the whole remaining headroom
+sets `maxDeposit` to 0 for every other address until the owner raises the cap, a timelock operation
+public for 48 hours. Raising it reopens entry and dilutes the squatter's position rather than
+removing it; a cap of zero is refused, so `pause` is the only lever that shuts the pool. Exits are
+unaffected and nobody loses money: the squatter can withdraw the capital, at a cost of little more
+than rounding, and a squat can be renewed after a raise only by adding capital. It cannot be told
+apart from honest lenders filling a deliberately small cap, and the routine cap raise is the remedy.
+The mechanism is in the `_setDepositCap` NatSpec and is executed in
+`test_R40_D7_capSquatShutsOutEveryoneElse` in [`test/R40D7Capture.t.sol`](test/R40D7Capture.t.sol).
+That NatSpec calls shipping the pool paused the practical mitigation; the Base mainnet pool is
+unpaused, so the mitigation no longer applies there. Live: `maxDeposit` offered 2,885.629007 USDC to
+any address, so one deposit of that amount closes entry. Fix not built: a per-lender cap or a
+minimum headroom.
+
+### A loan can be written at the accepted NAV while a lower value waits for the second key. Low, open, dated 2026-11-19
+
+`borrow` and a debt-bearing `withdrawBonds` gate on `isStale()` and price at `navPerBond`, the
+accepted value; nothing outside `NAVOracle` reads `pendingNav`. While a lower post waits for
+`confirmNav`, a borrower can draw at the old price a loan that is liquidatable once the lower value
+is accepted. The per-loan loss is the same as for a loan written the day before the move; what the
+window adds is new exposure written while the lower price is already on chain. It is pinned open in
+`test_R56A01_pin_borrowAgainstTheAnchorWhileALowerNavIsParked` in
+[`test/R56A01_BorrowerJourney.t.sol`](test/R56A01_BorrowerJourney.t.sol): a post 55% lower parks,
+a loan at the 25% max LTV reads 5,555 bps at the parked price, and it is liquidatable after
+confirmation. At the live 25% max LTV a floor fill leaves the lenders no loss on a confirmed move of
+up to about 63%; past that, per max-LTV loan of 628.75 USDC, the shortfall is 115.69 at a 70% move
+and 286.71 at 80%. Live: `pendingNav` reads 0. Fix not built: price both gates at the lower of
+`navPerBond` and `pendingNav`, which only lowers borrowing, on `CreditManager`'s binding EIP-170
+margin; bytes not measured.
+
+### Re-attaching a detached manager: the vault's guard reads only `accYieldPerBond`. Low, open, dated 2026-11-19
+
+`CollateralVault.setCreditManager` refuses to re-attach a manager only when its `accYieldPerBond`
+is not 0, and its comment says this blocks exactly the dangerous case. A manager can hold a pot with
+the accumulator still 0: the shipped harvest calls `receiveYield` and `distributeYield` in one
+transaction, and the accumulator moves only at the next accrual. Detach such a manager, let bonds be
+deposited during the gap, then point the vault back: the guard passes, the old pot streams over the
+new bond base, and after the re-attach `migrateReserves` reverts `StillAttached`, so the allocation
+cannot be undone. Measured on this source in a test that is not in this repository: of a 1,000 USDC
+first-epoch pot, the holder through the epoch was paid 499.999999 and a newcomer who arrived during
+the detachment 499.999999; with the pot received and never distributed, the newcomer took
+999.999999. `migrateReserves` during the detachment, or one accrual before the re-attach, closes it.
+It needs a migration and a rollback, two public 48-hour owner operations, each needing the joint
+approver's consent on Base mainnet. Live: the manager's `accYieldPerBond` is above 0 and it carries
+debt, so it cannot be detached; a future successor is exposed in its first epoch, by at most one
+epoch's borrower share. Fix measured on a copy and not shipped: also refuse a non-zero
+`undistributedYield`, +104 bytes of `CollateralVault` runtime.
+
+### The borrow guard is one-sided under manager-first auction wiring. Low, open, dated 2026-11-19
+
+`borrow` compares the manager's auction pointer with the vault's only while
+`vault.liquidationAuction()` is set. With only the manager's side wired and the vault's still zero,
+`borrow` lends while `liquidate` reverts `AuctionPointerMismatch`, which contradicts `borrow`'s own
+docstring. Unreachable on Base mainnet: the vault names the live auction and
+`CollateralVault.setLiquidationAuction` refuses zero, so it applies only to a fresh deployment wired
+manager-first, and the published deployment path wires the vault first. Fix not built: mirror the
+branch in `borrow`; bytes on `CreditManager`'s binding margin not measured.
+
+### A successor manager starts its first stream window at its deployment. Low, open, dated 2026-11-19
+
+`CreditManager` stamps `lastDistributeAt` in its constructor. A successor deployed shortly before
+its first harvest after a long harvest gap streams the pot that built up over the gap over the
+five-day minimum rather than the window it was earned over, which weakens the anti-JIT stretch for
+that one pot in favour of a bond holder who enters before it and holds five days. It needs an owner
+migration, a long harvest gap (`harvest` is permissionless and weekly) and an entrant with DexFi
+bonds; an ordinary migration also sweeps the outgoing manager's pot to insurance through
+`migrateReserves`. Read from the source, not reproduced. Live: no migration is pending. Fix not
+built: carry the harvester's earning-window origin into a successor's first stream.
+
+### `CreditManager` books the nominal amount on its inbound USDC legs. Low, open, dated 2026-11-19
+
+Six inbound legs, `receiveYield`, `fundInsurance`, `fundBounty`, `creditLiquidationProceeds`,
+`recoverWrittenDownLoss` and the pull in `_repay`, book the amount asked for rather than the amount
+that arrived, while `borrow` measures delivery and reverts `LiquidityNotDelivered`. With USDC as it
+is this is inert; if USDC on Base ever delivered short, for instance through a transfer fee, the
+manager's books would run ahead of its cash. Reproduced on this source by
+[`test/R56A02_NominalInboundLegs.t.sol`](test/R56A02_NominalInboundLegs.t.sol), 7 of 7 passing, whose
+own NatSpec records it as Low. Live: the manager holds 10.009902 USDC with `totalDebt` 193.699389.
+Fix not built: a measured pull that books what arrived, with any liquidation-proceeds shortfall taken
+from insurance first, estimated at +150 to +250 bytes of `CreditManager` runtime against its binding
+margin and not measured.
+
+### The adapter does not check the farm position on stake and unstake. Low, open, dated 2026-11-19
+
+`DirectCallAdapter`'s `_depositAndSettle` and `unstake` never compare the farm position before and
+after, while the mint path does (`_stakeReleasedMint`, `AdapterPositionMismatch`). If DexFi's farm,
+which is owned and upgradeable outside Recoup's control, ever credited less than it took, custody
+would record more bonds than the farm holds. With a mock farm that pulls 100 and credits 95,
+`depositBonds(100)` succeeds with the ledger at 100 and the stake at 95, `custodyIsSolvent` reads
+false, the next deposit reverts `CustodyInsolvent`, and `withdrawBonds(100)` reverts while
+`withdrawBonds(95)` succeeds and leaves 5 on the ledger, measured on this source in a test that is
+not in this repository. It needs DexFi's farm to change behaviour (see "External dependencies remain
+real" below). Live: existing-bond deposits are off (`bondDepositsPaused` reads true), so the deposit
+leg is closed, and the farm position and the vault's `totalBondCount` both read 37. Fix not built:
+read `userInfo` before and after in both and revert on a mismatch; on `unstake` that turns a desync
+into a refused exit, which is a design choice, and the bytes, against the adapter's tight initcode
+margin, are not measured.
+
+### Two hardening gaps in the published deploy scripts. Low, open, dated 2026-11-19
+
+In the Base Sepolia and local scripts under `script/`, `vm.envOr` returns its fallback for a
+malformed `bytes32`, so `RECOUP_SWITCHOVER_ATTEMPT` set to junk silently becomes zero (measured on
+forge 1.8.3), and `_validateNewDeployment` compares the protocol fee wallet only with the deployer
+and the owner, not with the vault or another core contract. Both depend on operator input. The
+mainnet deploy scripts are not published here and the live fee wallet is the `ProtocolFeeSplitter`,
+so nothing deployed is affected. Fix not built: parse the `bytes32` from text the way
+`_envOrAddress` parses addresses, and refuse a fee wallet that is the vault or another core
+contract; no runtime bytes.
 
 ## Open findings from internal review round 45, at the audit commit
 
@@ -1059,7 +1267,7 @@ L-01.
 |---|---|---|---|
 | #45 H-01 | Borrower-keyed recovery provenance redirects an earlier workout's recovery | **Fixed.** `writeDownLoss` and `recoverWrittenDownLoss` on `ICreditManager` take the auction id, and `CreditManager` records the bearer and the funder per auction and id in `recoveryBearerOf` and `recoveryFunderOf` and routes the recovery through them; `lossBearerOf` and `lossFunderOf` stay as the borrower's latest record. `LiquidationAuction` passes the id at `closeWorkout`, `workoutSettleAfterClose` and `_settleFill`. Regression: `test_H01_aLaterDefaultDoesNotRedirectAnEarlierWorkoutsRecovery` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol), the reviewers' reproduction with its last two assertions reversed: the first workout's pool is paid 628,750,000 and the second's 0, then the second is paid its own; and in [`test/R59A02_H01SecondDefault.t.sol`](test/R59A02_H01SecondDefault.t.sol) the two records are read out of storage for two write-downs by the same borrower, the second write-down is recovered first and both still route correctly, the fix composes with L-01 across a pool migration and a manager migration, and one auction id carries at most one write-down. The two records are internal because making them public getters put the manager under 2,000 bytes of runtime margin. Verified fixed by the reviewers on 68c0c26, 2026-09-16 (comment 5700959027) | `CreditManager` +307, `LiquidationAuction` +17 |
 | #46 H-02 | Auction replacement orphans a closed workout's recovery leg | **Fixed, earlier.** This is the auction-side twin the previous revision of this file called fixed but not yet synced. `setLiquidationAuction` stamps `wasLiquidationAuction`, and `recoverWrittenDownLoss` accepts the live auction or a former one; `checkAuctionSwap` is unchanged, so no fourth clause was added to the migration guard. Regressions: `test_R46_theRecoveryLandsAfterALegalAuctionRepoint` and `test_R46_aFormerAuctionReachesNoOtherAuctionGatedLeg` in [`test/R46AuctionRepointRecovery.t.sol`](test/R46AuctionRepointRecovery.t.sol), `test_R22_theReturnLegSurvivesAMigrationToAFreshAuction` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol). Verified fixed by the reviewers on 68c0c26, 2026-09-16 (comment 5700962106) | earlier |
-| #47 H-03 | Repeated request service converts more than a requester's pro-rata cash into senior claims | **Fixed on both doors: the reviewers' request-draw memory (2026-09-14) closes the same-controller loop, and a cash floor per request (2026-09-15) closes the two routes the memory left open, at the cost disclosed at the end of this row.** The 2026-09-12 revision of this row said the stepped loop reaches no more than the synchronous door already allows; that was measured with nobody else queued and is false with another lender's request holding the reserve. Counter-case, two lenders of 10,000 with 15,000 lent and the other lender's whole position queued: before the memory the same-controller request loop paid 4,999.999998 over 53 calls against 2,500.000000 from one synchronous `redeem` of the same shares, 45 of 60 cells of a grid over the queue and the loan favoured the loop, and the best excess was 3,999.999995 (`test_R59A02_H03_aSecondLendersQueueMakesTheLoopBeatTheSyncDoor` and `test_R59A02_H03_gridSearchForTheBestCounterCase` in [`test/R59A02_H03CounterCase.t.sol`](test/R59A02_H03CounterCase.t.sol), which assert the closed state and keep those figures as history). The memory is the reviewers' per-controller record (`RequestDraw`, `_requestDraws`, declared after every older slot): `maxRequestRedeem` adds the controller's earlier draws back into all three terms of the slice and deducts them from the answer, and `serviceWithdrawalRequest` records each service and clears the memory only once the request is empty and the controller holds no shares, which is what closes cancel-and-re-request. The reviewers' eight tests pass verbatim in [`test/R60S1_H03RequestDraw.t.sol`](test/R60S1_H03RequestDraw.t.sol): the loop 2,500.000000 in one call, 0 of 60 grid cells, cancel-and-re-request 2,500.000000; and `test_H03_steppedRequestServiceReachesNoMoreThanOneSyncRedeem` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) asserts the stepped total equals the single slice, 4,874.250000. Before this sync `queueCashReserve` was a fraction of live cash rather than an amount of it, so from the same state the stepped synchronous door, `redeem(maxRedeem)` until it read zero, paid 4,999.999998 over 53 calls with no request serviced, a walk through forty fresh controllers one request each paid 4,999.999773 through either door, and the queued lender's serviceable figure ended at 0.000001 either way. Since 2026-09-15 a queued lender is owed the cash she was quoted when she queued. `requestWithdrawal` quotes a floor through `_freshFloor`, the executable cash not already reserved for the requests ahead of her, pro rata over the shares not yet queued, and records it in `WithdrawalRequest.floor`; with no earlier floor binding that is exactly her pro-rata slice, and where the earlier floors hold the whole cash it is 0, so the floors never exceed the cash at request time. Their sum, `_floorTotal` (declared last, at slot 33, so no existing slot moves; `LenderPoolFormulaPins` pins the layout), is the second arm of `_queueCashReserve`: the reserve is the larger of the queued shares' pro-rata fraction and the floors, clamped at the executable cash, so the floor is held against `lend`, against every synchronous exit and against every other request until she is paid or cancels. `maxRequestRedeem` pays the larger of her remaining floor and her live slice, capped at the executable cash not owed to the other live requests, which is the request-door twin of `_unreservedIdle` and is what stops a fresh controller's empty memory re-slicing cash the floors hold; `serviceWithdrawalRequest` spends the floor by what it paid and releases whatever is left when the request is gone; `cancelWithdrawalRequest` releases it whole. The memory stays, because under a floor it is what holds one request to one slice of the cash above the floor. Measured on this source from the counter-case: the stepped synchronous door, the sequential split through either door and cancel-and-re-request each pay 2,500.000000 in one call, the walk stops with 7,500 shares on its first address, and she keeps 2,500.000000 before and after (`test_R60S1_H03_theSyncDoorSteppedDrainsTheSameCash`, `test_R60S1_H03_theSequentialAddressSplitThroughTheRequestDoor` and `test_R60S1_H03_theSequentialAddressSplitThroughTheSyncDoor` in [`test/R60S1_H03Routes.t.sol`](test/R60S1_H03Routes.t.sol), which asserted the open figures until this sync and keep them as history; the reviewers' five verification tests of the two routes and the two side effects, ported verbatim as `test_R42S1_verify47_route2_syncDoorStepped`, `test_R42S1_verify47_route3_sequentialSplitRequestDoor`, `test_R42S1_verify47_route3_sequentialSplitSyncDoor`, `test_R42S1_verify47_phantomReserve` and `test_R42S1_verify47_staleMemory` in [`test/R60S1_H03RequestDraw.t.sol`](test/R60S1_H03RequestDraw.t.sol), with the floor's figures asserted under their logs and the fraction's beside them; and `test_R59A02_H03_theExcessComesOutOfTheQueuedLendersOwnReserve`, which asserted her loss and now asserts her figure unmoved). The memory's two side effects, re-measured in [`test/R60S1_H03Probes.t.sol`](test/R60S1_H03Probes.t.sol): the phantom reserve is 0 in the two-lender state where the floor binds (1,071.428572 before this sync) and 347.826087 in the three-lender state where the fraction arm still exceeds the floors (1,043.478261 before), because that arm still counts queued shares whose controller has drawn its whole slice; and the memory still outlives the position it priced, but no re-request is priced below its fresh floor, so the controller whose ratio of cash to supply fell reads 750.000000, equal to a fresh holder (0 before this sync), and a request with shares transferred in reaches no more than a fresh holder's slice. What the floor costs, present tense about this source and measured in [`test/R42S1_H03Floor.t.sol`](test/R42S1_H03Floor.t.sol): the floors are not written down on a loss, so after a raw loss their sum can exceed the executable cash. Each request is then capped at the cash the others are not owed, so nobody is paid beyond what exists, but the cash no door can reach is locked, and the amount locked is NOT bounded by the raw loss: with several equal floors every cap can read 0 at once and the whole remaining cash is locked, three floors of 100.000000 locking 200.000000 against 100.000000 lost and one hundred floors locking 9,900.000000 (the reviewers' rows on #47, comment 5718920756, ported verbatim as `test_AuditH03_threeFloorsLockMoreThanTheRawLoss` and `test_AuditH03_oneHundredFloorsLockNinetyNineTimesTheRawLoss` in [`test/R60S2_H03LockBound.t.sol`](test/R60S2_H03LockBound.t.sol), where `testFuzz_R60S2_theLockIsTheQueueNotTheRawLoss` states the general form over 2 to 40 equal floors and any raw loss inside the book). The excess of the floors over the cash measures the shortfall, not the amount locked. With two floors of 2,000.000000 and 1,000.000000 and 2,500 of cash lost from 5,000, the two requests are serviced to 1,499.999999 and 499.999999, 500.000002 of executable cash remains, and `unreservedIdle`, the third lender's `maxRedeem` and `available()` all read 0: no door reaches it until a repayment or a new deposit lifts the cash above the floors or one of them cancels (`test_R42S1_floorF_aLossWithTwoFloorsLocksTheOverPromise`; after a `repayPrincipal` of 20,000 the two read 7,499.999965 and 3,999.999925 and `available()` 7,650.000095). The repair doors do not release it: `claimSolvencyDeficit()` and `entryPriceDeficit()` both read 0 in that state, and `coverClaimDeficit(1)` and `coverEntryPriceDeficit(1)` revert `ClaimDeficitExceeded` and `EntryPriceDeficitExceeded`, because the locked cash is recognised shareholder cash promised twice, not a shortfall either door is built for. A queued lender who never services holds a cash amount against lending, not a fraction the next exit shrinks, until she cancels (`test_R42S1_floorG_theFloorHoldsAgainstLendingUntilRepaidOrCancelled`). The floor does not ratchet up: it is what she was quoted, the live slice above it rises with a repayment, and other exits re-slice that lift back down to the floor (`test_R42S1_floorH_theUpwardRederivationIsAFractionTheSyncDoorReslices`: after a 5,000 repayment her slice reads 5,000.000000, the stepped sync door pays 7,500.000000 over 4 calls, and she is left with her floor of 2,500.000000; `test_R42S1_floorI_aDroughtFloorDoesNotRatchetUp`: a floor of 1,500.000000 quoted in a drought stays 1,500.000000 while the slice reads 6,000.000000 after a 9,000 repayment and 4,050.000000 once that cash is lent again). An unqueued holder's share of the cash is what a walker still reaches, through either door, which is the non-requester exposure the paragraph above has disclosed since 2026-09-12 and is unchanged by the floor (`test_R42S1_floorD_theUnqueuedBystanderIsWhatTheAttackerReaches`): a holder who wants a reservation queues for one. In [`test/LenderPool.invariants.t.sol`](test/LenderPool.invariants.t.sol), `invariant_oneRequestNeverDrawsMoreThanOneSliceOfTheLiveCash` now bounds each service by the larger of the floor and the live slice, capped at the cash not owed to the other floors, `invariant_theFloorTotalIsTheSumOfTheLiveFloors` and `invariant_noServiceEverPaysBeyondTheExecutableCash` are new, and `test_handlerCanReachABoundFloorAndAFloorBoundService` asserts the campaign reaches a bound floor and a floor-bound service rather than assuming it. The variants refused before the floor stay refused: never clearing the memory (+172), clearing it on transfer or on request, and the aggregate reconstruction of the reserve (+532, +533); a floor without the memory was measured to reopen the same-controller loop up to the cap and was not shipped. On 2026-09-16 the reviewers verified the three drain routes fixed on 68c0c26 (comment 5700944284), reproduced the post-loss lock above at the same 500.000002, and wrote that it "still needs an explicit audit-team disposition before unconditional closure"; the maintainer's disposition, hold the lock as a disclosed residual at Low with the floor write-down costed and refused, is posted on #47 (comment 5715504360, 2026-09-17) and stated present tense under the heading "33audits H-03, the post-loss lock the floor retains" above. The reviewers answered on 2026-09-17 (comment 5718920756): the three withdrawal routes stay verified fixed on 68c0c26, the residual is recorded separately as a Low that is acknowledged and retained by design rather than fixed, and they support closing the original High without the floor write-down shipping, once the bound is corrected and multiple-request coverage is added. Both shipped in 0f49e61 (#60): the corrected bound under that heading, and [`test/R60S2_H03LockBound.t.sol`](test/R60S2_H03LockBound.t.sol); on 2026-09-18 the reviewers supported closing the original H-03 as verified fixed on that commit (comment 5727241497), with the lock tracked as #61 | `LenderPool` +219 (memory, 2026-09-14) and +370 (floor, 2026-09-15) |
+| #47 H-03 | Repeated request service converts more than a requester's pro-rata cash into senior claims | **Fixed on both doors: the reviewers' request-draw memory (2026-09-14) closes the same-controller loop, and a cash floor per request (2026-09-15) closes the two routes the memory left open, at the cost disclosed at the end of this row.** The 2026-09-12 revision of this row said the stepped loop reaches no more than the synchronous door already allows; that was measured with nobody else queued and is false with another lender's request holding the reserve. Counter-case, two lenders of 10,000 with 15,000 lent and the other lender's whole position queued: before the memory the same-controller request loop paid 4,999.999998 over 53 calls against 2,500.000000 from one synchronous `redeem` of the same shares, 45 of 60 cells of a grid over the queue and the loan favoured the loop, and the best excess was 3,999.999995 (`test_R59A02_H03_aSecondLendersQueueMakesTheLoopBeatTheSyncDoor` and `test_R59A02_H03_gridSearchForTheBestCounterCase` in [`test/R59A02_H03CounterCase.t.sol`](test/R59A02_H03CounterCase.t.sol), which assert the closed state and keep those figures as history). The memory is the reviewers' per-controller record (`RequestDraw`, `_requestDraws`, declared after every older slot): `maxRequestRedeem` adds the controller's earlier draws back into all three terms of the slice and deducts them from the answer, and `serviceWithdrawalRequest` records each service and clears the memory only once the request is empty and the controller holds no shares, which is what closes cancel-and-re-request against QUEUED lenders' cash; against an unqueued holder's share of idle cash the loop still reaches what one synchronous `redeem` of the same shares pays, the exposure stated at the end of this row. The reviewers' eight tests pass verbatim in [`test/R60S1_H03RequestDraw.t.sol`](test/R60S1_H03RequestDraw.t.sol): the loop 2,500.000000 in one call, 0 of 60 grid cells, cancel-and-re-request 2,500.000000; and `test_H03_steppedRequestServiceReachesNoMoreThanOneSyncRedeem` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol) asserts the stepped total equals the single slice, 4,874.250000. Before this sync `queueCashReserve` was a fraction of live cash rather than an amount of it, so from the same state the stepped synchronous door, `redeem(maxRedeem)` until it read zero, paid 4,999.999998 over 53 calls with no request serviced, a walk through forty fresh controllers one request each paid 4,999.999773 through either door, and the queued lender's serviceable figure ended at 0.000001 either way. Since 2026-09-15 a queued lender is owed the cash she was quoted when she queued. `requestWithdrawal` quotes a floor through `_freshFloor`, the executable cash not already reserved for the requests ahead of her, pro rata over the shares not yet queued, and records it in `WithdrawalRequest.floor`; with no earlier floor binding that is exactly her pro-rata slice, and where the earlier floors hold the whole cash it is 0, so the floors never exceed the cash at request time. Their sum, `_floorTotal` (declared last, at slot 33, so no existing slot moves; `LenderPoolFormulaPins` pins the layout), is the second arm of `_queueCashReserve`: the reserve is the larger of the queued shares' pro-rata fraction and the floors, clamped at the executable cash, so the floor is held against `lend`, against every synchronous exit and against every other request until she is paid or cancels. `maxRequestRedeem` pays the larger of her remaining floor and her live slice, capped at the executable cash not owed to the other live requests, which is the request-door twin of `_unreservedIdle` and is what stops a fresh controller's empty memory re-slicing cash the floors hold; `serviceWithdrawalRequest` spends the floor by what it paid and releases whatever is left when the request is gone; `cancelWithdrawalRequest` releases it whole. The memory stays, because under a floor it is what holds one request to one slice of the cash above the floor. Measured on this source from the counter-case: the stepped synchronous door, the sequential split through either door and cancel-and-re-request each pay 2,500.000000 in one call, the walk stops with 7,500 shares on its first address, and she keeps 2,500.000000 before and after (`test_R60S1_H03_theSyncDoorSteppedDrainsTheSameCash`, `test_R60S1_H03_theSequentialAddressSplitThroughTheRequestDoor` and `test_R60S1_H03_theSequentialAddressSplitThroughTheSyncDoor` in [`test/R60S1_H03Routes.t.sol`](test/R60S1_H03Routes.t.sol), which asserted the open figures until this sync and keep them as history; the reviewers' five verification tests of the two routes and the two side effects, ported verbatim as `test_R42S1_verify47_route2_syncDoorStepped`, `test_R42S1_verify47_route3_sequentialSplitRequestDoor`, `test_R42S1_verify47_route3_sequentialSplitSyncDoor`, `test_R42S1_verify47_phantomReserve` and `test_R42S1_verify47_staleMemory` in [`test/R60S1_H03RequestDraw.t.sol`](test/R60S1_H03RequestDraw.t.sol), with the floor's figures asserted under their logs and the fraction's beside them; and `test_R59A02_H03_theExcessComesOutOfTheQueuedLendersOwnReserve`, which asserted her loss and now asserts her figure unmoved). The memory's two side effects, re-measured in [`test/R60S1_H03Probes.t.sol`](test/R60S1_H03Probes.t.sol): the phantom reserve is 0 in the two-lender state where the floor binds (1,071.428572 before this sync) and 347.826087 in the three-lender state where the fraction arm still exceeds the floors (1,043.478261 before), because that arm still counts queued shares whose controller has drawn its whole slice; and the memory still outlives the position it priced, but no re-request is priced below its fresh floor, so the controller whose ratio of cash to supply fell reads 750.000000, equal to a fresh holder (0 before this sync), and a request with shares transferred in reaches no more than a fresh holder's slice. What the floor costs, present tense about this source and measured in [`test/R42S1_H03Floor.t.sol`](test/R42S1_H03Floor.t.sol): the floors are not written down on a loss, so after a raw loss their sum can exceed the executable cash. Each request is then capped at the cash the others are not owed, so nobody is paid beyond what exists, but the cash no door can reach is locked, and the amount locked is NOT bounded by the raw loss: with several equal floors every cap can read 0 at once and the whole remaining cash is locked, three floors of 100.000000 locking 200.000000 against 100.000000 lost and one hundred floors locking 9,900.000000 (the reviewers' rows on #47, comment 5718920756, ported verbatim as `test_AuditH03_threeFloorsLockMoreThanTheRawLoss` and `test_AuditH03_oneHundredFloorsLockNinetyNineTimesTheRawLoss` in [`test/R60S2_H03LockBound.t.sol`](test/R60S2_H03LockBound.t.sol), where `testFuzz_R60S2_theLockIsTheQueueNotTheRawLoss` states the general form over 2 to 40 equal floors and any raw loss inside the book). The excess of the floors over the cash measures the shortfall, not the amount locked. With two floors of 2,000.000000 and 1,000.000000 and 2,500 of cash lost from 5,000, the two requests are serviced to 1,499.999999 and 499.999999, 500.000002 of executable cash remains, and `unreservedIdle`, the third lender's `maxRedeem` and `available()` all read 0: no door reaches it until a repayment or a new deposit lifts the cash above the floors or one of them cancels (`test_R42S1_floorF_aLossWithTwoFloorsLocksTheOverPromise`; after a `repayPrincipal` of 20,000 the two read 7,499.999965 and 3,999.999925 and `available()` 7,650.000095). The repair doors do not release it: `claimSolvencyDeficit()` and `entryPriceDeficit()` both read 0 in that state, and `coverClaimDeficit(1)` and `coverEntryPriceDeficit(1)` revert `ClaimDeficitExceeded` and `EntryPriceDeficitExceeded`, because the locked cash is recognised shareholder cash promised twice, not a shortfall either door is built for. A queued lender who never services holds a cash amount against lending, not a fraction the next exit shrinks, until she cancels (`test_R42S1_floorG_theFloorHoldsAgainstLendingUntilRepaidOrCancelled`). The floor does not ratchet up: it is what she was quoted, the live slice above it rises with a repayment, and other exits re-slice that lift back down to the floor (`test_R42S1_floorH_theUpwardRederivationIsAFractionTheSyncDoorReslices`: after a 5,000 repayment her slice reads 5,000.000000, the stepped sync door pays 7,500.000000 over 4 calls, and she is left with her floor of 2,500.000000; `test_R42S1_floorI_aDroughtFloorDoesNotRatchetUp`: a floor of 1,500.000000 quoted in a drought stays 1,500.000000 while the slice reads 6,000.000000 after a 9,000 repayment and 4,050.000000 once that cash is lent again). An unqueued holder's share of the cash is what a walker still reaches, through either door, which is the non-requester exposure the paragraph above has disclosed since 2026-09-12 and is unchanged by the floor (`test_R42S1_floorD_theUnqueuedBystanderIsWhatTheAttackerReaches`): a holder who wants a reservation queues for one. In [`test/LenderPool.invariants.t.sol`](test/LenderPool.invariants.t.sol), `invariant_oneRequestNeverDrawsMoreThanOneSliceOfTheLiveCash` now bounds each service by the larger of the floor and the live slice, capped at the cash not owed to the other floors, `invariant_theFloorTotalIsTheSumOfTheLiveFloors` and `invariant_noServiceEverPaysBeyondTheExecutableCash` are new, and `test_handlerCanReachABoundFloorAndAFloorBoundService` asserts the campaign reaches a bound floor and a floor-bound service rather than assuming it. The variants refused before the floor stay refused: never clearing the memory (+172), clearing it on transfer or on request, and the aggregate reconstruction of the reserve (+532, +533); a floor without the memory was measured to reopen the same-controller loop up to the cap and was not shipped. On 2026-09-16 the reviewers verified the three drain routes fixed on 68c0c26 (comment 5700944284), reproduced the post-loss lock above at the same 500.000002, and wrote that it "still needs an explicit audit-team disposition before unconditional closure"; the maintainer's disposition, hold the lock as a disclosed residual at Low with the floor write-down costed and refused, is posted on #47 (comment 5715504360, 2026-09-17) and stated present tense under the heading "33audits H-03, the post-loss lock the floor retains" above. The reviewers answered on 2026-09-17 (comment 5718920756): the three withdrawal routes stay verified fixed on 68c0c26, the residual is recorded separately as a Low that is acknowledged and retained by design rather than fixed, and they support closing the original High without the floor write-down shipping, once the bound is corrected and multiple-request coverage is added. Both shipped in 0f49e61 (#60): the corrected bound under that heading, and [`test/R60S2_H03LockBound.t.sol`](test/R60S2_H03LockBound.t.sol); on 2026-09-18 the reviewers supported closing the original H-03 as verified fixed on that commit (comment 5727241497), with the lock tracked as #61 | `LenderPool` +219 (memory, 2026-09-14) and +370 (floor, 2026-09-15) |
 | #48 M-01 | Permissionless yield sweep can confiscate an open workout's borrower yield | **Fixed, earlier.** `_fundInsuranceWithFree`, which both pre-close sweeps go through, owes `totalUnclaimedRewards + totalWorkoutYieldOwed + _openWorkoutAccrual`; the third term is the accrual on every open workout's bonds, read from the manager's accumulator, so `sweepWorkoutYieldToInsurance` reverts `NothingUnreserved` rather than moving it. Regressions: `test_R51_154_regression_aStrangerCannotSweepAnOpenWorkoutsBacking` in [`test/R51A02_OverRealisationDoor.t.sol`](test/R51A02_OverRealisationDoor.t.sol), `test_R56A02_81_negative_walk00_sweepWorkoutYieldFirst` in [`test/R56A02_SweepVersusF18.t.sol`](test/R56A02_SweepVersusF18.t.sol). Verified fixed by the reviewers on 68c0c26, 2026-09-16 (comment 5700964558) | earlier |
 | #49 M-02 | Realised open-workout yield bypasses the dedicated sweep protection | **Fixed, earlier, by the same reserve.** It is derived from the accumulator and not from where the cash sits, so realising the yield onto the auction through `claimSurplusFor` and taking it with `sweepFreeBalanceToInsurance` is refused the same way. Regressions: `test_R51_154_regression_theSiblingSweepReachesItWithNoClaimInFront` in [`test/R51A02_OverRealisationDoor.t.sol`](test/R51A02_OverRealisationDoor.t.sol), `test_R56A02_81_negative_walk02_claimSurplusForFirst` in [`test/R56A02_SweepVersusF18.t.sol`](test/R56A02_SweepVersusF18.t.sol) | earlier |
 | #50 M-03 | First clean workout close captures shared residual yield | **Fixed, earlier.** The shortfall that close ordering allocated can no longer be created once the open-workout accrual is reserved, and the owed ledger is kept per bearer. The public test at b66023d, `test_R23_04_theResidual_aSweptPotIsAllocatedToWhicheverClosesFirst`, asserted that the second close booked nothing, which was a pinned disclosure of the round 22 F18 residual and is what the reviewers' reproduction restates; it now asserts that both closes book and are paid, beside `test_R23_04_twoCleanClosesCannotBookTheSameClaimTwice` in [`test/Impairment.integration.t.sol`](test/Impairment.integration.t.sol). The forced-close fix the reviewers asked about is separate and is in this source; see the round 54 paragraph above | earlier |
@@ -1092,7 +1300,7 @@ b66023d). `src/LenderPool.sol` additionally differs from b66023d by the
 reviewer verifying a fix should read the function and run the test named in its row here, not the
 development tree, which is not published.
 
-## Other pre-launch risks and dependencies
+## Other risks and dependencies
 
 ### Referral source fixed through partner self-registration
 
@@ -1169,15 +1377,50 @@ Referral launch also needs an operational policy for claim-before-publication, l
 Sybil attribution and the first qualifying borrow. The registry alone does not solve those programme
 rules.
 
-### Governance: a timelock and a Safe on Base mainnet, a single EOA on Base Sepolia
+### Governance: a timelock, a Safe and two consent gates on Base mainnet, a single EOA on Base Sepolia
 
-On Base mainnet the nine Ownable core contracts are owned by a `TimelockController` with a
-172,800-second (48-hour) minimum delay. Its only proposer and canceller is a 2-of-3 governance Safe,
-and anyone may execute an operation once it is ready. A guardian address, separate from the Safe,
-can pause `CreditManager`, `CollateralVault` and `LenderPool` immediately; `unpause()` on each is
-owner-only, so resuming waits the timelock's delay. The deployer holds no role. Every owner action,
-including a change to risk parameters or wiring, is therefore public for 48 hours before it can take
-effect.
+On Base mainnet seven of the nine Ownable core contracts (`NAVOracle`, `RiskParams`,
+`CreditManager`, `TreasuryLiquiditySource`, `LenderPool`, `EpochHarvester` and
+`LiquidationAuction`) are owned by a `TimelockController` with a 172,800-second (48-hour) minimum
+delay. Its only proposer and canceller is a 2-of-3 governance Safe, and anyone may execute an
+operation once it is ready. A guardian address, separate from the Safe, can pause `CreditManager`,
+`CollateralVault` and `LenderPool` immediately; `unpause()` on each is owner-only, so resuming waits
+the timelock's delay. The deployer holds no role. Every owner action, including a change to risk
+parameters or wiring, is therefore public for 48 hours before it can take effect.
+
+The other two, `CollateralVault` and `DirectCallAdapter`, are owned by two consent gates
+(BondDepositConsentGate at `0xF24235E22FC6c52F37512f6f330536c49f61da48` and AdapterConsentGate at
+`0x2A733afD666839998cfF09Ab5c18F5FA7746022C`), whose controller is the same timelock. Each gate
+forwards every call from the timelock unchanged, so the 48-hour delay still applies to every owner
+action, and refuses every other caller. A few calls also need a consent from a joint approver Safe
+(`0x615C34e41F031B0ba1E3ba984388FEDE9eB56819`, 2-of-3, whose signers include both Recoup and
+DexFi). A consent is bound to the keccak256 of the exact calldata, is used once, and lasts at most
+seven days. On the vault the gate holds back `setBondDepositsPaused` with anything but `true`
+(opening existing-bond deposits), `transferOwnership`, `setCustodyAdapter`, `setCreditManager` and
+`setLiquidationAuction`. On the adapter it holds back `emergencyUnstake` to any address but the
+adapter itself, and `transferOwnership`. Everything else passes straight through: shutting
+existing-bond deposits, `pause` and `unpause`, the harvester and yield-recipient setters (which
+route USDC yield only, never a bond), the guardian setter, mint-attempt recovery, and the adapter's
+self-hatch (`emergencyUnstake` to the adapter itself, which moves no bond out of custody) followed
+by `restakeLoose`. The guardian still pauses the vault directly. Read at block 59,460,998: each of
+the seven held-back calls, sent from the timelock with no consent, reverts with the gate's
+consent-required error, while `setBondDepositsPaused(true)` and the adapter's `setHarvester` go
+through. The two gate contracts are not part of this repository's source and were not in the
+external audit's scope; their source is verified exact match on Sourcify, and they have unit and
+fork tests and internal review only.
+
+What the gates do not cover. They bind the timelock to the approver for the calls they hold back and
+no others. The `NAVOracle` owner powers stay with the timelock alone: it can replace both NAV keys
+(`setKeeper`, `setNavConfirmer`), and keys that post and confirm a near-zero NAV through the pending
+path would make every position with debt liquidatable. That route is public for 48 hours like every
+other owner action, and the NAV pending delay follows it; the structural fix is the PRD section 9
+two-key split, with one NAV key held outside Recoup, and it is not in place. Every other owner power
+on the seven timelock-owned contracts, `LenderPool` and `CreditManager` wiring included, is outside
+the gates too, as are liquidation to a paying bidder through the real auction and disposal of a
+closed workout lot. A lost approver Safe means existing-bond deposits can never open, neither
+contract can change owner again, the vault's custody adapter, credit manager and liquidation auction
+can never be repointed, and the adapter can hatch only into itself; every other owner power is
+unaffected.
 
 The Base Sepolia stack is still controlled by a single EOA. That key can redirect yield, replace the
 auction pointer before seizure, emergency-unstake collateral, pause core paths and stop lender-yield
@@ -1257,7 +1500,7 @@ These are additional to the pool's activation gates and the external-audit gate.
 
 None of these is an activation blocker (the former three-item pool list is two closed and one
 residual, in the `LenderPool` findings section above), but they remain open, partly closed or
-accepted for the present pre-launch state.
+accepted in the present state.
 
 ### Pool, stream and liquidation
 
@@ -1287,8 +1530,10 @@ accepted for the present pre-launch state.
 | Recovery-era binding | **Closed in this source since 2026-09-12, in three parts.** Written-down-loss recovery follows the bearer and funder recorded at write-down, keyed by auction and workout id (`recoveryBearerOf`, `recoveryFunderOf`), so a later default by the same borrower cannot redirect an earlier workout's recovery (the external reviewers' H-01); a former auction can still deliver it (`wasLiquidationAuction`, their H-02); and the pool accepts it from a former manager (`wasCreditManager`, their L-01). At b66023d recovery was keyed by borrower and the pool-side case was a permanent refusal; see "Recovery of a written-down loss is undeliverable after a manager migration" above. The zero-supply derecognition item above is unaffected |
 | Risk-parameter check | The deployment check can approve a liquidation-threshold transition that the on-chain setter would reject |
 | Insurance target | `INSURANCE_FUND_TARGET_BPS` has no consumer or enforcement path |
-| Pointer probes | Contract-graph probe coverage remains incomplete as a class and must be re-derived when interfaces change |
-| Lender-yield authority | Until governance is installed, the pool owner can stop new lender-yield delivery by changing `epochHarvester` |
+| Pointer probes | Contract-graph probe coverage remains incomplete as a class and must be re-derived when interfaces change. One door named: `CollateralVault.setCreditManager` probes the incoming manager's vault, risk-parameter and NAV pointers and `accYieldPerBond`, but the vault also calls `settleForVault`, `debtOf` and `currentDebtOf` on it bare. A contract answering only the probed four installs once the book is flat, and from then on every deposit, withdrawal, seizure and reassignment reverts; pointing back at the old manager is refused `CreditManagerNotVirgin` once it has accrued, so the recovery is a fresh, complete manager and another timelock operation. The same missing probe lets an auction open against such a manager and its bid and `expireToWorkout` revert. Nothing is lost while it holds. Raised through the bug bounty, 2026-11; Low, open. It needs an owner (timelock, approver-consented) install of the wrong contract, and on Base mainnet the live debt (`totalDebt` 193.699389 at block 59,460,998) refuses any manager install today. Fix not built: probe the three selectors, bytes not measured |
+| Manager and harvester pair | `CreditManager.setEpochHarvester` checks only for zero, and `EpochHarvester.setCreditManager` checks that the vault names the incoming manager but not that the manager names this harvester back. A wrong address, or a migration batch in the wrong order, makes `receiveYield` revert `NotEpochHarvester` and `harvest` fail until one more owner operation repairs it; the yield waits at the harvester and nothing is lost. Raised through the bug bounty, 2026-11; Low, open. A binding check on `CreditManager` was costed at +156 runtime bytes against its binding EIP-170 margin and refused; the harvester-side check is not built |
+| Treasury manager binding | `TreasuryLiquiditySource.setCreditManager` lacks the live-book guard `LenderPool.setCreditManager` has. Repointed while a loan it funded is out, `settlePrincipal` reverts until it is pointed back, and after a permissionless flush its `outstandingPrincipal` is stale; nothing on chain reads that counter, so the effect is bookkeeping. Raised through the bug bounty, 2026-11; Low, open. On Base mainnet the treasury source is not the live liquidity source and holds 0 USDC with 0 outstanding (block 59,460,998). Fix not built: refuse while `outstandingPrincipal` is not 0 |
+| Lender-yield authority | The pool owner (the timelock on Base mainnet) can stop lender-yield delivery by changing `epochHarvester`: delivery then reverts `NotEpochHarvester`, which stops yield already accrued and waiting at the harvester as well as new yield, until the pointer is repaired. Pointing it back lets the permissionless `flushLenderYieldTo` deliver what waited, in full. `pendingLenderYield` read 0 at block 59,460,998 |
 
 ### Liquidation incentives and lifecycle
 

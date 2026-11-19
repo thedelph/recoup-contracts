@@ -2,22 +2,27 @@
   "network": "base",
   "chainId": 8453,
   "deployedAt": "2026-10-02",
-  "note": "Recoup on Base mainnet. Deployed but not yet open to users. Operator wallets are not listed here; they are readable on chain.",
+  "note": "Recoup on Base mainnet. The LenderPool has accepted deposits from any address since 2026-10-18, up to its deposit cap. Operator wallets are not listed here; they are readable on chain.",
   "source": {
     "srcTree": "69c16afc1e7123027016b3d221e5cc726bb770a2",
-    "statement": "The deployed runtime of every contract below equals the bytecode that this repository's src/ builds with its foundry.toml and pinned libraries: exactly for NAVOracle, RiskParams, ReferralRegistry and TimelockController, and apart from constructor-set immutables for the rest. The mainnet deploy scripts are not published in this repository."
+    "statement": "The deployed runtime of every contract under contracts, libraries and children, and of the timelock, equals the bytecode that this repository's src/ builds with its foundry.toml and pinned libraries: exactly for NAVOracle, RiskParams, ReferralRegistry and TimelockController, and apart from constructor-set immutables for the rest. The two consent gates under governance are not built from this repository; their source is verified exact match on Sourcify. The mainnet deploy scripts are not published in this repository."
   },
   "verified": {
     "sourcify": "14 of 14 exact_match",
     "blockscout": "14 of 14",
-    "basescan": "14 of 14 Exact Match"
+    "basescan": "14 of 14 Exact Match",
+    "consentGatesSourcify": "2 of 2 exact_match"
   },
   "deployBlocks": {
     "protocol": {
       "first": 52095163,
       "last": 52095204
     },
-    "referralRegistry": 52095514
+    "referralRegistry": 52095514,
+    "consentGates": {
+      "bondDepositConsentGate": 52511119,
+      "adapterConsentGate": 52511124
+    }
   },
   "contracts": {
     "NAVOracle": "0xF18ed41cfC1d00A179Eea790a2A4C7d48365681d",
@@ -43,10 +48,33 @@
   "governance": {
     "timelock": "0x8357AA0899917755744B139b51c72A8AEE0301Bf",
     "timelockMinDelaySeconds": 172800,
+    "timelockOwns": [
+      "NAVOracle",
+      "RiskParams",
+      "CreditManager",
+      "TreasuryLiquiditySource",
+      "LenderPool",
+      "EpochHarvester",
+      "LiquidationAuction"
+    ],
     "governanceSafe": "0x06ac4Ad08474F9C86912009b8489b8d363d3B2D3",
     "safeThreshold": "2 of 3",
     "proposerAndCanceller": "governanceSafe",
     "executor": "anyone",
+    "bondDepositConsentGate": {
+      "address": "0xF24235E22FC6c52F37512f6f330536c49f61da48",
+      "owns": "CollateralVault",
+      "controller": "timelock",
+      "approver": "approverSafe"
+    },
+    "adapterConsentGate": {
+      "address": "0x2A733afD666839998cfF09Ab5c18F5FA7746022C",
+      "owns": "DirectCallAdapter",
+      "controller": "timelock",
+      "approver": "approverSafe"
+    },
+    "approverSafe": "0x615C34e41F031B0ba1E3ba984388FEDE9eB56819",
+    "approverSafeThreshold": "2 of 3",
     "protocolFeeSplitter": "0xA905d06704451733Ea77889FD3ac9847dcD35177"
   },
   "externals": {
@@ -59,5 +87,10 @@
     "liquidationThresholdBps": 5000,
     "globalBorrowCapUsdc": 25000,
     "perAccountBorrowCapUsdc": 5000
+  },
+  "lenderPool": {
+    "openToDepositsSince": "2026-10-18",
+    "openToDepositsSinceBlock": 52747165,
+    "depositCapUsdc": 5000
   }
 }
