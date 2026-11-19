@@ -65,7 +65,7 @@ Fixed parameters and external addresses live in [`src/Config.sol`](src/Config.so
 liquidation threshold and the borrow caps live in bounded storage in
 [`src/RiskParams.sol`](src/RiskParams.sol).
 
-## Pool status and residual risks
+## Activation blockers and residual risks
 
 On Base mainnet the lender pool is wired through the timelock and has accepted deposits from any
 address since 2026-10-18, up to its 5,000 USDC deposit cap. What the open pool rests on:
