@@ -963,6 +963,62 @@ so nothing deployed is affected. Fix not built: parse the `bytes32` from text th
 `_envOrAddress` parses addresses, and refuse a fee wallet that is the vault or another core
 contract; no runtime bytes.
 
+### A live auction whose lot was emptied quotes a price of zero. Low, open, dated 2026-11-24
+
+If a borrower in auction is fully cured by `repayFor` and then withdraws the whole lot,
+`isLiquidating` still reads true, `currentPrice` returns 0 and every `bid` reverts
+`NothingToAuction`. The function's own comment says a price nobody can fill is as misleading as a
+silent zero, and this case returns one. It lasts until anyone calls `cancel`, which the healed
+position allows at once, or until the six-hour window ends, after which `currentPrice` reverts
+`AuctionLapsed`. Nothing moves and no accounting figure changes; what it can mislead is anything
+that reads the quote, such as a keeper or a front end. Measured on this source in a test that is not
+in this repository. Live: no auction has ever run on Base mainnet (`nextAuctionId` read 0 at block
+61,739,018, 2026-11-24 16:36:19 UTC). Fix not built: revert `NothingToAuction` from
+`currentPrice` when the lot is empty, in `LiquidationAuction`.
+
+### A bond holder who withdraws while a yield stream runs gives up the rest of that stream. Low, open, dated 2026-11-24
+
+Yield reaches bond holders as a stream after each harvest, paid to whoever is staked while it
+streams; that is the anti-JIT design described on `distributeYield`. A holder who withdraws every
+bond part-way through a stream keeps only what accrued before the exit, and the rest of that stream
+goes to the holders who stay. Yield the farm earned on the leaver's bonds before the harvest is paid
+the same way, to whoever is staked while it streams. Measured on this source in a test that is not
+in this repository: two equal holders and a 1,000 USDC epoch, one withdrawing everything halfway
+through the stream, kept 249.999999 USDC and the holder who stayed took 749.999999. A borrower who
+harvests and waits for the stream to finish before withdrawing gives up nothing. The lender-side
+counterpart is "Closing the last position destroys the yield still streaming to it" above; this is
+the bond-holder side, which this file did not state. Live: applies to every full exit while a stream
+runs. No fix planned: it is the design, and this entry is its disclosure.
+
+### Credits
+
+Reporters through the bug bounty, by the name each chose, or by GitHub username where no name was
+given. The first valid report of a root cause is credited; a later report of the same root cause is
+listed where its reporter asked to be.
+
+| Finding | Credited to | Also reported independently by |
+| --- | --- | --- |
+| After a clean workout close, the lot's yield until its disposal goes to the insurance fund | everforyou | Oxsohi, maniaantok3, Rudy Rusmanto |
+| A serviced request's floor under a mark, and after a later loss (the #64 entry) | hokkyycell-arch | airdropgodx24, Feymarl |
+| The harvester's parked lender yield once the pool opened | sian-hunt | |
+| One deposit can fill the deposit cap and shut entry for everyone else | Oxsohi | |
+| The entry-price repair door admits no partial cover (round 22 F3) | Muhammad Harley | |
+| Re-attaching a detached manager: the vault's guard reads only `accYieldPerBond` | Juann | Feymarl |
+| A loan can be written at the accepted NAV while a lower value waits for the second key | ihavemage | |
+| The vault's manager door does not probe every selector it later calls | Yudiasher | LordVoldemort067 |
+| The treasury's manager setter has no live-book guard | nanda-102c | |
+| The harvester's manager door does not check that the manager points back | polaikan | |
+| The manager's harvester door has no binding check | LordVoldemort067 | |
+| The borrow guard is one-sided under manager-first auction wiring | indomie | |
+| A successor manager starts its first stream window at its deployment | everforyou | |
+| The consent gates, and what they cover | Mgbutf | |
+| Two hardening gaps in the published deploy scripts | Muhammad Harley | |
+| `CreditManager` books the nominal amount on its inbound USDC legs | Ahkimochi | |
+| The adapter does not check the farm position on stake and unstake | mr-hrydarie | Agus |
+| The auction's manager door probes `yieldAccruedOn` with zero arguments | Yudiasher | |
+| A live auction whose lot was emptied quotes a price of zero | AirdropGlobe | |
+| A bond holder who withdraws while a yield stream runs gives up the rest of that stream | viseweb3 | |
+
 ## Open findings from internal review round 45, at the audit commit
 
 In the week before the external audit, a twelve-reader internal adversarial pass was run over the
